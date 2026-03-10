@@ -1,11 +1,11 @@
-# kapsl-runtime
+# kapsl-sdk
 
 Python SDK for [kapsl-runtime](https://kapsl.ai) — a high-performance on-device inference engine for LLMs and multimodal models.
 
 ## Installation
 
 ```bash
-pip install kapsl-runtime
+pip install kapsl-sdk
 ```
 
 ## Usage
