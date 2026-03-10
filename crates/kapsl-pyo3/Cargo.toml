@@ -8,7 +8,7 @@ name = "kapsl_sdk"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.22", features = ["extension-module"] }
+pyo3 = { version = "0.22", features = ["extension-module", "generate-import-lib"] }
 numpy = "0.22"
 kapsl-ipc = { path = "../kapsl-ipc" }
 kapsl-engine-api = { path = "../kapsl-engine-api" }
