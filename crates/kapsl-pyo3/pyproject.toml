@@ -27,6 +27,6 @@ classifiers = [
 Homepage = "https://kapsl.ai"
 
 [tool.maturin]
-module-name = "kapsl_runtime.kapsl_runtime"
-python-packages = ["kapsl_runtime"]
+module-name = "kapsl_sdk.kapsl_sdk"
+python-packages = ["kapsl_sdk"]
 features = ["pyo3/extension-module"]

@@ -610,7 +610,7 @@ impl StreamIterator {
 }
 
 #[pymodule]
-fn kapsl_runtime(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn kapsl_sdk(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<KapslClient>()?;
     m.add_class::<KapslShmClient>()?;
     m.add_class::<KapslHybridClient>()?;

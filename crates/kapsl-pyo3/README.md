@@ -11,7 +11,7 @@ pip install kapsl-sdk
 ## Usage
 
 ```python
-from kapsl_runtime import KapslClient
+from kapsl_sdk import KapslClient
 
 client = KapslClient()
 result = client.infer(model_id=0, inputs={"input_ids": ...})
