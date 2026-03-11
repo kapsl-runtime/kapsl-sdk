@@ -395,7 +395,8 @@ impl KapslClient {
         dtype: &str,
         data: &[u8],
         additional_inputs: Vec<NamedTensor>,
-    ) -> Result<Vec<u8>, ClientError> {
+        session_id: Option<String>,
+    ) -> Result<BinaryTensorPacket, ClientError> {
         let dtype =
             TensorDtype::from_str(dtype).map_err(|e| ClientError::InvalidDtype(e.to_string()))?;
         let input = BinaryTensorPacket {
@@ -410,11 +411,10 @@ impl KapslClient {
             m
         });
 
-        // Wrap in InferenceRequest (what the server expects)
         let request = InferenceRequest {
             input,
             additional_inputs,
-            session_id: None,
+            session_id,
             metadata,
             cancellation: None,
         };
@@ -428,15 +428,13 @@ impl KapslClient {
             payload_size: input_bytes.len() as u32,
         };
 
-        // Write header as raw bytes (not bincode)
         stream.write_all(&header.model_id.to_le_bytes())?;
         stream.write_all(&header.op_code.to_le_bytes())?;
         stream.write_all(&header.payload_size.to_le_bytes())?;
         stream.write_all(&input_bytes)?;
-        stream.flush()?; // Ensure data is sent
+        stream.flush()?;
 
-        // Read response
-        let mut header_buf = [0u8; 8]; // 2 * u32 = 8 bytes
+        let mut header_buf = [0u8; 8];
         stream.read_exact(&mut header_buf)?;
 
         let resp_header: ResponseHeader = bincode::deserialize(&header_buf)
@@ -450,11 +448,10 @@ impl KapslClient {
             return Err(ClientError::Server(error_msg.to_string()));
         }
 
-        // Deserialize payload to BinaryTensorPacket to get data
         let output: BinaryTensorPacket = bincode::deserialize(&payload)
             .map_err(|e| ClientError::Serialization(e.to_string()))?;
 
-        Ok(output.data)
+        Ok(output)
     }
 }
 
@@ -508,7 +505,7 @@ impl KapslClient {
         self.target.endpoint_display()
     }
 
-    #[pyo3(signature = (model_id, shape, dtype, data, additional_inputs = None))]
+    #[pyo3(signature = (model_id, shape, dtype, data, additional_inputs = None, session_id = None))]
     fn infer(
         &self,
         model_id: u32,
@@ -516,22 +513,22 @@ impl KapslClient {
         dtype: String,
         data: Vec<u8>,
         additional_inputs: Option<HashMap<String, (Vec<i64>, String, Vec<u8>)>>,
+        session_id: Option<String>,
     ) -> PyResult<Vec<u8>> {
         let extra = Self::parse_additional_inputs(additional_inputs.unwrap_or_default())
             .map_err(PyErr::from)?;
         let mut stream = self.checkout_connection().map_err(PyErr::from)?;
-        match self.infer_impl(&mut stream, model_id, &shape, &dtype, &data, extra.clone()) {
+        match self.infer_impl(&mut stream, model_id, &shape, &dtype, &data, extra.clone(), session_id.clone()) {
             Ok(output) => {
                 self.return_connection(stream);
-                Ok(output)
+                Ok(output.data)
             }
             Err(ClientError::Io(_)) => {
-                // Connection likely stale; retry once with a fresh socket.
                 let mut fresh = self.connect_stream().map_err(PyErr::from)?;
-                match self.infer_impl(&mut fresh, model_id, &shape, &dtype, &data, extra) {
+                match self.infer_impl(&mut fresh, model_id, &shape, &dtype, &data, extra, session_id) {
                     Ok(output) => {
                         self.return_connection(fresh);
-                        Ok(output)
+                        Ok(output.data)
                     }
                     Err(err) => Err(err.into()),
                 }
@@ -543,7 +540,45 @@ impl KapslClient {
         }
     }
 
-    #[pyo3(signature = (model_id, shape, dtype, data, additional_inputs = None))]
+    /// Like `infer` but returns `(data, shape, dtype)` so the caller knows
+    /// how to interpret the output bytes without hardcoding dimensions.
+    /// Essential for models whose output shape varies (diffusion, video, TTS).
+    #[pyo3(signature = (model_id, shape, dtype, data, additional_inputs = None, session_id = None))]
+    fn infer_tensor(
+        &self,
+        model_id: u32,
+        shape: Vec<i64>,
+        dtype: String,
+        data: Vec<u8>,
+        additional_inputs: Option<HashMap<String, (Vec<i64>, String, Vec<u8>)>>,
+        session_id: Option<String>,
+    ) -> PyResult<(Vec<u8>, Vec<i64>, String)> {
+        let extra = Self::parse_additional_inputs(additional_inputs.unwrap_or_default())
+            .map_err(PyErr::from)?;
+        let mut stream = self.checkout_connection().map_err(PyErr::from)?;
+        match self.infer_impl(&mut stream, model_id, &shape, &dtype, &data, extra.clone(), session_id.clone()) {
+            Ok(output) => {
+                self.return_connection(stream);
+                Ok((output.data, output.shape, output.dtype.as_str().to_string()))
+            }
+            Err(ClientError::Io(_)) => {
+                let mut fresh = self.connect_stream().map_err(PyErr::from)?;
+                match self.infer_impl(&mut fresh, model_id, &shape, &dtype, &data, extra, session_id) {
+                    Ok(output) => {
+                        self.return_connection(fresh);
+                        Ok((output.data, output.shape, output.dtype.as_str().to_string()))
+                    }
+                    Err(err) => Err(err.into()),
+                }
+            }
+            Err(err) => {
+                self.return_connection(stream);
+                Err(err.into())
+            }
+        }
+    }
+
+    #[pyo3(signature = (model_id, shape, dtype, data, additional_inputs = None, session_id = None))]
     fn infer_stream(
         &self,
         model_id: u32,
@@ -551,6 +586,7 @@ impl KapslClient {
         dtype: String,
         data: Vec<u8>,
         additional_inputs: Option<HashMap<String, (Vec<i64>, String, Vec<u8>)>>,
+        session_id: Option<String>,
     ) -> PyResult<StreamIterator> {
         let extra = Self::parse_additional_inputs(additional_inputs.unwrap_or_default())
             .map_err(PyErr::from)?;
@@ -568,7 +604,7 @@ impl KapslClient {
         let request = InferenceRequest {
             input,
             additional_inputs: extra,
-            session_id: None,
+            session_id,
             metadata,
             cancellation: None,
         };
