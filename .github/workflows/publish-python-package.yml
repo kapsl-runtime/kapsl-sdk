@@ -28,6 +28,21 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Set package version from tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          export VERSION="${GITHUB_REF_NAME#v}"
+          python - <<'PY'
+          from pathlib import Path
+          import os
+          import re
+          path = Path("crates/kapsl-pyo3/pyproject.toml")
+          text = path.read_text()
+          version = os.environ["VERSION"]
+          path.write_text(re.sub(r'^version = ".*"$', f'version = "{version}"', text, count=1, flags=re.MULTILINE))
+          PY
+
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -63,6 +78,21 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
+      - name: Set package version from tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          export VERSION="${GITHUB_REF_NAME#v}"
+          python - <<'PY'
+          from pathlib import Path
+          import os
+          import re
+          path = Path("crates/kapsl-pyo3/pyproject.toml")
+          text = path.read_text()
+          version = os.environ["VERSION"]
+          path.write_text(re.sub(r'^version = ".*"$', f'version = "{version}"', text, count=1, flags=re.MULTILINE))
+          PY
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
