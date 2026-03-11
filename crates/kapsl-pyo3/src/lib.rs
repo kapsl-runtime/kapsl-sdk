@@ -1,6 +1,6 @@
 #![allow(clippy::useless_conversion)]
 
-use kapsl_engine_api::{BinaryTensorPacket, InferenceRequest, TensorDtype};
+use kapsl_engine_api::{BinaryTensorPacket, InferenceRequest, NamedTensor, TensorDtype};
 use kapsl_ipc::{
     RequestHeader, ResponseHeader, OP_INFER, OP_INFER_STREAM, STATUS_OK, STATUS_STREAM_CHUNK,
     STATUS_STREAM_END,
@@ -372,6 +372,21 @@ impl KapslClient {
         }
     }
 
+    fn parse_additional_inputs(
+        raw: Vec<(String, Vec<i64>, String, Vec<u8>)>,
+    ) -> Result<Vec<NamedTensor>, ClientError> {
+        raw.into_iter()
+            .map(|(name, shape, dtype_str, data)| {
+                let dtype = TensorDtype::from_str(&dtype_str)
+                    .map_err(|e| ClientError::InvalidDtype(e.to_string()))?;
+                Ok(NamedTensor {
+                    name,
+                    tensor: BinaryTensorPacket { shape, dtype, data },
+                })
+            })
+            .collect()
+    }
+
     fn infer_impl(
         &self,
         stream: &mut dyn ReadWriteConnection,
@@ -379,6 +394,7 @@ impl KapslClient {
         shape: &[i64],
         dtype: &str,
         data: &[u8],
+        additional_inputs: Vec<NamedTensor>,
     ) -> Result<Vec<u8>, ClientError> {
         let dtype =
             TensorDtype::from_str(dtype).map_err(|e| ClientError::InvalidDtype(e.to_string()))?;
@@ -397,7 +413,7 @@ impl KapslClient {
         // Wrap in InferenceRequest (what the server expects)
         let request = InferenceRequest {
             input,
-            additional_inputs: Vec::new(),
+            additional_inputs,
             session_id: None,
             metadata,
             cancellation: None,
@@ -492,15 +508,19 @@ impl KapslClient {
         self.target.endpoint_display()
     }
 
+    #[pyo3(signature = (model_id, shape, dtype, data, additional_inputs = None))]
     fn infer(
         &self,
         model_id: u32,
         shape: Vec<i64>,
         dtype: String,
         data: Vec<u8>,
+        additional_inputs: Option<Vec<(String, Vec<i64>, String, Vec<u8>)>>,
     ) -> PyResult<Vec<u8>> {
+        let extra = Self::parse_additional_inputs(additional_inputs.unwrap_or_default())
+            .map_err(PyErr::from)?;
         let mut stream = self.checkout_connection().map_err(PyErr::from)?;
-        match self.infer_impl(&mut stream, model_id, &shape, &dtype, &data) {
+        match self.infer_impl(&mut stream, model_id, &shape, &dtype, &data, extra.clone()) {
             Ok(output) => {
                 self.return_connection(stream);
                 Ok(output)
@@ -508,7 +528,7 @@ impl KapslClient {
             Err(ClientError::Io(_)) => {
                 // Connection likely stale; retry once with a fresh socket.
                 let mut fresh = self.connect_stream().map_err(PyErr::from)?;
-                match self.infer_impl(&mut fresh, model_id, &shape, &dtype, &data) {
+                match self.infer_impl(&mut fresh, model_id, &shape, &dtype, &data, extra) {
                     Ok(output) => {
                         self.return_connection(fresh);
                         Ok(output)
@@ -523,13 +543,17 @@ impl KapslClient {
         }
     }
 
+    #[pyo3(signature = (model_id, shape, dtype, data, additional_inputs = None))]
     fn infer_stream(
         &self,
         model_id: u32,
         shape: Vec<i64>,
         dtype: String,
         data: Vec<u8>,
+        additional_inputs: Option<Vec<(String, Vec<i64>, String, Vec<u8>)>>,
     ) -> PyResult<StreamIterator> {
+        let extra = Self::parse_additional_inputs(additional_inputs.unwrap_or_default())
+            .map_err(PyErr::from)?;
         let mut stream = self.connect_stream().map_err(PyErr::from)?;
 
         // Send request
@@ -543,7 +567,7 @@ impl KapslClient {
         });
         let request = InferenceRequest {
             input,
-            additional_inputs: Vec::new(),
+            additional_inputs: extra,
             session_id: None,
             metadata,
             cancellation: None,
