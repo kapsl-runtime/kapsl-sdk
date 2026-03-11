@@ -453,6 +453,38 @@ impl KapslClient {
 
         Ok(output)
     }
+
+    fn run_infer(
+        &self,
+        model_id: u32,
+        shape: &[i64],
+        dtype: &str,
+        data: &[u8],
+        extra: Vec<NamedTensor>,
+        session_id: Option<String>,
+    ) -> PyResult<BinaryTensorPacket> {
+        let mut stream = self.checkout_connection().map_err(PyErr::from)?;
+        match self.infer_impl(&mut stream, model_id, shape, dtype, data, extra.clone(), session_id.clone()) {
+            Ok(output) => {
+                self.return_connection(stream);
+                Ok(output)
+            }
+            Err(ClientError::Io(_)) => {
+                let mut fresh = self.connect_stream().map_err(PyErr::from)?;
+                match self.infer_impl(&mut fresh, model_id, shape, dtype, data, extra, session_id) {
+                    Ok(output) => {
+                        self.return_connection(fresh);
+                        Ok(output)
+                    }
+                    Err(err) => Err(err.into()),
+                }
+            }
+            Err(err) => {
+                self.return_connection(stream);
+                Err(err.into())
+            }
+        }
+    }
 }
 
 #[pymethods]
@@ -517,27 +549,8 @@ impl KapslClient {
     ) -> PyResult<Vec<u8>> {
         let extra = Self::parse_additional_inputs(additional_inputs.unwrap_or_default())
             .map_err(PyErr::from)?;
-        let mut stream = self.checkout_connection().map_err(PyErr::from)?;
-        match self.infer_impl(&mut stream, model_id, &shape, &dtype, &data, extra.clone(), session_id.clone()) {
-            Ok(output) => {
-                self.return_connection(stream);
-                Ok(output.data)
-            }
-            Err(ClientError::Io(_)) => {
-                let mut fresh = self.connect_stream().map_err(PyErr::from)?;
-                match self.infer_impl(&mut fresh, model_id, &shape, &dtype, &data, extra, session_id) {
-                    Ok(output) => {
-                        self.return_connection(fresh);
-                        Ok(output.data)
-                    }
-                    Err(err) => Err(err.into()),
-                }
-            }
-            Err(err) => {
-                self.return_connection(stream);
-                Err(err.into())
-            }
-        }
+        self.run_infer(model_id, &shape, &dtype, &data, extra, session_id)
+            .map(|p| p.data)
     }
 
     /// Like `infer` but returns `(data, shape, dtype)` so the caller knows
@@ -555,27 +568,8 @@ impl KapslClient {
     ) -> PyResult<(Vec<u8>, Vec<i64>, String)> {
         let extra = Self::parse_additional_inputs(additional_inputs.unwrap_or_default())
             .map_err(PyErr::from)?;
-        let mut stream = self.checkout_connection().map_err(PyErr::from)?;
-        match self.infer_impl(&mut stream, model_id, &shape, &dtype, &data, extra.clone(), session_id.clone()) {
-            Ok(output) => {
-                self.return_connection(stream);
-                Ok((output.data, output.shape, output.dtype.as_str().to_string()))
-            }
-            Err(ClientError::Io(_)) => {
-                let mut fresh = self.connect_stream().map_err(PyErr::from)?;
-                match self.infer_impl(&mut fresh, model_id, &shape, &dtype, &data, extra, session_id) {
-                    Ok(output) => {
-                        self.return_connection(fresh);
-                        Ok((output.data, output.shape, output.dtype.as_str().to_string()))
-                    }
-                    Err(err) => Err(err.into()),
-                }
-            }
-            Err(err) => {
-                self.return_connection(stream);
-                Err(err.into())
-            }
-        }
+        self.run_infer(model_id, &shape, &dtype, &data, extra, session_id)
+            .map(|p| (p.data, p.shape, p.dtype.as_str().to_string()))
     }
 
     #[pyo3(signature = (model_id, shape, dtype, data, additional_inputs = None, session_id = None))]
