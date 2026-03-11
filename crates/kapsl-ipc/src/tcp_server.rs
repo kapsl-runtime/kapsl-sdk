@@ -10,6 +10,7 @@ pub struct TcpServer {
     bind_addr: String,
     port: u16,
     scheduler_lookup: crate::server::SchedulerLookup,
+    auth_token: Option<Arc<str>>,
 }
 
 impl TcpServer {
@@ -33,13 +34,20 @@ impl TcpServer {
             bind_addr: bind_addr.to_string(),
             port,
             scheduler_lookup,
+            auth_token: None,
         }
+    }
+
+    pub fn with_auth_token(mut self, token: impl Into<String>) -> Self {
+        self.auth_token = Some(Arc::from(token.into().as_str()));
+        self
     }
 
     async fn run_internal(&self) -> std::io::Result<()> {
         let addr = format!("{}:{}", self.bind_addr, self.port);
         let listener = TcpListener::bind(&addr).await?;
         let scheduler_lookup = self.scheduler_lookup.clone();
+        let auth_token = self.auth_token.clone();
 
         log::info!("TCP Server listening on {}", addr);
         log::info!("TCP Server bound to {}", addr);
@@ -47,12 +55,14 @@ impl TcpServer {
         loop {
             let (stream, peer_addr) = listener.accept().await?;
             let scheduler_lookup = scheduler_lookup.clone();
+            let auth_token = auth_token.clone();
 
             log::info!("New TCP connection from {}", peer_addr);
 
             tokio::spawn(async move {
                 if let Err(e) =
-                    crate::server::handle_connection(stream, scheduler_lookup, None).await
+                    crate::server::handle_connection(stream, scheduler_lookup, None, auth_token)
+                        .await
                 {
                     log::error!("Connection error: {}", e);
                 }

@@ -38,6 +38,21 @@ struct LegacyInferenceRequestV0 {
     input: BinaryTensorPacket,
 }
 
+fn check_auth(request: &InferenceRequest, expected: Option<&str>) -> Option<String> {
+    let Some(expected_token) = expected else {
+        return None; // auth not configured — allow all
+    };
+    let presented = request
+        .metadata
+        .as_ref()
+        .and_then(|m| m.auth_token.as_deref());
+    if presented != Some(expected_token) {
+        Some("Unauthorized".to_string())
+    } else {
+        None
+    }
+}
+
 fn decode_inference_request(payload: &[u8]) -> Result<InferenceRequest, String> {
     match bincode::deserialize::<InferenceRequest>(payload) {
         Ok(request) => Ok(request),
@@ -69,6 +84,7 @@ pub struct IpcServer {
     socket_path: String,
     scheduler_lookup: SchedulerLookup,
     shm_manager: Option<Arc<ShmManager>>,
+    auth_token: Option<Arc<str>>,
 }
 
 impl IpcServer {
@@ -92,11 +108,21 @@ impl IpcServer {
             socket_path: socket_path.to_string(),
             scheduler_lookup,
             shm_manager,
+            auth_token: None,
         }
+    }
+
+    /// Require every inference request to carry this token in
+    /// `request.metadata.auth_token`. Requests without the token
+    /// or with a wrong token receive `STATUS_ERR: Unauthorized`.
+    pub fn with_auth_token(mut self, token: impl Into<String>) -> Self {
+        self.auth_token = Some(Arc::from(token.into().as_str()));
+        self
     }
 
     async fn run_internal(&self) -> std::io::Result<()> {
         let scheduler_lookup = self.scheduler_lookup.clone();
+        let auth_token = self.auth_token.clone();
 
         #[cfg(unix)]
         {
@@ -125,9 +151,12 @@ impl IpcServer {
                 let (stream, _) = listener.accept().await?;
                 let scheduler_lookup = scheduler_lookup.clone();
                 let shm_manager = self.shm_manager.clone();
+                let auth_token = auth_token.clone();
 
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, scheduler_lookup, shm_manager).await {
+                    if let Err(e) =
+                        handle_connection(stream, scheduler_lookup, shm_manager, auth_token).await
+                    {
                         log::error!("Connection error: {}", e);
                     }
                 });
@@ -142,9 +171,12 @@ impl IpcServer {
                 server.connect().await?;
                 let scheduler_lookup = scheduler_lookup.clone();
                 let shm_manager = self.shm_manager.clone();
+                let auth_token = auth_token.clone();
 
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(server, scheduler_lookup, shm_manager).await {
+                    if let Err(e) =
+                        handle_connection(server, scheduler_lookup, shm_manager, auth_token).await
+                    {
                         log::error!("Connection error: {}", e);
                     }
                 });
@@ -179,6 +211,7 @@ pub(crate) async fn handle_connection<T>(
     mut connection: T,
     scheduler_lookup: SchedulerLookup,
     shm_manager: Option<Arc<ShmManager>>,
+    auth_token: Option<Arc<str>>,
 ) -> std::io::Result<()>
 where
     T: AsyncRead + AsyncWrite + Unpin,
@@ -224,6 +257,21 @@ where
                         continue;
                     }
                 };
+
+                if let Some(error_msg) = check_auth(&request, auth_token.as_deref()) {
+                    let resp_header = ResponseHeader {
+                        status: STATUS_ERR,
+                        payload_size: error_msg.len() as u32,
+                    };
+                    connection
+                        .write_all(&resp_header.status.to_le_bytes())
+                        .await?;
+                    connection
+                        .write_all(&resp_header.payload_size.to_le_bytes())
+                        .await?;
+                    connection.write_all(error_msg.as_bytes()).await?;
+                    continue;
+                }
 
                 // Get scheduler for model
                 let scheduler = match scheduler_lookup(header.model_id) {
@@ -354,6 +402,21 @@ where
                             continue;
                         }
                     };
+
+                    if let Some(error_msg) = check_auth(&request, auth_token.as_deref()) {
+                        let resp_header = ResponseHeader {
+                            status: STATUS_ERR,
+                            payload_size: error_msg.len() as u32,
+                        };
+                        connection
+                            .write_all(&resp_header.status.to_le_bytes())
+                            .await?;
+                        connection
+                            .write_all(&resp_header.payload_size.to_le_bytes())
+                            .await?;
+                        connection.write_all(error_msg.as_bytes()).await?;
+                        continue;
+                    }
 
                     // Process
                     // Default to Throughput priority and allow GPU (force_cpu = false)
