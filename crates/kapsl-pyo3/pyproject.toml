@@ -36,3 +36,4 @@ Issues = "https://github.com/kapsl-runtime/kapsl-sdk/issues"
 module-name = "kapsl_sdk.kapsl_sdk"
 python-packages = ["kapsl_sdk"]
 features = ["pyo3/extension-module"]
+include = ["kapsl_sdk/*.bin"]

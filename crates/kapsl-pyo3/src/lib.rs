@@ -6,7 +6,7 @@ use kapsl_ipc::{
     STATUS_STREAM_END,
 };
 use pyo3::prelude::*;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 #[cfg(unix)]
@@ -373,10 +373,10 @@ impl KapslClient {
     }
 
     fn parse_additional_inputs(
-        raw: Vec<(String, Vec<i64>, String, Vec<u8>)>,
+        raw: HashMap<String, (Vec<i64>, String, Vec<u8>)>,
     ) -> Result<Vec<NamedTensor>, ClientError> {
         raw.into_iter()
-            .map(|(name, shape, dtype_str, data)| {
+            .map(|(name, (shape, dtype_str, data))| {
                 let dtype = TensorDtype::from_str(&dtype_str)
                     .map_err(|e| ClientError::InvalidDtype(e.to_string()))?;
                 Ok(NamedTensor {
@@ -515,7 +515,7 @@ impl KapslClient {
         shape: Vec<i64>,
         dtype: String,
         data: Vec<u8>,
-        additional_inputs: Option<Vec<(String, Vec<i64>, String, Vec<u8>)>>,
+        additional_inputs: Option<HashMap<String, (Vec<i64>, String, Vec<u8>)>>,
     ) -> PyResult<Vec<u8>> {
         let extra = Self::parse_additional_inputs(additional_inputs.unwrap_or_default())
             .map_err(PyErr::from)?;
@@ -550,7 +550,7 @@ impl KapslClient {
         shape: Vec<i64>,
         dtype: String,
         data: Vec<u8>,
-        additional_inputs: Option<Vec<(String, Vec<i64>, String, Vec<u8>)>>,
+        additional_inputs: Option<HashMap<String, (Vec<i64>, String, Vec<u8>)>>,
     ) -> PyResult<StreamIterator> {
         let extra = Self::parse_additional_inputs(additional_inputs.unwrap_or_default())
             .map_err(PyErr::from)?;
