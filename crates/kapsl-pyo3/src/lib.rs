@@ -329,6 +329,7 @@ struct KapslClient {
     target: ConnectionTarget,
     max_pool_size: usize,
     connection_pool: Mutex<VecDeque<ClientConnection>>,
+    api_token: Option<String>,
 }
 
 impl KapslClient {
@@ -387,12 +388,18 @@ impl KapslClient {
             data: data.to_vec(),
         };
 
+        let metadata = self.api_token.as_ref().map(|token| {
+            let mut m = kapsl_engine_api::RequestMetadata::default();
+            m.auth_token = Some(token.clone());
+            m
+        });
+
         // Wrap in InferenceRequest (what the server expects)
         let request = InferenceRequest {
             input,
             additional_inputs: Vec::new(),
             session_id: None,
-            metadata: None,
+            metadata,
             cancellation: None,
         };
 
@@ -447,7 +454,8 @@ impl KapslClient {
         port = None,
         socket_path = None,
         pipe_name = None,
-        max_pool_size = DEFAULT_MAX_POOL_SIZE
+        max_pool_size = DEFAULT_MAX_POOL_SIZE,
+        api_token = None
     ))]
     fn new(
         endpoint: Option<String>,
@@ -457,6 +465,7 @@ impl KapslClient {
         socket_path: Option<String>,
         pipe_name: Option<String>,
         max_pool_size: usize,
+        api_token: Option<String>,
     ) -> PyResult<Self> {
         let target = ConnectionTarget::from_options(
             endpoint.as_deref(),
@@ -471,6 +480,7 @@ impl KapslClient {
             target,
             max_pool_size,
             connection_pool: Mutex::new(VecDeque::new()),
+            api_token,
         })
     }
 
@@ -526,11 +536,16 @@ impl KapslClient {
         let dtype = TensorDtype::from_str(&dtype)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
         let input = BinaryTensorPacket { shape, dtype, data };
+        let metadata = self.api_token.as_ref().map(|token| {
+            let mut m = kapsl_engine_api::RequestMetadata::default();
+            m.auth_token = Some(token.clone());
+            m
+        });
         let request = InferenceRequest {
             input,
             additional_inputs: Vec::new(),
             session_id: None,
-            metadata: None,
+            metadata,
             cancellation: None,
         };
         let input_bytes = bincode::serialize(&request)

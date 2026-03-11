@@ -452,6 +452,8 @@ pub struct RequestMetadata {
     pub force_cpu: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_token: Option<String>,
 
     // === Optional LLM overrides ===
     #[serde(default, skip_serializing_if = "Option::is_none", alias = "max_tokens")]
