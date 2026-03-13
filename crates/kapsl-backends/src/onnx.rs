@@ -156,7 +156,7 @@ impl OnnxBackendBuilder {
         let memory_pattern = read_env_flag(ORT_MEMORY_PATTERN_ENV, true);
         let disable_cpu_mem_arena = read_env_flag(ORT_DISABLE_CPU_MEM_ARENA_ENV, false);
         let max_bucket_sessions = read_env_usize(ORT_SESSION_BUCKETS_ENV)
-            .unwrap_or(1)
+            .unwrap_or(4)
             .clamp(1, ORT_SESSION_BUCKETS_MAX);
         let bucket_dim_granularity = read_env_usize(ORT_BUCKET_DIM_GRANULARITY_ENV)
             .unwrap_or(64)
@@ -449,29 +449,29 @@ impl OnnxBackend {
         let mut builder = Session::builder()
             .map_err(|e| EngineError::ModelLoadError {
                 path: model_path.to_string_lossy().into_owned(),
-                source: Box::new(e),
+                source: Box::new(std::io::Error::other(e.to_string())),
             })?
             .with_optimization_level(opt_level)
             .map_err(|e| EngineError::ModelLoadError {
                 path: model_path.to_string_lossy().into_owned(),
-                source: Box::new(e),
+                source: Box::new(std::io::Error::other(e.to_string())),
             })?
             .with_memory_pattern(self.memory_pattern)
             .map_err(|e| EngineError::ModelLoadError {
                 path: model_path.to_string_lossy().into_owned(),
-                source: Box::new(e),
+                source: Box::new(std::io::Error::other(e.to_string())),
             })?;
         if self.disable_cpu_mem_arena {
             builder = builder
                 .with_config_entry("session.disable_cpu_mem_arena", "1")
                 .map_err(|e| EngineError::ModelLoadError {
                     path: model_path.to_string_lossy().into_owned(),
-                    source: Box::new(e),
+                    source: Box::new(std::io::Error::other(e.to_string())),
                 })?;
         }
 
         // Configure execution providers based on the selected backend
-        let builder = match self.provider {
+        let mut builder = match self.provider {
             ExecutionProvider::CUDA => {
                 if !ort::execution_providers::CUDAExecutionProvider::default()
                     .is_available()
@@ -492,7 +492,7 @@ impl OnnxBackend {
                     ])
                     .map_err(|e| EngineError::ModelLoadError {
                         path: model_path.to_string_lossy().into_owned(),
-                        source: Box::new(e),
+                        source: Box::new(std::io::Error::other(e.to_string())),
                     })?
             }
             ExecutionProvider::TensorRT => {
@@ -517,7 +517,7 @@ impl OnnxBackend {
                     ])
                     .map_err(|e| EngineError::ModelLoadError {
                         path: model_path.to_string_lossy().into_owned(),
-                        source: Box::new(e),
+                        source: Box::new(std::io::Error::other(e.to_string())),
                     })?
             }
             ExecutionProvider::DirectML => {
@@ -540,7 +540,7 @@ impl OnnxBackend {
                         ])
                         .map_err(|e| EngineError::ModelLoadError {
                             path: model_path.to_string_lossy().into_owned(),
-                            source: Box::new(e),
+                            source: Box::new(std::io::Error::other(e.to_string())),
                         })?
                 }
                 #[cfg(not(target_os = "windows"))]
@@ -570,7 +570,7 @@ impl OnnxBackend {
                     ])
                     .map_err(|e| EngineError::ModelLoadError {
                         path: model_path.to_string_lossy().into_owned(),
-                        source: Box::new(e),
+                        source: Box::new(std::io::Error::other(e.to_string())),
                     })?
             }
             ExecutionProvider::OpenVINO => {
@@ -589,7 +589,7 @@ impl OnnxBackend {
                     ])
                     .map_err(|e| EngineError::ModelLoadError {
                         path: model_path.to_string_lossy().into_owned(),
-                        source: Box::new(e),
+                        source: Box::new(std::io::Error::other(e.to_string())),
                     })?
             }
             ExecutionProvider::CoreML => {
@@ -612,7 +612,7 @@ impl OnnxBackend {
                     ])
                     .map_err(|e| EngineError::ModelLoadError {
                         path: model_path.to_string_lossy().into_owned(),
-                        source: Box::new(e),
+                        source: Box::new(std::io::Error::other(e.to_string())),
                     })?
             }
             ExecutionProvider::CPU => {
@@ -626,7 +626,7 @@ impl OnnxBackend {
             .commit_from_file(model_path)
             .map_err(|e| EngineError::ModelLoadError {
                 path: model_path.to_string_lossy().into_owned(),
-                source: Box::new(e),
+                source: Box::new(std::io::Error::other(e.to_string())),
             })
     }
 }

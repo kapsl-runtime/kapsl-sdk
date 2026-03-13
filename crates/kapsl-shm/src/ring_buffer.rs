@@ -128,17 +128,27 @@ impl<T: Copy> LockFreeRingBuffer<T> {
 
                 // Phase 3: commit in reservation order so consumers always see
                 // a contiguous prefix of written slots.
-                loop {
-                    match unsafe {
-                        (*self.head_committed).compare_exchange_weak(
-                            reserved,
-                            next_reserved,
-                            Ordering::Release,
-                            Ordering::Relaxed,
-                        )
-                    } {
-                        Ok(_) => break,
-                        Err(_) => std::hint::spin_loop(),
+                {
+                    let mut spins: u32 = 0;
+                    loop {
+                        match unsafe {
+                            (*self.head_committed).compare_exchange_weak(
+                                reserved,
+                                next_reserved,
+                                Ordering::Release,
+                                Ordering::Relaxed,
+                            )
+                        } {
+                            Ok(_) => break,
+                            Err(_) => {
+                                spins += 1;
+                                if spins & 63 == 0 {
+                                    std::thread::yield_now();
+                                } else {
+                                    std::hint::spin_loop();
+                                }
+                            }
+                        }
                     }
                 }
                 return Ok(());

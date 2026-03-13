@@ -33,11 +33,6 @@ struct LegacyInferenceRequestV1 {
     session_id: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct LegacyInferenceRequestV0 {
-    input: BinaryTensorPacket,
-}
-
 fn check_auth(request: &InferenceRequest, expected: Option<&str>) -> Option<String> {
     let Some(expected_token) = expected else {
         return None; // auth not configured — allow all
@@ -62,15 +57,6 @@ fn decode_inference_request(payload: &[u8]) -> Result<InferenceRequest, String> 
                     input: legacy.input,
                     additional_inputs: legacy.additional_inputs,
                     session_id: legacy.session_id,
-                    metadata: None,
-                    cancellation: None,
-                });
-            }
-            if let Ok(legacy) = bincode::deserialize::<LegacyInferenceRequestV0>(payload) {
-                return Ok(InferenceRequest {
-                    input: legacy.input,
-                    additional_inputs: Vec::new(),
-                    session_id: None,
                     metadata: None,
                     cancellation: None,
                 });
