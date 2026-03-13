@@ -313,9 +313,12 @@ impl BackendFactory {
                 Self::build_onnx_backend(ExecutionProvider::TensorRT, opt_level, device_id, tuning)
             }
 
-            "metal" => {
+            "metal" | "coreml" => {
                 if !device_info.has_metal {
-                    return Err("Metal not available on this system".to_string());
+                    return Err(format!(
+                        "{} not available on this system",
+                        if provider_lower == "metal" { "Metal" } else { "CoreML" }
+                    ));
                 }
                 if !CoreMLExecutionProvider::default()
                     .is_available()
@@ -323,22 +326,29 @@ impl BackendFactory {
                 {
                     return Err("CoreML execution provider is not available".to_string());
                 }
-                log::info!("   Metal available on macOS");
-                log::info!("   Using CoreML execution provider for Metal");
-                Self::build_onnx_backend(ExecutionProvider::CoreML, opt_level, device_id, tuning)
-            }
-            "coreml" => {
-                if !device_info.has_metal {
-                    return Err("CoreML not available on this system".to_string());
+                if provider_lower == "metal" {
+                    log::info!("   Metal available on macOS");
+                    log::info!("   Using CoreML execution provider for Metal");
+                } else {
+                    log::info!("   CoreML available on macOS");
                 }
-                if !CoreMLExecutionProvider::default()
-                    .is_available()
-                    .unwrap_or(false)
-                {
-                    return Err("CoreML execution provider is not available".to_string());
-                }
-                log::info!("   CoreML available on macOS");
-                Self::build_onnx_backend(ExecutionProvider::CoreML, opt_level, device_id, tuning)
+                // CoreML performs best with basic optimization; aggressive levels
+                // can cause layout issues and runtime errors on Apple Silicon.
+                let coreml_opt_level = match opt_level {
+                    GraphOptimizationLevel::Level2 | GraphOptimizationLevel::Level3 => {
+                        log::info!(
+                            "   Capping optimization level to Level1 for CoreML backend"
+                        );
+                        GraphOptimizationLevel::Level1
+                    }
+                    other => other,
+                };
+                Self::build_onnx_backend(
+                    ExecutionProvider::CoreML,
+                    coreml_opt_level,
+                    device_id,
+                    tuning,
+                )
             }
             "rocm" => {
                 if !device_info.has_rocm {

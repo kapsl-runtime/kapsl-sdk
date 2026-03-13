@@ -2,7 +2,7 @@ use crate::priority::Priority;
 use kapsl_engine_api::{BinaryTensorPacket, EngineError, InferenceRequest};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use parking_lot::RwLock;
 
 /// Strategy for selecting which replica to route requests to
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,8 +51,8 @@ where
     }
 
     /// Add a replica to the pool
-    pub async fn add_replica(&self, replica_id: u32, scheduler: Arc<T>) {
-        let mut replicas = self.replicas.write().await;
+    pub fn add_replica(&self, replica_id: u32, scheduler: Arc<T>) {
+        let mut replicas = self.replicas.write();
         replicas.push(PooledReplica {
             replica_id,
             scheduler,
@@ -61,8 +61,8 @@ where
     }
 
     /// Remove a replica from the pool by replica_id
-    pub async fn remove_replica(&self, replica_id: u32) -> bool {
-        let mut replicas = self.replicas.write().await;
+    pub fn remove_replica(&self, replica_id: u32) -> bool {
+        let mut replicas = self.replicas.write();
         if let Some(pos) = replicas.iter().position(|r| r.replica_id == replica_id) {
             replicas.remove(pos);
             true
@@ -72,13 +72,13 @@ where
     }
 
     /// Get the number of replicas in the pool
-    pub async fn size(&self) -> usize {
-        self.replicas.read().await.len()
+    pub fn size(&self) -> usize {
+        self.replicas.read().len()
     }
 
     /// Get statistics about a specific replica
-    pub async fn get_replica_stats(&self, replica_id: u32) -> Option<ReplicaStats> {
-        let replicas = self.replicas.read().await;
+    pub fn get_replica_stats(&self, replica_id: u32) -> Option<ReplicaStats> {
+        let replicas = self.replicas.read();
         replicas
             .iter()
             .find(|r| r.replica_id == replica_id)
@@ -92,30 +92,21 @@ where
 
     /// Get the total number of replicas in the pool
     pub fn get_replica_count(&self) -> usize {
-        // Use blocking read since this is called from sync context
-        // We can safely use tokio::runtime::Handle since we're always in a tokio context
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async { self.replicas.read().await.len() })
-        })
+        self.replicas.read().len()
     }
 
     /// Get the number of healthy replicas in the pool
     pub fn get_healthy_replica_count(&self) -> usize {
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                self.replicas
-                    .read()
-                    .await
-                    .iter()
-                    .filter(|replica| replica.scheduler.is_healthy())
-                    .count()
-            })
-        })
+        self.replicas
+            .read()
+            .iter()
+            .filter(|replica| replica.scheduler.is_healthy())
+            .count()
     }
 
     /// Get statistics for all replicas
-    pub async fn stats(&self) -> Vec<ReplicaStats> {
-        let replicas = self.replicas.read().await;
+    pub fn stats(&self) -> Vec<ReplicaStats> {
+        let replicas = self.replicas.read();
         let mut stats = Vec::new();
         for replica in replicas.iter() {
             stats.push(ReplicaStats {
@@ -139,7 +130,7 @@ where
         // otherwise scale-up/down cannot add/remove replicas until all in-flight
         // requests finish.
         let (selected_replica_id, selected_scheduler, fallback_schedulers) = {
-            let replicas = self.replicas.read().await;
+            let replicas = self.replicas.read();
 
             if replicas.is_empty() {
                 return Err(EngineError::overloaded(
@@ -187,7 +178,7 @@ where
                 }
                 log::info!("Failing over to replica {}", replica_id);
                 if let Ok(response) = scheduler.infer(&request, priority, force_cpu).await {
-                    if let Ok(replicas) = self.replicas.try_read() {
+                    if let Some(replicas) = self.replicas.try_read() {
                         if let Some(replica) = replicas.iter().find(|r| r.replica_id == replica_id)
                         {
                             replica.requests_total.fetch_add(1, Ordering::Relaxed);
@@ -249,7 +240,7 @@ where
     T: ReplicaScheduler + Send + Sync + 'static,
 {
     fn get_queue_depth(&self) -> (usize, usize) {
-        if let Ok(replicas) = self.replicas.try_read() {
+        if let Some(replicas) = self.replicas.try_read() {
             let mut total_high = 0;
             let mut total_low = 0;
             for replica in replicas.iter() {
@@ -264,7 +255,7 @@ where
     }
 
     fn is_healthy(&self) -> bool {
-        if let Ok(replicas) = self.replicas.try_read() {
+        if let Some(replicas) = self.replicas.try_read() {
             if replicas.is_empty() {
                 return true;
             }
@@ -290,7 +281,7 @@ where
         let mut gpu_q = 0;
         let mut count = 0;
 
-        if let Ok(replicas) = self.replicas.try_read() {
+        if let Some(replicas) = self.replicas.try_read() {
             count = replicas.len();
             for replica in replicas.iter() {
                 let m = replica.scheduler.get_metrics();
@@ -333,7 +324,7 @@ where
     }
 
     fn model_info(&self) -> Option<kapsl_engine_api::EngineModelInfo> {
-        if let Ok(replicas) = self.replicas.try_read() {
+        if let Some(replicas) = self.replicas.try_read() {
             for replica in replicas.iter() {
                 if let Some(model_info) = replica.scheduler.model_info() {
                     return Some(model_info);
@@ -365,7 +356,7 @@ where
     > {
         // Select the schedulers to attempt without holding the pool lock across awaits.
         let (selected_replica_id, selected_scheduler, fallback_schedulers) = {
-            let replicas = self.replicas.read().await;
+            let replicas = self.replicas.read();
 
             if replicas.is_empty() {
                 return Err(EngineError::overloaded(
@@ -425,7 +416,7 @@ where
                     .await
                 {
                     Ok(stream) => {
-                        if let Ok(replicas) = self.replicas.try_read() {
+                        if let Some(replicas) = self.replicas.try_read() {
                             if let Some(replica) =
                                 replicas.iter().find(|r| r.replica_id == replica_id)
                             {

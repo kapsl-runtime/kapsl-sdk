@@ -29,12 +29,13 @@ use ort::session::{
     builder::GraphOptimizationLevel, builder::SessionBuilder, Session, SessionInputValue,
 };
 use ort::tensor::TensorElementType;
-use ort::value::{DynValue, Value};
+use ort::value::{DynValue, TensorRef, Value};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 use tokenizers::Tokenizer;
 use tokio::sync::mpsc;
 
@@ -96,6 +97,43 @@ fn env_var_alias(primary: &str, legacy: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn llm_decode_profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("KAPSL_LLM_PROFILE_DECODE")
+            .ok()
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+    })
+}
+
+fn llm_decode_bucket_granularity() -> usize {
+    static GRANULARITY: OnceLock<usize> = OnceLock::new();
+    *GRANULARITY.get_or_init(|| {
+        std::env::var("KAPSL_LLM_DECODE_BUCKET_GRANULARITY")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|value| *value > 1)
+            .unwrap_or(1)
+    })
+}
+
+fn round_up_to_granularity(value: usize, granularity: usize) -> usize {
+    if value == 0 || granularity <= 1 {
+        return value;
+    }
+    value
+        .saturating_add(granularity - 1)
+        .checked_div(granularity)
+        .unwrap_or(0)
+        .saturating_mul(granularity)
 }
 
 fn llm_provider_policy() -> String {
@@ -457,6 +495,54 @@ fn build_kv_array_f32_from_f16(
     }
 }
 
+fn build_kv_array_f16_from_packed(
+    data: &[f16],
+    num_heads: usize,
+    seq_len: usize,
+    head_dim: usize,
+    layout: KvLayout,
+    label: &str,
+) -> Result<Array4<f16>, EngineError> {
+    let expected = num_heads * seq_len * head_dim;
+    if expected == 0 {
+        return Err(EngineError::backend(format!(
+            "Invalid KV tensor config for {}: num_heads={}, seq_len={}, head_dim={}",
+            label, num_heads, seq_len, head_dim
+        )));
+    }
+    if data.len() != expected {
+        return Err(EngineError::backend(format!(
+            "Packed KV length {} does not match expected {} for {}",
+            data.len(),
+            expected,
+            label
+        )));
+    }
+
+    match layout {
+        KvLayout::SeqFirst => Array4::from_shape_vec(
+            (1, num_heads, seq_len, head_dim),
+            data.to_vec(),
+        )
+        .map_err(|e| EngineError::backend(format!("Failed to make {} array: {:?}", label, e))),
+        KvLayout::HeadDimFirst => {
+            let mut reordered = vec![f16::ZERO; expected];
+            for h in 0..num_heads {
+                for pos in 0..seq_len {
+                    for d in 0..head_dim {
+                        let src = (h * seq_len * head_dim) + (pos * head_dim) + d;
+                        let dst = (h * head_dim * seq_len) + (d * seq_len) + pos;
+                        reordered[dst] = data[src];
+                    }
+                }
+            }
+            Array4::from_shape_vec((1, num_heads, head_dim, seq_len), reordered).map_err(|e| {
+                EngineError::backend(format!("Failed to make {} array: {:?}", label, e))
+            })
+        }
+    }
+}
+
 fn build_kv_array_f32_from_packed(
     data: &[f16],
     num_heads: usize,
@@ -490,10 +576,88 @@ fn build_kv_array_f32_from_packed(
     }
 }
 
+fn extract_tensor_f16<'a>(
+    value: &'a DynValue,
+    label: &str,
+) -> Result<(Vec<usize>, Cow<'a, [f16]>), EngineError> {
+    match value.try_extract_tensor::<f16>() {
+        Ok((shape, data)) => Ok((
+            shape.iter().map(|&dim| dim as usize).collect(),
+            Cow::Borrowed(data),
+        )),
+        Err(f16_err) => {
+            let (shape, data_f32) = value.try_extract_tensor::<f32>().map_err(|f32_err| {
+                EngineError::backend(format!(
+                    "Failed to extract {} as f16 ({:?}) or f32 ({:?})",
+                    label, f16_err, f32_err
+                ))
+            })?;
+            Ok((
+                shape.iter().map(|&dim| dim as usize).collect(),
+                Cow::Owned(data_f32.iter().map(|v| f16::from_f32(*v)).collect()),
+            ))
+        }
+    }
+}
+
+fn extract_tensor_f32<'a>(
+    value: &'a DynValue,
+    label: &str,
+) -> Result<(Vec<usize>, Cow<'a, [f32]>), EngineError> {
+    match value.try_extract_tensor::<f32>() {
+        Ok((shape, data)) => Ok((
+            shape.iter().map(|&dim| dim as usize).collect(),
+            Cow::Borrowed(data),
+        )),
+        Err(f32_err) => {
+            let (shape, data_f16) = value.try_extract_tensor::<f16>().map_err(|f16_err| {
+                EngineError::backend(format!(
+                    "Failed to extract {} as f32 ({:?}) or f16 ({:?})",
+                    label, f32_err, f16_err
+                ))
+            })?;
+            Ok((
+                shape.iter().map(|&dim| dim as usize).collect(),
+                Cow::Owned(data_f16.iter().map(|v| v.to_f32()).collect()),
+            ))
+        }
+    }
+}
+
+fn build_packed_kv_input_f16<'a>(
+    data: Arc<[f16]>,
+    num_heads: usize,
+    seq_len: usize,
+    head_dim: usize,
+    layout: KvLayout,
+    label: &str,
+) -> Result<SessionInputValue<'a>, EngineError> {
+    match layout {
+        KvLayout::SeqFirst => TensorRef::from_array_view(([1usize, num_heads, seq_len, head_dim], data))
+            .map(|tensor| tensor.into())
+            .map_err(|e| {
+                EngineError::backend(format!("Failed to make {} tensor view: {}", label, e))
+            }),
+        KvLayout::HeadDimFirst => {
+            let arr = build_kv_array_f16_from_packed(
+                data.as_ref(),
+                num_heads,
+                seq_len,
+                head_dim,
+                layout,
+                label,
+            )?;
+            Value::from_array(arr)
+                .map(|value| value.into())
+                .map_err(|e| EngineError::backend(e.to_string()))
+        }
+    }
+}
+
 #[derive(Clone)]
 enum EmptyKvArray {
-    F16(ArrayD<f16>),
-    F32(ArrayD<f32>),
+    F16(Arc<ArrayD<f16>>),
+    F32(Arc<ArrayD<f32>>),
 }
 
 fn empty_kv_shape(
@@ -502,11 +666,13 @@ fn empty_kv_shape(
     num_heads: usize,
     head_dim: usize,
 ) -> Vec<usize> {
+    // Use seq_len=1 (not 0) so CoreML EP doesn't reject zero-element tensors.
+    // The single dummy timestep is masked out by a leading 0 in the attention mask.
     if let Some(def) = shape_def {
         if def.len() == 4 {
             return match kv_layout {
-                KvLayout::SeqFirst => vec![1, num_heads, 0, head_dim],
-                KvLayout::HeadDimFirst => vec![1, num_heads, head_dim, 0],
+                KvLayout::SeqFirst => vec![1, num_heads, 1, head_dim],
+                KvLayout::HeadDimFirst => vec![1, num_heads, head_dim, 1],
             };
         }
 
@@ -521,8 +687,8 @@ fn empty_kv_shape(
     }
 
     match kv_layout {
-        KvLayout::SeqFirst => vec![1, num_heads, 0, head_dim],
-        KvLayout::HeadDimFirst => vec![1, num_heads, head_dim, 0],
+        KvLayout::SeqFirst => vec![1, num_heads, 1, head_dim],
+        KvLayout::HeadDimFirst => vec![1, num_heads, head_dim, 1],
     }
 }
 
@@ -542,7 +708,7 @@ fn get_empty_kv_value_cached(
     } else {
         let total_elems: usize = shape.iter().product();
         let new_entry = match dtype {
-            TensorElementType::Float16 => EmptyKvArray::F16(
+            TensorElementType::Float16 => EmptyKvArray::F16(Arc::new(
                 ArrayD::<f16>::from_shape_vec(IxDyn(shape), vec![f16::ZERO; total_elems]).map_err(
                     |e| {
                         EngineError::backend(format!(
@@ -551,8 +717,8 @@ fn get_empty_kv_value_cached(
                         ))
                     },
                 )?,
-            ),
-            TensorElementType::Float32 => EmptyKvArray::F32(
+            )),
+            TensorElementType::Float32 => EmptyKvArray::F32(Arc::new(
                 ArrayD::<f32>::from_shape_vec(IxDyn(shape), vec![0f32; total_elems]).map_err(
                     |e| {
                         EngineError::backend(format!(
@@ -561,7 +727,7 @@ fn get_empty_kv_value_cached(
                         ))
                     },
                 )?,
-            ),
+            )),
             other => {
                 return Err(EngineError::backend(format!(
                     "Unsupported KV tensor dtype for {}: {:?}",
@@ -573,14 +739,34 @@ fn get_empty_kv_value_cached(
         new_entry
     };
 
-    match entry {
-        EmptyKvArray::F16(arr) => Value::from_array(arr)
+    match &entry {
+        EmptyKvArray::F16(arr) => Value::from_array(arr.as_ref().clone())
             .map_err(|e| EngineError::backend(e.to_string()))
             .map(|v| v.into_dyn()),
-        EmptyKvArray::F32(arr) => Value::from_array(arr)
+        EmptyKvArray::F32(arr) => Value::from_array(arr.as_ref().clone())
             .map_err(|e| EngineError::backend(e.to_string()))
             .map(|v| v.into_dyn()),
     }
+}
+
+/// Item used during batched prefill steps; lives at module level so the pool Vec
+/// can be stored on LLMEngine and reused across calls without reallocating.
+struct PrefillItem {
+    group_arc: Arc<Mutex<SequenceGroup>>,
+    seq_arc: Arc<Mutex<Sequence>>,
+    seq_id: u64,
+    input_tokens: Vec<u32>,
+    input_len: usize,
+    total_len: usize,
+}
+
+/// Item used during batched decode steps; lives at module level for the same reason.
+struct BatchItem {
+    group_arc: Arc<Mutex<SequenceGroup>>,
+    seq_arc: Arc<Mutex<Sequence>>,
+    seq_id: u64,
+    input_token: u32,
+    total_len: usize,
 }
 
 /// LLM engine: prepares inputs for ONNX Runtime and manages KV cache.
@@ -639,6 +825,9 @@ pub struct LLMEngine {
     kv_workspace_val: Vec<f16>,
     // Reusable workspace for logits modification (avoids per-sequence clone).
     logits_workspace: Vec<f32>,
+    // Reusable Vec storage for per-batch items (avoids realloc on each batched step).
+    prefill_items_pool: Vec<PrefillItem>,
+    decode_items_pool: Vec<BatchItem>,
 }
 
 impl LLMEngine {
@@ -766,6 +955,8 @@ impl LLMEngine {
             kv_workspace_key: Vec::new(),
             kv_workspace_val: Vec::new(),
             logits_workspace: Vec::new(),
+            prefill_items_pool: Vec::new(),
+            decode_items_pool: Vec::new(),
         }
     }
 
@@ -884,6 +1075,16 @@ impl LLMEngine {
                                 "Unknown kv_cache eviction policy '{}', defaulting to none",
                                 other
                             ),
+                        }
+                    }
+                    if let Some(v) = kv.get("initial_seq_len").and_then(|v| v.as_u64()) {
+                        if v > 0 {
+                            kv_cache_config.initial_seq_len = v as usize;
+                        }
+                    }
+                    if let Some(v) = kv.get("dense_free_list_cap").and_then(|v| v.as_u64()) {
+                        if v > 0 {
+                            kv_cache_config.dense_free_list_cap = v as usize;
                         }
                     }
                 }
@@ -1051,6 +1252,25 @@ impl LLMEngine {
                     "Unknown KAPSL_LLM_KV_CACHE_EVICTION '{}', using metadata/default",
                     other
                 ),
+            }
+        }
+        if let Some(v) =
+            env_var_alias("KAPSL_LLM_KV_INITIAL_SEQ_LEN", "KAPSL_LLM_KV_INITIAL_SEQ_LEN")
+        {
+            if let Ok(parsed) = v.parse::<usize>() {
+                if parsed > 0 {
+                    kv_cache_config.initial_seq_len = parsed;
+                }
+            }
+        }
+        if let Some(v) = env_var_alias(
+            "KAPSL_LLM_KV_FREE_LIST_CAP",
+            "KAPSL_LLM_KV_FREE_LIST_CAP",
+        ) {
+            if let Ok(parsed) = v.parse::<usize>() {
+                if parsed > 0 {
+                    kv_cache_config.dense_free_list_cap = parsed;
+                }
             }
         }
         let tokenizer_path = find_model_asset(model_path, "tokenizer.json").ok_or_else(|| {
@@ -2025,16 +2245,8 @@ impl LLMEngine {
             return Ok(false);
         }
 
-        struct PrefillItem {
-            group_arc: Arc<Mutex<SequenceGroup>>,
-            seq_arc: Arc<Mutex<Sequence>>,
-            seq_id: u64,
-            input_tokens: Vec<u32>,
-            input_len: usize,
-            total_len: usize,
-        }
-
-        let mut items: Vec<PrefillItem> = Vec::new();
+        let mut items = std::mem::take(&mut self.prefill_items_pool);
+        items.clear();
 
         for group_arc in groups {
             if Self::cancel_group_if_needed(group_arc) {
@@ -2057,6 +2269,8 @@ impl LLMEngine {
                 };
                 // Only batch fresh prefill: full prompt, no prior KV
                 if input_tokens.len() <= 1 || kv_cached_len != 0 {
+                    items.clear();
+                    self.prefill_items_pool = items;
                     return Ok(false);
                 }
                 items.push(PrefillItem {
@@ -2071,12 +2285,16 @@ impl LLMEngine {
         }
 
         if items.len() < 2 {
+            items.clear();
+            self.prefill_items_pool = items;
             return Ok(false);
         }
 
         // All must share the same prompt length for a rectangular batch.
         let input_len = items[0].input_len;
         if items.iter().any(|item| item.input_len != input_len) {
+            items.clear();
+            self.prefill_items_pool = items;
             return Ok(false);
         }
 
@@ -2089,11 +2307,13 @@ impl LLMEngine {
             .collect();
         let input_ids_i64 =
             Array2::from_shape_vec((batch_size, input_len), input_ids_flat).unwrap();
-        let mask_i64 = Array2::from_shape_vec(
-            (batch_size, input_len),
-            vec![1i64; batch_size * input_len],
-        )
-        .unwrap();
+        // CoreML rejects zero-element KV tensors, so we feed a dummy past KV of length 1 (zeros).
+        // The attention mask must cover past + present positions: prepend a 0 to mask out the dummy.
+        let mask_len = 1 + input_len;
+        let mask_data: Vec<i64> = (0..batch_size)
+            .flat_map(|_| std::iter::once(0i64).chain(std::iter::repeat(1i64).take(input_len)))
+            .collect();
+        let mask_i64 = Array2::from_shape_vec((batch_size, mask_len), mask_data).unwrap();
         let pos_ids_flat: Vec<i64> = (0..batch_size)
             .flat_map(|_| 0..input_len as i64)
             .collect();
@@ -2148,27 +2368,36 @@ impl LLMEngine {
                 TensorElementType::Int64 => Value::from_array(mask_i64)
                     .map_err(|e| EngineError::backend(e.to_string()))?
                     .into_dyn(),
-                TensorElementType::Int32 => Value::from_array(Array2::from_shape_vec(
-                    (batch_size, input_len),
-                    vec![1i32; batch_size * input_len],
-                )
-                .unwrap())
-                .map_err(|e| EngineError::backend(e.to_string()))?
-                .into_dyn(),
-                TensorElementType::Bool => Value::from_array(Array2::from_shape_vec(
-                    (batch_size, input_len),
-                    vec![true; batch_size * input_len],
-                )
-                .unwrap())
-                .map_err(|e| EngineError::backend(e.to_string()))?
-                .into_dyn(),
-                TensorElementType::Float32 => Value::from_array(Array2::from_shape_vec(
-                    (batch_size, input_len),
-                    vec![1.0f32; batch_size * input_len],
-                )
-                .unwrap())
-                .map_err(|e| EngineError::backend(e.to_string()))?
-                .into_dyn(),
+                TensorElementType::Int32 => {
+                    let data: Vec<i32> = (0..batch_size)
+                        .flat_map(|_| {
+                            std::iter::once(0i32).chain(std::iter::repeat(1i32).take(input_len))
+                        })
+                        .collect();
+                    Value::from_array(Array2::from_shape_vec((batch_size, mask_len), data).unwrap())
+                        .map_err(|e| EngineError::backend(e.to_string()))?
+                        .into_dyn()
+                }
+                TensorElementType::Bool => {
+                    let data: Vec<bool> = (0..batch_size)
+                        .flat_map(|_| {
+                            std::iter::once(false).chain(std::iter::repeat(true).take(input_len))
+                        })
+                        .collect();
+                    Value::from_array(Array2::from_shape_vec((batch_size, mask_len), data).unwrap())
+                        .map_err(|e| EngineError::backend(e.to_string()))?
+                        .into_dyn()
+                }
+                TensorElementType::Float32 => {
+                    let data: Vec<f32> = (0..batch_size)
+                        .flat_map(|_| {
+                            std::iter::once(0.0f32).chain(std::iter::repeat(1.0f32).take(input_len))
+                        })
+                        .collect();
+                    Value::from_array(Array2::from_shape_vec((batch_size, mask_len), data).unwrap())
+                        .map_err(|e| EngineError::backend(e.to_string()))?
+                        .into_dyn()
+                }
                 other => {
                     return Err(EngineError::backend(format!(
                         "Unsupported attention_mask dtype: {:?}",
@@ -2226,18 +2455,23 @@ impl LLMEngine {
                 .get(&val_name)
                 .copied()
                 .unwrap_or(TensorElementType::Float16);
-            // Zero-element tensors: past_len = 0
-            let empty_shape = (batch_size, self.num_heads, 0usize, self.head_dim);
+            // Dummy past KV of length 1 (zeros) — CoreML rejects zero-element tensors.
+            // The attention mask already masks out this dummy position (leading 0).
+            let empty_shape = (batch_size, self.num_heads, 1usize, self.head_dim);
+            let kv_num_elems = batch_size * self.num_heads * self.head_dim;
             if needs_key {
                 let k_input: SessionInputValue<'_> = match key_type {
                     TensorElementType::Float16 => Value::from_array(
-                        Array4::<f16>::from_shape_vec(empty_shape, vec![])
-                            .map_err(|e| EngineError::backend(e.to_string()))?,
+                        Array4::<f16>::from_shape_vec(
+                            empty_shape,
+                            vec![f16::ZERO; kv_num_elems],
+                        )
+                        .map_err(|e| EngineError::backend(e.to_string()))?,
                     )
                     .map_err(|e| EngineError::backend(e.to_string()))?
                     .into(),
                     TensorElementType::Float32 => Value::from_array(
-                        Array4::<f32>::from_shape_vec(empty_shape, vec![])
+                        Array4::<f32>::from_shape_vec(empty_shape, vec![0.0f32; kv_num_elems])
                             .map_err(|e| EngineError::backend(e.to_string()))?,
                     )
                     .map_err(|e| EngineError::backend(e.to_string()))?
@@ -2254,13 +2488,16 @@ impl LLMEngine {
             if needs_val {
                 let v_input: SessionInputValue<'_> = match val_type {
                     TensorElementType::Float16 => Value::from_array(
-                        Array4::<f16>::from_shape_vec(empty_shape, vec![])
-                            .map_err(|e| EngineError::backend(e.to_string()))?,
+                        Array4::<f16>::from_shape_vec(
+                            empty_shape,
+                            vec![f16::ZERO; kv_num_elems],
+                        )
+                        .map_err(|e| EngineError::backend(e.to_string()))?,
                     )
                     .map_err(|e| EngineError::backend(e.to_string()))?
                     .into(),
                     TensorElementType::Float32 => Value::from_array(
-                        Array4::<f32>::from_shape_vec(empty_shape, vec![])
+                        Array4::<f32>::from_shape_vec(empty_shape, vec![0.0f32; kv_num_elems])
                             .map_err(|e| EngineError::backend(e.to_string()))?,
                     )
                     .map_err(|e| EngineError::backend(e.to_string()))?
@@ -2337,14 +2574,20 @@ impl LLMEngine {
             let k_out_heads = k_shape[1] as usize;
             let k_out_seq = k_shape[2] as usize;
             let k_out_dim = k_shape[3] as usize;
-            let per_seq_stride = k_out_heads * k_out_seq * k_out_dim;
 
             for (batch_idx, item) in items.iter().enumerate() {
-                // Append each head's token range into the sequence view.
+                // k_out_seq = 1 + input_len (dummy past position 0 + actual tokens 1..input_len+1).
+                // Skip position 0 (dummy) and store only the actual input_len positions at cache pos 0.
+                let actual_seq = k_out_seq.saturating_sub(1); // = input_len
+                let skip_elems = k_out_dim; // one dummy position per head to skip
+                let packed_len = self.num_heads * actual_seq * k_out_dim;
+                let mut packed_key = Vec::with_capacity(packed_len);
+                let mut packed_val = Vec::with_capacity(packed_len);
                 for h in 0..self.num_heads {
                     let head_start = (batch_idx * k_out_heads + h) * k_out_seq * k_out_dim;
-                    let head_end = head_start + k_out_seq * k_out_dim;
-                    if head_end > k_data.len() || head_end > v_data.len() {
+                    let actual_start = head_start + skip_elems;
+                    let actual_end = head_start + k_out_seq * k_out_dim;
+                    if actual_end > k_data.len() || actual_end > v_data.len() {
                         log::warn!(
                             "Batched prefill: KV out-of-bounds layer {} batch {} head {}",
                             layer,
@@ -2353,28 +2596,25 @@ impl LLMEngine {
                         );
                         continue;
                     }
+                    if actual_seq == 0 {
+                        continue;
+                    }
+                    packed_key.extend_from_slice(&k_data[actual_start..actual_end]);
+                    packed_val.extend_from_slice(&v_data[actual_start..actual_end]);
                     self.kv_cache
                         .append_head_range_seq_first(
                             item.seq_id,
                             layer,
                             h,
                             0,
-                            &k_data[head_start..head_end],
-                            &v_data[head_start..head_end],
+                            &k_data[actual_start..actual_end],
+                            &v_data[actual_start..actual_end],
                         )
                         .map_err(|e| EngineError::resource_exhausted(e.to_string()))?;
                 }
-                // Also store as packed layer so subsequent single-seq fallback can use it.
-                let seq_start = batch_idx * per_seq_stride;
-                let seq_end = seq_start + per_seq_stride;
-                if seq_end <= k_data.len() && seq_end <= v_data.len() {
-                    self.kv_cache.set_packed_layer(
-                        item.seq_id,
-                        layer,
-                        k_out_seq,
-                        &k_data[seq_start..seq_end],
-                        &v_data[seq_start..seq_end],
-                    );
+                if actual_seq > 0 && packed_key.len() == packed_len && packed_val.len() == packed_len {
+                    self.kv_cache
+                        .set_packed_layer(item.seq_id, layer, actual_seq, &packed_key, &packed_val);
                 } else {
                     self.kv_cache.clear_packed_layer(item.seq_id, layer);
                 }
@@ -2550,6 +2790,8 @@ impl LLMEngine {
             });
         }
 
+        items.clear();
+        self.prefill_items_pool = items;
         Ok(true)
     }
 
@@ -2563,15 +2805,8 @@ impl LLMEngine {
             return Ok(false);
         }
 
-        struct BatchItem {
-            group_arc: Arc<Mutex<SequenceGroup>>,
-            seq_arc: Arc<Mutex<Sequence>>,
-            seq_id: u64,
-            input_token: u32,
-            total_len: usize,
-        }
-
-        let mut items: Vec<BatchItem> = Vec::new();
+        let mut items = std::mem::take(&mut self.decode_items_pool);
+        items.clear();
 
         for group_arc in groups {
             if Self::cancel_group_if_needed(group_arc) {
@@ -2594,6 +2829,8 @@ impl LLMEngine {
                     )
                 };
                 if input_tokens.len() != 1 || total_len == 0 {
+                    items.clear();
+                    self.decode_items_pool = items;
                     return Ok(false);
                 }
                 items.push(BatchItem {
@@ -2606,34 +2843,54 @@ impl LLMEngine {
             }
         }
 
-        if items.len() < 2 {
+        if items.is_empty() {
+            items.clear();
+            self.decode_items_pool = items;
             return Ok(false);
         }
 
-        let total_len = items[0].total_len;
-        if total_len <= 1 || items.iter().any(|item| item.total_len != total_len) {
+        let actual_max_total_len = items.iter().map(|item| item.total_len).max().unwrap_or(0);
+        if actual_max_total_len <= 1 {
+            items.clear();
+            self.decode_items_pool = items;
             return Ok(false);
         }
 
-        let past_len = total_len - 1;
+        let decode_bucket_granularity = llm_decode_bucket_granularity();
+        let max_total_len = round_up_to_granularity(
+            actual_max_total_len,
+            decode_bucket_granularity,
+        )
+        .max(actual_max_total_len);
+        let max_past_len = max_total_len - 1;
         let batch_size = items.len();
+        let profile_decode = llm_decode_profile_enabled();
+        let step_started = profile_decode.then(Instant::now);
+        let input_prep_started = profile_decode.then(Instant::now);
+        let input_tokens_i64 = items
+            .iter()
+            .map(|item| item.input_token as i64)
+            .collect::<Vec<i64>>();
+        let attention_mask_i64 = items
+            .iter()
+            .flat_map(|item| {
+                let pad_len = max_total_len.saturating_sub(item.total_len);
+                std::iter::repeat_n(0i64, pad_len)
+                    .chain(std::iter::repeat_n(1i64, item.total_len))
+            })
+            .collect::<Vec<i64>>();
+        let position_ids_i64 = items
+            .iter()
+            .map(|item| item.total_len.saturating_sub(1) as i64)
+            .collect::<Vec<i64>>();
 
-        let input_ids_i64 = Array2::from_shape_vec(
-            (batch_size, 1),
-            items
-                .iter()
-                .map(|item| item.input_token as i64)
-                .collect::<Vec<i64>>(),
-        )
-        .unwrap();
+        let input_ids_i64 =
+            Array2::from_shape_vec((batch_size, 1), input_tokens_i64.clone()).unwrap();
         let mask_i64 =
-            Array2::from_shape_vec((batch_size, total_len), vec![1i64; batch_size * total_len])
+            Array2::from_shape_vec((batch_size, max_total_len), attention_mask_i64.clone())
                 .unwrap();
-        let pos_ids_i64 = Array2::from_shape_vec(
-            (batch_size, 1),
-            vec![(total_len.saturating_sub(1)) as i64; batch_size],
-        )
-        .unwrap();
+        let pos_ids_i64 =
+            Array2::from_shape_vec((batch_size, 1), position_ids_i64.clone()).unwrap();
 
         let mut inputs: Vec<(Cow<'_, str>, SessionInputValue<'_>)> =
             Vec::with_capacity(3 + (self.num_layers * 2));
@@ -2649,9 +2906,9 @@ impl LLMEngine {
             TensorElementType::Int32 => {
                 let input_ids_i32 = Array2::from_shape_vec(
                     (batch_size, 1),
-                    items
+                    input_tokens_i64
                         .iter()
-                        .map(|item| item.input_token as i32)
+                        .map(|token| *token as i32)
                         .collect::<Vec<i32>>(),
                 )
                 .unwrap();
@@ -2679,8 +2936,11 @@ impl LLMEngine {
                     .into_dyn(),
                 TensorElementType::Int32 => {
                     let mask_i32 = Array2::from_shape_vec(
-                        (batch_size, total_len),
-                        vec![1i32; batch_size * total_len],
+                        (batch_size, max_total_len),
+                        attention_mask_i64
+                            .iter()
+                            .map(|value| *value as i32)
+                            .collect::<Vec<i32>>(),
                     )
                     .unwrap();
                     Value::from_array(mask_i32)
@@ -2689,8 +2949,11 @@ impl LLMEngine {
                 }
                 TensorElementType::Bool => {
                     let mask_bool = Array2::from_shape_vec(
-                        (batch_size, total_len),
-                        vec![true; batch_size * total_len],
+                        (batch_size, max_total_len),
+                        attention_mask_i64
+                            .iter()
+                            .map(|value| *value != 0)
+                            .collect::<Vec<bool>>(),
                     )
                     .unwrap();
                     Value::from_array(mask_bool)
@@ -2699,8 +2962,11 @@ impl LLMEngine {
                 }
                 TensorElementType::Float32 => {
                     let mask_f32 = Array2::from_shape_vec(
-                        (batch_size, total_len),
-                        vec![1.0f32; batch_size * total_len],
+                        (batch_size, max_total_len),
+                        attention_mask_i64
+                            .iter()
+                            .map(|value| *value as f32)
+                            .collect::<Vec<f32>>(),
                     )
                     .unwrap();
                     Value::from_array(mask_f32)
@@ -2729,7 +2995,10 @@ impl LLMEngine {
                 TensorElementType::Int32 => {
                     let pos_i32 = Array2::from_shape_vec(
                         (batch_size, 1),
-                        vec![(total_len.saturating_sub(1)) as i32; batch_size],
+                        position_ids_i64
+                            .iter()
+                            .map(|pos| *pos as i32)
+                            .collect::<Vec<i32>>(),
                     )
                     .unwrap();
                     Value::from_array(pos_i32)
@@ -2745,6 +3014,11 @@ impl LLMEngine {
             };
             inputs.push(("position_ids".into(), pos_value.into()));
         }
+
+        let input_prep_ms = input_prep_started
+            .map(|started| started.elapsed().as_secs_f64() * 1000.0)
+            .unwrap_or(0.0);
+        let kv_pack_started = profile_decode.then(Instant::now);
 
         for layer in 0..self.num_layers {
             let key_name = format!("past_key_values.{}.key", layer);
@@ -2764,7 +3038,7 @@ impl LLMEngine {
                 .copied()
                 .unwrap_or(TensorElementType::Float16);
 
-            let seq_first_size = batch_size * self.num_heads * past_len * self.head_dim;
+            let seq_first_size = batch_size * self.num_heads * max_past_len * self.head_dim;
             // Reuse workspace buffers to avoid per-layer heap allocation.
             self.kv_workspace_key.clear();
             self.kv_workspace_key.resize(seq_first_size, f16::ZERO);
@@ -2774,6 +3048,26 @@ impl LLMEngine {
             let val_seq_first = &mut self.kv_workspace_val;
 
             for (batch_idx, item) in items.iter().enumerate() {
+                let past_len = item.total_len.saturating_sub(1);
+                let pad_len = max_past_len.saturating_sub(past_len);
+
+                if let Some(packed) = self.kv_cache.get_packed_layer(item.seq_id, layer) {
+                    if packed.length < past_len {
+                        return Ok(false);
+                    }
+                    let packed_head_stride = packed.length * self.head_dim;
+                    let copy_len = past_len * self.head_dim;
+                    for h in 0..self.num_heads {
+                        let src_start = h * packed_head_stride;
+                        let dst_start = ((batch_idx * self.num_heads + h) * max_past_len + pad_len) * self.head_dim;
+                        key_seq_first[dst_start..dst_start + copy_len]
+                            .copy_from_slice(&packed.key[src_start..src_start + copy_len]);
+                        val_seq_first[dst_start..dst_start + copy_len]
+                            .copy_from_slice(&packed.value[src_start..src_start + copy_len]);
+                    }
+                    continue;
+                }
+
                 let view = match self.kv_cache.get_layer_view(item.seq_id, layer) {
                     Some(view) => view,
                     None => return Ok(false),
@@ -2794,17 +3088,14 @@ impl LLMEngine {
                     return Ok(false);
                 }
 
+                let copy_len = past_len * self.head_dim;
                 for h in 0..self.num_heads {
-                    let src_head = h * max_seq_len * self.head_dim;
-                    let dst_head = ((batch_idx * self.num_heads + h) * past_len) * self.head_dim;
-                    for pos in 0..past_len {
-                        let src = src_head + pos * self.head_dim;
-                        let dst = dst_head + pos * self.head_dim;
-                        key_seq_first[dst..dst + self.head_dim]
-                            .copy_from_slice(&view.key[src..src + self.head_dim]);
-                        val_seq_first[dst..dst + self.head_dim]
-                            .copy_from_slice(&view.value[src..src + self.head_dim]);
-                    }
+                    let src_start = h * max_seq_len * self.head_dim;
+                    let dst_start = ((batch_idx * self.num_heads + h) * max_past_len + pad_len) * self.head_dim;
+                    key_seq_first[dst_start..dst_start + copy_len]
+                        .copy_from_slice(&view.key[src_start..src_start + copy_len]);
+                    val_seq_first[dst_start..dst_start + copy_len]
+                        .copy_from_slice(&view.value[src_start..src_start + copy_len]);
                 }
             }
 
@@ -2812,13 +3103,13 @@ impl LLMEngine {
                 let mut dst = vec![f16::ZERO; src.len()];
                 for b in 0..batch_size {
                     for h in 0..self.num_heads {
-                        for pos in 0..past_len {
+                        for pos in 0..max_past_len {
                             for d in 0..self.head_dim {
-                                let src_idx = (((b * self.num_heads + h) * past_len + pos)
+                                let src_idx = (((b * self.num_heads + h) * max_past_len + pos)
                                     * self.head_dim)
                                     + d;
                                 let dst_idx = (((b * self.num_heads + h) * self.head_dim + d)
-                                    * past_len)
+                                    * max_past_len)
                                     + pos;
                                 dst[dst_idx] = src[src_idx];
                             }
@@ -2834,12 +3125,12 @@ impl LLMEngine {
                     KvLayout::SeqFirst => (
                         key_seq_first.clone(),
                         val_seq_first.clone(),
-                        (batch_size, self.num_heads, past_len, self.head_dim),
+                        (batch_size, self.num_heads, max_past_len, self.head_dim),
                     ),
                     KvLayout::HeadDimFirst => (
                         reorder_to_head_dim_first(key_seq_first),
                         reorder_to_head_dim_first(val_seq_first),
-                        (batch_size, self.num_heads, self.head_dim, past_len),
+                        (batch_size, self.num_heads, self.head_dim, max_past_len),
                     ),
                 };
 
@@ -2905,11 +3196,20 @@ impl LLMEngine {
             }
         }
 
+        let kv_pack_ms = kv_pack_started
+            .map(|started| started.elapsed().as_secs_f64() * 1000.0)
+            .unwrap_or(0.0);
+        let ort_started = profile_decode.then(Instant::now);
         let outputs = {
             let sess = self.session.as_mut().ok_or(EngineError::ModelNotLoaded)?;
             sess.run(inputs)
                 .map_err(|e| EngineError::backend(e.to_string()))?
         };
+        let ort_run_ms = ort_started
+            .map(|started| started.elapsed().as_secs_f64() * 1000.0)
+            .unwrap_or(0.0);
+        let kv_writeback_started = profile_decode.then(Instant::now);
+        let mut first_present_shape: Option<Vec<usize>> = None;
 
         for layer in 0..self.num_layers {
             let key_name = format!("present.{}.key", layer);
@@ -2952,6 +3252,9 @@ impl LLMEngine {
                 }
             };
 
+            if first_present_shape.is_none() {
+                first_present_shape = Some(k_shape.iter().map(|&dim| dim as usize).collect());
+            }
             if k_shape.len() < 4 || v_shape.len() < 4 {
                 return Err(EngineError::backend(format!(
                     "Unsupported present KV rank for layer {}: key={:?} value={:?}",
@@ -2981,11 +3284,14 @@ impl LLMEngine {
             }
 
             for (batch_idx, item) in items.iter().enumerate() {
-                let abs_pos = item.total_len.saturating_sub(1);
-                if abs_pos >= k_seq {
+                let past_len = item.total_len.saturating_sub(1);
+                let pad_len = max_past_len.saturating_sub(past_len);
+                let output_pos = pad_len + past_len;
+                let abs_pos = past_len;
+                if output_pos >= k_seq {
                     return Err(EngineError::backend(format!(
-                        "Present KV sequence dim too small on layer {}: abs_pos={} seq_dim={}",
-                        layer, abs_pos, k_seq
+                        "Present KV sequence dim too small on layer {}: output_pos={} seq_dim={}",
+                        layer, output_pos, k_seq
                     )));
                 }
 
@@ -2995,10 +3301,10 @@ impl LLMEngine {
                     for d in 0..self.head_dim {
                         let key_idx = match self.kv_layout {
                             KvLayout::SeqFirst => {
-                                (((batch_idx * k_heads + h) * k_seq + abs_pos) * k_head_dim) + d
+                                (((batch_idx * k_heads + h) * k_seq + output_pos) * k_head_dim) + d
                             }
                             KvLayout::HeadDimFirst => {
-                                (((batch_idx * k_heads + h) * k_head_dim + d) * k_seq) + abs_pos
+                                (((batch_idx * k_heads + h) * k_head_dim + d) * k_seq) + output_pos
                             }
                         };
                         let val_idx = key_idx;
@@ -3032,6 +3338,10 @@ impl LLMEngine {
             }
         }
 
+        let kv_writeback_ms = kv_writeback_started
+            .map(|started| started.elapsed().as_secs_f64() * 1000.0)
+            .unwrap_or(0.0);
+        let sampling_started = profile_decode.then(Instant::now);
         let (logits_shape, logits_data) = {
             let logits = outputs
                 .get("logits")
@@ -3187,6 +3497,32 @@ impl LLMEngine {
             });
         }
 
+        let sampling_ms = sampling_started
+            .map(|started| started.elapsed().as_secs_f64() * 1000.0)
+            .unwrap_or(0.0);
+        let total_ms = step_started
+            .map(|started| started.elapsed().as_secs_f64() * 1000.0)
+            .unwrap_or(0.0);
+        if profile_decode {
+            eprintln!(
+                "[decode-profile] batch_size={} actual_max_total_len={} padded_max_total_len={} bucket_granularity={} input_prep_ms={:.3} kv_pack_ms={:.3} ort_run_ms={:.3} kv_writeback_ms={:.3} sampling_ms={:.3} total_ms={:.3} present0={:?} logits_shape={:?}",
+                batch_size,
+                actual_max_total_len,
+                max_total_len,
+                decode_bucket_granularity,
+                input_prep_ms,
+                kv_pack_ms,
+                ort_run_ms,
+                kv_writeback_ms,
+                sampling_ms,
+                total_ms,
+                first_present_shape,
+                logits_shape,
+            );
+        }
+
+        items.clear();
+        self.decode_items_pool = items;
         Ok(true)
     }
 
@@ -3224,16 +3560,17 @@ impl LLMEngine {
             };
 
             for seq_arc in seqs {
-                let (input_tokens, seq_id, total_len) = {
+                let (input_tokens, seq_id, total_len, kv_cached_len) = {
                     let seq = seq_arc.lock().unwrap();
                     if seq.is_finished() {
                         continue;
                     }
 
                     let total_len = seq.get_len();
+                    let kv_cached_len = seq.kv_cached_len;
                     let input_tokens = if use_kv_cache {
                         let prompt_len = seq.prompt_token_ids.len();
-                        let start = seq.kv_cached_len;
+                        let start = kv_cached_len;
                         if start < prompt_len {
                             let mut tokens = seq.prompt_token_ids[start..].to_vec();
                             tokens.extend_from_slice(&seq.output_token_ids);
@@ -3248,7 +3585,7 @@ impl LLMEngine {
                         tokens
                     };
 
-                    (input_tokens, seq.sequence_id, total_len)
+                    (input_tokens, seq.sequence_id, total_len, kv_cached_len)
                 };
 
                 let input_len = input_tokens.len();
@@ -3261,8 +3598,18 @@ impl LLMEngine {
                     Array2::from_shape_vec((1, input_len), input_tokens_i64).unwrap();
 
                 // attention_mask: use total sequence length (past + current).
-                let mask_data_i64: Vec<i64> = (0..total_len).map(|_| 1i64).collect();
-                let mask_i64 = Array2::from_shape_vec((1, total_len), mask_data_i64).unwrap();
+                // When kv_cached_len == 0 we send a dummy past KV of length 1 to avoid
+                // zero-element tensors rejected by CoreML; prepend a 0 to mask it out.
+                let uses_dummy_past = use_kv_cache && kv_cached_len == 0;
+                let mask_len = if uses_dummy_past { 1 + total_len } else { total_len };
+                let mask_data_i64: Vec<i64> = if uses_dummy_past {
+                    std::iter::once(0i64)
+                        .chain((0..total_len).map(|_| 1i64))
+                        .collect()
+                } else {
+                    (0..total_len).map(|_| 1i64).collect()
+                };
+                let mask_i64 = Array2::from_shape_vec((1, mask_len), mask_data_i64).unwrap();
 
                 // position_ids: [batch, input_len] with absolute positions into total sequence.
                 let pos_start = total_len.saturating_sub(input_len);
@@ -3313,31 +3660,40 @@ impl LLMEngine {
                             .map_err(|e| EngineError::backend(e.to_string()))?
                             .into_dyn(),
                         TensorElementType::Int32 => {
-                            let mask_i32 = Array2::from_shape_vec(
-                                (1, total_len),
-                                (0..total_len).map(|_| 1i32).collect::<Vec<i32>>(),
-                            )
-                            .unwrap();
+                            let data: Vec<i32> = if uses_dummy_past {
+                                std::iter::once(0i32)
+                                    .chain((0..total_len).map(|_| 1i32))
+                                    .collect()
+                            } else {
+                                (0..total_len).map(|_| 1i32).collect()
+                            };
+                            let mask_i32 = Array2::from_shape_vec((1, mask_len), data).unwrap();
                             Value::from_array(mask_i32)
                                 .map_err(|e| EngineError::backend(e.to_string()))?
                                 .into_dyn()
                         }
                         TensorElementType::Bool => {
-                            let mask_bool = Array2::from_shape_vec(
-                                (1, total_len),
-                                (0..total_len).map(|_| true).collect::<Vec<bool>>(),
-                            )
-                            .unwrap();
+                            let data: Vec<bool> = if uses_dummy_past {
+                                std::iter::once(false)
+                                    .chain((0..total_len).map(|_| true))
+                                    .collect()
+                            } else {
+                                (0..total_len).map(|_| true).collect()
+                            };
+                            let mask_bool = Array2::from_shape_vec((1, mask_len), data).unwrap();
                             Value::from_array(mask_bool)
                                 .map_err(|e| EngineError::backend(e.to_string()))?
                                 .into_dyn()
                         }
                         TensorElementType::Float32 => {
-                            let mask_f32 = Array2::from_shape_vec(
-                                (1, total_len),
-                                (0..total_len).map(|_| 1.0f32).collect::<Vec<f32>>(),
-                            )
-                            .unwrap();
+                            let data: Vec<f32> = if uses_dummy_past {
+                                std::iter::once(0.0f32)
+                                    .chain((0..total_len).map(|_| 1.0f32))
+                                    .collect()
+                            } else {
+                                (0..total_len).map(|_| 1.0f32).collect()
+                            };
+                            let mask_f32 = Array2::from_shape_vec((1, mask_len), data).unwrap();
                             Value::from_array(mask_f32)
                                 .map_err(|e| EngineError::backend(e.to_string()))?
                                 .into_dyn()
@@ -3498,22 +3854,14 @@ impl LLMEngine {
                                                 .copied()
                                                 .unwrap_or(TensorElementType::Float16);
                                             let k_input: SessionInputValue<'_> = match key_type {
-                                                TensorElementType::Float16 => {
-                                                    let arr = build_kv_array_f16(
-                                                        packed.key.as_ref(),
-                                                        self.num_heads,
-                                                        packed.length,
-                                                        self.head_dim,
-                                                        self.kv_layout,
-                                                        "key",
-                                                    )
-                                                    .and_then(|arr| {
-                                                        Value::from_array(arr).map_err(|e| {
-                                                            EngineError::backend(e.to_string())
-                                                        })
-                                                    })?;
-                                                    arr.into()
-                                                }
+                                                TensorElementType::Float16 => build_packed_kv_input_f16(
+                                                    packed.key.clone(),
+                                                    self.num_heads,
+                                                    packed.length,
+                                                    self.head_dim,
+                                                    self.kv_layout,
+                                                    "key",
+                                                )?,
                                                 TensorElementType::Float32 => {
                                                     let arr = build_kv_array_f32_from_packed(
                                                         packed.key.as_ref(),
@@ -3546,22 +3894,14 @@ impl LLMEngine {
                                                 .copied()
                                                 .unwrap_or(TensorElementType::Float16);
                                             let v_input: SessionInputValue<'_> = match val_type {
-                                                TensorElementType::Float16 => {
-                                                    let arr = build_kv_array_f16(
-                                                        packed.value.as_ref(),
-                                                        self.num_heads,
-                                                        packed.length,
-                                                        self.head_dim,
-                                                        self.kv_layout,
-                                                        "value",
-                                                    )
-                                                    .and_then(|arr| {
-                                                        Value::from_array(arr).map_err(|e| {
-                                                            EngineError::backend(e.to_string())
-                                                        })
-                                                    })?;
-                                                    arr.into()
-                                                }
+                                                TensorElementType::Float16 => build_packed_kv_input_f16(
+                                                    packed.value.clone(),
+                                                    self.num_heads,
+                                                    packed.length,
+                                                    self.head_dim,
+                                                    self.kv_layout,
+                                                    "value",
+                                                )?,
                                                 TensorElementType::Float32 => {
                                                     let arr = build_kv_array_f32_from_packed(
                                                         packed.value.as_ref(),
@@ -3711,45 +4051,19 @@ impl LLMEngine {
                             outputs.get(format!("present.{}.key", layer)),
                             outputs.get(format!("present.{}.value", layer)),
                         ) {
-                            let (k_shape, k_data) = match k_out.try_extract_tensor::<f16>() {
-                                Ok((shape, data)) => (shape.to_vec(), data.to_vec()),
-                                Err(f16_err) => {
-                                    let (shape, data_f32) =
-                                        k_out.try_extract_tensor::<f32>().map_err(|f32_err| {
-                                            EngineError::backend(format!(
-                                                "Failed to extract present key tensor as f16 ({:?}) or f32 ({:?})",
-                                                f16_err, f32_err
-                                            ))
-                                        })?;
-                                    (
-                                        shape.to_vec(),
-                                        data_f32.iter().map(|v| f16::from_f32(*v)).collect(),
-                                    )
-                                }
-                            };
-                            let (_v_shape, v_data) = match v_out.try_extract_tensor::<f16>() {
-                                Ok((shape, data)) => (shape.to_vec(), data.to_vec()),
-                                Err(f16_err) => {
-                                    let (shape, data_f32) =
-                                        v_out.try_extract_tensor::<f32>().map_err(|f32_err| {
-                                            EngineError::backend(format!(
-                                                "Failed to extract present value tensor as f16 ({:?}) or f32 ({:?})",
-                                                f16_err, f32_err
-                                            ))
-                                        })?;
-                                    (
-                                        shape.to_vec(),
-                                        data_f32.iter().map(|v| f16::from_f32(*v)).collect(),
-                                    )
-                                }
-                            };
+                            let (k_shape_vec, k_data) = extract_tensor_f16(
+                                k_out,
+                                &format!("present key tensor for layer {}", layer),
+                            )?;
+                            let (_v_shape, v_data) = extract_tensor_f16(
+                                v_out,
+                                &format!("present value tensor for layer {}", layer),
+                            )?;
 
                             // Robust handling:
                             // Determine dimensionality and layout heuristically. We try to find
                             // axes corresponding to num_heads and head_dim; if not found, fall back
                             // to the conventional layout [1, num_heads, delta_len, head_dim].
-                            let k_shape_vec: Vec<usize> =
-                                k_shape.iter().map(|&d| d as usize).collect();
                             // Find axis indices
                             let mut idx_head_dim: Option<usize> = None;
                             let mut idx_num_heads: Option<usize> = None;
@@ -3831,8 +4145,15 @@ impl LLMEngine {
                             let num_heads = k_shape_vec[idx_num_heads];
                             let seq_dim = k_shape_vec[idx_seq_dim];
                             // Map present seq axis to absolute cache positions (handles delta-only outputs).
+                            // When uses_dummy_past, position 0 in the present KV is the dummy zero-filled
+                            // timestep; append_start=1 skips it. abs_pos_start is always 0 so actual tokens
+                            // are cached starting at position 0 (not 1).
                             let base_pos = total_len.saturating_sub(seq_dim);
-                            let append_start = seq_dim.saturating_sub(input_len);
+                            let append_start = if uses_dummy_past {
+                                1
+                            } else {
+                                seq_dim.saturating_sub(input_len)
+                            };
                             let appended = seq_dim.saturating_sub(append_start);
                             if let Some(prev) = delta_positions {
                                 if prev != appended {
@@ -3858,7 +4179,8 @@ impl LLMEngine {
                             }
 
                             let delta_len = seq_dim.saturating_sub(append_start);
-                            let abs_pos_start = base_pos + append_start;
+                            // When uses_dummy_past, the first real token belongs at cache position 0.
+                            let abs_pos_start = if uses_dummy_past { 0 } else { base_pos + append_start };
 
                             let seq_first_fast = ndim == 4
                                 && idx_num_heads == 1
@@ -3989,24 +4311,8 @@ impl LLMEngine {
                     let logits = outputs
                         .get("logits")
                         .ok_or_else(|| EngineError::backend("Missing logits output".to_string()))?;
-                    match logits.try_extract_tensor::<f32>() {
-                        Ok((shape, data)) => (shape.to_vec(), data.to_vec()),
-                        Err(f32_err) => {
-                            let (shape, data_f16) =
-                                logits.try_extract_tensor::<f16>().map_err(|f16_err| {
-                                    EngineError::backend(format!(
-                                        "Failed to extract logits as f32 ({:?}) or f16 ({:?})",
-                                        f32_err, f16_err
-                                    ))
-                                })?;
-                            (
-                                shape.to_vec(),
-                                data_f16.iter().map(|v| v.to_f32()).collect(),
-                            )
-                        }
-                    }
+                    extract_tensor_f32(logits, "logits")?
                 };
-                drop(outputs);
                 let mut vocab = logits_shape
                     .last()
                     .copied()
@@ -4046,8 +4352,9 @@ impl LLMEngine {
                 let mut logits_slice = if end <= logits_data.len() {
                     logits_data[start..end].to_vec()
                 } else {
-                    logits_data.clone()
+                    logits_data.to_vec()
                 };
+                drop(outputs);
                 let (token_ids_for_penalty, mut rng_state) = {
                     let seq = seq_arc.lock().unwrap();
                     let token_ids = (sampling_params.repetition_penalty > 1.0).then(|| {
@@ -4148,16 +4455,17 @@ impl LLMEngine {
             };
 
             for seq_arc in seqs {
-                let (input_tokens, seq_id, total_len) = {
+                let (input_tokens, seq_id, total_len, kv_cached_len) = {
                     let seq = seq_arc.lock().unwrap();
                     if seq.is_finished() {
                         continue;
                     }
 
                     let total_len = seq.get_len();
+                    let kv_cached_len = seq.kv_cached_len;
                     let input_tokens = if use_kv_cache {
                         let prompt_len = seq.prompt_token_ids.len();
-                        let start = seq.kv_cached_len;
+                        let start = kv_cached_len;
                         if start < prompt_len {
                             let mut tokens = seq.prompt_token_ids[start..].to_vec();
                             tokens.extend_from_slice(&seq.output_token_ids);
@@ -4172,7 +4480,7 @@ impl LLMEngine {
                         tokens
                     };
 
-                    (input_tokens, seq.sequence_id, total_len)
+                    (input_tokens, seq.sequence_id, total_len, kv_cached_len)
                 };
 
                 let input_len = input_tokens.len();
@@ -4184,8 +4492,16 @@ impl LLMEngine {
                 let input_ids_i64 =
                     Array2::from_shape_vec((1, input_len), input_tokens_i64).unwrap();
 
-                let mask_data_i64: Vec<i64> = (0..total_len).map(|_| 1i64).collect();
-                let mask_i64 = Array2::from_shape_vec((1, total_len), mask_data_i64).unwrap();
+                let uses_dummy_past = use_kv_cache && kv_cached_len == 0;
+                let mask_len = if uses_dummy_past { 1 + total_len } else { total_len };
+                let mask_data_i64: Vec<i64> = if uses_dummy_past {
+                    std::iter::once(0i64)
+                        .chain((0..total_len).map(|_| 1i64))
+                        .collect()
+                } else {
+                    (0..total_len).map(|_| 1i64).collect()
+                };
+                let mask_i64 = Array2::from_shape_vec((1, mask_len), mask_data_i64).unwrap();
 
                 let pos_start = total_len.saturating_sub(input_len);
                 let pos_ids_vec: Vec<i64> = (pos_start..total_len).map(|v| v as i64).collect();
@@ -4244,31 +4560,43 @@ impl LLMEngine {
                                 .map_err(|e| EngineError::backend(e.to_string()))?
                                 .into_dyn(),
                             TensorElementType::Int32 => {
-                                let mask_i32 = Array2::from_shape_vec(
-                                    (1, total_len),
-                                    (0..total_len).map(|_| 1i32).collect::<Vec<i32>>(),
-                                )
-                                .unwrap();
+                                let data: Vec<i32> = if uses_dummy_past {
+                                    std::iter::once(0i32)
+                                        .chain((0..total_len).map(|_| 1i32))
+                                        .collect()
+                                } else {
+                                    (0..total_len).map(|_| 1i32).collect()
+                                };
+                                let mask_i32 =
+                                    Array2::from_shape_vec((1, mask_len), data).unwrap();
                                 Value::from_array(mask_i32)
                                     .map_err(|e| EngineError::backend(e.to_string()))?
                                     .into_dyn()
                             }
                             TensorElementType::Bool => {
-                                let mask_bool = Array2::from_shape_vec(
-                                    (1, total_len),
-                                    (0..total_len).map(|_| true).collect::<Vec<bool>>(),
-                                )
-                                .unwrap();
+                                let data: Vec<bool> = if uses_dummy_past {
+                                    std::iter::once(false)
+                                        .chain((0..total_len).map(|_| true))
+                                        .collect()
+                                } else {
+                                    (0..total_len).map(|_| true).collect()
+                                };
+                                let mask_bool =
+                                    Array2::from_shape_vec((1, mask_len), data).unwrap();
                                 Value::from_array(mask_bool)
                                     .map_err(|e| EngineError::backend(e.to_string()))?
                                     .into_dyn()
                             }
                             TensorElementType::Float32 => {
-                                let mask_f32 = Array2::from_shape_vec(
-                                    (1, total_len),
-                                    (0..total_len).map(|_| 1.0f32).collect::<Vec<f32>>(),
-                                )
-                                .unwrap();
+                                let data: Vec<f32> = if uses_dummy_past {
+                                    std::iter::once(0.0f32)
+                                        .chain((0..total_len).map(|_| 1.0f32))
+                                        .collect()
+                                } else {
+                                    (0..total_len).map(|_| 1.0f32).collect()
+                                };
+                                let mask_f32 =
+                                    Array2::from_shape_vec((1, mask_len), data).unwrap();
                                 Value::from_array(mask_f32)
                                     .map_err(|e| EngineError::backend(e.to_string()))?
                                     .into_dyn()
@@ -4442,22 +4770,14 @@ impl LLMEngine {
                                                     .unwrap_or(TensorElementType::Float16);
                                                 let k_input: SessionInputValue<'_> = match key_type
                                                 {
-                                                    TensorElementType::Float16 => {
-                                                        let arr = build_kv_array_f16(
-                                                            packed.key.as_ref(),
-                                                            self.num_heads,
-                                                            packed.length,
-                                                            self.head_dim,
-                                                            self.kv_layout,
-                                                            "key",
-                                                        )
-                                                        .and_then(|arr| {
-                                                            Value::from_array(arr).map_err(|e| {
-                                                                EngineError::backend(e.to_string())
-                                                            })
-                                                        })?;
-                                                        arr.into()
-                                                    }
+                                                    TensorElementType::Float16 => build_packed_kv_input_f16(
+                                                        packed.key.clone(),
+                                                        self.num_heads,
+                                                        packed.length,
+                                                        self.head_dim,
+                                                        self.kv_layout,
+                                                        "key",
+                                                    )?,
                                                     TensorElementType::Float32 => {
                                                         let arr = build_kv_array_f32_from_packed(
                                                             packed.key.as_ref(),
@@ -4706,41 +5026,14 @@ impl LLMEngine {
                             outputs.get(format!("present.{}.key", layer)),
                             outputs.get(format!("present.{}.value", layer)),
                         ) {
-                            let (k_shape, k_data) = match k_out.try_extract_tensor::<f16>() {
-                                Ok((shape, data)) => (shape.to_vec(), data.to_vec()),
-                                Err(f16_err) => {
-                                    let (shape, data_f32) =
-                                        k_out.try_extract_tensor::<f32>().map_err(|f32_err| {
-                                            EngineError::backend(format!(
-                                                "Failed to extract present key tensor as f16 ({:?}) or f32 ({:?})",
-                                                f16_err, f32_err
-                                            ))
-                                        })?;
-                                    (
-                                        shape.to_vec(),
-                                        data_f32.iter().map(|v| f16::from_f32(*v)).collect(),
-                                    )
-                                }
-                            };
-                            let (_v_shape, v_data) = match v_out.try_extract_tensor::<f16>() {
-                                Ok((shape, data)) => (shape.to_vec(), data.to_vec()),
-                                Err(f16_err) => {
-                                    let (shape, data_f32) =
-                                        v_out.try_extract_tensor::<f32>().map_err(|f32_err| {
-                                            EngineError::backend(format!(
-                                                "Failed to extract present value tensor as f16 ({:?}) or f32 ({:?})",
-                                                f16_err, f32_err
-                                            ))
-                                        })?;
-                                    (
-                                        shape.to_vec(),
-                                        data_f32.iter().map(|v| f16::from_f32(*v)).collect(),
-                                    )
-                                }
-                            };
-
-                            let k_shape_vec: Vec<usize> =
-                                k_shape.iter().map(|&d| d as usize).collect();
+                            let (k_shape_vec, k_data) = extract_tensor_f16(
+                                k_out,
+                                &format!("pipeline present key tensor for layer {}", layer),
+                            )?;
+                            let (_v_shape, v_data) = extract_tensor_f16(
+                                v_out,
+                                &format!("pipeline present value tensor for layer {}", layer),
+                            )?;
                             let mut idx_head_dim: Option<usize> = None;
                             let mut idx_num_heads: Option<usize> = None;
                             let mut idx_seq_dim: Option<usize> = None;
@@ -4838,7 +5131,8 @@ impl LLMEngine {
                             }
 
                             let delta_len = seq_dim.saturating_sub(append_start);
-                            let abs_pos_start = base_pos + append_start;
+                            // When uses_dummy_past, the first real token belongs at cache position 0.
+                            let abs_pos_start = if uses_dummy_past { 0 } else { base_pos + append_start };
 
                             let seq_first_fast = ndim == 4
                                 && idx_num_heads == 1
@@ -4957,24 +5251,8 @@ impl LLMEngine {
                     let logits = outputs
                         .get("logits")
                         .ok_or_else(|| EngineError::backend("Missing logits output".to_string()))?;
-                    match logits.try_extract_tensor::<f32>() {
-                        Ok((shape, data)) => (shape.to_vec(), data.to_vec()),
-                        Err(f32_err) => {
-                            let (shape, data_f16) =
-                                logits.try_extract_tensor::<f16>().map_err(|f16_err| {
-                                    EngineError::backend(format!(
-                                        "Failed to extract logits as f32 ({:?}) or f16 ({:?})",
-                                        f32_err, f16_err
-                                    ))
-                                })?;
-                            (
-                                shape.to_vec(),
-                                data_f16.iter().map(|v| v.to_f32()).collect(),
-                            )
-                        }
-                    }
+                    extract_tensor_f32(logits, "logits")?
                 };
-                drop(outputs);
                 let mut vocab = logits_shape
                     .last()
                     .copied()
@@ -5014,8 +5292,9 @@ impl LLMEngine {
                 let mut logits_slice = if end <= logits_data.len() {
                     logits_data[start..end].to_vec()
                 } else {
-                    logits_data.clone()
+                    logits_data.to_vec()
                 };
+                drop(outputs);
                 let (token_ids_for_penalty, mut rng_state) = {
                     let seq = seq_arc.lock().unwrap();
                     let token_ids = (sampling_params.repetition_penalty > 1.0).then(|| {

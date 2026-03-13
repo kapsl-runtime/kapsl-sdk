@@ -29,6 +29,10 @@ pub struct KvCacheConfig {
     /// cache free-list for reuse. Capping this prevents unbounded RSS growth
     /// when many sequences finish without new ones arriving.
     pub dense_free_list_cap: usize,
+    /// Initial per-sequence KvTensor allocation in tokens. Sequences grow
+    /// dynamically up to max_seq_len. Tuned per-model via metadata.json
+    /// `kv_cache.initial_seq_len`. Default: 256.
+    pub initial_seq_len: usize,
 }
 
 impl Default for KvCacheConfig {
@@ -38,7 +42,8 @@ impl Default for KvCacheConfig {
             block_size: 16,
             total_blocks: 2048,
             eviction_policy: KvEvictionPolicy::LruInactive,
-            dense_free_list_cap: 8,
+            dense_free_list_cap: 32,
+            initial_seq_len: 256,
         }
     }
 }
@@ -87,28 +92,68 @@ pub struct PackedKvView {
 pub struct KvTensor {
     data: Vec<f16>,
     num_heads: usize,
+    /// The currently allocated sequence length (may be less than max_seq_len).
+    allocated_seq_len: usize,
+    /// The absolute maximum sequence length for this tensor.
     max_seq_len: usize,
     head_dim: usize,
 }
 
 impl KvTensor {
-    pub fn new(num_heads: usize, max_seq_len: usize, head_dim: usize) -> Self {
-        let size = num_heads * max_seq_len * head_dim;
+    /// Create a new KvTensor.
+    ///
+    /// `initial_seq_len` controls how many positions are allocated up front.
+    /// Pass `KvCacheConfig::initial_seq_len` (or 256 as a safe default).
+    /// The tensor grows on demand up to `max_seq_len`.
+    pub fn new(
+        num_heads: usize,
+        max_seq_len: usize,
+        head_dim: usize,
+        initial_seq_len: usize,
+    ) -> Self {
+        let initial_cap = initial_seq_len.clamp(1, max_seq_len.max(1));
+        let size = num_heads * initial_cap * head_dim;
         Self {
             data: vec![f16::ZERO; size],
             num_heads,
+            allocated_seq_len: initial_cap,
             max_seq_len,
             head_dim,
         }
     }
 
+    /// Grow the backing buffer so that `allocated_seq_len` is at least `required`.
+    /// Existing data is preserved via `Vec::resize`. The layout is
+    /// `[num_heads, allocated_seq_len, head_dim]` so growing the seq dimension
+    /// means we must re-layout the existing heads.
+    fn grow_to(&mut self, required: usize) {
+        if required <= self.allocated_seq_len {
+            return;
+        }
+        let new_cap = required.next_power_of_two().min(self.max_seq_len);
+        let old_seq = self.allocated_seq_len;
+        let new_size = self.num_heads * new_cap * self.head_dim;
+        let mut new_data = vec![f16::ZERO; new_size];
+        // Copy each head's existing rows into the new (wider) layout.
+        let hd = self.head_dim;
+        for h in 0..self.num_heads {
+            let old_base = h * old_seq * hd;
+            let new_base = h * new_cap * hd;
+            let copy_bytes = old_seq * hd;
+            new_data[new_base..new_base + copy_bytes]
+                .copy_from_slice(&self.data[old_base..old_base + copy_bytes]);
+        }
+        self.data = new_data;
+        self.allocated_seq_len = new_cap;
+    }
+
     #[inline(always)]
     fn index(&self, head: usize, pos: usize, dim: usize) -> usize {
         debug_assert!(head < self.num_heads);
-        debug_assert!(pos < self.max_seq_len);
+        debug_assert!(pos < self.allocated_seq_len);
         debug_assert!(dim < self.head_dim);
 
-        (head * self.max_seq_len * self.head_dim) + (pos * self.head_dim) + dim
+        (head * self.allocated_seq_len * self.head_dim) + (pos * self.head_dim) + dim
     }
 
     #[inline(always)]
@@ -119,10 +164,10 @@ impl KvTensor {
 
     #[inline(always)]
     pub fn write_head_range(&mut self, head: usize, pos_start: usize, values: &[f16]) {
-        debug_assert!(pos_start < self.max_seq_len);
+        debug_assert!(pos_start < self.allocated_seq_len);
         debug_assert!(values.len().is_multiple_of(self.head_dim));
         let num_positions = values.len() / self.head_dim;
-        debug_assert!(pos_start + num_positions <= self.max_seq_len);
+        debug_assert!(pos_start + num_positions <= self.allocated_seq_len);
         let base = self.index(head, pos_start, 0);
         let end = base + values.len();
         self.data[base..end].copy_from_slice(values);
@@ -130,6 +175,11 @@ impl KvTensor {
 
     pub fn as_slice(&self) -> &[f16] {
         &self.data
+    }
+
+    /// Return the currently allocated sequence length.
+    pub fn allocated_seq_len(&self) -> usize {
+        self.allocated_seq_len
     }
 }
 
@@ -146,10 +196,15 @@ struct PackedLayerKv {
 }
 
 impl LayerKv {
-    pub fn new(num_heads: usize, max_seq_len: usize, head_dim: usize) -> Self {
+    pub fn new(
+        num_heads: usize,
+        max_seq_len: usize,
+        head_dim: usize,
+        initial_seq_len: usize,
+    ) -> Self {
         Self {
-            key: KvTensor::new(num_heads, max_seq_len, head_dim),
-            value: KvTensor::new(num_heads, max_seq_len, head_dim),
+            key: KvTensor::new(num_heads, max_seq_len, head_dim, initial_seq_len),
+            value: KvTensor::new(num_heads, max_seq_len, head_dim, initial_seq_len),
         }
     }
 }
@@ -161,9 +216,15 @@ pub struct SequenceKvCache {
 }
 
 impl SequenceKvCache {
-    pub fn new(num_layers: usize, num_heads: usize, max_seq_len: usize, head_dim: usize) -> Self {
+    pub fn new(
+        num_layers: usize,
+        num_heads: usize,
+        max_seq_len: usize,
+        head_dim: usize,
+        initial_seq_len: usize,
+    ) -> Self {
         let layers = (0..num_layers)
-            .map(|_| LayerKv::new(num_heads, max_seq_len, head_dim))
+            .map(|_| LayerKv::new(num_heads, max_seq_len, head_dim, initial_seq_len))
             .collect();
 
         let mut packed_layers = Vec::with_capacity(num_layers);
@@ -175,6 +236,23 @@ impl SequenceKvCache {
             packed_layers,
         }
     }
+
+    /// The currently allocated sequence length across all layer tensors.
+    /// All layer tensors share the same allocated length.
+    pub fn allocated_seq_len(&self) -> usize {
+        self.layers
+            .first()
+            .map(|l| l.key.allocated_seq_len())
+            .unwrap_or(0)
+    }
+
+    /// Ensure every layer's key/value tensor can hold at least `required` positions.
+    fn ensure_capacity(&mut self, required: usize) {
+        for layer in &mut self.layers {
+            layer.key.grow_to(required);
+            layer.value.grow_to(required);
+        }
+    }
 }
 
 pub struct DenseKvCache {
@@ -183,7 +261,10 @@ pub struct DenseKvCache {
     free_list_cap: usize,
     scratch_key: Vec<f16>,
     scratch_value: Vec<f16>,
+    scratch_key_compact: Vec<f16>,
+    scratch_val_compact: Vec<f16>,
     max_seq_len: usize,
+    initial_seq_len: usize,
     num_layers: usize,
     num_heads: usize,
     head_dim: usize,
@@ -191,7 +272,7 @@ pub struct DenseKvCache {
 
 impl DenseKvCache {
     pub fn new(num_layers: usize, num_heads: usize, max_seq_len: usize, head_dim: usize) -> Self {
-        Self::new_with_free_list_cap(num_layers, num_heads, max_seq_len, head_dim, 8)
+        Self::new_with_config(num_layers, num_heads, max_seq_len, head_dim, 32, 256)
     }
 
     pub fn new_with_free_list_cap(
@@ -201,6 +282,17 @@ impl DenseKvCache {
         head_dim: usize,
         free_list_cap: usize,
     ) -> Self {
+        Self::new_with_config(num_layers, num_heads, max_seq_len, head_dim, free_list_cap, 256)
+    }
+
+    pub fn new_with_config(
+        num_layers: usize,
+        num_heads: usize,
+        max_seq_len: usize,
+        head_dim: usize,
+        free_list_cap: usize,
+        initial_seq_len: usize,
+    ) -> Self {
         let expected = num_heads * head_dim;
         Self {
             sequences: HashMap::new(),
@@ -208,9 +300,12 @@ impl DenseKvCache {
             free_list_cap,
             scratch_key: vec![f16::ZERO; expected],
             scratch_value: vec![f16::ZERO; expected],
+            scratch_key_compact: Vec::new(),
+            scratch_val_compact: Vec::new(),
             num_layers,
             num_heads,
             max_seq_len,
+            initial_seq_len,
             head_dim,
         }
     }
@@ -232,6 +327,7 @@ impl DenseKvCache {
                 self.num_heads,
                 self.max_seq_len,
                 self.head_dim,
+                self.initial_seq_len,
             )
         };
         seq.current_len = 0;
@@ -427,7 +523,7 @@ impl DenseKvCache {
         self.sequences.get(&sequence_id).map(|s| s.current_len)
     }
 
-    pub fn get_layer_view(&self, sequence_id: u64, layer_index: usize) -> Option<KvView> {
+    pub fn get_layer_view(&mut self, sequence_id: u64, layer_index: usize) -> Option<KvView> {
         let seq = self.sequences.get(&sequence_id)?;
         let length = seq.current_len;
         let layer = &seq.layers[layer_index];
@@ -441,29 +537,36 @@ impl DenseKvCache {
         }
 
         // Build compact [num_heads, length, head_dim] instead of copying the full
-        // [num_heads, max_seq_len, head_dim] buffer. Each head's used positions are
-        // contiguous (layout: head * max_seq_len * head_dim + pos * head_dim + dim).
-        let stride = self.max_seq_len * self.head_dim;
+        // [num_heads, allocated_seq_len, head_dim] buffer. Each head's used positions are
+        // contiguous (layout: head * allocated_seq_len * head_dim + pos * head_dim + dim).
+        // NOTE: must use allocated_seq_len (not max_seq_len) because KvTensor grows lazily.
+        let alloc_seq_len = layer.key.allocated_seq_len();
+        let stride = alloc_seq_len * self.head_dim;
         let compact_per_head = length * self.head_dim;
         let compact_len = self.num_heads * compact_per_head;
-        let mut key_compact = Vec::with_capacity(compact_len);
-        let mut val_compact = Vec::with_capacity(compact_len);
+
+        // Reuse workspace buffers instead of allocating new Vecs each call.
+        self.scratch_key_compact.clear();
+        self.scratch_key_compact.reserve(compact_len);
+        self.scratch_val_compact.clear();
+        self.scratch_val_compact.reserve(compact_len);
+
         let key_slice = layer.key.as_slice();
         let val_slice = layer.value.as_slice();
         for h in 0..self.num_heads {
             let src = h * stride;
-            key_compact.extend_from_slice(&key_slice[src..src + compact_per_head]);
-            val_compact.extend_from_slice(&val_slice[src..src + compact_per_head]);
+            self.scratch_key_compact.extend_from_slice(&key_slice[src..src + compact_per_head]);
+            self.scratch_val_compact.extend_from_slice(&val_slice[src..src + compact_per_head]);
         }
 
         Some(KvView {
-            key: Arc::from(key_compact),
-            value: Arc::from(val_compact),
+            key: Arc::from(self.scratch_key_compact.as_slice()),
+            value: Arc::from(self.scratch_val_compact.as_slice()),
             length,
         })
     }
 
-    pub fn get_layer_as_onnx(&self, sequence_id: u64, layer: usize) -> Option<Array4<f16>> {
+    pub fn get_layer_as_onnx(&mut self, sequence_id: u64, layer: usize) -> Option<Array4<f16>> {
         let view = self.get_layer_view(sequence_id, layer)?;
         let seq_len = view.length;
 
@@ -1374,12 +1477,13 @@ impl KvCache {
     ) -> Self {
         match config.mode {
             KvCacheMode::Dense => Self {
-                inner: KvCacheInner::Dense(DenseKvCache::new_with_free_list_cap(
+                inner: KvCacheInner::Dense(DenseKvCache::new_with_config(
                     num_layers,
                     num_heads,
                     max_seq_len,
                     head_dim,
                     config.dense_free_list_cap,
+                    config.initial_seq_len,
                 )),
                 mode: KvCacheMode::Dense,
             },

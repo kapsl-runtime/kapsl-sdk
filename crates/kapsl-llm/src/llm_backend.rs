@@ -12,7 +12,7 @@ use kapsl_engine_api::{
 use serde_json::Value;
 use std::fs;
 use std::path::Path;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use tokio::runtime::Runtime;
 use tokio::runtime::RuntimeFlavor;
 use tokio::sync::{mpsc, oneshot};
@@ -29,7 +29,7 @@ fn shared_runtime() -> &'static Runtime {
 
 /// LLM Backend that bridges the Engine trait to the asynchronous LLMEngine loop
 pub struct LLMBackend {
-    request_tx: Mutex<Option<mpsc::Sender<SequenceGroup>>>,
+    request_tx: RwLock<Option<mpsc::Sender<SequenceGroup>>>,
     metrics: Arc<Mutex<LLMMetrics>>,
     model_config: Arc<Mutex<ModelRuntimeConfig>>,
     provider_override: Option<String>,
@@ -316,7 +316,7 @@ fn load_model_runtime_config(model_path: &Path) -> ModelRuntimeConfig {
 impl LLMBackend {
     pub fn new() -> Self {
         Self {
-            request_tx: Mutex::new(None),
+            request_tx: RwLock::new(None),
             metrics: Arc::new(Mutex::new(LLMMetrics::default())),
             model_config: Arc::new(Mutex::new(ModelRuntimeConfig {
                 use_chat_template: false,
@@ -475,7 +475,7 @@ impl Engine for LLMBackend {
         // Await the oneshot receiver instead of blocking the current runtime
         match load_rx.await {
             Ok(Ok(_)) => {
-                let mut tx_guard = self.request_tx.lock().unwrap();
+                let mut tx_guard = self.request_tx.write().unwrap();
                 *tx_guard = Some(request_tx);
                 Ok(())
             }
@@ -629,7 +629,7 @@ impl Engine for LLMBackend {
             response_tx,
         );
 
-        let tx_guard = self.request_tx.lock().unwrap();
+        let tx_guard = self.request_tx.read().unwrap();
         if let Some(tx) = tx_guard.as_ref() {
             let tx = tx.clone();
             drop(tx_guard);
@@ -708,7 +708,7 @@ impl Engine for LLMBackend {
     }
 
     fn unload(&mut self) {
-        let mut tx_guard = self.request_tx.lock().unwrap();
+        let mut tx_guard = self.request_tx.write().unwrap();
         *tx_guard = None;
     }
 
@@ -729,7 +729,7 @@ impl Engine for LLMBackend {
     }
 
     fn health_check(&self) -> Result<(), EngineError> {
-        let tx_guard = self.request_tx.lock().unwrap();
+        let tx_guard = self.request_tx.read().unwrap();
         if tx_guard.is_some() {
             Ok(())
         } else {

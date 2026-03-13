@@ -265,11 +265,26 @@ impl<'de> Deserialize<'de> for TensorDtype {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct BinaryTensorPacket {
     pub shape: Vec<i64>,
     pub dtype: TensorDtype,
     pub data: Vec<u8>,
+}
+
+impl serde::Serialize for BinaryTensorPacket {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        // Must match the 4-field layout of BinaryTensorPacketPayload in the Deserialize impl
+        // so that bincode round-trips correctly (derived Serialize only emits 3 fields,
+        // causing a field-count mismatch on the bincode decode side).
+        let mut state = serializer.serialize_struct("BinaryTensorPacket", 4)?;
+        state.serialize_field("shape", &self.shape)?;
+        state.serialize_field("dtype", &self.dtype)?;
+        state.serialize_field("data", &Some(&self.data))?;
+        state.serialize_field("data_base64", &None::<&str>)?;
+        state.end()
+    }
 }
 
 impl<'de> Deserialize<'de> for BinaryTensorPacket {
@@ -442,33 +457,33 @@ fn shape_elements(shape: &[i64]) -> Result<usize, EngineError> {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RequestMetadata {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub request_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub timeout_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub priority: Option<u8>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub force_cpu: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub model_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_token: Option<String>,
 
     // === Optional LLM overrides ===
-    #[serde(default, skip_serializing_if = "Option::is_none", alias = "max_tokens")]
+    #[serde(default, alias = "max_tokens")]
     pub max_new_tokens: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub temperature: Option<f32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub top_p: Option<f32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub top_k: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub repetition_penalty: Option<f32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub seed: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none", alias = "stop_ids")]
+    #[serde(default, alias = "stop_ids")]
     pub stop_token_ids: Option<Vec<u32>>,
 }
 
@@ -502,11 +517,11 @@ impl CancellationToken {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferenceRequest {
     pub input: BinaryTensorPacket,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub additional_inputs: Vec<NamedTensor>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub session_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub metadata: Option<RequestMetadata>,
     #[serde(skip, default)]
     pub cancellation: Option<CancellationToken>,

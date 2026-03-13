@@ -1705,6 +1705,7 @@ dependencies = [
  "kapsl-engine-api",
  "kapsl-hal",
  "log",
+ "parking_lot",
  "rayon",
  "tokio",
 ]
