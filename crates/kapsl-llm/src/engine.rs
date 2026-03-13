@@ -3056,17 +3056,14 @@ impl LLMEngine {
                         return Ok(false);
                     }
                     let packed_head_stride = packed.length * self.head_dim;
+                    let copy_len = past_len * self.head_dim;
                     for h in 0..self.num_heads {
-                        let src_head = h * packed_head_stride;
-                        let dst_head = ((batch_idx * self.num_heads + h) * max_past_len) * self.head_dim;
-                        for pos in 0..past_len {
-                            let src = src_head + pos * self.head_dim;
-                            let dst = dst_head + (pad_len + pos) * self.head_dim;
-                            key_seq_first[dst..dst + self.head_dim]
-                                .copy_from_slice(&packed.key[src..src + self.head_dim]);
-                            val_seq_first[dst..dst + self.head_dim]
-                                .copy_from_slice(&packed.value[src..src + self.head_dim]);
-                        }
+                        let src_start = h * packed_head_stride;
+                        let dst_start = ((batch_idx * self.num_heads + h) * max_past_len + pad_len) * self.head_dim;
+                        key_seq_first[dst_start..dst_start + copy_len]
+                            .copy_from_slice(&packed.key[src_start..src_start + copy_len]);
+                        val_seq_first[dst_start..dst_start + copy_len]
+                            .copy_from_slice(&packed.value[src_start..src_start + copy_len]);
                     }
                     continue;
                 }
@@ -3091,17 +3088,14 @@ impl LLMEngine {
                     return Ok(false);
                 }
 
+                let copy_len = past_len * self.head_dim;
                 for h in 0..self.num_heads {
-                    let src_head = h * max_seq_len * self.head_dim;
-                    let dst_head = ((batch_idx * self.num_heads + h) * max_past_len) * self.head_dim;
-                    for pos in 0..past_len {
-                        let src = src_head + pos * self.head_dim;
-                        let dst = dst_head + (pad_len + pos) * self.head_dim;
-                        key_seq_first[dst..dst + self.head_dim]
-                            .copy_from_slice(&view.key[src..src + self.head_dim]);
-                        val_seq_first[dst..dst + self.head_dim]
-                            .copy_from_slice(&view.value[src..src + self.head_dim]);
-                    }
+                    let src_start = h * max_seq_len * self.head_dim;
+                    let dst_start = ((batch_idx * self.num_heads + h) * max_past_len + pad_len) * self.head_dim;
+                    key_seq_first[dst_start..dst_start + copy_len]
+                        .copy_from_slice(&view.key[src_start..src_start + copy_len]);
+                    val_seq_first[dst_start..dst_start + copy_len]
+                        .copy_from_slice(&view.value[src_start..src_start + copy_len]);
                 }
             }
 
