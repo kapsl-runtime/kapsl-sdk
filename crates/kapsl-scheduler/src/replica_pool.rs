@@ -1,8 +1,9 @@
 use crate::priority::Priority;
-use kapsl_engine_api::{BinaryTensorPacket, EngineError, InferenceRequest};
+use kapsl_engine_api::{BinaryTensorPacket, EngineError, EngineMetrics, InferenceRequest};
+use parking_lot::RwLock;
+use std::cmp::Reverse;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use parking_lot::RwLock;
 
 /// Strategy for selecting which replica to route requests to
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +42,74 @@ impl<T> ReplicaPool<T>
 where
     T: ReplicaScheduler + Send + Sync + 'static,
 {
+    fn paged_kv_routing_key(metrics: &EngineMetrics) -> Option<(u8, usize, usize)> {
+        let total_blocks = metrics.kv_cache_blocks_total;
+        if total_blocks == 0 {
+            return None;
+        }
+
+        let free_blocks = metrics.kv_cache_blocks_free.min(total_blocks);
+        let used_blocks = total_blocks.saturating_sub(free_blocks);
+        let utilization_permille = used_blocks.saturating_mul(1000) / total_blocks.max(1);
+        let pressure_tier = match utilization_permille {
+            0..=699 => 0,
+            700..=849 => 1,
+            850..=949 => 2,
+            _ => 3,
+        };
+        let free_bytes = metrics
+            .kv_cache_bytes_capacity
+            .saturating_sub(metrics.kv_cache_bytes_used);
+
+        Some((pressure_tier, free_blocks, free_bytes))
+    }
+
+    fn memory_routing_enabled(replicas: &[PooledReplica<T>]) -> bool {
+        replicas
+            .iter()
+            .filter(|replica| replica.scheduler.is_healthy())
+            .any(|replica| Self::paged_kv_routing_key(&replica.scheduler.get_metrics()).is_some())
+    }
+
+    fn routing_key(
+        &self,
+        replica: &PooledReplica<T>,
+        memory_aware: bool,
+    ) -> (u8, usize, Reverse<usize>, Reverse<usize>, usize) {
+        let (high, low) = replica.scheduler.get_queue_depth();
+        let total_depth = high + low;
+
+        if memory_aware {
+            if let Some((pressure_tier, free_blocks, free_bytes)) =
+                Self::paged_kv_routing_key(&replica.scheduler.get_metrics())
+            {
+                return (
+                    pressure_tier,
+                    total_depth,
+                    Reverse(free_blocks),
+                    Reverse(free_bytes),
+                    replica.requests_total.load(Ordering::Relaxed),
+                );
+            }
+
+            return (
+                u8::MAX,
+                total_depth,
+                Reverse(0usize),
+                Reverse(0usize),
+                replica.requests_total.load(Ordering::Relaxed),
+            );
+        }
+
+        (
+            0,
+            total_depth,
+            Reverse(0usize),
+            Reverse(0usize),
+            replica.requests_total.load(Ordering::Relaxed),
+        )
+    }
+
     /// Create a new replica pool with the specified strategy
     pub fn new(strategy: PoolStrategy) -> Self {
         Self {
@@ -131,6 +200,7 @@ where
         // requests finish.
         let (selected_replica_id, selected_scheduler, fallback_schedulers) = {
             let replicas = self.replicas.read();
+            let memory_aware = Self::memory_routing_enabled(&replicas);
 
             if replicas.is_empty() {
                 return Err(EngineError::overloaded(
@@ -154,12 +224,24 @@ where
                         continue;
                     }
                     if other.scheduler.is_healthy() {
-                        fallbacks.push((other.replica_id, other.scheduler.clone()));
+                        fallbacks.push((
+                            self.routing_key(other, memory_aware),
+                            other.replica_id,
+                            other.scheduler.clone(),
+                        ));
                     }
                 }
+                fallbacks.sort_by(|a, b| a.0.cmp(&b.0));
             }
 
-            (selected.replica_id, selected.scheduler.clone(), fallbacks)
+            (
+                selected.replica_id,
+                selected.scheduler.clone(),
+                fallbacks
+                    .into_iter()
+                    .map(|(_, replica_id, scheduler)| (replica_id, scheduler))
+                    .collect::<Vec<(u32, Arc<T>)>>(),
+            )
         };
 
         let result = selected_scheduler
@@ -198,24 +280,23 @@ where
     }
 
     fn select_least_loaded(&self, replicas: &[PooledReplica<T>]) -> usize {
-        let mut min_load = usize::MAX;
-        let mut min_idx = 0;
+        let memory_aware = Self::memory_routing_enabled(replicas);
+        let mut best_idx = 0;
+        let mut best_key: Option<(u8, usize, Reverse<usize>, Reverse<usize>, usize)> = None;
 
         for (idx, replica) in replicas.iter().enumerate() {
             if !replica.scheduler.is_healthy() {
                 continue;
             }
 
-            let (high, low) = replica.scheduler.get_queue_depth();
-            let total_depth = high + low;
-
-            if total_depth < min_load {
-                min_load = total_depth;
-                min_idx = idx;
+            let key = self.routing_key(replica, memory_aware);
+            if best_key.as_ref().map(|best| key < *best).unwrap_or(true) {
+                best_key = Some(key);
+                best_idx = idx;
             }
         }
 
-        min_idx
+        best_idx
     }
 
     fn select_sticky(&self, replicas: &[PooledReplica<T>], request: &InferenceRequest) -> usize {
@@ -357,6 +438,7 @@ where
         // Select the schedulers to attempt without holding the pool lock across awaits.
         let (selected_replica_id, selected_scheduler, fallback_schedulers) = {
             let replicas = self.replicas.read();
+            let memory_aware = Self::memory_routing_enabled(&replicas);
 
             if replicas.is_empty() {
                 return Err(EngineError::overloaded(
@@ -380,12 +462,24 @@ where
                         continue;
                     }
                     if other.scheduler.is_healthy() {
-                        fallbacks.push((other.replica_id, other.scheduler.clone()));
+                        fallbacks.push((
+                            self.routing_key(other, memory_aware),
+                            other.replica_id,
+                            other.scheduler.clone(),
+                        ));
                     }
                 }
+                fallbacks.sort_by(|a, b| a.0.cmp(&b.0));
             }
 
-            (selected.replica_id, selected.scheduler.clone(), fallbacks)
+            (
+                selected.replica_id,
+                selected.scheduler.clone(),
+                fallbacks
+                    .into_iter()
+                    .map(|(_, replica_id, scheduler)| (replica_id, scheduler))
+                    .collect::<Vec<(u32, Arc<T>)>>(),
+            )
         };
 
         if selected_scheduler.is_healthy() {
@@ -476,6 +570,7 @@ mod tests {
     struct MockScheduler {
         queue_depth: (usize, usize),
         healthy: bool,
+        metrics: kapsl_engine_api::EngineMetrics,
     }
 
     impl MockScheduler {
@@ -483,6 +578,22 @@ mod tests {
             Self {
                 queue_depth,
                 healthy,
+                metrics: kapsl_engine_api::EngineMetrics {
+                    queue_depth: queue_depth.0 + queue_depth.1,
+                    ..kapsl_engine_api::EngineMetrics::default()
+                },
+            }
+        }
+
+        fn with_metrics(
+            queue_depth: (usize, usize),
+            healthy: bool,
+            metrics: kapsl_engine_api::EngineMetrics,
+        ) -> Self {
+            Self {
+                queue_depth,
+                healthy,
+                metrics,
             }
         }
     }
@@ -513,10 +624,7 @@ mod tests {
         }
 
         fn get_metrics(&self) -> kapsl_engine_api::EngineMetrics {
-            kapsl_engine_api::EngineMetrics {
-                queue_depth: self.queue_depth.0 + self.queue_depth.1,
-                ..kapsl_engine_api::EngineMetrics::default()
-            }
+            self.metrics.clone()
         }
 
         async fn infer_stream(
@@ -547,8 +655,7 @@ mod tests {
 
         // Add 3 replicas
         for i in 0..3 {
-            pool.add_replica(i, Arc::new(MockScheduler::new((0, 0), true)))
-                .await;
+            pool.add_replica(i, Arc::new(MockScheduler::new((0, 0), true)));
         }
 
         let request = InferenceRequest::new(BinaryTensorPacket {
@@ -565,7 +672,7 @@ mod tests {
         }
 
         // Verify distribution is even (each should have 3 requests)
-        let stats = pool.stats().await;
+        let stats = pool.stats();
         for stat in stats {
             assert_eq!(stat.requests_total, 3);
         }
@@ -576,12 +683,9 @@ mod tests {
         let pool = ReplicaPool::new(PoolStrategy::LeastLoaded);
 
         // Add replicas with different queue depths
-        pool.add_replica(0, Arc::new(MockScheduler::new((10, 5), true)))
-            .await;
-        pool.add_replica(1, Arc::new(MockScheduler::new((2, 1), true)))
-            .await;
-        pool.add_replica(2, Arc::new(MockScheduler::new((5, 3), true)))
-            .await;
+        pool.add_replica(0, Arc::new(MockScheduler::new((10, 5), true)));
+        pool.add_replica(1, Arc::new(MockScheduler::new((2, 1), true)));
+        pool.add_replica(2, Arc::new(MockScheduler::new((5, 3), true)));
 
         let request = InferenceRequest::new(BinaryTensorPacket {
             shape: vec![1, 1],
@@ -592,7 +696,7 @@ mod tests {
         // Execute request - should go to replica 1 (lowest queue depth of 3)
         let _ = pool.execute(request, Priority::Throughput, false).await;
 
-        let stats = pool.stats().await;
+        let stats = pool.stats();
         // Replica 1 should have received the request
         assert_eq!(stats[1].requests_total, 1);
         assert_eq!(stats[0].requests_total, 0);
@@ -605,8 +709,7 @@ mod tests {
 
         // Add 3 replicas
         for i in 0..3 {
-            pool.add_replica(i, Arc::new(MockScheduler::new((0, 0), true)))
-                .await;
+            pool.add_replica(i, Arc::new(MockScheduler::new((0, 0), true)));
         }
 
         let request = InferenceRequest::new(BinaryTensorPacket {
@@ -623,7 +726,7 @@ mod tests {
                 .await;
         }
 
-        let stats = pool.stats().await;
+        let stats = pool.stats();
         // All requests should go to the same replica (whichever the hash maps to)
         let total_requests: u64 = stats.iter().map(|s| s.requests_total).sum();
         assert_eq!(total_requests, 5);
@@ -637,10 +740,8 @@ mod tests {
         let pool = ReplicaPool::new(PoolStrategy::RoundRobin);
 
         // Add unhealthy and healthy replicas
-        pool.add_replica(0, Arc::new(MockScheduler::new((0, 0), false)))
-            .await;
-        pool.add_replica(1, Arc::new(MockScheduler::new((0, 0), true)))
-            .await;
+        pool.add_replica(0, Arc::new(MockScheduler::new((0, 0), false)));
+        pool.add_replica(1, Arc::new(MockScheduler::new((0, 0), true)));
 
         let request = InferenceRequest::new(BinaryTensorPacket {
             shape: vec![1, 1],
@@ -652,7 +753,7 @@ mod tests {
         let result = pool.execute(request, Priority::Throughput, false).await;
         assert!(result.is_ok());
 
-        let stats = pool.stats().await;
+        let stats = pool.stats();
         // Replica 1 should have received the failover request
         assert_eq!(stats[1].requests_total, 1);
     }
@@ -662,10 +763,8 @@ mod tests {
         let pool = ReplicaPool::new(PoolStrategy::RoundRobin);
 
         // Add unhealthy and healthy replicas
-        pool.add_replica(0, Arc::new(MockScheduler::new((0, 0), false)))
-            .await;
-        pool.add_replica(1, Arc::new(MockScheduler::new((0, 0), true)))
-            .await;
+        pool.add_replica(0, Arc::new(MockScheduler::new((0, 0), false)));
+        pool.add_replica(1, Arc::new(MockScheduler::new((0, 0), true)));
 
         let request = InferenceRequest::new(BinaryTensorPacket {
             shape: vec![1, 1],
@@ -689,7 +788,7 @@ mod tests {
         assert!(item.is_some());
         assert!(item.unwrap().is_ok());
 
-        let stats = pool.stats().await;
+        let stats = pool.stats();
         // Replica 1 should have received the request (Replica 0 failed)
         assert!(stats[1].requests_total >= 1);
     }
@@ -699,17 +798,110 @@ mod tests {
         let pool = ReplicaPool::new(PoolStrategy::RoundRobin);
 
         // Add replicas with different queue depths
-        pool.add_replica(0, Arc::new(MockScheduler::new((10, 5), true)))
-            .await;
-        pool.add_replica(1, Arc::new(MockScheduler::new((2, 1), true)))
-            .await;
-        pool.add_replica(2, Arc::new(MockScheduler::new((5, 3), true)))
-            .await;
+        pool.add_replica(0, Arc::new(MockScheduler::new((10, 5), true)));
+        pool.add_replica(1, Arc::new(MockScheduler::new((2, 1), true)));
+        pool.add_replica(2, Arc::new(MockScheduler::new((5, 3), true)));
 
         // Total high: 10 + 2 + 5 = 17
         // Total low: 5 + 1 + 3 = 9
         let (high, low) = pool.get_queue_depth();
         assert_eq!(high, 17);
         assert_eq!(low, 9);
+    }
+
+    #[tokio::test]
+    async fn test_least_loaded_prefers_lower_kv_pressure_when_paged_metrics_exist() {
+        let pool = ReplicaPool::new(PoolStrategy::LeastLoaded);
+
+        let high_pressure_metrics = kapsl_engine_api::EngineMetrics {
+            kv_cache_blocks_total: 100,
+            kv_cache_blocks_free: 4,
+            kv_cache_bytes_capacity: 1_000,
+            kv_cache_bytes_used: 960,
+            ..kapsl_engine_api::EngineMetrics::default()
+        };
+        let low_pressure_metrics = kapsl_engine_api::EngineMetrics {
+            kv_cache_blocks_total: 100,
+            kv_cache_blocks_free: 32,
+            kv_cache_bytes_capacity: 1_000,
+            kv_cache_bytes_used: 680,
+            ..kapsl_engine_api::EngineMetrics::default()
+        };
+
+        pool.add_replica(
+            0,
+            Arc::new(MockScheduler::with_metrics(
+                (0, 0),
+                true,
+                high_pressure_metrics,
+            )),
+        );
+        pool.add_replica(
+            1,
+            Arc::new(MockScheduler::with_metrics(
+                (1, 0),
+                true,
+                low_pressure_metrics,
+            )),
+        );
+
+        let request = InferenceRequest::new(BinaryTensorPacket {
+            shape: vec![1, 1],
+            dtype: TensorDtype::Float32,
+            data: vec![0, 0, 0, 0],
+        });
+
+        let _ = pool.execute(request, Priority::Throughput, false).await;
+
+        let stats = pool.stats();
+        assert_eq!(stats[0].requests_total, 0);
+        assert_eq!(stats[1].requests_total, 1);
+    }
+
+    #[tokio::test]
+    async fn test_failover_prefers_more_kv_headroom() {
+        let pool = ReplicaPool::new(PoolStrategy::RoundRobin);
+
+        let failing_metrics = kapsl_engine_api::EngineMetrics::default();
+        let worse_headroom = kapsl_engine_api::EngineMetrics {
+            kv_cache_blocks_total: 100,
+            kv_cache_blocks_free: 8,
+            kv_cache_bytes_capacity: 1_000,
+            kv_cache_bytes_used: 920,
+            ..kapsl_engine_api::EngineMetrics::default()
+        };
+        let better_headroom = kapsl_engine_api::EngineMetrics {
+            kv_cache_blocks_total: 100,
+            kv_cache_blocks_free: 40,
+            kv_cache_bytes_capacity: 1_000,
+            kv_cache_bytes_used: 600,
+            ..kapsl_engine_api::EngineMetrics::default()
+        };
+
+        pool.add_replica(
+            0,
+            Arc::new(MockScheduler::with_metrics((0, 0), false, failing_metrics)),
+        );
+        pool.add_replica(
+            1,
+            Arc::new(MockScheduler::with_metrics((0, 0), true, worse_headroom)),
+        );
+        pool.add_replica(
+            2,
+            Arc::new(MockScheduler::with_metrics((0, 0), true, better_headroom)),
+        );
+
+        let request = InferenceRequest::new(BinaryTensorPacket {
+            shape: vec![1, 1],
+            dtype: TensorDtype::Float32,
+            data: vec![0, 0, 0, 0],
+        });
+
+        let result = pool.execute(request, Priority::Throughput, false).await;
+        assert!(result.is_ok());
+
+        let stats = pool.stats();
+        assert_eq!(stats[1].requests_total, 0);
+        assert_eq!(stats[2].requests_total, 1);
     }
 }

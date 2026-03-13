@@ -114,6 +114,45 @@ fn llm_decode_profile_enabled() -> bool {
     })
 }
 
+fn parse_byte_size(value: &str) -> Option<usize> {
+    let lower = value.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return None;
+    }
+
+    let (number, multiplier) = if let Some(number) = lower.strip_suffix("gib") {
+        (number, 1024usize.pow(3))
+    } else if let Some(number) = lower.strip_suffix("mib") {
+        (number, 1024usize.pow(2))
+    } else if let Some(number) = lower.strip_suffix("kib") {
+        (number, 1024usize)
+    } else if let Some(number) = lower.strip_suffix("gb") {
+        (number, 1000usize.pow(3))
+    } else if let Some(number) = lower.strip_suffix("mb") {
+        (number, 1000usize.pow(2))
+    } else if let Some(number) = lower.strip_suffix("kb") {
+        (number, 1000usize)
+    } else if let Some(number) = lower.strip_suffix('b') {
+        (number, 1usize)
+    } else {
+        (lower.as_str(), 1usize)
+    };
+
+    number
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .and_then(|parsed| parsed.checked_mul(multiplier))
+}
+
+fn parse_byte_size_json(value: &serde_json::Value) -> Option<usize> {
+    match value {
+        serde_json::Value::Number(number) => number.as_u64().and_then(|v| usize::try_from(v).ok()),
+        serde_json::Value::String(text) => parse_byte_size(text),
+        _ => None,
+    }
+}
+
 fn llm_decode_bucket_granularity() -> usize {
     static GRANULARITY: OnceLock<usize> = OnceLock::new();
     *GRANULARITY.get_or_init(|| {
@@ -520,11 +559,11 @@ fn build_kv_array_f16_from_packed(
     }
 
     match layout {
-        KvLayout::SeqFirst => Array4::from_shape_vec(
-            (1, num_heads, seq_len, head_dim),
-            data.to_vec(),
-        )
-        .map_err(|e| EngineError::backend(format!("Failed to make {} array: {:?}", label, e))),
+        KvLayout::SeqFirst => {
+            Array4::from_shape_vec((1, num_heads, seq_len, head_dim), data.to_vec()).map_err(|e| {
+                EngineError::backend(format!("Failed to make {} array: {:?}", label, e))
+            })
+        }
         KvLayout::HeadDimFirst => {
             let mut reordered = vec![f16::ZERO; expected];
             for h in 0..num_heads {
@@ -633,11 +672,13 @@ fn build_packed_kv_input_f16<'a>(
     label: &str,
 ) -> Result<SessionInputValue<'a>, EngineError> {
     match layout {
-        KvLayout::SeqFirst => TensorRef::from_array_view(([1usize, num_heads, seq_len, head_dim], data))
-            .map(|tensor| tensor.into())
-            .map_err(|e| {
-                EngineError::backend(format!("Failed to make {} tensor view: {}", label, e))
-            }),
+        KvLayout::SeqFirst => {
+            TensorRef::from_array_view(([1usize, num_heads, seq_len, head_dim], data))
+                .map(|tensor| tensor.into())
+                .map_err(|e| {
+                    EngineError::backend(format!("Failed to make {} tensor view: {}", label, e))
+                })
+        }
         KvLayout::HeadDimFirst => {
             let arr = build_kv_array_f16_from_packed(
                 data.as_ref(),
@@ -812,6 +853,8 @@ pub struct LLMEngine {
     max_seq_len: usize,
     max_session_tokens: usize,
     kv_layout: KvLayout,
+    kv_admission_soft_limit_bytes: Option<usize>,
+    kv_admission_hard_limit_bytes: Option<usize>,
     // Detected vocabulary size (optional). Populated at load() when available.
     vocab_size: Option<usize>,
     // Detected BOS token id (optional).
@@ -948,6 +991,8 @@ impl LLMEngine {
             max_seq_len: MAX_SEQ_LEN,
             max_session_tokens: MAX_SEQ_LEN * 4,
             kv_layout: KvLayout::SeqFirst,
+            kv_admission_soft_limit_bytes: None,
+            kv_admission_hard_limit_bytes: None,
             vocab_size: None,
             bos_token_id: None,
             use_kv_cache: true,
@@ -993,6 +1038,8 @@ impl LLMEngine {
         let mut manifest_max_seq_len: Option<usize> = None;
         let mut manifest_vocab_size: Option<usize> = None;
         let mut manifest_max_session_tokens: Option<usize> = None;
+        let mut kv_admission_soft_limit_bytes: Option<usize> = None;
+        let mut kv_admission_hard_limit_bytes: Option<usize> = None;
 
         let meta_path = model_root.join("metadata.json");
         if let Ok(file) = std::fs::File::open(meta_path) {
@@ -1087,6 +1134,22 @@ impl LLMEngine {
                             kv_cache_config.dense_free_list_cap = v as usize;
                         }
                     }
+                    if let Some(v) = kv
+                        .get("admission_soft_limit_bytes")
+                        .and_then(parse_byte_size_json)
+                    {
+                        if v > 0 {
+                            kv_admission_soft_limit_bytes = Some(v);
+                        }
+                    }
+                    if let Some(v) = kv
+                        .get("admission_hard_limit_bytes")
+                        .and_then(parse_byte_size_json)
+                    {
+                        if v > 0 {
+                            kv_admission_hard_limit_bytes = Some(v);
+                        }
+                    }
                 }
 
                 if let Some(stages) = meta
@@ -1138,10 +1201,7 @@ impl LLMEngine {
                             manifest_vocab_size = Some(v as usize);
                         }
                     }
-                    if let Some(v) = llm
-                        .get("max_session_tokens")
-                        .and_then(|v| v.as_u64())
-                    {
+                    if let Some(v) = llm.get("max_session_tokens").and_then(|v| v.as_u64()) {
                         if v > 0 {
                             manifest_max_session_tokens = Some(v as usize);
                         }
@@ -1254,22 +1314,40 @@ impl LLMEngine {
                 ),
             }
         }
-        if let Some(v) =
-            env_var_alias("KAPSL_LLM_KV_INITIAL_SEQ_LEN", "KAPSL_LLM_KV_INITIAL_SEQ_LEN")
-        {
+        if let Some(v) = env_var_alias(
+            "KAPSL_LLM_KV_INITIAL_SEQ_LEN",
+            "KAPSL_LLM_KV_INITIAL_SEQ_LEN",
+        ) {
             if let Ok(parsed) = v.parse::<usize>() {
                 if parsed > 0 {
                     kv_cache_config.initial_seq_len = parsed;
                 }
             }
         }
-        if let Some(v) = env_var_alias(
-            "KAPSL_LLM_KV_FREE_LIST_CAP",
-            "KAPSL_LLM_KV_FREE_LIST_CAP",
-        ) {
+        if let Some(v) = env_var_alias("KAPSL_LLM_KV_FREE_LIST_CAP", "KAPSL_LLM_KV_FREE_LIST_CAP") {
             if let Ok(parsed) = v.parse::<usize>() {
                 if parsed > 0 {
                     kv_cache_config.dense_free_list_cap = parsed;
+                }
+            }
+        }
+        if let Some(v) = env_var_alias(
+            "KAPSL_LLM_KV_ADMISSION_SOFT_LIMIT_BYTES",
+            "KAPSL_LLM_KV_ADMISSION_SOFT_LIMIT_BYTES",
+        ) {
+            if let Some(parsed) = parse_byte_size(&v) {
+                if parsed > 0 {
+                    kv_admission_soft_limit_bytes = Some(parsed);
+                }
+            }
+        }
+        if let Some(v) = env_var_alias(
+            "KAPSL_LLM_KV_ADMISSION_HARD_LIMIT_BYTES",
+            "KAPSL_LLM_KV_ADMISSION_HARD_LIMIT_BYTES",
+        ) {
+            if let Some(parsed) = parse_byte_size(&v) {
+                if parsed > 0 {
+                    kv_admission_hard_limit_bytes = Some(parsed);
                 }
             }
         }
@@ -1789,8 +1867,8 @@ impl LLMEngine {
             self.num_layers = DEFAULT_NUM_LAYERS;
         }
         self.max_seq_len = manifest_max_seq_len.unwrap_or(MAX_SEQ_LEN);
-        self.max_session_tokens = manifest_max_session_tokens
-            .unwrap_or(self.max_seq_len.saturating_mul(4));
+        self.max_session_tokens =
+            manifest_max_session_tokens.unwrap_or(self.max_seq_len.saturating_mul(4));
 
         self.kv_layout = infer_kv_layout(&input_shapes_map, self.num_heads, self.head_dim);
 
@@ -1816,6 +1894,8 @@ impl LLMEngine {
         }
 
         self.kv_cache_config = kv_cache_config.clone();
+        self.kv_admission_soft_limit_bytes = kv_admission_soft_limit_bytes;
+        self.kv_admission_hard_limit_bytes = kv_admission_hard_limit_bytes;
         // Recreate kv_cache using detected geometry (max_seq_len from manifest or default).
         self.kv_cache = KvCache::new_with_config(
             self.num_layers,
@@ -1831,6 +1911,15 @@ impl LLMEngine {
             self.kv_cache_config.total_blocks,
             self.kv_cache_config.eviction_policy
         );
+        if self.kv_admission_soft_limit_bytes.is_some()
+            || self.kv_admission_hard_limit_bytes.is_some()
+        {
+            log::info!(
+                "KV admission budgets: soft_limit_bytes={:?}, hard_limit_bytes={:?}",
+                self.kv_admission_soft_limit_bytes,
+                self.kv_admission_hard_limit_bytes
+            );
+        }
 
         // Attempt to detect model vocab size from declared outputs (logits) as a best-effort.
         // Typical logits output shape: [batch, seq_len, vocab_size]
@@ -1911,6 +2000,127 @@ impl LLMEngine {
         metrics.kv_cache_packed_layers = stats.packed_layers;
     }
 
+    fn kv_bytes_per_token(&self) -> Option<usize> {
+        if self.num_layers == 0 || self.num_heads == 0 || self.head_dim == 0 {
+            return None;
+        }
+        Some(
+            self.num_layers
+                .saturating_mul(self.num_heads)
+                .saturating_mul(self.head_dim)
+                .saturating_mul(2)
+                .saturating_mul(std::mem::size_of::<f16>()),
+        )
+    }
+
+    fn kv_admission_limits(&self, current_capacity_bytes: usize) -> (Option<usize>, Option<usize>) {
+        let mut hard = self.kv_admission_hard_limit_bytes;
+        if hard.is_none()
+            && self.kv_cache_config.mode == KvCacheMode::Paged
+            && current_capacity_bytes > 0
+        {
+            hard = Some(current_capacity_bytes);
+        }
+
+        let mut soft = self
+            .kv_admission_soft_limit_bytes
+            .or_else(|| hard.map(|hard_limit| hard_limit.saturating_mul(9) / 10));
+        if let (Some(soft_limit), Some(hard_limit)) = (soft, hard) {
+            soft = Some(soft_limit.min(hard_limit));
+        }
+        (soft, hard)
+    }
+
+    fn projected_kv_reservation_bytes(
+        &self,
+        prompt_tokens: usize,
+        max_new_tokens: usize,
+        has_live_sequence: bool,
+    ) -> Option<usize> {
+        match self.kv_cache_config.mode {
+            KvCacheMode::Dense => {
+                if has_live_sequence {
+                    return Some(0);
+                }
+                Some(
+                    self.num_layers
+                        .saturating_mul(self.num_heads)
+                        .saturating_mul(self.max_seq_len)
+                        .saturating_mul(self.head_dim)
+                        .saturating_mul(2)
+                        .saturating_mul(std::mem::size_of::<f16>()),
+                )
+            }
+            KvCacheMode::Paged => {
+                let bytes_per_token = self.kv_bytes_per_token()?;
+                Some(
+                    prompt_tokens
+                        .saturating_add(max_new_tokens)
+                        .saturating_mul(bytes_per_token),
+                )
+            }
+        }
+    }
+
+    fn enforce_kv_admission(
+        &self,
+        request_id: &str,
+        session_id: Option<&str>,
+        prompt_tokens: usize,
+        max_new_tokens: usize,
+        has_live_sequence: bool,
+    ) -> Result<(), EngineError> {
+        if !self.use_kv_cache {
+            return Ok(());
+        }
+
+        let additional_reserved = match self.projected_kv_reservation_bytes(
+            prompt_tokens,
+            max_new_tokens,
+            has_live_sequence,
+        ) {
+            Some(bytes) if bytes > 0 => bytes,
+            _ => return Ok(()),
+        };
+
+        let stats = self.kv_cache.stats();
+        let projected = stats.bytes_used.saturating_add(additional_reserved);
+        let (soft_limit, hard_limit) = self.kv_admission_limits(stats.bytes_capacity);
+        let session_suffix = session_id
+            .map(|id| format!(" session='{}'", id))
+            .unwrap_or_default();
+
+        if let Some(limit) = hard_limit {
+            if projected > limit {
+                return Err(EngineError::resource_exhausted(format!(
+                    "KV admission rejected for request '{}'{}: projected {} bytes exceeds hard limit {} (current used {}, additional reserved {})",
+                    request_id,
+                    session_suffix,
+                    projected,
+                    limit,
+                    stats.bytes_used,
+                    additional_reserved,
+                )));
+            }
+        }
+
+        if let Some(limit) = soft_limit {
+            if projected > limit {
+                return Err(EngineError::overloaded(format!(
+                    "KV admission deferred for request '{}'{}: projected {} bytes exceeds soft limit {} (current used {}, additional reserved {})",
+                    request_id,
+                    session_suffix,
+                    projected,
+                    limit,
+                    stats.bytes_used,
+                    additional_reserved,
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
     pub async fn run_loop(&mut self) {
         loop {
             while let Ok(mut req) = self.request_rx.try_recv() {
@@ -1971,7 +2181,23 @@ impl LLMEngine {
                 }
 
                 let prompt_len = token_ids.len();
+                let max_new_tokens = req.sampling_params.max_tokens;
                 if let Some(existing_seq_arc) = existing_seq_arc {
+                    let existing_seq_id = existing_seq_arc.lock().unwrap().sequence_id;
+                    let has_live_sequence =
+                        self.use_kv_cache && self.kv_cache.has_sequence(existing_seq_id);
+                    if let Err(engine_err) = self.enforce_kv_admission(
+                        &req.request_id,
+                        session_id.as_deref(),
+                        prompt_len,
+                        max_new_tokens,
+                        has_live_sequence,
+                    ) {
+                        let group = Arc::new(Mutex::new(req));
+                        self.fail_groups_with_error(&[group], &engine_err);
+                        continue;
+                    }
+
                     let (seq_id, new_len) = {
                         let mut seq = existing_seq_arc.lock().unwrap();
                         seq.output_token_ids.extend(token_ids.clone());
@@ -2015,6 +2241,18 @@ impl LLMEngine {
                     req.sequences.insert(seq_id, existing_seq_arc);
                     req.reset_cache_for_single_seq(seq_id, new_len, SequenceStatus::Waiting);
                     self.scheduler.add_sequence_group(req);
+                    continue;
+                }
+
+                if let Err(engine_err) = self.enforce_kv_admission(
+                    &req.request_id,
+                    session_id.as_deref(),
+                    prompt_len,
+                    max_new_tokens,
+                    false,
+                ) {
+                    let group = Arc::new(Mutex::new(req));
+                    self.fail_groups_with_error(&[group], &engine_err);
                     continue;
                 }
 
@@ -2314,11 +2552,8 @@ impl LLMEngine {
             .flat_map(|_| std::iter::once(0i64).chain(std::iter::repeat(1i64).take(input_len)))
             .collect();
         let mask_i64 = Array2::from_shape_vec((batch_size, mask_len), mask_data).unwrap();
-        let pos_ids_flat: Vec<i64> = (0..batch_size)
-            .flat_map(|_| 0..input_len as i64)
-            .collect();
-        let pos_ids_i64 =
-            Array2::from_shape_vec((batch_size, input_len), pos_ids_flat).unwrap();
+        let pos_ids_flat: Vec<i64> = (0..batch_size).flat_map(|_| 0..input_len as i64).collect();
+        let pos_ids_i64 = Array2::from_shape_vec((batch_size, input_len), pos_ids_flat).unwrap();
 
         if !model_input_names.contains("input_ids") {
             return Err(EngineError::backend(
@@ -2418,9 +2653,8 @@ impl LLMEngine {
                     .map_err(|e| EngineError::backend(e.to_string()))?
                     .into_dyn(),
                 TensorElementType::Int32 => {
-                    let pos_i32: Vec<i32> = (0..batch_size)
-                        .flat_map(|_| 0..input_len as i32)
-                        .collect();
+                    let pos_i32: Vec<i32> =
+                        (0..batch_size).flat_map(|_| 0..input_len as i32).collect();
                     Value::from_array(
                         Array2::from_shape_vec((batch_size, input_len), pos_i32).unwrap(),
                     )
@@ -2462,11 +2696,8 @@ impl LLMEngine {
             if needs_key {
                 let k_input: SessionInputValue<'_> = match key_type {
                     TensorElementType::Float16 => Value::from_array(
-                        Array4::<f16>::from_shape_vec(
-                            empty_shape,
-                            vec![f16::ZERO; kv_num_elems],
-                        )
-                        .map_err(|e| EngineError::backend(e.to_string()))?,
+                        Array4::<f16>::from_shape_vec(empty_shape, vec![f16::ZERO; kv_num_elems])
+                            .map_err(|e| EngineError::backend(e.to_string()))?,
                     )
                     .map_err(|e| EngineError::backend(e.to_string()))?
                     .into(),
@@ -2488,11 +2719,8 @@ impl LLMEngine {
             if needs_val {
                 let v_input: SessionInputValue<'_> = match val_type {
                     TensorElementType::Float16 => Value::from_array(
-                        Array4::<f16>::from_shape_vec(
-                            empty_shape,
-                            vec![f16::ZERO; kv_num_elems],
-                        )
-                        .map_err(|e| EngineError::backend(e.to_string()))?,
+                        Array4::<f16>::from_shape_vec(empty_shape, vec![f16::ZERO; kv_num_elems])
+                            .map_err(|e| EngineError::backend(e.to_string()))?,
                     )
                     .map_err(|e| EngineError::backend(e.to_string()))?
                     .into(),
@@ -2524,8 +2752,7 @@ impl LLMEngine {
         for layer in 0..self.num_layers {
             let key_name = format!("present.{}.key", layer);
             let val_name = format!("present.{}.value", layer);
-            let (Some(k_out), Some(v_out)) =
-                (outputs.get(&key_name), outputs.get(&val_name))
+            let (Some(k_out), Some(v_out)) = (outputs.get(&key_name), outputs.get(&val_name))
             else {
                 continue;
             };
@@ -2612,9 +2839,17 @@ impl LLMEngine {
                         )
                         .map_err(|e| EngineError::resource_exhausted(e.to_string()))?;
                 }
-                if actual_seq > 0 && packed_key.len() == packed_len && packed_val.len() == packed_len {
-                    self.kv_cache
-                        .set_packed_layer(item.seq_id, layer, actual_seq, &packed_key, &packed_val);
+                if actual_seq > 0
+                    && packed_key.len() == packed_len
+                    && packed_val.len() == packed_len
+                {
+                    self.kv_cache.set_packed_layer(
+                        item.seq_id,
+                        layer,
+                        actual_seq,
+                        &packed_key,
+                        &packed_val,
+                    );
                 } else {
                     self.kv_cache.clear_packed_layer(item.seq_id, layer);
                 }
@@ -2629,7 +2864,8 @@ impl LLMEngine {
                         .advance_sequence_by(item.seq_id, item.total_len - current_len);
                 }
             } else {
-                self.kv_cache.advance_sequence_by(item.seq_id, item.total_len);
+                self.kv_cache
+                    .advance_sequence_by(item.seq_id, item.total_len);
             }
         }
 
@@ -2691,8 +2927,7 @@ impl LLMEngine {
 
         for (batch_idx, item) in items.iter().enumerate() {
             // Take the last position's logits for each batch element.
-            let row =
-                batch_idx * rows_per_batch + (seq_len.min(rows_per_batch).saturating_sub(1));
+            let row = batch_idx * rows_per_batch + (seq_len.min(rows_per_batch).saturating_sub(1));
             let start = row * vocab;
             let end = start + vocab;
             if end > logits_data.len() {
@@ -2733,21 +2968,16 @@ impl LLMEngine {
                     let idx = token_id as usize;
                     if idx < self.logits_workspace.len() {
                         let val = self.logits_workspace[idx];
-                        self.logits_workspace[idx] =
-                            if val > 0.0 { val / penalty } else { val * penalty };
+                        self.logits_workspace[idx] = if val > 0.0 {
+                            val / penalty
+                        } else {
+                            val * penalty
+                        };
                     }
                 }
-                Self::sample_next_token(
-                    &self.logits_workspace,
-                    &sampling_params,
-                    &mut rng_state,
-                )
+                Self::sample_next_token(&self.logits_workspace, &sampling_params, &mut rng_state)
             } else {
-                Self::sample_next_token(
-                    &logits_data[start..end],
-                    &sampling_params,
-                    &mut rng_state,
-                )
+                Self::sample_next_token(&logits_data[start..end], &sampling_params, &mut rng_state)
             };
             let mut finish_reason = None;
             let (old_len, old_status, new_len, new_status, text) = {
@@ -2857,11 +3087,9 @@ impl LLMEngine {
         }
 
         let decode_bucket_granularity = llm_decode_bucket_granularity();
-        let max_total_len = round_up_to_granularity(
-            actual_max_total_len,
-            decode_bucket_granularity,
-        )
-        .max(actual_max_total_len);
+        let max_total_len =
+            round_up_to_granularity(actual_max_total_len, decode_bucket_granularity)
+                .max(actual_max_total_len);
         let max_past_len = max_total_len - 1;
         let batch_size = items.len();
         let profile_decode = llm_decode_profile_enabled();
@@ -2875,8 +3103,7 @@ impl LLMEngine {
             .iter()
             .flat_map(|item| {
                 let pad_len = max_total_len.saturating_sub(item.total_len);
-                std::iter::repeat_n(0i64, pad_len)
-                    .chain(std::iter::repeat_n(1i64, item.total_len))
+                std::iter::repeat_n(0i64, pad_len).chain(std::iter::repeat_n(1i64, item.total_len))
             })
             .collect::<Vec<i64>>();
         let position_ids_i64 = items
@@ -3059,7 +3286,8 @@ impl LLMEngine {
                     let copy_len = past_len * self.head_dim;
                     for h in 0..self.num_heads {
                         let src_start = h * packed_head_stride;
-                        let dst_start = ((batch_idx * self.num_heads + h) * max_past_len + pad_len) * self.head_dim;
+                        let dst_start = ((batch_idx * self.num_heads + h) * max_past_len + pad_len)
+                            * self.head_dim;
                         key_seq_first[dst_start..dst_start + copy_len]
                             .copy_from_slice(&packed.key[src_start..src_start + copy_len]);
                         val_seq_first[dst_start..dst_start + copy_len]
@@ -3091,7 +3319,8 @@ impl LLMEngine {
                 let copy_len = past_len * self.head_dim;
                 for h in 0..self.num_heads {
                     let src_start = h * max_seq_len * self.head_dim;
-                    let dst_start = ((batch_idx * self.num_heads + h) * max_past_len + pad_len) * self.head_dim;
+                    let dst_start =
+                        ((batch_idx * self.num_heads + h) * max_past_len + pad_len) * self.head_dim;
                     key_seq_first[dst_start..dst_start + copy_len]
                         .copy_from_slice(&view.key[src_start..src_start + copy_len]);
                     val_seq_first[dst_start..dst_start + copy_len]
@@ -3138,20 +3367,17 @@ impl LLMEngine {
                 // key_data is moved into Array4 — no extra clone.
                 let key_input: SessionInputValue<'_> = match key_type {
                     TensorElementType::Float16 => {
-                        Value::from_array(Array4::from_shape_vec(shape, key_data).map_err(
-                            |e| EngineError::backend(format!("KV key shape error: {e}")),
-                        )?)
+                        Value::from_array(Array4::from_shape_vec(shape, key_data).map_err(|e| {
+                            EngineError::backend(format!("KV key shape error: {e}"))
+                        })?)
                         .map_err(|e| EngineError::backend(e.to_string()))?
                         .into()
                     }
                     TensorElementType::Float32 => {
-                        let key_f32: Vec<f32> =
-                            key_data.iter().map(|v| v.to_f32()).collect();
-                        Value::from_array(
-                            Array4::from_shape_vec(shape, key_f32).map_err(|e| {
-                                EngineError::backend(format!("KV key shape error: {e}"))
-                            })?,
-                        )
+                        let key_f32: Vec<f32> = key_data.iter().map(|v| v.to_f32()).collect();
+                        Value::from_array(Array4::from_shape_vec(shape, key_f32).map_err(|e| {
+                            EngineError::backend(format!("KV key shape error: {e}"))
+                        })?)
                         .map_err(|e| EngineError::backend(e.to_string()))?
                         .into()
                     }
@@ -3168,20 +3394,17 @@ impl LLMEngine {
                 // val_data is moved into Array4 — no extra clone.
                 let val_input: SessionInputValue<'_> = match val_type {
                     TensorElementType::Float16 => {
-                        Value::from_array(Array4::from_shape_vec(shape, val_data).map_err(
-                            |e| EngineError::backend(format!("KV value shape error: {e}")),
-                        )?)
+                        Value::from_array(Array4::from_shape_vec(shape, val_data).map_err(|e| {
+                            EngineError::backend(format!("KV value shape error: {e}"))
+                        })?)
                         .map_err(|e| EngineError::backend(e.to_string()))?
                         .into()
                     }
                     TensorElementType::Float32 => {
-                        let val_f32: Vec<f32> =
-                            val_data.iter().map(|v| v.to_f32()).collect();
-                        Value::from_array(
-                            Array4::from_shape_vec(shape, val_f32).map_err(|e| {
-                                EngineError::backend(format!("KV value shape error: {e}"))
-                            })?,
-                        )
+                        let val_f32: Vec<f32> = val_data.iter().map(|v| v.to_f32()).collect();
+                        Value::from_array(Array4::from_shape_vec(shape, val_f32).map_err(|e| {
+                            EngineError::backend(format!("KV value shape error: {e}"))
+                        })?)
                         .map_err(|e| EngineError::backend(e.to_string()))?
                         .into()
                     }
@@ -3440,21 +3663,16 @@ impl LLMEngine {
                     let idx = token_id as usize;
                     if idx < self.logits_workspace.len() {
                         let val = self.logits_workspace[idx];
-                        self.logits_workspace[idx] =
-                            if val > 0.0 { val / penalty } else { val * penalty };
+                        self.logits_workspace[idx] = if val > 0.0 {
+                            val / penalty
+                        } else {
+                            val * penalty
+                        };
                     }
                 }
-                Self::sample_next_token(
-                    &self.logits_workspace,
-                    &sampling_params,
-                    &mut rng_state,
-                )
+                Self::sample_next_token(&self.logits_workspace, &sampling_params, &mut rng_state)
             } else {
-                Self::sample_next_token(
-                    &logits_data[start..end],
-                    &sampling_params,
-                    &mut rng_state,
-                )
+                Self::sample_next_token(&logits_data[start..end], &sampling_params, &mut rng_state)
             };
             let mut finish_reason = None;
             let (old_len, old_status, new_len, new_status, text) = {
@@ -3540,9 +3758,7 @@ impl LLMEngine {
         let model_input_types = self.model_input_types.clone();
         let use_kv_cache = self.use_kv_cache;
 
-        if self
-            .try_execute_batched_prefill_step(groups, &model_input_names, &model_input_types)?
-        {
+        if self.try_execute_batched_prefill_step(groups, &model_input_names, &model_input_types)? {
             return Ok(());
         }
 
@@ -3601,7 +3817,11 @@ impl LLMEngine {
                 // When kv_cached_len == 0 we send a dummy past KV of length 1 to avoid
                 // zero-element tensors rejected by CoreML; prepend a 0 to mask it out.
                 let uses_dummy_past = use_kv_cache && kv_cached_len == 0;
-                let mask_len = if uses_dummy_past { 1 + total_len } else { total_len };
+                let mask_len = if uses_dummy_past {
+                    1 + total_len
+                } else {
+                    total_len
+                };
                 let mask_data_i64: Vec<i64> = if uses_dummy_past {
                     std::iter::once(0i64)
                         .chain((0..total_len).map(|_| 1i64))
@@ -3854,14 +4074,16 @@ impl LLMEngine {
                                                 .copied()
                                                 .unwrap_or(TensorElementType::Float16);
                                             let k_input: SessionInputValue<'_> = match key_type {
-                                                TensorElementType::Float16 => build_packed_kv_input_f16(
-                                                    packed.key.clone(),
-                                                    self.num_heads,
-                                                    packed.length,
-                                                    self.head_dim,
-                                                    self.kv_layout,
-                                                    "key",
-                                                )?,
+                                                TensorElementType::Float16 => {
+                                                    build_packed_kv_input_f16(
+                                                        packed.key.clone(),
+                                                        self.num_heads,
+                                                        packed.length,
+                                                        self.head_dim,
+                                                        self.kv_layout,
+                                                        "key",
+                                                    )?
+                                                }
                                                 TensorElementType::Float32 => {
                                                     let arr = build_kv_array_f32_from_packed(
                                                         packed.key.as_ref(),
@@ -3894,14 +4116,16 @@ impl LLMEngine {
                                                 .copied()
                                                 .unwrap_or(TensorElementType::Float16);
                                             let v_input: SessionInputValue<'_> = match val_type {
-                                                TensorElementType::Float16 => build_packed_kv_input_f16(
-                                                    packed.value.clone(),
-                                                    self.num_heads,
-                                                    packed.length,
-                                                    self.head_dim,
-                                                    self.kv_layout,
-                                                    "value",
-                                                )?,
+                                                TensorElementType::Float16 => {
+                                                    build_packed_kv_input_f16(
+                                                        packed.value.clone(),
+                                                        self.num_heads,
+                                                        packed.length,
+                                                        self.head_dim,
+                                                        self.kv_layout,
+                                                        "value",
+                                                    )?
+                                                }
                                                 TensorElementType::Float32 => {
                                                     let arr = build_kv_array_f32_from_packed(
                                                         packed.value.as_ref(),
@@ -4180,7 +4404,11 @@ impl LLMEngine {
 
                             let delta_len = seq_dim.saturating_sub(append_start);
                             // When uses_dummy_past, the first real token belongs at cache position 0.
-                            let abs_pos_start = if uses_dummy_past { 0 } else { base_pos + append_start };
+                            let abs_pos_start = if uses_dummy_past {
+                                0
+                            } else {
+                                base_pos + append_start
+                            };
 
                             let seq_first_fast = ndim == 4
                                 && idx_num_heads == 1
@@ -4493,7 +4721,11 @@ impl LLMEngine {
                     Array2::from_shape_vec((1, input_len), input_tokens_i64).unwrap();
 
                 let uses_dummy_past = use_kv_cache && kv_cached_len == 0;
-                let mask_len = if uses_dummy_past { 1 + total_len } else { total_len };
+                let mask_len = if uses_dummy_past {
+                    1 + total_len
+                } else {
+                    total_len
+                };
                 let mask_data_i64: Vec<i64> = if uses_dummy_past {
                     std::iter::once(0i64)
                         .chain((0..total_len).map(|_| 1i64))
@@ -4567,8 +4799,7 @@ impl LLMEngine {
                                 } else {
                                     (0..total_len).map(|_| 1i32).collect()
                                 };
-                                let mask_i32 =
-                                    Array2::from_shape_vec((1, mask_len), data).unwrap();
+                                let mask_i32 = Array2::from_shape_vec((1, mask_len), data).unwrap();
                                 Value::from_array(mask_i32)
                                     .map_err(|e| EngineError::backend(e.to_string()))?
                                     .into_dyn()
@@ -4595,8 +4826,7 @@ impl LLMEngine {
                                 } else {
                                     (0..total_len).map(|_| 1.0f32).collect()
                                 };
-                                let mask_f32 =
-                                    Array2::from_shape_vec((1, mask_len), data).unwrap();
+                                let mask_f32 = Array2::from_shape_vec((1, mask_len), data).unwrap();
                                 Value::from_array(mask_f32)
                                     .map_err(|e| EngineError::backend(e.to_string()))?
                                     .into_dyn()
@@ -4770,14 +5000,16 @@ impl LLMEngine {
                                                     .unwrap_or(TensorElementType::Float16);
                                                 let k_input: SessionInputValue<'_> = match key_type
                                                 {
-                                                    TensorElementType::Float16 => build_packed_kv_input_f16(
-                                                        packed.key.clone(),
-                                                        self.num_heads,
-                                                        packed.length,
-                                                        self.head_dim,
-                                                        self.kv_layout,
-                                                        "key",
-                                                    )?,
+                                                    TensorElementType::Float16 => {
+                                                        build_packed_kv_input_f16(
+                                                            packed.key.clone(),
+                                                            self.num_heads,
+                                                            packed.length,
+                                                            self.head_dim,
+                                                            self.kv_layout,
+                                                            "key",
+                                                        )?
+                                                    }
                                                     TensorElementType::Float32 => {
                                                         let arr = build_kv_array_f32_from_packed(
                                                             packed.key.as_ref(),
@@ -5132,7 +5364,11 @@ impl LLMEngine {
 
                             let delta_len = seq_dim.saturating_sub(append_start);
                             // When uses_dummy_past, the first real token belongs at cache position 0.
-                            let abs_pos_start = if uses_dummy_past { 0 } else { base_pos + append_start };
+                            let abs_pos_start = if uses_dummy_past {
+                                0
+                            } else {
+                                base_pos + append_start
+                            };
 
                             let seq_first_fast = ndim == 4
                                 && idx_num_heads == 1
