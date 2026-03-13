@@ -20,5 +20,7 @@ members = [
 
 resolver = "2"
 
+license = "Apache-2.0"
+
 [patch.crates-io]
 esaxx-rs = { path = "patches/esaxx-rs" }
