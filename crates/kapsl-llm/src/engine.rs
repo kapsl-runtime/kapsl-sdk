@@ -819,6 +819,7 @@ pub struct LLMEngine {
     request_rx: mpsc::Receiver<SequenceGroup>,
     sessions: HashMap<String, Arc<Mutex<Sequence>>>,
     session: Option<Session>,
+    decode_session: Option<Session>,
     tokenizer: Option<Tokenizer>,
     tokenizer_path: Option<PathBuf>,
     model_path: Option<PathBuf>,
@@ -843,6 +844,11 @@ pub struct LLMEngine {
     model_input_shapes: Arc<HashMap<String, Vec<i64>>>,
     // Keep model-declared input element types so we can match expected dtypes.
     model_input_types: Arc<HashMap<String, TensorElementType>>,
+    // Optional dedicated decode graph metadata. When present, single-token decode can run through
+    // a smaller ONNX/CoreML session than the primary prefill graph.
+    decode_model_input_names: Arc<HashSet<String>>,
+    decode_model_input_shapes: Arc<HashMap<String, Vec<i64>>>,
+    decode_model_input_types: Arc<HashMap<String, TensorElementType>>,
     // Cache of zero-length KV arrays keyed by name/dtype/shape to avoid reallocs.
     empty_kv_cache: HashMap<String, EmptyKvArray>,
 
@@ -969,6 +975,7 @@ impl LLMEngine {
             request_rx,
             sessions: HashMap::new(),
             session: None,
+            decode_session: None,
             tokenizer: None,
             tokenizer_path: None,
             model_path: None,
@@ -984,6 +991,9 @@ impl LLMEngine {
             model_input_names: Arc::new(HashSet::new()),
             model_input_shapes: Arc::new(HashMap::new()),
             model_input_types: Arc::new(HashMap::new()),
+            decode_model_input_names: Arc::new(HashSet::new()),
+            decode_model_input_shapes: Arc::new(HashMap::new()),
+            decode_model_input_types: Arc::new(HashMap::new()),
             empty_kv_cache: HashMap::new(),
             num_layers: DEFAULT_NUM_LAYERS,
             num_heads: DEFAULT_NUM_HEADS,
@@ -1038,6 +1048,7 @@ impl LLMEngine {
         let mut manifest_max_seq_len: Option<usize> = None;
         let mut manifest_vocab_size: Option<usize> = None;
         let mut manifest_max_session_tokens: Option<usize> = None;
+        let mut decode_model_file: Option<String> = None;
         let mut kv_admission_soft_limit_bytes: Option<usize> = None;
         let mut kv_admission_hard_limit_bytes: Option<usize> = None;
 
@@ -1085,6 +1096,17 @@ impl LLMEngine {
                     metadata_safe_load = parse_safe_load_setting(value);
                     if metadata_safe_load.is_none() {
                         log::warn!("Unknown metadata.llm.safe_load value; expected bool or 'auto'");
+                    }
+                }
+                if let Some(value) = meta
+                    .get("metadata")
+                    .and_then(|m| m.get("llm"))
+                    .and_then(|m| m.get("decode_model_file"))
+                    .and_then(|v| v.as_str())
+                {
+                    let trimmed = value.trim();
+                    if !trimmed.is_empty() {
+                        decode_model_file = Some(trimmed.to_string());
                     }
                 }
 
@@ -1627,10 +1649,19 @@ impl LLMEngine {
         let mut input_shapes_map: HashMap<String, Vec<i64>> = HashMap::new();
         let mut input_types_map: HashMap<String, TensorElementType> = HashMap::new();
         let mut output_names_set: HashSet<String> = HashSet::new();
+        let mut decode_input_names_set: HashSet<String> = HashSet::new();
+        let mut decode_input_shapes_map: HashMap<String, Vec<i64>> = HashMap::new();
+        let mut decode_input_types_map: HashMap<String, TensorElementType> = HashMap::new();
         let mut pipeline_stages: Option<Vec<PipelineStage>> = None;
         let mut session: Option<Session> = None;
+        let mut decode_session: Option<Session> = None;
 
         if !pipeline_stage_files.is_empty() {
+            if decode_model_file.is_some() {
+                log::warn!(
+                    "Ignoring metadata.llm.decode_model_file because pipeline execution uses staged sessions."
+                );
+            }
             let device_ids = if let Some(ids) = &self.device_ids_override {
                 ids.clone()
             } else {
@@ -1701,6 +1732,41 @@ impl LLMEngine {
             input_types_map = types;
             output_names_set = outputs;
             session = Some(built_session);
+
+            if let Some(decode_name) = decode_model_file.as_deref() {
+                if let Some(decode_path) = resolve_stage_path(&model_root, model_path, decode_name)
+                {
+                    if decode_path != model_path {
+                        ensure_external_data_near_model(&decode_path, &model_root);
+                        match build_session(&decode_path, preferred_device_id) {
+                            Ok(built_decode_session) => {
+                                let (names, shapes, types, _) =
+                                    capture_session_io(&built_decode_session);
+                                decode_input_names_set = names;
+                                decode_input_shapes_map = shapes;
+                                decode_input_types_map = types;
+                                decode_session = Some(built_decode_session);
+                                log::info!(
+                                    "Loaded dedicated decode session from {}",
+                                    decode_path.display()
+                                );
+                            }
+                            Err(error) => {
+                                log::warn!(
+                                    "Failed to load dedicated decode model {}: {}. Falling back to primary session.",
+                                    decode_path.display(),
+                                    error
+                                );
+                            }
+                        }
+                    }
+                } else {
+                    log::warn!(
+                        "Dedicated decode model '{}' was configured but could not be resolved; falling back to primary session.",
+                        decode_name
+                    );
+                }
+            }
         }
 
         log::info!(
@@ -1975,9 +2041,13 @@ impl LLMEngine {
         self.model_input_names = Arc::new(input_names_set);
         self.model_input_shapes = Arc::new(input_shapes_map);
         self.model_input_types = Arc::new(input_types_map);
+        self.decode_model_input_names = Arc::new(decode_input_names_set);
+        self.decode_model_input_shapes = Arc::new(decode_input_shapes_map);
+        self.decode_model_input_types = Arc::new(decode_input_types_map);
         self.empty_kv_cache.clear();
         self.pipeline_stages = pipeline_stages;
         self.session = session;
+        self.decode_session = decode_session;
         self.update_kv_cache_metrics();
 
         Ok(())
@@ -1985,6 +2055,30 @@ impl LLMEngine {
 
     pub fn is_loaded(&self) -> bool {
         (self.session.is_some() || self.pipeline_stages.is_some()) && self.tokenizer.is_some()
+    }
+
+    fn decode_model_input_names(&self) -> Arc<HashSet<String>> {
+        if self.decode_session.is_some() {
+            self.decode_model_input_names.clone()
+        } else {
+            self.model_input_names.clone()
+        }
+    }
+
+    fn decode_model_input_shapes(&self) -> Arc<HashMap<String, Vec<i64>>> {
+        if self.decode_session.is_some() {
+            self.decode_model_input_shapes.clone()
+        } else {
+            self.model_input_shapes.clone()
+        }
+    }
+
+    fn decode_model_input_types(&self) -> Arc<HashMap<String, TensorElementType>> {
+        if self.decode_session.is_some() {
+            self.decode_model_input_types.clone()
+        } else {
+            self.model_input_types.clone()
+        }
     }
 
     fn update_kv_cache_metrics(&self) {
@@ -3423,7 +3517,10 @@ impl LLMEngine {
             .map(|started| started.elapsed().as_secs_f64() * 1000.0)
             .unwrap_or(0.0);
         let ort_started = profile_decode.then(Instant::now);
-        let outputs = {
+        let outputs = if let Some(sess) = self.decode_session.as_mut() {
+            sess.run(inputs)
+                .map_err(|e| EngineError::backend(e.to_string()))?
+        } else {
             let sess = self.session.as_mut().ok_or(EngineError::ModelNotLoaded)?;
             sess.run(inputs)
                 .map_err(|e| EngineError::backend(e.to_string()))?
@@ -3509,14 +3606,24 @@ impl LLMEngine {
             for (batch_idx, item) in items.iter().enumerate() {
                 let past_len = item.total_len.saturating_sub(1);
                 let pad_len = max_past_len.saturating_sub(past_len);
-                let output_pos = pad_len + past_len;
                 let abs_pos = past_len;
-                if output_pos >= k_seq {
+                let output_pos = if k_seq == max_total_len {
+                    let pos = pad_len + past_len;
+                    if pos >= k_seq {
+                        return Err(EngineError::backend(format!(
+                            "Present KV sequence dim too small on layer {}: output_pos={} seq_dim={}",
+                            layer, pos, k_seq
+                        )));
+                    }
+                    pos
+                } else if k_seq == 1 {
+                    0
+                } else {
                     return Err(EngineError::backend(format!(
-                        "Present KV sequence dim too small on layer {}: output_pos={} seq_dim={}",
-                        layer, output_pos, k_seq
+                        "Unsupported batched decode present seq dim on layer {}: seq_dim={} expected {} (full history) or 1 (delta-only)",
+                        layer, k_seq, max_total_len
                     )));
-                }
+                };
 
                 let mut key_token = vec![f16::ZERO; self.num_heads * self.head_dim];
                 let mut val_token = vec![f16::ZERO; self.num_heads * self.head_dim];
@@ -3545,7 +3652,16 @@ impl LLMEngine {
                 self.kv_cache
                     .append_token(item.seq_id, layer, abs_pos, &key_token, &val_token, None)
                     .map_err(|e| EngineError::resource_exhausted(e.to_string()))?;
-                self.kv_cache.clear_packed_layer(item.seq_id, layer);
+                let can_store_packed = k_seq == max_total_len
+                    && batch_size == 1
+                    && self.kv_layout == KvLayout::SeqFirst
+                    && item.total_len == max_total_len;
+                if can_store_packed {
+                    self.kv_cache
+                        .set_packed_layer(item.seq_id, layer, k_seq, &k_data, &v_data);
+                } else {
+                    self.kv_cache.clear_packed_layer(item.seq_id, layer);
+                }
             }
         }
 
@@ -3756,13 +3872,20 @@ impl LLMEngine {
         let model_input_names = self.model_input_names.clone();
         let model_input_shapes = self.model_input_shapes.clone();
         let model_input_types = self.model_input_types.clone();
+        let decode_model_input_names = self.decode_model_input_names();
+        let decode_model_input_shapes = self.decode_model_input_shapes();
+        let decode_model_input_types = self.decode_model_input_types();
         let use_kv_cache = self.use_kv_cache;
 
         if self.try_execute_batched_prefill_step(groups, &model_input_names, &model_input_types)? {
             return Ok(());
         }
 
-        if self.try_execute_batched_decode_step(groups, &model_input_names, &model_input_types)? {
+        if self.try_execute_batched_decode_step(
+            groups,
+            &decode_model_input_names,
+            &decode_model_input_types,
+        )? {
             return Ok(());
         }
 
@@ -3836,14 +3959,34 @@ impl LLMEngine {
                 let pos_ids_vec: Vec<i64> = (pos_start..total_len).map(|v| v as i64).collect();
                 let pos_ids_i64 = Array2::from_shape_vec((1, input_len), pos_ids_vec).unwrap();
 
-                if !model_input_names.contains("input_ids") {
+                let use_dedicated_decode_session = self.decode_session.is_some()
+                    && use_kv_cache
+                    && kv_cached_len > 0
+                    && input_len == 1;
+                let active_input_names = if use_dedicated_decode_session {
+                    &decode_model_input_names
+                } else {
+                    &model_input_names
+                };
+                let active_input_shapes = if use_dedicated_decode_session {
+                    &decode_model_input_shapes
+                } else {
+                    &model_input_shapes
+                };
+                let active_input_types = if use_dedicated_decode_session {
+                    &decode_model_input_types
+                } else {
+                    &model_input_types
+                };
+
+                if !active_input_names.contains("input_ids") {
                     return Err(EngineError::backend(
                         "Model input 'input_ids' not found".to_string(),
                     ));
                 }
 
                 let mut inputs: Vec<(Cow<'_, str>, SessionInputValue<'_>)> = Vec::with_capacity(3);
-                let input_ids_type = model_input_types
+                let input_ids_type = active_input_types
                     .get("input_ids")
                     .copied()
                     .unwrap_or(TensorElementType::Int64);
@@ -3870,8 +4013,8 @@ impl LLMEngine {
                 };
                 inputs.push(("input_ids".into(), input_ids_value.into()));
 
-                if model_input_names.contains("attention_mask") {
-                    let mask_type = model_input_types
+                if active_input_names.contains("attention_mask") {
+                    let mask_type = active_input_types
                         .get("attention_mask")
                         .copied()
                         .unwrap_or(TensorElementType::Int64);
@@ -3928,8 +4071,8 @@ impl LLMEngine {
                     inputs.push(("attention_mask".into(), mask_value.into()));
                 }
 
-                if model_input_names.contains("position_ids") {
-                    let pos_type = model_input_types
+                if active_input_names.contains("position_ids") {
+                    let pos_type = active_input_types
                         .get("position_ids")
                         .copied()
                         .unwrap_or(TensorElementType::Int64);
@@ -3979,8 +4122,8 @@ impl LLMEngine {
                         let key_name = format!("past_key_values.{}.key", layer);
                         let val_name = format!("past_key_values.{}.value", layer);
 
-                        if !model_input_names.contains(&key_name)
-                            && !model_input_names.contains(&val_name)
+                        if !active_input_names.contains(&key_name)
+                            && !active_input_names.contains(&val_name)
                         {
                             plans.push(KvPlan::Skip);
                             continue;
@@ -3993,10 +4136,10 @@ impl LLMEngine {
                             .unwrap_or(0);
                         if packed_len > 0 {
                             plans.push(KvPlan::Packed);
-                            if model_input_names.contains(&key_name) {
+                            if active_input_names.contains(&key_name) {
                                 present_names.insert(key_name.clone());
                             }
-                            if model_input_names.contains(&val_name) {
+                            if active_input_names.contains(&val_name) {
                                 present_names.insert(val_name.clone());
                             }
                             continue;
@@ -4009,10 +4152,10 @@ impl LLMEngine {
                             .unwrap_or(0);
                         if view_len > 0 {
                             plans.push(KvPlan::View);
-                            if model_input_names.contains(&key_name) {
+                            if active_input_names.contains(&key_name) {
                                 present_names.insert(key_name.clone());
                             }
-                            if model_input_names.contains(&val_name) {
+                            if active_input_names.contains(&val_name) {
                                 present_names.insert(val_name.clone());
                             }
                         } else {
@@ -4024,15 +4167,15 @@ impl LLMEngine {
                     for layer in 0..self.num_layers {
                         let key_name = format!("past_key_values.{}.key", layer);
                         let val_name = format!("past_key_values.{}.value", layer);
-                        if model_input_names.contains(&key_name)
+                        if active_input_names.contains(&key_name)
                             && !present_names.contains(&key_name)
                         {
-                            let kv_type = model_input_types
+                            let kv_type = active_input_types
                                 .get(&key_name)
                                 .copied()
                                 .unwrap_or(TensorElementType::Float16);
                             let target_shape = empty_kv_shape(
-                                model_input_shapes.get(&key_name),
+                                active_input_shapes.get(&key_name),
                                 self.kv_layout,
                                 self.num_heads,
                                 self.head_dim,
@@ -4040,15 +4183,15 @@ impl LLMEngine {
                             let v = self.get_empty_kv_value(&key_name, kv_type, &target_shape)?;
                             empty_inputs.push((key_name, v));
                         }
-                        if model_input_names.contains(&val_name)
+                        if active_input_names.contains(&val_name)
                             && !present_names.contains(&val_name)
                         {
-                            let kv_type = model_input_types
+                            let kv_type = active_input_types
                                 .get(&val_name)
                                 .copied()
                                 .unwrap_or(TensorElementType::Float16);
                             let target_shape = empty_kv_shape(
-                                model_input_shapes.get(&val_name),
+                                active_input_shapes.get(&val_name),
                                 self.kv_layout,
                                 self.num_heads,
                                 self.head_dim,
@@ -4068,8 +4211,8 @@ impl LLMEngine {
                                 if let Some(packed) = self.kv_cache.get_packed_layer(seq_id, layer)
                                 {
                                     if packed.length > 0 {
-                                        if model_input_names.contains(&key_name) {
-                                            let key_type = model_input_types
+                                        if active_input_names.contains(&key_name) {
+                                            let key_type = active_input_types
                                                 .get(&key_name)
                                                 .copied()
                                                 .unwrap_or(TensorElementType::Float16);
@@ -4110,8 +4253,8 @@ impl LLMEngine {
                                             inputs.push((key_name.clone().into(), k_input));
                                         }
 
-                                        if model_input_names.contains(&val_name) {
-                                            let val_type = model_input_types
+                                        if active_input_names.contains(&val_name) {
+                                            let val_type = active_input_types
                                                 .get(&val_name)
                                                 .copied()
                                                 .unwrap_or(TensorElementType::Float16);
@@ -4157,16 +4300,16 @@ impl LLMEngine {
                             KvPlan::View => {
                                 if let Some(view) = self.kv_cache.get_layer_view(seq_id, layer) {
                                     if view.length > 0 {
-                                        let key_type = model_input_types
+                                        let key_type = active_input_types
                                             .get(&key_name)
                                             .copied()
                                             .unwrap_or(TensorElementType::Float16);
-                                        let val_type = model_input_types
+                                        let val_type = active_input_types
                                             .get(&val_name)
                                             .copied()
                                             .unwrap_or(TensorElementType::Float16);
 
-                                        if model_input_names.contains(&key_name) {
+                                        if active_input_names.contains(&key_name) {
                                             let k: DynValue = match key_type {
                                                 TensorElementType::Float16 => build_kv_array_f16(
                                                     view.key.as_ref(),
@@ -4208,7 +4351,7 @@ impl LLMEngine {
                                             inputs.push((key_name.clone().into(), k.into()));
                                         }
 
-                                        if model_input_names.contains(&val_name) {
+                                        if active_input_names.contains(&val_name) {
                                             let v: DynValue = match val_type {
                                                 TensorElementType::Float16 => build_kv_array_f16(
                                                     view.value.as_ref(),
@@ -4261,7 +4404,14 @@ impl LLMEngine {
                 }
 
                 // Run inference (acquire mutable session only for run)
-                let outputs = {
+                let outputs = if use_dedicated_decode_session {
+                    let sess = self
+                        .decode_session
+                        .as_mut()
+                        .ok_or(EngineError::ModelNotLoaded)?;
+                    sess.run(inputs)
+                        .map_err(|e| EngineError::backend(e.to_string()))?
+                } else {
                     let sess = self.session.as_mut().ok_or(EngineError::ModelNotLoaded)?;
                     sess.run(inputs)
                         .map_err(|e| EngineError::backend(e.to_string()))?
