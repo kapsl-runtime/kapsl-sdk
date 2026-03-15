@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "kapsl-sdk"
-version = "0.1.14"
+version = "0.1.15"
 description = "Python client SDK for kapsl-runtime with IPC, shared-memory, and hybrid inference transports"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -40,4 +40,4 @@ manifest-path = "crates/kapsl-pyo3/Cargo.toml"
 module-name = "kapsl_sdk.kapsl_sdk"
 python-packages = ["crates/kapsl-pyo3/kapsl_sdk"]
 features = ["pyo3/extension-module"]
-include = ["crates/kapsl-pyo3/kapsl_sdk/*.bin", "patches/**/*"]
+include = ["crates/kapsl-pyo3/kapsl_sdk/*.bin", "patches/**/*", "LICENSE"]
