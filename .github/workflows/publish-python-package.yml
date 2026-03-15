@@ -37,10 +37,10 @@ jobs:
           from pathlib import Path
           import os
           import re
-          path = Path("crates/kapsl-pyo3/pyproject.toml")
-          text = path.read_text()
           version = os.environ["VERSION"]
-          path.write_text(re.sub(r'^version = ".*"$', f'version = "{version}"', text, count=1, flags=re.MULTILINE))
+          for path in [Path("pyproject.toml"), Path("crates/kapsl-pyo3/pyproject.toml")]:
+              text = path.read_text()
+              path.write_text(re.sub(r'^version = ".*"$', f'version = "{version}"', text, count=1, flags=re.MULTILINE))
           PY
 
       - name: Set up Rust
@@ -55,14 +55,13 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           command: build
-          working-directory: crates/kapsl-pyo3
           args: --release --out dist --interpreter 3.9 3.10 3.11 3.12
 
       - name: Upload wheel artifacts
         uses: actions/upload-artifact@v4
         with:
           name: python-wheels-${{ matrix.os }}
-          path: crates/kapsl-pyo3/dist/*
+          path: dist/*
           if-no-files-found: error
 
   build-sdist:
@@ -88,10 +87,10 @@ jobs:
           from pathlib import Path
           import os
           import re
-          path = Path("crates/kapsl-pyo3/pyproject.toml")
-          text = path.read_text()
           version = os.environ["VERSION"]
-          path.write_text(re.sub(r'^version = ".*"$', f'version = "{version}"', text, count=1, flags=re.MULTILINE))
+          for path in [Path("pyproject.toml"), Path("crates/kapsl-pyo3/pyproject.toml")]:
+              text = path.read_text()
+              path.write_text(re.sub(r'^version = ".*"$', f'version = "{version}"', text, count=1, flags=re.MULTILINE))
           PY
 
       - name: Set up Rust
@@ -103,14 +102,13 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           command: sdist
-          working-directory: crates/kapsl-pyo3
           args: --out dist
 
       - name: Upload sdist artifact
         uses: actions/upload-artifact@v4
         with:
           name: python-sdist
-          path: crates/kapsl-pyo3/dist/*
+          path: dist/*
           if-no-files-found: error
 
   publish-pypi:
