@@ -32,6 +32,9 @@ Homepage = "https://kapsl.ai"
 Repository = "https://github.com/kapsl-runtime/kapsl-sdk"
 Issues = "https://github.com/kapsl-runtime/kapsl-sdk/issues"
 
+[tool.maturin.env]
+PYO3_USE_ABI3_FORWARD_COMPATIBILITY = "1"
+
 [tool.maturin]
 module-name = "kapsl_sdk.kapsl_sdk"
 python-packages = ["kapsl_sdk"]
