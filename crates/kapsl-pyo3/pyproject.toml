@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "kapsl-sdk"
-version = "0.1.14"
+version = "0.1.15"
 description = "Python client SDK for kapsl-runtime with IPC, shared-memory, and hybrid inference transports"
 readme = "README.md"
 requires-python = ">=3.9"
