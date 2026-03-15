@@ -91,12 +91,12 @@ mod tests {
     #[test]
     fn empty_kv_shape_prefers_layout_for_rank4() {
         let shape = empty_kv_shape(Some(&vec![1, 2, 3, 4]), KvLayout::SeqFirst, 8, 16);
-        assert_eq!(shape, vec![1, 8, 0, 16]);
+        assert_eq!(shape, vec![1, 8, 1, 16]);
 
         let shape = empty_kv_shape(Some(&vec![2, -1, 5]), KvLayout::SeqFirst, 4, 8);
         assert_eq!(shape, vec![1, 1, 5]);
 
         let shape = empty_kv_shape(None, KvLayout::HeadDimFirst, 3, 7);
-        assert_eq!(shape, vec![1, 3, 7, 0]);
+        assert_eq!(shape, vec![1, 3, 7, 1]);
     }
 }

@@ -114,7 +114,7 @@ mod tests {
     async fn infer_stream_handles_cumulative_and_incremental_outputs() {
         let backend = LLMBackend::new();
         let (tx, mut rx) = mpsc::channel(1);
-        *backend.request_tx.lock().unwrap() = Some(tx);
+        *backend.request_tx.write().unwrap() = Some(tx);
 
         let request = InferenceRequest {
             input: BinaryTensorPacket {

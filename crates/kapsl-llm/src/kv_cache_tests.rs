@@ -88,6 +88,7 @@ mod tests {
             total_blocks: 4,
             eviction_policy: KvEvictionPolicy::None,
             dense_free_list_cap: 8,
+            initial_seq_len: 256,
         };
         let mut cache = KvCache::new_with_config(1, 1, 8, 2, config);
         cache.allocate_sequence(1, &[]).unwrap();
@@ -122,6 +123,7 @@ mod tests {
             total_blocks: 1,
             eviction_policy: KvEvictionPolicy::LruInactive,
             dense_free_list_cap: 8,
+            initial_seq_len: 256,
         };
         let mut cache = KvCache::new_with_config(1, 1, 4, 1, config);
         cache.allocate_sequence(1, &[]).unwrap();
@@ -155,6 +157,7 @@ mod tests {
             total_blocks: 1,
             eviction_policy: KvEvictionPolicy::Fifo,
             dense_free_list_cap: 8,
+            initial_seq_len: 256,
         };
         let mut cache = KvCache::new_with_config(1, 1, 4, 1, config);
 
@@ -195,6 +198,7 @@ mod tests {
             total_blocks: 4,
             eviction_policy: KvEvictionPolicy::None,
             dense_free_list_cap: 8,
+            initial_seq_len: 256,
         };
         let mut cache = KvCache::new_with_config(1, 1, 8, 2, config);
 
@@ -243,6 +247,7 @@ mod tests {
             total_blocks: 4,
             eviction_policy: KvEvictionPolicy::None,
             dense_free_list_cap: 8,
+            initial_seq_len: 256,
         };
         let mut cache = KvCache::new_with_config(1, 1, 8, 2, config);
 
@@ -287,6 +292,7 @@ mod tests {
             total_blocks: 2,
             eviction_policy: KvEvictionPolicy::None,
             dense_free_list_cap: 8,
+            initial_seq_len: 256,
         };
         let mut cache = KvCache::new_with_config(1, 1, 8, 2, config);
         let prefix = [100, 101, 102, 103];
@@ -319,6 +325,7 @@ mod tests {
             total_blocks: 1,
             eviction_policy: KvEvictionPolicy::None,
             dense_free_list_cap: 8,
+            initial_seq_len: 256,
         };
         let mut cache = KvCache::new_with_config(1, 1, 8, 2, config);
         let prefix = [7, 8];
@@ -357,6 +364,7 @@ mod tests {
             total_blocks: 2,
             eviction_policy: KvEvictionPolicy::None,
             dense_free_list_cap: 8,
+            initial_seq_len: 256,
         };
         let mut cache = KvCache::new_with_config(1, 1, 8, 2, config);
         let prefix = [41, 42];
