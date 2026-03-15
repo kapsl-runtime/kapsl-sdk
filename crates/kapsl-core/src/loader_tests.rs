@@ -68,6 +68,9 @@ mod tests {
 
     #[test]
     fn test_load_success() {
+        let _guard = env_lock().lock().expect("acquire env lock");
+        clear_model_cache_env();
+
         let manifest = default_manifest("model.onnx");
         let manifest_bytes = serde_json::to_vec(&manifest).expect("serialize manifest");
         let model_bytes = vec![1u8, 2u8, 3u8];
