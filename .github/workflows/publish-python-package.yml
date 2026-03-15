@@ -127,10 +127,22 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Check distribution metadata
+        run: |
+          pip install twine
+          twine check dist/*
+
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist
+          verbose: true
+          skip-existing: true
 
   upload-r2:
     needs: [build-wheels, build-sdist]
