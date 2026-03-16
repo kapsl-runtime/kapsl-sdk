@@ -64,7 +64,10 @@ fn run_benchmark() {
                 let mut header_buf = [0u8; 8];
                 stream.read_exact(&mut header_buf).unwrap();
 
-                let resp_header: ResponseHeader = bincode::deserialize(&header_buf).unwrap();
+                let resp_header = ResponseHeader {
+                    status: u32::from_le_bytes([header_buf[0], header_buf[1], header_buf[2], header_buf[3]]),
+                    payload_size: u32::from_le_bytes([header_buf[4], header_buf[5], header_buf[6], header_buf[7]]),
+                };
 
                 if resp_header.status == STATUS_OK {
                     let mut payload = vec![0u8; resp_header.payload_size as usize];
@@ -146,7 +149,10 @@ async fn run_benchmark_async() {
                 let mut header_buf = [0u8; 8];
                 stream.read_exact(&mut header_buf).await.unwrap();
 
-                let resp_header: ResponseHeader = bincode::deserialize(&header_buf).unwrap();
+                let resp_header = ResponseHeader {
+                    status: u32::from_le_bytes([header_buf[0], header_buf[1], header_buf[2], header_buf[3]]),
+                    payload_size: u32::from_le_bytes([header_buf[4], header_buf[5], header_buf[6], header_buf[7]]),
+                };
 
                 if resp_header.status == STATUS_OK {
                     let mut payload = vec![0u8; resp_header.payload_size as usize];
