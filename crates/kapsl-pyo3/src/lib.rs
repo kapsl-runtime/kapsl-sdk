@@ -437,8 +437,10 @@ impl KapslClient {
         let mut header_buf = [0u8; 8];
         stream.read_exact(&mut header_buf)?;
 
-        let resp_header: ResponseHeader = bincode::deserialize(&header_buf)
-            .map_err(|e| ClientError::Serialization(e.to_string()))?;
+        let resp_header = ResponseHeader {
+            status: u32::from_le_bytes([header_buf[0], header_buf[1], header_buf[2], header_buf[3]]),
+            payload_size: u32::from_le_bytes([header_buf[4], header_buf[5], header_buf[6], header_buf[7]]),
+        };
 
         let mut payload = vec![0u8; resp_header.payload_size as usize];
         stream.read_exact(&mut payload)?;
@@ -646,8 +648,10 @@ impl StreamIterator {
             }
         }
 
-        let resp_header: ResponseHeader = bincode::deserialize(&header_buf)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        let resp_header = ResponseHeader {
+            status: u32::from_le_bytes([header_buf[0], header_buf[1], header_buf[2], header_buf[3]]),
+            payload_size: u32::from_le_bytes([header_buf[4], header_buf[5], header_buf[6], header_buf[7]]),
+        };
 
         if resp_header.payload_size > 0 {
             let mut payload = vec![0u8; resp_header.payload_size as usize];
