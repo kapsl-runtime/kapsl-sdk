@@ -42,6 +42,10 @@ impl LLMScheduler {
         self.config.max_paddings
     }
 
+    pub fn config_max_num_batched_tokens(&self) -> usize {
+        self.config.max_num_batched_tokens
+    }
+
     pub fn add_sequence_group(&mut self, seq_group: SequenceGroup) {
         self.waiting_queue
             .push_back(Arc::new(Mutex::new(seq_group)));

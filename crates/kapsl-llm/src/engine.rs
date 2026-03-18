@@ -1026,7 +1026,7 @@ impl LLMEngine {
         let block_manager = BlockManager::new_shared(allocator, block_size);
         let scheduler = LLMScheduler::new(
             SchedulerConfig {
-                max_num_batched_tokens: self.max_seq_len,
+                max_num_batched_tokens: self.scheduler.config_max_num_batched_tokens(),
                 max_num_seqs: self.scheduler.config_max_num_seqs(),
                 max_paddings: self.scheduler.config_max_paddings(),
             },

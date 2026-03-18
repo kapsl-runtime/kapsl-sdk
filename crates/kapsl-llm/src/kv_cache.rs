@@ -249,7 +249,7 @@ impl SequenceKvCache {
     }
 
     /// Ensure every layer's key/value tensor can hold at least `required` positions.
-    fn ensure_capacity(&mut self, required: usize) {
+    pub fn ensure_capacity(&mut self, required: usize) {
         for layer in &mut self.layers {
             layer.key.grow_to(required);
             layer.value.grow_to(required);
@@ -361,6 +361,7 @@ impl DenseKvCache {
 
         assert!(pos < self.max_seq_len, "KV cache overflow");
 
+        seq.ensure_capacity(pos + 1);
         let layer = &mut seq.layers[layer_index];
 
         let expected = self.num_heads * self.head_dim;
