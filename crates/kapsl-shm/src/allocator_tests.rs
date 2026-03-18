@@ -1,6 +1,9 @@
 #[cfg(test)]
 mod tests {
-    use super::super::{ShmClassBudget, ShmPoolAllocator, SimpleShmAllocator, TieredShmAllocator};
+    use super::super::{
+        ModelSubPoolConfig, PerModelShmAllocator, ShmClassBudget, ShmPoolAllocator,
+        SimpleShmAllocator, TieredShmAllocator,
+    };
     use std::thread;
     use std::time::Duration;
 
@@ -166,5 +169,123 @@ mod tests {
             .find(|c| c.slot_size == 4096)
             .expect("large class must exist");
         assert!(large.bytes > small.bytes);
+    }
+
+    // ── PerModelShmAllocator tests ────────────────────────────────────────────
+
+    fn make_pool(
+        base: usize,
+        total: usize,
+        model_bytes: &[(u32, usize)],
+    ) -> PerModelShmAllocator {
+        let configs: Vec<ModelSubPoolConfig> = model_bytes
+            .iter()
+            .map(|(id, bytes)| ModelSubPoolConfig {
+                model_id: *id,
+                pool_bytes: *bytes,
+                class_budgets: vec![
+                    ShmClassBudget {
+                        slot_size: 256,
+                        weight: 1,
+                    },
+                    ShmClassBudget {
+                        slot_size: 1024,
+                        weight: 1,
+                    },
+                ],
+            })
+            .collect();
+        PerModelShmAllocator::new(base, total, configs, Duration::from_secs(30))
+    }
+
+    #[test]
+    fn test_per_model_allocator_routes_to_model_pool() {
+        // 2 MiB total: 512 KiB for model 1, 512 KiB for model 2, rest shared.
+        let pool = make_pool(0, 2 * 1024 * 1024, &[(1, 512 * 1024), (2, 512 * 1024)]);
+
+        let off1 = pool.try_allocate(1, 100).expect("model 1 slot");
+        let off2 = pool.try_allocate(2, 100).expect("model 2 slot");
+
+        // The two offsets must be in different regions (model 1 starts at 0, model 2 at 512 KiB).
+        assert!(off1 < 512 * 1024, "model 1 offset should be in its sub-pool");
+        assert!(
+            off2 >= 512 * 1024 && off2 < 1024 * 1024,
+            "model 2 offset should be in its sub-pool"
+        );
+    }
+
+    #[test]
+    fn test_per_model_allocator_falls_back_to_shared_pool() {
+        // Give model 1 a tiny pool (only one 256-byte slot possible) then exhaust it.
+        let configs = vec![ModelSubPoolConfig {
+            model_id: 1,
+            pool_bytes: 256,
+            class_budgets: vec![ShmClassBudget {
+                slot_size: 256,
+                weight: 1,
+            }],
+        }];
+        let pool = PerModelShmAllocator::new(0, 4 * 1024 * 1024, configs, Duration::from_secs(30));
+
+        // Exhaust the model pool.
+        let _first = pool.try_allocate(1, 200).expect("first slot from model pool");
+
+        // Second allocation must come from the shared pool (offset beyond model-1 range).
+        let second = pool
+            .try_allocate(1, 200)
+            .expect("second slot should come from shared pool");
+        assert!(second >= 256, "fallback offset must be in the shared pool");
+    }
+
+    #[test]
+    fn test_per_model_allocator_release_by_offset() {
+        // Use a single-slot model pool so release/reuse is deterministic.
+        let configs = vec![ModelSubPoolConfig {
+            model_id: 1,
+            pool_bytes: 256,
+            class_budgets: vec![ShmClassBudget {
+                slot_size: 256,
+                weight: 1,
+            }],
+        }];
+        let pool = PerModelShmAllocator::new(0, 4 * 1024 * 1024, configs, Duration::from_secs(30));
+
+        let off = pool.try_allocate(1, 200).expect("slot from model pool");
+        assert!(pool.release(off), "release by offset should succeed");
+        // With a single model-pool slot, the next allocation reuses the same offset.
+        let off2 = pool.try_allocate(1, 200).expect("reused slot");
+        assert_eq!(off, off2, "single-slot pool must reuse released offset");
+    }
+
+    #[test]
+    fn test_per_model_allocator_unknown_model_uses_shared_pool() {
+        let pool = make_pool(0, 4 * 1024 * 1024, &[(1, 512 * 1024)]);
+        // model 99 has no dedicated pool — should still allocate from shared.
+        let off = pool.try_allocate(99, 100).expect("shared pool slot for unknown model");
+        assert!(off >= 512 * 1024, "unknown model must use shared pool");
+    }
+
+    #[test]
+    fn test_per_model_allocator_layout_summary_contains_model_and_shared() {
+        let pool = make_pool(0, 4 * 1024 * 1024, &[(3, 512 * 1024), (7, 512 * 1024)]);
+        let summary = pool.layout_summary();
+        assert!(summary.contains("model3:"), "summary should include model 3");
+        assert!(summary.contains("model7:"), "summary should include model 7");
+        assert!(summary.contains("shared:"), "summary should include shared pool");
+    }
+
+    #[test]
+    fn test_per_model_allocator_aggregate_snapshot() {
+        let pool = make_pool(0, 4 * 1024 * 1024, &[(1, 512 * 1024), (2, 512 * 1024)]);
+        pool.try_allocate(1, 100).expect("slot in model 1");
+        pool.try_allocate(2, 100).expect("slot in model 2");
+
+        let snap = pool.snapshot();
+        assert_eq!(snap.in_use_slots, 2);
+
+        let m1 = pool.model_snapshot(1);
+        assert_eq!(m1.in_use_slots, 1);
+        let m2 = pool.model_snapshot(2);
+        assert_eq!(m2.in_use_slots, 1);
     }
 }

@@ -6,7 +6,7 @@ This file is adapted from the original implementation and preserves the engine's
 behavior while making the KV geometry configurable at model-load time.
 */
 
-use crate::block_manager::BlockManager;
+use crate::block_manager::{BlockManager, SharedBlockAllocator};
 use crate::kv_cache::{KvCache, KvCacheConfig, KvCacheMode, KvEvictionPolicy};
 use crate::llm_metrics::LLMMetrics;
 use crate::model_paths::{find_model_asset, find_model_root};
@@ -1013,6 +1013,27 @@ impl LLMEngine {
             prefill_items_pool: Vec::new(),
             decode_items_pool: Vec::new(),
         }
+    }
+
+    /// Replace the private block allocator with a shared one so this engine
+    /// draws from the same GPU KV block pool as other engines.
+    ///
+    /// Must be called **before** `load()`.  Engines sharing the same
+    /// `SharedBlockAllocator` form a unified KV block pool: blocks freed by
+    /// any engine become immediately available to all others.
+    pub fn with_shared_pool(mut self, allocator: SharedBlockAllocator) -> Self {
+        let block_size = self._block_size;
+        let block_manager = BlockManager::new_shared(allocator, block_size);
+        let scheduler = LLMScheduler::new(
+            SchedulerConfig {
+                max_num_batched_tokens: self.max_seq_len,
+                max_num_seqs: self.scheduler.config_max_num_seqs(),
+                max_paddings: self.scheduler.config_max_paddings(),
+            },
+            block_manager,
+        );
+        self.scheduler = scheduler;
+        self
     }
 
     /// Load model and capture its input names and shapes. Detect KV geometry
@@ -2092,6 +2113,7 @@ impl LLMEngine {
         metrics.kv_cache_evicted_blocks = stats.evicted_blocks;
         metrics.kv_cache_evicted_sequences = stats.evicted_sequences;
         metrics.kv_cache_packed_layers = stats.packed_layers;
+        metrics.kv_cache_cpu_offloaded_blocks = stats.cpu_offloaded_blocks;
     }
 
     fn kv_bytes_per_token(&self) -> Option<usize> {

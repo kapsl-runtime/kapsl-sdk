@@ -1,3 +1,4 @@
+use crate::block_manager::SharedBlockAllocator;
 use crate::engine::LLMEngine;
 use crate::llm_metrics::LLMMetrics;
 use crate::model_paths::{find_model_asset, find_model_root};
@@ -35,6 +36,9 @@ pub struct LLMBackend {
     provider_override: Option<String>,
     device_id_override: Option<i32>,
     device_ids_override: Option<Vec<i32>>,
+    /// Optional shared block pool.  When set, the engine draws from this pool
+    /// instead of a private allocator, enabling unified KV memory across models.
+    shared_pool: Option<SharedBlockAllocator>,
 }
 
 #[derive(Clone)]
@@ -327,7 +331,15 @@ impl LLMBackend {
             provider_override: None,
             device_id_override: None,
             device_ids_override: None,
+            shared_pool: None,
         }
+    }
+
+    /// Attach a shared block allocator so this backend draws from a unified
+    /// KV pool shared with other `LLMBackend` instances on the same device.
+    pub fn with_shared_pool(mut self, allocator: SharedBlockAllocator) -> Self {
+        self.shared_pool = Some(allocator);
+        self
     }
 
     pub fn with_device(provider: String, device_id: i32) -> Self {
@@ -450,6 +462,7 @@ impl Engine for LLMBackend {
         let device_ids_override = self.device_ids_override.clone();
         let engine_block_size = hints.block_size;
         let engine_num_gpu_blocks = hints.num_gpu_blocks;
+        let shared_pool = self.shared_pool.clone();
         tokio::spawn(async move {
             let mut engine = LLMEngine::new(
                 config,
@@ -461,6 +474,12 @@ impl Engine for LLMBackend {
                 device_id_override,
                 device_ids_override,
             );
+            // If a shared pool was attached, replace the private allocator.
+            let mut engine = if let Some(pool) = shared_pool {
+                engine.with_shared_pool(pool)
+            } else {
+                engine
+            };
             let load_result = engine.load(&engine_path).await;
             if let Err(e) = load_tx.send(load_result) {
                 log::error!("Failed to send load result: {:?}", e);

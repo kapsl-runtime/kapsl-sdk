@@ -105,6 +105,18 @@ pub struct Device {
 
     pub pci_bus_id: Option<String>,
 
+    /// Stable partition identifier for sub-device addressing.
+    ///
+    /// For NVIDIA devices this is the GPU UUID (e.g.
+    /// `"GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"`), which survives
+    /// index reordering. For MIG compute instances the MIG UUID
+    /// (e.g. `"MIG-GPU-xxx/0/0"`) is stored here instead.
+    ///
+    /// Matched by `GpuPreference::Partition` using the `mig:<id>` or
+    /// `partition:<id>` selector syntax. `None` for backends that do
+    /// not expose a stable UUID.
+    pub partition_id: Option<String>,
+
     /// Driver version string (when available).
     pub driver_version: Option<String>,
 
@@ -146,6 +158,12 @@ pub enum GpuPreference {
     PciBusId(String),
     /// Match by case-insensitive substring in `Device.name`.
     NameContains(String),
+    /// Match by stable partition identifier (GPU UUID or MIG UUID).
+    ///
+    /// Parsed from `"mig:<id>"` or `"partition:<id>"` selector strings.
+    /// The stored value is the portion after the prefix, matched
+    /// case-insensitively against `Device.partition_id`.
+    Partition(String),
 }
 
 impl GpuPreference {
@@ -156,6 +174,17 @@ impl GpuPreference {
         }
 
         let lowered = trimmed.to_ascii_lowercase();
+
+        // Partition prefix: "mig:<id>" or "partition:<id>".
+        // Preserve original case for UUID matching (UUIDs are typically mixed-case).
+        for prefix in &["mig:", "partition:"] {
+            if lowered.starts_with(prefix) {
+                let rest = trimmed[prefix.len()..].trim();
+                if !rest.is_empty() {
+                    return Some(Self::Partition(rest.to_string()));
+                }
+            }
+        }
 
         if let Some((backend, id)) = lowered.split_once(':') {
             if let Ok(id) = id.trim().parse::<usize>() {
@@ -172,6 +201,27 @@ impl GpuPreference {
         }
 
         Some(Self::NameContains(trimmed.to_string()))
+    }
+
+    /// Returns `true` if this preference matches the given device.
+    pub fn matches(&self, device: &Device) -> bool {
+        match self {
+            Self::BackendId { backend, id } => {
+                device.backend.to_string().eq_ignore_ascii_case(backend) && device.id == *id
+            }
+            Self::PciBusId(bus_id) => device
+                .pci_bus_id
+                .as_deref()
+                .is_some_and(|v| v.eq_ignore_ascii_case(bus_id)),
+            Self::NameContains(needle) => {
+                let needle_lower = needle.to_ascii_lowercase();
+                device.name.to_ascii_lowercase().contains(&needle_lower)
+            }
+            Self::Partition(partition_id) => device
+                .partition_id
+                .as_deref()
+                .is_some_and(|v| v.eq_ignore_ascii_case(partition_id)),
+        }
     }
 }
 
@@ -211,6 +261,7 @@ impl DeviceInfo {
             memory_mb: total_memory / 1024,
             compute_units: cpu_cores,
             pci_bus_id: None,
+            partition_id: None,
             driver_version: None,
             cuda_version: None,
             compute_capability: None,
@@ -266,6 +317,7 @@ impl DeviceInfo {
                 memory_mb: 0,
                 compute_units: 1,
                 pci_bus_id: None,
+                partition_id: None,
                 driver_version: None,
                 cuda_version: None,
                 compute_capability: None,
@@ -362,7 +414,7 @@ impl DeviceInfo {
     fn detect_cuda_gpus(timeout: Duration, cuda_version: Option<&str>) -> Vec<Device> {
         let mut devices = Vec::new();
 
-        let query = "index,name,memory.total,utilization.gpu,temperature.gpu,pci.bus_id,driver_version,compute_cap";
+        let query = "index,name,memory.total,utilization.gpu,temperature.gpu,pci.bus_id,driver_version,compute_cap,uuid";
         let args = ["--query-gpu", query, "--format=csv,noheader,nounits"];
 
         let stdout = match Self::run_command_with_timeout("nvidia-smi", &args, timeout) {
@@ -404,6 +456,14 @@ impl DeviceInfo {
                 .filter(|v| !v.is_empty() && !v.eq_ignore_ascii_case("n/a"))
                 .map(|v| v.to_string());
 
+            // parts[8] = uuid (e.g. "GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx").
+            // Used as the stable partition_id so placement can survive index reordering.
+            let partition_id = parts
+                .get(8)
+                .map(|v| v.trim())
+                .filter(|v| !v.is_empty() && !v.eq_ignore_ascii_case("n/a"))
+                .map(|v| v.to_string());
+
             let (supports_fp16, supports_int8) = match compute_capability
                 .as_deref()
                 .and_then(Self::parse_compute_capability)
@@ -419,6 +479,7 @@ impl DeviceInfo {
                 memory_mb,
                 compute_units: 0,
                 pci_bus_id,
+                partition_id,
                 driver_version,
                 cuda_version: cuda_version.map(|s| s.to_string()),
                 compute_capability,
@@ -483,6 +544,7 @@ impl DeviceInfo {
                 memory_mb: 0,
                 compute_units: 0,
                 pci_bus_id: None,
+                partition_id: None,
                 driver_version: Some(os_release.to_string()),
                 cuda_version: None,
                 compute_capability: None,
@@ -570,6 +632,7 @@ impl DeviceInfo {
                     memory_mb,
                     compute_units: 0,
                     pci_bus_id: None,
+                    partition_id: None,
                     driver_version: Some(os_release.to_string()),
                     cuda_version: None,
                     compute_capability: None,
@@ -602,6 +665,7 @@ impl DeviceInfo {
                 memory_mb: 0,
                 compute_units: 0,
                 pci_bus_id: None,
+                partition_id: None,
                 driver_version: Some(os_release.to_string()),
                 cuda_version: None,
                 compute_capability: None,
@@ -662,6 +726,14 @@ impl DeviceInfo {
                 .ok()
                 .map(|(maj, min)| format!("{maj}.{min}"));
 
+            // UUID is a stable per-device identifier (e.g. "GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx")
+            // that survives index reordering. For MIG compute instances NVML would return a
+            // MIG-scoped UUID here instead. Used as partition_id for selector matching.
+            let partition_id = dev
+                .uuid()
+                .ok()
+                .filter(|s| !s.trim().is_empty());
+
             let (supports_fp16, supports_int8) =
                 match cc.as_deref().and_then(Self::parse_compute_capability) {
                     Some((major, _minor)) => (major >= 5, major >= 6),
@@ -675,6 +747,7 @@ impl DeviceInfo {
                 memory_mb,
                 compute_units: 0,
                 pci_bus_id,
+                partition_id,
                 driver_version: driver_version.clone(),
                 cuda_version: cuda_version.map(|s| s.to_string()),
                 compute_capability: cc,
@@ -722,26 +795,9 @@ impl DeviceInfo {
     }
 
     pub fn best_gpu_with_preference(&self, preference: &GpuPreference) -> Option<&Device> {
-        match preference {
-            GpuPreference::BackendId { backend, id } => self.devices.iter().find(|d| {
-                !matches!(d.backend, DeviceBackend::Cpu)
-                    && d.backend.to_string().eq_ignore_ascii_case(backend)
-                    && d.id == *id
-            }),
-            GpuPreference::PciBusId(bus_id) => self.devices.iter().find(|d| {
-                !matches!(d.backend, DeviceBackend::Cpu)
-                    && d.pci_bus_id
-                        .as_deref()
-                        .is_some_and(|v| v.eq_ignore_ascii_case(bus_id))
-            }),
-            GpuPreference::NameContains(needle) => {
-                let needle = needle.to_ascii_lowercase();
-                self.devices.iter().find(|d| {
-                    !matches!(d.backend, DeviceBackend::Cpu)
-                        && d.name.to_ascii_lowercase().contains(&needle)
-                })
-            }
-        }
+        self.devices.iter().find(|d| {
+            !matches!(d.backend, DeviceBackend::Cpu) && preference.matches(d)
+        })
     }
 
     pub fn cuda_devices(&self) -> Vec<&Device> {
