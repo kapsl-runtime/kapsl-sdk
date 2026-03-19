@@ -9,6 +9,7 @@ fn make_device(id: usize, backend: DeviceBackend, memory_mb: u64) -> Device {
         memory_mb,
         compute_units: 8,
         pci_bus_id: None,
+        partition_id: None,
         driver_version: None,
         supports_fp16: true,
         supports_int8: true,

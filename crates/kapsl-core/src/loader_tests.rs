@@ -159,7 +159,7 @@ mod tests {
 
         let cache_dir = tempfile::tempdir().expect("create cache dir");
         std::env::set_var("KAPSL_MODEL_CACHE_DIR", cache_dir.path());
-        std::env::set_var("KAPSL_MODEL_CACHE_MAX_BYTES", "1500");
+        std::env::set_var("KAPSL_MODEL_CACHE_MAX_BYTES", "2048");
 
         let create_pkg = |name: &str, byte: u8| -> (TempDir, PathBuf) {
             let temp_dir = tempfile::tempdir().expect("create temp dir");

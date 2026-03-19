@@ -59,6 +59,8 @@ pub struct KvCacheStats {
     pub evicted_blocks: u64,
     pub evicted_sequences: u64,
     pub packed_layers: usize,
+    /// Blocks currently held in the CPU offload store (paged mode only).
+    pub cpu_offloaded_blocks: u64,
 }
 
 #[derive(Debug)]
@@ -158,15 +160,16 @@ impl KvTensor {
 
     #[inline(always)]
     pub fn write_head(&mut self, head: usize, pos: usize, values: &[f16]) {
+        self.grow_to(pos + 1);
         let base = self.index(head, pos, 0);
         self.data[base..base + self.head_dim].copy_from_slice(values);
     }
 
     #[inline(always)]
     pub fn write_head_range(&mut self, head: usize, pos_start: usize, values: &[f16]) {
-        debug_assert!(pos_start < self.allocated_seq_len);
         debug_assert!(values.len().is_multiple_of(self.head_dim));
         let num_positions = values.len() / self.head_dim;
+        self.grow_to(pos_start + num_positions);
         debug_assert!(pos_start + num_positions <= self.allocated_seq_len);
         let base = self.index(head, pos_start, 0);
         let end = base + values.len();
@@ -247,7 +250,7 @@ impl SequenceKvCache {
     }
 
     /// Ensure every layer's key/value tensor can hold at least `required` positions.
-    fn ensure_capacity(&mut self, required: usize) {
+    pub fn ensure_capacity(&mut self, required: usize) {
         for layer in &mut self.layers {
             layer.key.grow_to(required);
             layer.value.grow_to(required);
@@ -359,6 +362,7 @@ impl DenseKvCache {
 
         assert!(pos < self.max_seq_len, "KV cache overflow");
 
+        seq.ensure_capacity(pos + 1);
         let layer = &mut seq.layers[layer_index];
 
         let expected = self.num_heads * self.head_dim;
@@ -619,6 +623,7 @@ impl DenseKvCache {
             evicted_blocks: 0,
             evicted_sequences: 0,
             packed_layers,
+            cpu_offloaded_blocks: 0,
         }
     }
 }
@@ -687,6 +692,9 @@ struct PagedSequence {
     packed_layers: Vec<Option<PackedLayerKv>>,
     last_access: u64,
     tokens: Vec<u64>,
+    /// Eviction priority mirror from the owning `SequenceGroup`.
+    /// Lower value → evicted first when blocks are scarce.
+    priority: u8,
 }
 
 impl PagedSequence {
@@ -699,7 +707,107 @@ impl PagedSequence {
             packed_layers,
             last_access: 0,
             tokens: Vec::new(),
+            priority: 0,
         }
+    }
+}
+
+/// Snapshot of one offloaded sequence kept in CPU memory.
+struct OffloadedSequence {
+    /// KV block data in block-index order.
+    /// Each entry is `(key_data, value_data)` with `block_stride` f16 elements.
+    blocks: Vec<(Vec<f16>, Vec<f16>)>,
+    /// Number of valid tokens when the sequence was offloaded.
+    current_len: usize,
+    /// Priority inherited from the originating `SequenceGroup`.
+    priority: u8,
+}
+
+/// CPU-side store for sequences whose KV blocks have been offloaded from GPU.
+///
+/// When the GPU block pool is exhausted and inactive-sequence eviction cannot
+/// free space, the lowest-priority inactive sequence's KV data is copied here
+/// instead of being permanently discarded.  `restore_offloaded_sequence_inner`
+/// allocates fresh GPU blocks and copies the data back, allowing the sequence
+/// to continue without recomputing the prefix.
+pub struct CpuKvBlockStore {
+    /// Maps `sequence_id` → stored block data + metadata.
+    sequences: HashMap<u64, OffloadedSequence>,
+    /// Elements per block: `num_layers * num_heads * block_size * head_dim`.
+    block_stride: usize,
+    /// Running total of blocks across all stored sequences.
+    total_blocks: usize,
+}
+
+impl CpuKvBlockStore {
+    fn new(block_stride: usize) -> Self {
+        Self {
+            sequences: HashMap::new(),
+            block_stride,
+            total_blocks: 0,
+        }
+    }
+
+    /// Copy all blocks for a sequence from the GPU storage slices into CPU
+    /// memory, preserving their order so they can be restored later.
+    fn offload_sequence(
+        &mut self,
+        sequence_id: u64,
+        block_ids: &[usize],
+        current_len: usize,
+        priority: u8,
+        key_storage: &[f16],
+        value_storage: &[f16],
+    ) {
+        let mut block_data = Vec::with_capacity(block_ids.len());
+        for &block_id in block_ids {
+            let start = block_id * self.block_stride;
+            let end = start + self.block_stride;
+            if end <= key_storage.len() {
+                block_data.push((
+                    key_storage[start..end].to_vec(),
+                    value_storage[start..end].to_vec(),
+                ));
+            }
+        }
+        self.total_blocks += block_data.len();
+        self.sequences.insert(
+            sequence_id,
+            OffloadedSequence {
+                blocks: block_data,
+                current_len,
+                priority,
+            },
+        );
+    }
+
+    fn has_sequence(&self, sequence_id: u64) -> bool {
+        self.sequences.contains_key(&sequence_id)
+    }
+
+    /// Remove and return the stored data for `sequence_id`, if present.
+    fn take_sequence(&mut self, sequence_id: u64) -> Option<OffloadedSequence> {
+        if let Some(entry) = self.sequences.remove(&sequence_id) {
+            self.total_blocks = self.total_blocks.saturating_sub(entry.blocks.len());
+            Some(entry)
+        } else {
+            None
+        }
+    }
+
+    /// Put back a sequence that could not be restored (not enough GPU blocks).
+    fn return_sequence(&mut self, sequence_id: u64, entry: OffloadedSequence) {
+        self.total_blocks += entry.blocks.len();
+        self.sequences.insert(sequence_id, entry);
+    }
+
+    /// Total number of GPU blocks whose data is currently held in CPU memory.
+    pub fn offloaded_block_count(&self) -> usize {
+        self.total_blocks
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.sequences.is_empty()
     }
 }
 
@@ -721,6 +829,11 @@ pub struct PagedKvCache {
     scratch_key: Vec<f16>,
     scratch_value: Vec<f16>,
     radix_tree: RadixTree,
+    /// CPU offload store: blocks moved here instead of being permanently freed
+    /// when the GPU pool is exhausted after LRU eviction.
+    cpu_store: CpuKvBlockStore,
+    /// Running count of blocks currently sitting in `cpu_store`.
+    cpu_offloaded_blocks: u64,
 }
 
 impl PagedKvCache {
@@ -733,13 +846,12 @@ impl PagedKvCache {
         eviction_policy: KvEvictionPolicy,
     ) -> Self {
         let block_stride = num_layers * num_heads * block_size * head_dim;
-        let total_elems = total_blocks * block_stride;
         let expected = num_heads * head_dim;
         Self {
             sequences: HashMap::new(),
             allocator: PagedBlockAllocator::new(total_blocks),
-            key_storage: vec![f16::ZERO; total_elems],
-            value_storage: vec![f16::ZERO; total_elems],
+            key_storage: Vec::new(),
+            value_storage: Vec::new(),
             num_layers,
             num_heads,
             head_dim,
@@ -753,6 +865,8 @@ impl PagedKvCache {
             scratch_key: vec![f16::ZERO; expected],
             scratch_value: vec![f16::ZERO; expected],
             radix_tree: RadixTree::new(),
+            cpu_store: CpuKvBlockStore::new(block_stride),
+            cpu_offloaded_blocks: 0,
         }
     }
 
@@ -778,6 +892,7 @@ impl PagedKvCache {
             return Ok(block);
         }
 
+        // First attempt: evict an inactive sequence from GPU memory.
         if self.eviction_policy != KvEvictionPolicy::None
             && self.evict_one_inactive(protected_seq_id)
         {
@@ -786,7 +901,179 @@ impl PagedKvCache {
             }
         }
 
+        // Second attempt: offload an inactive sequence's blocks to CPU instead
+        // of discarding them, preserving the ability to restore later.
+        if self.try_offload_to_cpu(protected_seq_id) {
+            if let Some(block) = self.allocator.allocate() {
+                return Ok(block);
+            }
+        }
+
         Err(KvCacheError::OutOfBlocks)
+    }
+
+    /// Set the eviction priority for an already-allocated sequence.
+    ///
+    /// Call this after `allocate_sequence` when a request priority is known
+    /// (e.g. propagated from `SequenceGroup::priority`). Lower values are
+    /// evicted first under memory pressure.
+    pub fn set_sequence_priority(&mut self, sequence_id: u64, priority: u8) {
+        if let Some(seq) = self.sequences.get_mut(&sequence_id) {
+            seq.priority = priority;
+        }
+    }
+
+    /// Attempt to offload one inactive sequence's blocks to the CPU store,
+    /// freeing GPU blocks without permanently losing the KV data.
+    ///
+    /// Chooses the victim using the same priority-composite key as
+    /// `evict_one_inactive`. Returns `true` if at least one GPU block was freed.
+    fn try_offload_to_cpu(&mut self, protected_seq_id: Option<u64>) -> bool {
+        if self.eviction_policy == KvEvictionPolicy::None {
+            return false;
+        }
+
+        // Find a victim using the same priority-composite key as evict_one_inactive.
+        let mut victim: Option<u64> = None;
+        let mut best_key: (u8, u64) = (0, u64::MAX);
+
+        for (seq_id, seq) in &self.sequences {
+            if self.active_sequences.contains(seq_id) {
+                continue;
+            }
+            if Some(*seq_id) == protected_seq_id {
+                continue;
+            }
+            let time_val = match self.eviction_policy {
+                KvEvictionPolicy::LruInactive => seq.last_access,
+                KvEvictionPolicy::Fifo => *seq_id,
+                KvEvictionPolicy::None => continue,
+            };
+            let priority_bucket = u8::MAX - seq.priority;
+            let key = (priority_bucket, time_val);
+            let is_better = match victim {
+                None => true,
+                Some(_) => key.0 > best_key.0 || (key.0 == best_key.0 && key.1 < best_key.1),
+            };
+            if is_better {
+                best_key = key;
+                victim = Some(*seq_id);
+            }
+        }
+
+        let victim_id = match victim {
+            Some(id) => id,
+            None => return false,
+        };
+
+        // Capture block IDs and sequence metadata before mutably borrowing storage.
+        let (block_ids, current_len, priority): (Vec<usize>, usize, u8) = match self
+            .sequences
+            .get(&victim_id)
+        {
+            Some(seq) => (
+                seq.blocks.iter().copied().collect(),
+                seq.current_len,
+                seq.priority,
+            ),
+            None => return false,
+        };
+
+        if block_ids.is_empty() {
+            return false;
+        }
+
+        // Copy KV data to CPU store, then free GPU blocks.
+        self.cpu_store.offload_sequence(
+            victim_id,
+            &block_ids,
+            current_len,
+            priority,
+            &self.key_storage,
+            &self.value_storage,
+        );
+        for &block_id in &block_ids {
+            self.allocator.free(block_id);
+        }
+        self.cpu_offloaded_blocks += block_ids.len() as u64;
+
+        // Remove the sequence so the scheduler sees it as gone.
+        self.sequences.remove(&victim_id);
+        self.evicted_sequences.push(victim_id);
+        self.evicted_sequences_count += 1;
+
+        true
+    }
+
+    /// Attempt to restore an offloaded sequence from CPU memory back onto GPU.
+    ///
+    /// Allocates fresh GPU blocks (which may have different indices than the
+    /// originals), copies the stored KV data into them, and re-inserts the
+    /// sequence into the live map.  Returns the restored `current_len` on
+    /// success, or `None` if the sequence was not found in the CPU store or
+    /// there were not enough free GPU blocks to accommodate it.
+    fn restore_offloaded_sequence_inner(&mut self, sequence_id: u64) -> Option<usize> {
+        // Move the stored entry out so we can freely borrow the rest of self.
+        let entry = self.cpu_store.take_sequence(sequence_id)?;
+        let num_blocks = entry.blocks.len();
+
+        if num_blocks == 0 {
+            // Empty sequence — recreate with no blocks.
+            let mut seq = PagedSequence::new(self.num_layers);
+            seq.priority = entry.priority;
+            seq.last_access = self.access_counter;
+            self.sequences.insert(sequence_id, seq);
+            self.cpu_offloaded_blocks = self.cpu_offloaded_blocks.saturating_sub(0);
+            return Some(0);
+        }
+
+        // Try to allocate enough fresh GPU blocks.
+        let mut new_block_ids = Vec::with_capacity(num_blocks);
+        for _ in 0..num_blocks {
+            match self.allocator.allocate() {
+                Some(id) => new_block_ids.push(id),
+                None => {
+                    // Not enough free blocks — free what we got and put data back.
+                    for &b in &new_block_ids {
+                        self.allocator.free(b);
+                    }
+                    self.cpu_store.return_sequence(sequence_id, entry);
+                    return None;
+                }
+            }
+        }
+
+        // Write each stored block into its new GPU slot.
+        let block_stride = self.block_stride();
+        // Lazily grow storage to cover the highest new block id.
+        if let Some(&max_block_id) = new_block_ids.iter().max() {
+            let needed_storage = (max_block_id + 1) * block_stride;
+            if self.key_storage.len() < needed_storage {
+                self.key_storage.resize(needed_storage, f16::ZERO);
+                self.value_storage.resize(needed_storage, f16::ZERO);
+            }
+        }
+        for (i, &new_block_id) in new_block_ids.iter().enumerate() {
+            let (ref key_data, ref val_data) = entry.blocks[i];
+            let start = new_block_id * block_stride;
+            let end = start + block_stride;
+            self.key_storage[start..end].copy_from_slice(key_data);
+            self.value_storage[start..end].copy_from_slice(val_data);
+        }
+
+        // Recreate the sequence with the restored state.
+        let access = self.bump_access();
+        let mut seq = PagedSequence::new(self.num_layers);
+        seq.blocks.extend(new_block_ids);
+        seq.current_len = entry.current_len;
+        seq.priority = entry.priority;
+        seq.last_access = access;
+        self.sequences.insert(sequence_id, seq);
+
+        let freed = num_blocks as u64;
+        self.cpu_offloaded_blocks = self.cpu_offloaded_blocks.saturating_sub(freed);
+
+        Some(entry.current_len)
     }
 
     fn allocate_blocks(
@@ -811,8 +1098,12 @@ impl PagedKvCache {
     }
 
     fn evict_one_inactive(&mut self, protected_seq_id: Option<u64>) -> bool {
+        // Composite eviction key: (priority_bucket, time_val).
+        // priority_bucket = 255 - priority, so lower-priority sequences get a
+        // higher bucket and are chosen before higher-priority ones.
+        // Within the same bucket, the oldest sequence (lowest time_val) wins.
         let mut victim: Option<u64> = None;
-        let mut min_val: u64 = u64::MAX;
+        let mut best_key: (u8, u64) = (0, u64::MAX); // sentinel: nothing selected yet
 
         for (seq_id, seq) in &self.sequences {
             if self.active_sequences.contains(seq_id) {
@@ -822,14 +1113,26 @@ impl PagedKvCache {
                 continue;
             }
 
-            let val = match self.eviction_policy {
+            let time_val = match self.eviction_policy {
                 KvEvictionPolicy::LruInactive => seq.last_access,
-                KvEvictionPolicy::Fifo => *seq_id, // Approximation using ID
+                KvEvictionPolicy::Fifo => *seq_id, // Approximation using ID as FIFO order
                 KvEvictionPolicy::None => continue,
             };
 
-            if val < min_val {
-                min_val = val;
+            let priority_bucket = u8::MAX - seq.priority;
+            let key = (priority_bucket, time_val);
+
+            let is_better = match victim {
+                None => true,
+                Some(_) => {
+                    // Higher priority_bucket (lower priority) → evict first.
+                    // Tie-break: lower time_val (older) → evict first.
+                    key.0 > best_key.0 || (key.0 == best_key.0 && key.1 < best_key.1)
+                }
+            };
+
+            if is_better {
+                best_key = key;
                 victim = Some(*seq_id);
             }
         }
@@ -944,6 +1247,18 @@ impl PagedKvCache {
     ) -> Result<usize, KvCacheError> {
         if let Some(seq) = self.sequences.get(&sequence_id) {
             return Ok(seq.current_len.min(tokens.len().saturating_sub(1)));
+        }
+
+        // Before creating a fresh sequence, check whether this ID was previously
+        // offloaded to CPU.  If restoration succeeds the sequence resumes from
+        // where it left off, avoiding a full prefix recompute.
+        if self.cpu_store.has_sequence(sequence_id) {
+            if let Some(restored_len) = self.restore_offloaded_sequence_inner(sequence_id) {
+                return Ok(restored_len.min(tokens.len().saturating_sub(1)));
+            }
+            // If restoration failed (not enough GPU blocks), fall through to
+            // fresh allocation below — the data remains in cpu_store for a
+            // later retry.
         }
 
         // Try to match prefix
@@ -1078,6 +1393,12 @@ impl PagedKvCache {
         }
 
         let block = *seq.blocks.get(logical_block).expect("block missing");
+        // Lazily grow flat storage so this physical block is addressable.
+        let needed_storage = (block + 1) * block_stride;
+        if self.key_storage.len() < needed_storage {
+            self.key_storage.resize(needed_storage, f16::ZERO);
+            self.value_storage.resize(needed_storage, f16::ZERO);
+        }
         for h in 0..num_heads {
             let offset = h * head_dim;
             let end = offset + head_dim;
@@ -1142,6 +1463,12 @@ impl PagedKvCache {
             let token_in_block = pos % block_size;
 
             let block = *seq.blocks.get(logical_block).expect("block missing");
+            // Lazily grow flat storage so this physical block is addressable.
+            let needed_storage = (block + 1) * block_stride;
+            if self.key_storage.len() < needed_storage {
+                self.key_storage.resize(needed_storage, f16::ZERO);
+                self.value_storage.resize(needed_storage, f16::ZERO);
+            }
             let capacity = block_size - token_in_block;
             let to_copy = remaining.min(capacity);
             let copy_len = to_copy * head_dim;
@@ -1256,8 +1583,10 @@ impl PagedKvCache {
                 let dst = h * seq_len * head_dim + pos * head_dim;
                 let src_end = src + head_dim;
                 let dst_end = dst + head_dim;
-                key[dst..dst_end].copy_from_slice(&self.key_storage[src..src_end]);
-                value[dst..dst_end].copy_from_slice(&self.value_storage[src..src_end]);
+                if src_end <= self.key_storage.len() {
+                    key[dst..dst_end].copy_from_slice(&self.key_storage[src..src_end]);
+                    value[dst..dst_end].copy_from_slice(&self.value_storage[src..src_end]);
+                }
             }
         }
 
@@ -1324,6 +1653,16 @@ impl PagedKvCache {
         let head_stride = self.head_stride();
         let head_dim = self.head_dim;
         let num_heads = self.num_heads;
+
+        // Lazily grow storage to cover the highest new block id before mutably
+        // borrowing seq (borrow checker constraint).
+        if let Some(&max_block_id) = new_blocks.iter().max() {
+            let needed_storage = (max_block_id + 1) * block_stride;
+            if self.key_storage.len() < needed_storage {
+                self.key_storage.resize(needed_storage, f16::ZERO);
+                self.value_storage.resize(needed_storage, f16::ZERO);
+            }
+        }
 
         let seq = self.sequences.get_mut(&sequence_id).unwrap();
         seq.blocks = new_blocks.into();
@@ -1424,7 +1763,8 @@ impl PagedKvCache {
         let blocks_used = blocks_total - blocks_free;
         let block_stride = self.block_stride();
         let bytes_used = blocks_used * block_stride * 2 * 2;
-        let bytes_capacity = blocks_total * block_stride * 2 * 2;
+        let bytes_capacity = self.key_storage.len() * std::mem::size_of::<half::f16>()
+            + self.value_storage.len() * std::mem::size_of::<half::f16>();
         let packed_layers = self
             .sequences
             .values()
@@ -1441,6 +1781,9 @@ impl PagedKvCache {
             evicted_blocks: self.evicted_blocks,
             evicted_sequences: self.evicted_sequences_count,
             packed_layers,
+            // Use the store's authoritative count so stats stay consistent
+            // even when blocks are put back during failed restore attempts.
+            cpu_offloaded_blocks: self.cpu_store.offloaded_block_count() as u64,
         }
     }
 }
@@ -1522,6 +1865,37 @@ impl KvCache {
             return cache.drain_evicted_sequences();
         }
         Vec::new()
+    }
+
+    /// Update the eviction priority of an already-allocated sequence.
+    ///
+    /// Propagate `SequenceGroup::priority` here after `allocate_sequence` so
+    /// that the KV cache uses the same priority ordering as the scheduler when
+    /// choosing blocks to offload under memory pressure. No-op in dense mode.
+    pub fn set_sequence_priority(&mut self, sequence_id: u64, priority: u8) {
+        if let KvCacheInner::Paged(cache) = &mut self.inner {
+            cache.set_sequence_priority(sequence_id, priority);
+        }
+    }
+
+    /// Number of blocks currently held in the CPU offload store (paged mode only).
+    pub fn cpu_offloaded_blocks(&self) -> u64 {
+        if let KvCacheInner::Paged(cache) = &self.inner {
+            return cache.cpu_store.offloaded_block_count() as u64;
+        }
+        0
+    }
+
+    /// Attempt to restore an offloaded sequence from CPU memory back to GPU.
+    ///
+    /// Returns `true` if the sequence was successfully restored. The next call
+    /// to `allocate_sequence` for the same ID will see it as already present.
+    /// No-op in dense mode.
+    pub fn restore_offloaded_sequence(&mut self, sequence_id: u64) -> bool {
+        if let KvCacheInner::Paged(cache) = &mut self.inner {
+            return cache.restore_offloaded_sequence_inner(sequence_id).is_some();
+        }
+        false
     }
 
     pub fn rollback_sequence(&mut self, sequence_id: u64, length: usize) {

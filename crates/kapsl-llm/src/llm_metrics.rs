@@ -9,4 +9,6 @@ pub struct LLMMetrics {
     pub kv_cache_evicted_blocks: u64,
     pub kv_cache_evicted_sequences: u64,
     pub kv_cache_packed_layers: usize,
+    /// Blocks currently sitting in the CPU offload store (paged mode only).
+    pub kv_cache_cpu_offloaded_blocks: u64,
 }

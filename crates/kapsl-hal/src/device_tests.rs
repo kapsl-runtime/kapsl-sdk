@@ -1,4 +1,4 @@
-use crate::device::{Device, DeviceBackend, DeviceInfo};
+use crate::device::{Device, DeviceBackend, DeviceInfo, GpuPreference};
 
 fn make_device(id: usize, backend: DeviceBackend, memory_mb: u64) -> Device {
     Device {
@@ -8,6 +8,7 @@ fn make_device(id: usize, backend: DeviceBackend, memory_mb: u64) -> Device {
         memory_mb,
         compute_units: 16,
         pci_bus_id: None,
+        partition_id: None,
         driver_version: None,
         supports_fp16: true,
         supports_int8: true,
@@ -105,4 +106,146 @@ fn provider_helpers_use_flags_and_defaults() {
     assert!(info.has_provider("coreml"));
     assert!(info.has_provider("cpu"));
     assert!(!info.has_provider("rocm"));
+}
+
+// ── GpuPreference::parse ─────────────────────────────────────────────────────
+
+#[test]
+fn gpu_preference_parse_backend_id() {
+    let pref = GpuPreference::parse("cuda:2").unwrap();
+    assert_eq!(
+        pref,
+        GpuPreference::BackendId {
+            backend: "cuda".to_string(),
+            id: 2
+        }
+    );
+}
+
+#[test]
+fn gpu_preference_parse_pci_bus_id() {
+    let pref = GpuPreference::parse("0000:01:00.0").unwrap();
+    assert_eq!(pref, GpuPreference::PciBusId("0000:01:00.0".to_string()));
+}
+
+#[test]
+fn gpu_preference_parse_name_contains() {
+    let pref = GpuPreference::parse("A100").unwrap();
+    assert_eq!(pref, GpuPreference::NameContains("a100".to_string()));
+}
+
+#[test]
+fn gpu_preference_parse_mig_prefix() {
+    let pref = GpuPreference::parse("mig:GPU-abc123/0/0").unwrap();
+    assert_eq!(
+        pref,
+        GpuPreference::Partition("GPU-abc123/0/0".to_string())
+    );
+}
+
+#[test]
+fn gpu_preference_parse_partition_prefix() {
+    let pref = GpuPreference::parse("partition:GPU-xyz/1/0").unwrap();
+    assert_eq!(
+        pref,
+        GpuPreference::Partition("GPU-xyz/1/0".to_string())
+    );
+}
+
+#[test]
+fn gpu_preference_parse_empty_returns_none() {
+    assert!(GpuPreference::parse("").is_none());
+    assert!(GpuPreference::parse("  ").is_none());
+}
+
+// ── GpuPreference::matches ────────────────────────────────────────────────────
+
+#[test]
+fn gpu_preference_matches_backend_id() {
+    let mut dev = make_device(1, DeviceBackend::Cuda, 8_000);
+    dev.pci_bus_id = Some("0000:01:00.0".to_string());
+
+    let pref = GpuPreference::BackendId {
+        backend: "cuda".to_string(),
+        id: 1,
+    };
+    assert!(pref.matches(&dev));
+
+    let wrong_id = GpuPreference::BackendId {
+        backend: "cuda".to_string(),
+        id: 2,
+    };
+    assert!(!wrong_id.matches(&dev));
+}
+
+#[test]
+fn gpu_preference_matches_pci_bus_id() {
+    let mut dev = make_device(0, DeviceBackend::Cuda, 8_000);
+    dev.pci_bus_id = Some("0000:03:00.0".to_string());
+
+    let pref = GpuPreference::PciBusId("0000:03:00.0".to_string());
+    assert!(pref.matches(&dev));
+
+    // Case-insensitive
+    let pref_upper = GpuPreference::PciBusId("0000:03:00.0".to_ascii_uppercase());
+    assert!(pref_upper.matches(&dev));
+
+    // Different bus
+    assert!(!GpuPreference::PciBusId("0000:04:00.0".to_string()).matches(&dev));
+
+    // Missing pci_bus_id
+    let no_pci = make_device(0, DeviceBackend::Cuda, 8_000);
+    assert!(!pref.matches(&no_pci));
+}
+
+#[test]
+fn gpu_preference_matches_name_contains() {
+    let mut dev = make_device(0, DeviceBackend::Cuda, 8_000);
+    dev.name = "NVIDIA A100 80GB PCIe".to_string();
+
+    assert!(GpuPreference::NameContains("a100".to_string()).matches(&dev));
+    assert!(GpuPreference::NameContains("80GB".to_string()).matches(&dev));
+    assert!(!GpuPreference::NameContains("H100".to_string()).matches(&dev));
+}
+
+#[test]
+fn gpu_preference_matches_partition() {
+    let mut dev = make_device(0, DeviceBackend::Cuda, 8_000);
+    dev.partition_id = Some("GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx".to_string());
+
+    let pref = GpuPreference::Partition("GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx".to_string());
+    assert!(pref.matches(&dev));
+
+    // Case-insensitive
+    let pref_upper =
+        GpuPreference::Partition("GPU-XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX".to_string());
+    assert!(pref_upper.matches(&dev));
+
+    assert!(!GpuPreference::Partition("GPU-other".to_string()).matches(&dev));
+
+    // No partition_id on device
+    let no_part = make_device(0, DeviceBackend::Cuda, 8_000);
+    assert!(!pref.matches(&no_part));
+}
+
+#[test]
+fn best_gpu_with_preference_partition() {
+    let mut dev0 = make_device(0, DeviceBackend::Cuda, 8_000);
+    dev0.partition_id = Some("GPU-aaa".to_string());
+    let mut dev1 = make_device(1, DeviceBackend::Cuda, 8_000);
+    dev1.partition_id = Some("GPU-bbb".to_string());
+    let info = make_info(vec![
+        make_device(0, DeviceBackend::Cpu, 1024),
+        dev0,
+        dev1,
+    ]);
+
+    let found = info
+        .best_gpu_with_preference(&GpuPreference::Partition("GPU-bbb".to_string()))
+        .expect("should find partition");
+    assert_eq!(found.id, 1);
+
+    assert!(info
+        .best_gpu_with_preference(&GpuPreference::Partition("GPU-ccc".to_string()))
+        .is_none());
 }

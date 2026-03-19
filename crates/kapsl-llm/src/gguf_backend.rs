@@ -17,6 +17,21 @@ use llama_cpp_2::{
     sampling::LlamaSampler,
 };
 
+/// Static weak cache: model path → shared inner.
+/// A `Weak` reference is stored so that when all replicas using the model are
+/// dropped, the `Arc` refcount falls to zero and memory is freed.
+#[cfg(feature = "gguf")]
+static GGUF_MODEL_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, std::sync::Weak<GgufInner>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(feature = "gguf")]
+fn gguf_model_cache() -> &'static std::sync::Mutex<
+    std::collections::HashMap<std::path::PathBuf, std::sync::Weak<GgufInner>>,
+> {
+    GGUF_MODEL_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
 /// GGUF inference backend backed by llama.cpp via the `llama-cpp-2` crate.
 ///
 /// The model and backend are loaded once and reused across requests. A new
@@ -24,7 +39,7 @@ use llama_cpp_2::{
 /// `Send` and cannot be shared across threads.
 pub struct GgufBackend {
     #[cfg(feature = "gguf")]
-    inner: Option<GgufInner>,
+    inner: Option<Arc<GgufInner>>,
     metrics: EngineMetrics,
 }
 
@@ -73,30 +88,57 @@ impl Default for GgufBackend {
 #[async_trait]
 impl Engine for GgufBackend {
     async fn load(&mut self, model_path: &Path) -> Result<(), EngineError> {
-        let model_path = model_path.to_path_buf();
-        let (backend, model, n_ctx) = tokio::task::spawn_blocking(move || {
-            let backend = LlamaBackend::init()
-                .map_err(|e| EngineError::backend(format!("llama backend init failed: {e}")))?;
-            let params = LlamaModelParams::default();
-            let model = LlamaModel::load_from_file(&backend, &model_path, &params)
-                .map_err(|e| EngineError::backend(format!("GGUF load failed: {e}")))?;
-            let n_ctx = model.n_ctx_train();
-            Ok::<_, EngineError>((backend, model, n_ctx))
-        })
-        .await
-        .map_err(|e| EngineError::backend(format!("spawn_blocking join error: {e}")))??;
+        let model_path_key = model_path.to_path_buf();
 
-        let max_context = (n_ctx as u32).min(4096);
-        log::info!(
-            "[gguf] Model loaded; train ctx={}, effective ctx={}",
-            n_ctx,
-            max_context
-        );
-        self.inner = Some(GgufInner {
-            backend: Arc::new(backend),
-            model: Arc::new(model),
-            max_context,
-        });
+        // Check whether another replica has already loaded this model.
+        // If so, reuse its weights — each replica still creates its own
+        // LlamaContext per inference call, so inference is not serialized.
+        let cached = gguf_model_cache()
+            .lock()
+            .unwrap()
+            .get(&model_path_key)
+            .and_then(|w| w.upgrade());
+
+        let inner = if let Some(shared) = cached {
+            log::info!(
+                "[gguf] Reusing shared model weights for {} (replica path)",
+                model_path_key.display()
+            );
+            shared
+        } else {
+            let model_path_load = model_path_key.clone();
+            let (backend, model, n_ctx) = tokio::task::spawn_blocking(move || {
+                let backend = LlamaBackend::init()
+                    .map_err(|e| EngineError::backend(format!("llama backend init failed: {e}")))?;
+                let params = LlamaModelParams::default().with_n_gpu_layers(99);
+                let model = LlamaModel::load_from_file(&backend, &model_path_load, &params)
+                    .map_err(|e| EngineError::backend(format!("GGUF load failed: {e}")))?;
+                let n_ctx = model.n_ctx_train();
+                Ok::<_, EngineError>((backend, model, n_ctx))
+            })
+            .await
+            .map_err(|e| EngineError::backend(format!("spawn_blocking join error: {e}")))??;
+
+            let max_context = (n_ctx as u32).min(4096);
+            log::info!(
+                "[gguf] Model loaded; train ctx={}, effective ctx={}",
+                n_ctx,
+                max_context
+            );
+            let arc_inner = Arc::new(GgufInner {
+                backend: Arc::new(backend),
+                model: Arc::new(model),
+                max_context,
+            });
+            // Register in cache so subsequent replicas can reuse this graph.
+            gguf_model_cache()
+                .lock()
+                .unwrap()
+                .insert(model_path_key, Arc::downgrade(&arc_inner));
+            arc_inner
+        };
+
+        self.inner = Some(inner);
         Ok(())
     }
 

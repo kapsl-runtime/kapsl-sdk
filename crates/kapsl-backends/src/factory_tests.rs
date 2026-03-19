@@ -29,6 +29,7 @@ mod tests {
                     supports_fp16: true,
                     supports_int8: true,
                     cuda_version: None,
+                    partition_id: None,
                 },
                 Device {
                     id: 1,
@@ -44,6 +45,7 @@ mod tests {
                     supports_fp16: true,
                     supports_int8: true,
                     cuda_version: Some("12.0".to_string()),
+                    partition_id: None,
                 },
                 Device {
                     id: 2,
@@ -59,6 +61,7 @@ mod tests {
                     supports_fp16: true,
                     supports_int8: true,
                     cuda_version: Some("12.0".to_string()),
+                    partition_id: None,
                 },
             ],
         }
