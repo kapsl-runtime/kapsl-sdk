@@ -198,43 +198,43 @@ impl GlobalKvScheduler {
 
         // If no engine reported itself active, treat all as active to avoid
         // zero-budget stalls on the first round.
-        let (use_active_only, total_weight) = if active_total_weight == 0 {
-            let all: u64 = self
-                .engines
-                .values()
-                .map(|s| s.share_weight as u64)
-                .sum();
-            (false, all.max(1))
-        } else {
-            (true, active_total_weight.max(1))
-        };
+        let treat_all_active = active_total_weight == 0;
+
+        // Always use all-engine weights for natural shares so that an idle
+        // engine's natural share can be measured and re-distributed.
+        let all_total_weight: u64 = self
+            .engines
+            .values()
+            .map(|s| s.share_weight as u64)
+            .sum::<u64>()
+            .max(1);
 
         let cap_tokens = (self.global_max_tokens as u64
             * self.max_single_engine_permille as u64
             / 1000) as usize;
 
         let mut budgets: Vec<EngineTokenBudget> = Vec::with_capacity(self.engines.len());
-        let mut remaining = self.global_max_tokens;
-        let mut allocated_so_far = 0usize;
+        // Shares from idle engines that should be absorbed by active engines.
+        let mut idle_pool: usize = 0;
+        // Sum of natural (uncapped) shares; used to compute integer-rounding leftover.
+        let mut natural_sum: usize = 0;
 
         for &engine_id in &self.engine_order {
             let Some(state) = self.engines.get(&engine_id) else {
                 continue;
             };
 
-            let is_active = state.was_active || !use_active_only;
+            let is_active = state.was_active || treat_all_active;
+            let natural = (self.global_max_tokens as u64 * state.share_weight as u64
+                / all_total_weight) as usize;
+            natural_sum += natural;
 
-            let max_tokens = if !is_active {
-                0
+            let max_tokens = if is_active {
+                natural.min(cap_tokens)
             } else {
-                // Proportional share, then cap.
-                let share = (self.global_max_tokens as u64 * state.share_weight as u64
-                    / total_weight) as usize;
-                share.min(cap_tokens).min(remaining)
+                idle_pool += natural;
+                0
             };
-
-            allocated_so_far += max_tokens;
-            remaining = self.global_max_tokens.saturating_sub(allocated_so_far);
 
             budgets.push(EngineTokenBudget {
                 engine_id,
@@ -242,14 +242,22 @@ impl GlobalKvScheduler {
             });
         }
 
-        // Distribute any rounding remainder to the first active engine.
-        if remaining > 0 {
-            let idx = budgets
-                .iter()
-                .position(|b| b.max_tokens > 0)
-                .unwrap_or(0);
-            if let Some(budget) = budgets.get_mut(idx) {
-                budget.max_tokens += remaining;
+        // Redistribute idle engines' natural shares to the first active engine.
+        // This is intentionally uncapped: the active engine is genuinely
+        // absorbing budget that idle peers are not using.
+        if idle_pool > 0 {
+            if let Some(budget) = budgets.iter_mut().find(|b| b.max_tokens > 0) {
+                budget.max_tokens += idle_pool;
+            }
+        }
+
+        // Distribute the integer-rounding remainder (global_max - sum of natural
+        // shares, at most n-1 tokens) to the first active engine, respecting cap.
+        let rounding = self.global_max_tokens.saturating_sub(natural_sum);
+        if rounding > 0 {
+            if let Some(budget) = budgets.iter_mut().find(|b| b.max_tokens > 0) {
+                let headroom = cap_tokens.saturating_sub(budget.max_tokens);
+                budget.max_tokens += rounding.min(headroom);
             }
         }
 
