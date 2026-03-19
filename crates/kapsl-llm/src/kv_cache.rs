@@ -845,13 +845,12 @@ impl PagedKvCache {
         eviction_policy: KvEvictionPolicy,
     ) -> Self {
         let block_stride = num_layers * num_heads * block_size * head_dim;
-        let total_elems = total_blocks * block_stride;
         let expected = num_heads * head_dim;
         Self {
             sequences: HashMap::new(),
             allocator: PagedBlockAllocator::new(total_blocks),
-            key_storage: vec![f16::ZERO; total_elems],
-            value_storage: vec![f16::ZERO; total_elems],
+            key_storage: Vec::new(),
+            value_storage: Vec::new(),
             num_layers,
             num_heads,
             head_dim,
@@ -1045,14 +1044,20 @@ impl PagedKvCache {
 
         // Write each stored block into its new GPU slot.
         let block_stride = self.block_stride();
+        // Lazily grow storage to cover the highest new block id.
+        if let Some(&max_block_id) = new_block_ids.iter().max() {
+            let needed_storage = (max_block_id + 1) * block_stride;
+            if self.key_storage.len() < needed_storage {
+                self.key_storage.resize(needed_storage, f16::ZERO);
+                self.value_storage.resize(needed_storage, f16::ZERO);
+            }
+        }
         for (i, &new_block_id) in new_block_ids.iter().enumerate() {
             let (ref key_data, ref val_data) = entry.blocks[i];
             let start = new_block_id * block_stride;
             let end = start + block_stride;
-            if end <= self.key_storage.len() {
-                self.key_storage[start..end].copy_from_slice(key_data);
-                self.value_storage[start..end].copy_from_slice(val_data);
-            }
+            self.key_storage[start..end].copy_from_slice(key_data);
+            self.value_storage[start..end].copy_from_slice(val_data);
         }
 
         // Recreate the sequence with the restored state.
@@ -1387,6 +1392,12 @@ impl PagedKvCache {
         }
 
         let block = *seq.blocks.get(logical_block).expect("block missing");
+        // Lazily grow flat storage so this physical block is addressable.
+        let needed_storage = (block + 1) * block_stride;
+        if self.key_storage.len() < needed_storage {
+            self.key_storage.resize(needed_storage, f16::ZERO);
+            self.value_storage.resize(needed_storage, f16::ZERO);
+        }
         for h in 0..num_heads {
             let offset = h * head_dim;
             let end = offset + head_dim;
@@ -1451,6 +1462,12 @@ impl PagedKvCache {
             let token_in_block = pos % block_size;
 
             let block = *seq.blocks.get(logical_block).expect("block missing");
+            // Lazily grow flat storage so this physical block is addressable.
+            let needed_storage = (block + 1) * block_stride;
+            if self.key_storage.len() < needed_storage {
+                self.key_storage.resize(needed_storage, f16::ZERO);
+                self.value_storage.resize(needed_storage, f16::ZERO);
+            }
             let capacity = block_size - token_in_block;
             let to_copy = remaining.min(capacity);
             let copy_len = to_copy * head_dim;
@@ -1565,8 +1582,10 @@ impl PagedKvCache {
                 let dst = h * seq_len * head_dim + pos * head_dim;
                 let src_end = src + head_dim;
                 let dst_end = dst + head_dim;
-                key[dst..dst_end].copy_from_slice(&self.key_storage[src..src_end]);
-                value[dst..dst_end].copy_from_slice(&self.value_storage[src..src_end]);
+                if src_end <= self.key_storage.len() {
+                    key[dst..dst_end].copy_from_slice(&self.key_storage[src..src_end]);
+                    value[dst..dst_end].copy_from_slice(&self.value_storage[src..src_end]);
+                }
             }
         }
 
@@ -1633,6 +1652,16 @@ impl PagedKvCache {
         let head_stride = self.head_stride();
         let head_dim = self.head_dim;
         let num_heads = self.num_heads;
+
+        // Lazily grow storage to cover the highest new block id before mutably
+        // borrowing seq (borrow checker constraint).
+        if let Some(&max_block_id) = new_blocks.iter().max() {
+            let needed_storage = (max_block_id + 1) * block_stride;
+            if self.key_storage.len() < needed_storage {
+                self.key_storage.resize(needed_storage, f16::ZERO);
+                self.value_storage.resize(needed_storage, f16::ZERO);
+            }
+        }
 
         let seq = self.sequences.get_mut(&sequence_id).unwrap();
         seq.blocks = new_blocks.into();
@@ -1733,7 +1762,8 @@ impl PagedKvCache {
         let blocks_used = blocks_total - blocks_free;
         let block_stride = self.block_stride();
         let bytes_used = blocks_used * block_stride * 2 * 2;
-        let bytes_capacity = blocks_total * block_stride * 2 * 2;
+        let bytes_capacity = self.key_storage.len() * std::mem::size_of::<half::f16>()
+            + self.value_storage.len() * std::mem::size_of::<half::f16>();
         let packed_layers = self
             .sequences
             .values()

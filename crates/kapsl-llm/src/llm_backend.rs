@@ -39,6 +39,9 @@ pub struct LLMBackend {
     /// Optional shared block pool.  When set, the engine draws from this pool
     /// instead of a private allocator, enabling unified KV memory across models.
     shared_pool: Option<SharedBlockAllocator>,
+    /// Optional per-replica cap on KV cache total_blocks. Set by the runtime
+    /// when scaling to multiple replicas to divide the block budget fairly.
+    kv_blocks_cap: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -332,6 +335,7 @@ impl LLMBackend {
             device_id_override: None,
             device_ids_override: None,
             shared_pool: None,
+            kv_blocks_cap: None,
         }
     }
 
@@ -339,6 +343,14 @@ impl LLMBackend {
     /// KV pool shared with other `LLMBackend` instances on the same device.
     pub fn with_shared_pool(mut self, allocator: SharedBlockAllocator) -> Self {
         self.shared_pool = Some(allocator);
+        self
+    }
+
+    /// Set a per-replica cap on KV cache total_blocks. The runtime calls this
+    /// when spawning additional replicas so the block budget is divided fairly
+    /// across all engines on the same device.
+    pub fn with_kv_blocks_cap(mut self, cap: usize) -> Self {
+        self.kv_blocks_cap = Some(cap);
         self
     }
 
@@ -463,6 +475,7 @@ impl Engine for LLMBackend {
         let engine_block_size = hints.block_size;
         let engine_num_gpu_blocks = hints.num_gpu_blocks;
         let shared_pool = self.shared_pool.clone();
+        let kv_blocks_cap = self.kv_blocks_cap;
         tokio::spawn(async move {
             let mut engine = LLMEngine::new(
                 config,
@@ -480,6 +493,10 @@ impl Engine for LLMBackend {
             } else {
                 engine
             };
+            // Apply per-replica block cap if set.
+            if let Some(cap) = kv_blocks_cap {
+                engine.set_kv_blocks_cap(cap);
+            }
             let load_result = engine.load(&engine_path).await;
             if let Err(e) = load_tx.send(load_result) {
                 log::error!("Failed to send load result: {:?}", e);
