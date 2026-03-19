@@ -228,6 +228,7 @@ mod tests {
                 supports_fp16: true,
                 supports_int8: true,
                 cuda_version: Some("12.0".to_string()),
+                partition_id: None,
             })
             .collect()
     }

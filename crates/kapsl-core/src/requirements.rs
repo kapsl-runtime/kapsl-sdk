@@ -18,6 +18,28 @@ pub struct HardwareRequirements {
     #[serde(default)]
     pub min_vram_mb: Option<u64>,
 
+    /// Target VRAM reservation in MB for this model on each selected GPU.
+    /// This is used for runtime admission control rather than capability checks.
+    #[serde(default)]
+    pub gpu_memory_reservation_mb: Option<u64>,
+
+    /// Hard VRAM ceiling in MB for runtime-managed allocations where supported.
+    /// If set without `gpu_memory_reservation_mb`, the runtime uses this as the
+    /// reservation value for load-time admission.
+    #[serde(default)]
+    pub gpu_memory_limit_mb: Option<u64>,
+
+    /// Relative compute share for shared-GPU scheduling in milli-units.
+    /// For example 1000 = 100%, 500 = half-share.
+    #[serde(default)]
+    pub gpu_compute_share_milli: Option<u32>,
+
+    /// Isolation mode requested by the model.
+    /// Supported values are runtime-defined, such as `best_effort`, `reserved`,
+    /// and `hard`.
+    #[serde(default)]
+    pub isolation_mode: Option<String>,
+
     /// Minimum CUDA version required (e.g., "11.8")
     #[serde(default)]
     pub min_cuda_version: Option<String>,
@@ -39,6 +61,10 @@ pub struct HardwareRequirements {
     #[serde(default)]
     pub device_id: Option<i32>,
 
+    /// Optional explicit GPU device allow-list for deterministic runtime placement.
+    #[serde(default)]
+    pub gpu_device_ids: Vec<i32>,
+
     #[serde(default)]
     pub strategy: Option<String>,
 }
@@ -51,11 +77,16 @@ impl HardwareRequirements {
             fallback_providers: vec![],
             min_memory_mb: None,
             min_vram_mb: None,
+            gpu_memory_reservation_mb: None,
+            gpu_memory_limit_mb: None,
+            gpu_compute_share_milli: None,
+            isolation_mode: None,
             min_cuda_version: None,
             required_precision: Some("fp32".to_string()),
             optimized_for: vec![],
             graph_optimization_level: Some("all".to_string()), // Default to max optimization
             device_id: Some(0),
+            gpu_device_ids: vec![],
             strategy: Some("round-robin".to_string()),
         }
     }
@@ -67,13 +98,31 @@ impl HardwareRequirements {
             fallback_providers: vec!["cpu".to_string()],
             min_memory_mb: None,
             min_vram_mb: None,
+            gpu_memory_reservation_mb: None,
+            gpu_memory_limit_mb: None,
+            gpu_compute_share_milli: None,
+            isolation_mode: None,
             min_cuda_version: None,
             required_precision: Some("fp32".to_string()),
             optimized_for: vec![],
             graph_optimization_level: Some("all".to_string()), // Default to max optimization
             device_id: Some(0),
+            gpu_device_ids: vec![],
             strategy: Some("round-robin".to_string()),
         }
+    }
+
+    pub fn requested_gpu_memory_mb(&self) -> Option<u64> {
+        self.gpu_memory_reservation_mb
+            .or(self.gpu_memory_limit_mb)
+            .or(self.min_vram_mb)
+    }
+
+    pub fn requested_isolation_mode(&self) -> &str {
+        self.isolation_mode
+            .as_deref()
+            .unwrap_or("best_effort")
+            .trim()
     }
 }
 

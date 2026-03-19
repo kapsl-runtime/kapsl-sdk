@@ -33,6 +33,19 @@ impl LLMScheduler {
         }
     }
 
+    /// Expose scheduler config fields for engine rebuild in `with_shared_pool`.
+    pub fn config_max_num_seqs(&self) -> usize {
+        self.config.max_num_seqs
+    }
+
+    pub fn config_max_paddings(&self) -> usize {
+        self.config.max_paddings
+    }
+
+    pub fn config_max_num_batched_tokens(&self) -> usize {
+        self.config.max_num_batched_tokens
+    }
+
     pub fn add_sequence_group(&mut self, seq_group: SequenceGroup) {
         self.waiting_queue
             .push_back(Arc::new(Mutex::new(seq_group)));
@@ -235,7 +248,14 @@ impl LLMScheduler {
             }
 
             if !self.block_manager.can_allocate(total_additional_blocks) {
-                break; // Not enough memory
+                // Before stalling, attempt to reclaim blocks from lower-priority
+                // running groups. Only proceed if preemption succeeds and we can
+                // now satisfy the request.
+                if !self.try_preempt_for_blocks(total_additional_blocks)
+                    || !self.block_manager.can_allocate(total_additional_blocks)
+                {
+                    break; // Not enough memory even after preemption
+                }
             }
 
             let mut status_updates: Vec<(SequenceStatus, SequenceStatus)> =
@@ -274,6 +294,104 @@ impl LLMScheduler {
         SchedulerOutputs {
             scheduled_seq_groups,
         }
+    }
+
+    /// Attempt to free at least `needed_blocks` by swapping out running groups
+    /// in ascending priority order (lowest-priority first, then FIFO within a tier).
+    ///
+    /// Blocks are returned to the pool immediately. The evicted groups are
+    /// moved to `swapped_queue` for later re-admission. Returns `true` when the
+    /// required number of blocks was successfully freed.
+    fn try_preempt_for_blocks(&mut self, needed_blocks: usize) -> bool {
+        if needed_blocks == 0 {
+            return true;
+        }
+
+        // Build (priority, queue_index) pairs for non-finished running groups.
+        let mut candidates: Vec<(u8, usize)> = self
+            .running_queue
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, group_arc)| {
+                let group = group_arc.lock().unwrap();
+                if group.is_finished() {
+                    None
+                } else {
+                    Some((group.priority, idx))
+                }
+            })
+            .collect();
+
+        // Lowest priority first; break ties by queue position (FIFO within a tier).
+        candidates.sort_unstable_by_key(|&(priority, idx)| (priority, idx));
+
+        let mut freed = 0usize;
+        let mut to_swap: Vec<usize> = Vec::new();
+
+        for (_, idx) in &candidates {
+            if freed >= needed_blocks {
+                break;
+            }
+            let group_arc = &self.running_queue[*idx];
+            let seq_ids: Vec<u64> = group_arc
+                .lock()
+                .unwrap()
+                .sequences
+                .keys()
+                .copied()
+                .collect();
+            for seq_id in &seq_ids {
+                freed += self.block_manager.blocks_for_sequence(*seq_id);
+            }
+            to_swap.push(*idx);
+        }
+
+        if freed < needed_blocks {
+            return false;
+        }
+
+        // Remove selected entries from running_queue in reverse-index order so
+        // earlier indices stay valid during removal.
+        to_swap.sort_unstable_by(|a, b| b.cmp(a));
+        for idx in to_swap {
+            let group_arc = self.running_queue.remove(idx).unwrap();
+
+            let seq_entries: Vec<(u64, Arc<Mutex<Sequence>>)> = {
+                let group = group_arc.lock().unwrap();
+                group
+                    .sequences
+                    .iter()
+                    .map(|(id, arc)| (*id, arc.clone()))
+                    .collect()
+            };
+
+            let mut status_updates: Vec<(SequenceStatus, SequenceStatus)> = Vec::new();
+            for (seq_id, seq_arc) in &seq_entries {
+                let (old_status, new_status) = {
+                    let mut seq = seq_arc.lock().unwrap();
+                    let old = seq.status;
+                    if !seq.is_finished() {
+                        seq.status = SequenceStatus::Swapped;
+                    }
+                    (old, seq.status)
+                };
+                if old_status != new_status {
+                    status_updates.push((old_status, new_status));
+                }
+                self.block_manager.free(*seq_id);
+            }
+
+            if !status_updates.is_empty() {
+                let mut group = group_arc.lock().unwrap();
+                for (old, new) in status_updates {
+                    group.update_seq_status(old, new);
+                }
+            }
+
+            self.swapped_queue.push_back(group_arc);
+        }
+
+        true
     }
 
     fn cancel_group(group_arc: &Arc<Mutex<SequenceGroup>>) {

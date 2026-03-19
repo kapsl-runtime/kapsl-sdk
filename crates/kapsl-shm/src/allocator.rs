@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -431,6 +432,178 @@ impl ShmPoolAllocator for TieredShmAllocator {
 
     fn largest_slot_size(&self) -> usize {
         self.classes.iter().map(|c| c.slot_size).max().unwrap_or(0)
+    }
+}
+
+// ── Per-model sub-pool allocator ─────────────────────────────────────────────
+
+/// Configuration for a single model's dedicated SHM sub-pool.
+#[derive(Debug, Clone)]
+pub struct ModelSubPoolConfig {
+    pub model_id: u32,
+    /// Bytes to reserve for this model (must be ≥ at least one slot size).
+    pub pool_bytes: usize,
+    /// Slot-class budgets for the model's `TieredShmAllocator`.
+    pub class_budgets: Vec<ShmClassBudget>,
+}
+
+/// Per-model + shared-pool allocator snapshots.
+#[derive(Debug, Clone, Default)]
+pub struct PerModelAllocatorSnapshot {
+    pub per_model: HashMap<u32, ShmAllocatorSnapshot>,
+    pub shared: ShmAllocatorSnapshot,
+}
+
+impl PerModelAllocatorSnapshot {
+    /// Aggregate in-use slots and oldest lease across all sub-pools.
+    pub fn aggregate(&self) -> ShmAllocatorSnapshot {
+        let mut in_use_slots = 0usize;
+        let mut oldest_lease_ms = 0u64;
+        for snap in self.per_model.values() {
+            in_use_slots = in_use_slots.saturating_add(snap.in_use_slots);
+            oldest_lease_ms = oldest_lease_ms.max(snap.oldest_lease_ms);
+        }
+        in_use_slots = in_use_slots.saturating_add(self.shared.in_use_slots);
+        oldest_lease_ms = oldest_lease_ms.max(self.shared.oldest_lease_ms);
+        ShmAllocatorSnapshot {
+            in_use_slots,
+            oldest_lease_ms,
+        }
+    }
+}
+
+/// A set of per-model SHM sub-pools carved from a single contiguous address range.
+///
+/// Each registered model receives a dedicated `TieredShmAllocator` sized by its
+/// `pool_bytes` in `ModelSubPoolConfig`. Any bytes not consumed by model pools form a
+/// **shared overflow pool** that handles unknown model IDs and spill-over when a
+/// model-specific pool is temporarily full.
+///
+/// Layout: `[model_0 pool][model_1 pool]...[shared overflow pool]`
+pub struct PerModelShmAllocator {
+    /// model_id → (base_offset, end_offset, allocator)
+    model_pools: HashMap<u32, (usize, usize, TieredShmAllocator)>,
+    shared_pool: TieredShmAllocator,
+    shared_pool_base: usize,
+    shared_pool_end: usize,
+}
+
+impl PerModelShmAllocator {
+    /// Partition `[base_offset, base_offset + total_bytes)` into per-model sub-pools.
+    ///
+    /// `model_configs` are laid out sequentially. Remaining bytes become the shared pool.
+    pub fn new(
+        base_offset: usize,
+        total_bytes: usize,
+        model_configs: Vec<ModelSubPoolConfig>,
+        lease_ttl: Duration,
+    ) -> Self {
+        let total_end = base_offset.saturating_add(total_bytes);
+        let mut cursor = base_offset;
+        let mut model_pools = HashMap::with_capacity(model_configs.len());
+
+        for config in model_configs {
+            let available = total_end.saturating_sub(cursor);
+            let bytes = config.pool_bytes.min(available);
+            if bytes == 0 {
+                continue;
+            }
+            let end = cursor.saturating_add(bytes);
+            let alloc = TieredShmAllocator::new_with_class_budgets(
+                cursor,
+                bytes,
+                &config.class_budgets,
+                lease_ttl,
+            );
+            model_pools.insert(config.model_id, (cursor, end, alloc));
+            cursor = end;
+        }
+
+        // Remaining bytes become the shared overflow pool.
+        let shared_bytes = total_end.saturating_sub(cursor);
+        let shared_pool = TieredShmAllocator::new_with_default_classes(
+            cursor,
+            shared_bytes.max(1),
+            lease_ttl,
+        );
+        let shared_pool_end = cursor.saturating_add(shared_bytes);
+
+        Self {
+            model_pools,
+            shared_pool,
+            shared_pool_base: cursor,
+            shared_pool_end,
+        }
+    }
+
+    /// Try to allocate from the model's dedicated pool, falling back to the shared pool.
+    pub fn try_allocate(&self, model_id: u32, required_size: usize) -> Option<usize> {
+        if let Some((_, _, alloc)) = self.model_pools.get(&model_id) {
+            if let Some(offset) = alloc.try_allocate(required_size) {
+                return Some(offset);
+            }
+        }
+        self.shared_pool.try_allocate(required_size)
+    }
+
+    /// Release a slot by offset. Searches model pools by range, then the shared pool.
+    pub fn release(&self, offset: usize) -> bool {
+        for (base, end, alloc) in self.model_pools.values() {
+            if offset >= *base && offset < *end {
+                return alloc.release(offset);
+            }
+        }
+        if offset >= self.shared_pool_base && offset < self.shared_pool_end {
+            return self.shared_pool.release(offset);
+        }
+        false
+    }
+
+    /// Snapshot for a specific model pool (returns default if model has no dedicated pool).
+    pub fn model_snapshot(&self, model_id: u32) -> ShmAllocatorSnapshot {
+        self.model_pools
+            .get(&model_id)
+            .map(|(_, _, alloc)| alloc.snapshot())
+            .unwrap_or_default()
+    }
+
+    /// Full per-model + shared snapshot.
+    pub fn full_snapshot(&self) -> PerModelAllocatorSnapshot {
+        PerModelAllocatorSnapshot {
+            per_model: self
+                .model_pools
+                .iter()
+                .map(|(id, (_, _, alloc))| (*id, alloc.snapshot()))
+                .collect(),
+            shared: self.shared_pool.snapshot(),
+        }
+    }
+
+    /// Aggregate snapshot combining all sub-pools (suitable for existing metrics).
+    pub fn snapshot(&self) -> ShmAllocatorSnapshot {
+        self.full_snapshot().aggregate()
+    }
+
+    /// Human-readable layout summary for logging.
+    pub fn layout_summary(&self) -> String {
+        let mut parts: Vec<String> = self
+            .model_pools
+            .iter()
+            .map(|(id, (_, _, alloc))| format!("model{}:[{}]", id, alloc.layout_summary()))
+            .collect();
+        parts.sort_unstable();
+        parts.push(format!("shared:[{}]", self.shared_pool.layout_summary()));
+        parts.join("; ")
+    }
+
+    /// Largest available slot for a model (falls back to shared pool max if no dedicated pool).
+    pub fn largest_slot_size_for_model(&self, model_id: u32) -> usize {
+        let model_max = self
+            .model_pools
+            .get(&model_id)
+            .map(|(_, _, alloc)| alloc.largest_slot_size())
+            .unwrap_or(0);
+        model_max.max(self.shared_pool.largest_slot_size())
     }
 }
 

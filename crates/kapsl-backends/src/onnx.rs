@@ -471,7 +471,7 @@ impl OnnxBackend {
         }
 
         // Configure execution providers based on the selected backend
-        let mut builder = match self.provider {
+        let builder = match self.provider {
             ExecutionProvider::CUDA => {
                 if !ort::execution_providers::CUDAExecutionProvider::default()
                     .is_available()

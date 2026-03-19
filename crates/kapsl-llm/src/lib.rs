@@ -1,6 +1,7 @@
 pub mod block_manager;
 pub mod engine;
 pub mod gguf_backend;
+pub mod global_scheduler;
 pub mod kv_cache;
 pub mod llm_backend;
 pub mod llm_metrics;

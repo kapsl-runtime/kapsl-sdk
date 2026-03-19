@@ -69,6 +69,12 @@ pub struct SequenceGroup {
     pub arrival_time: std::time::Instant,
     pub sampling_params: SamplingParams,
     pub cancellation: Option<CancellationToken>,
+    /// Scheduling priority for preemption decisions.
+    ///
+    /// Higher values are more important: when the block pool is under pressure,
+    /// running groups with a *lower* `priority` are swapped out first.
+    /// `0` = normal (default).  `255` = highest (latency-critical).
+    pub priority: u8,
     // Channel for streaming incremental outputs
     pub response_tx: mpsc::Sender<SequenceGroupOutput>,
     cached_total_len: usize,
@@ -103,6 +109,7 @@ impl SequenceGroup {
             arrival_time: std::time::Instant::now(),
             sampling_params,
             cancellation,
+            priority: 0,
             response_tx,
             cached_total_len: initial_len,
             cached_running_count: 0,

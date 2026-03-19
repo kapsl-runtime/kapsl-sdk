@@ -1,5 +1,6 @@
 use crate::allocator::{
-    ShmAllocatorSnapshot, ShmClassBudget, ShmPoolAllocator, TieredShmAllocator,
+    ModelSubPoolConfig, PerModelShmAllocator, ShmAllocatorSnapshot, ShmClassBudget,
+    ShmPoolAllocator,
 };
 use crate::memory::{ShmManager, TensorHeader};
 use crate::ring_buffer::LockFreeRingBuffer;
@@ -45,6 +46,8 @@ const MODEL_AWARE_DYNAMIC_BATCH_FALLBACK: usize = 1;
 const MODEL_AWARE_DYNAMIC_DIM_FALLBACK: usize = 256;
 const MODEL_AWARE_MAX_ESTIMATED_TENSOR_BYTES: usize = 128 * 1024 * 1024;
 const MODEL_AWARE_MAX_MODEL_WEIGHT: u32 = 1_000;
+/// Percentage of the tensor pool reserved as a shared overflow for all models.
+const MODEL_POOL_SHARED_RESERVE_PCT: usize = 10;
 
 /// Request entry in the shared memory queue
 #[repr(C)]
@@ -202,32 +205,30 @@ fn model_peak_weight(model_info: &EngineModelInfo) -> u32 {
         .clamp(1, MODEL_AWARE_MAX_MODEL_WEIGHT)
 }
 
-fn derive_model_aware_class_budgets(
+/// Derive model-aware class budgets for a single model given its allocated pool size.
+fn derive_single_model_class_budgets(
+    model_id: u32,
     schedulers: &HashMap<u32, Arc<dyn ReplicaScheduler + Send + Sync>>,
     pool_bytes: usize,
 ) -> Vec<ShmClassBudget> {
+    let Some(info) = schedulers.get(&model_id).and_then(|s| s.model_info()) else {
+        return DEFAULT_TENSOR_SLOT_CLASS_BUDGETS.to_vec();
+    };
+
     let mut buckets: HashMap<usize, u32> = HashMap::new();
-    // Keep a tiny class for errors/control payloads.
     let control_slot = bucket_slot_size(ERROR_LEN_PREFIX_BYTES + 4096, pool_bytes);
     buckets.insert(control_slot, 1);
+    let model_weight = model_peak_weight(&info);
+    add_model_info_buckets(&info, pool_bytes, model_weight, &mut buckets);
 
-    for scheduler in schedulers.values() {
-        if let Some(model_info) = scheduler.model_info() {
-            let model_weight = model_peak_weight(&model_info);
-            add_model_info_buckets(&model_info, pool_bytes, model_weight, &mut buckets);
-        }
-    }
-
-    // Only control bucket available means no usable model metadata.
     if buckets.len() <= 1 {
-        return Vec::new();
+        return DEFAULT_TENSOR_SLOT_CLASS_BUDGETS.to_vec();
     }
 
     let mut weighted: Vec<(usize, u32)> = buckets.into_iter().collect();
     weighted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     weighted.truncate(MODEL_AWARE_MAX_CLASSES);
-    weighted.sort_unstable_by_key(|(slot_size, _)| *slot_size);
-
+    weighted.sort_unstable_by_key(|(s, _)| *s);
     weighted
         .into_iter()
         .map(|(slot_size, weight)| ShmClassBudget {
@@ -235,6 +236,68 @@ fn derive_model_aware_class_budgets(
             weight: weight.max(1),
         })
         .collect()
+}
+
+/// Partition `[base_offset, base_offset + pool_bytes)` into per-model sub-pools.
+///
+/// Each model's share is proportional to its `peak_concurrency`. Models are ordered
+/// by `model_id` for a deterministic layout. A fixed percentage is reserved at the
+/// end as a shared overflow pool.
+fn build_per_model_pool(
+    schedulers: &HashMap<u32, Arc<dyn ReplicaScheduler + Send + Sync>>,
+    base_offset: usize,
+    pool_bytes: usize,
+    lease_ttl: std::time::Duration,
+) -> PerModelShmAllocator {
+    let mut model_weights: Vec<(u32, u32)> = schedulers
+        .keys()
+        .map(|&id| {
+            let weight = schedulers[&id]
+                .model_info()
+                .map(|info| model_peak_weight(&info))
+                .unwrap_or(1);
+            (id, weight)
+        })
+        .collect();
+    model_weights.sort_unstable_by_key(|(id, _)| *id);
+
+    let total_weight: u64 = model_weights
+        .iter()
+        .map(|(_, w)| *w as u64)
+        .sum::<u64>()
+        .max(1);
+
+    let shared_bytes =
+        (pool_bytes * MODEL_POOL_SHARED_RESERVE_PCT / 100).max(MODEL_AWARE_MIN_SLOT_BYTES);
+    let model_pool_total = pool_bytes.saturating_sub(shared_bytes);
+
+    let n = model_weights.len();
+    let mut model_configs: Vec<ModelSubPoolConfig> = Vec::with_capacity(n);
+    let mut allocated = 0usize;
+
+    for (idx, (model_id, weight)) in model_weights.iter().enumerate() {
+        let is_last = idx == n - 1;
+        let bytes = if is_last {
+            model_pool_total.saturating_sub(allocated)
+        } else {
+            (model_pool_total as u64 * *weight as u64 / total_weight) as usize
+        };
+
+        if bytes < MODEL_AWARE_MIN_SLOT_BYTES {
+            // Pool slice too small to be useful; requests fall back to the shared pool.
+            continue;
+        }
+
+        let class_budgets = derive_single_model_class_budgets(*model_id, schedulers, bytes);
+        model_configs.push(ModelSubPoolConfig {
+            model_id: *model_id,
+            pool_bytes: bytes,
+            class_budgets,
+        });
+        allocated = allocated.saturating_add(bytes);
+    }
+
+    PerModelShmAllocator::new(base_offset, pool_bytes, model_configs, lease_ttl)
 }
 
 /// Shared memory server implementing TransportServer
@@ -288,19 +351,12 @@ impl ShmServer {
             )));
         }
 
-        let model_budgets = derive_model_aware_class_budgets(&self.schedulers, tensor_pool_bytes);
-        let (class_budgets, budget_source): (Vec<ShmClassBudget>, &'static str) =
-            if model_budgets.is_empty() {
-                (DEFAULT_TENSOR_SLOT_CLASS_BUDGETS.to_vec(), "default")
-            } else {
-                (model_budgets, "model-metadata")
-            };
-
-        let tensor_allocator = Arc::new(TieredShmAllocator::new_with_class_budgets(
+        let lease_ttl = std::time::Duration::from_secs(DEFAULT_TENSOR_SLOT_LEASE_TTL_SECS);
+        let tensor_allocator = Arc::new(build_per_model_pool(
+            &self.schedulers,
             shm.tensor_pool_offset(),
             tensor_pool_bytes,
-            &class_budgets,
-            std::time::Duration::from_secs(DEFAULT_TENSOR_SLOT_LEASE_TTL_SECS),
+            lease_ttl,
         ));
         let schedulers = Arc::new(self.schedulers.clone());
         let shm_pool_metrics = self.metrics_registry.as_ref().and_then(|registry| {
@@ -316,9 +372,8 @@ impl ShmServer {
             metrics.update_from_snapshot(tensor_allocator.snapshot());
         }
         log::info!(
-            "SHM tensor pool configured: base={} source={} classes=[{}] ttl_s={}",
+            "SHM tensor pool configured (per-model sub-pools): base={} layout=[{}] ttl_s={}",
             shm.tensor_pool_offset(),
-            budget_source,
             tensor_allocator.layout_summary(),
             DEFAULT_TENSOR_SLOT_LEASE_TTL_SECS
         );
@@ -354,6 +409,7 @@ impl ShmServer {
                 if last_metrics_refresh.elapsed()
                     >= std::time::Duration::from_secs(SHM_METRICS_REFRESH_SECS)
                 {
+                    // Aggregate snapshot across all per-model sub-pools.
                     metrics.update_from_snapshot(tensor_allocator.snapshot());
                     last_metrics_refresh = Instant::now();
                 }
@@ -395,7 +451,8 @@ impl ShmServer {
                     };
 
                     // Process inference
-                    if let Some(scheduler) = schedulers.get(&request.metadata.model_id) {
+                    let model_id = request.metadata.model_id;
+                    if let Some(scheduler) = schedulers.get(&model_id) {
                         let priority = if request.metadata.priority == 0 {
                             Priority::LatencyCritical
                         } else {
@@ -418,11 +475,14 @@ impl ShmServer {
                             Ok(output) => {
                                 let result_size =
                                     std::mem::size_of::<TensorHeader>() + output.data.len();
-                                let response = if let Some(result_offset) = allocate_pool_slot(
-                                    tensor_allocator.as_ref(),
-                                    result_size,
-                                    shm_pool_metrics.as_deref(),
-                                ) {
+                                let response = if let Some(result_offset) =
+                                    allocate_pool_slot_for_model(
+                                        tensor_allocator.as_ref(),
+                                        model_id,
+                                        result_size,
+                                        shm_pool_metrics.as_deref(),
+                                    )
+                                {
                                     unsafe {
                                         write_tensor_to_shm(shm.as_ptr(), result_offset, &output);
                                     }
@@ -437,15 +497,17 @@ impl ShmServer {
                                     }
                                 } else {
                                     let msg = format!(
-                                        "SHM tensor pool exhausted (required={} bytes, largest_slot={} bytes, layout={})",
+                                        "SHM tensor pool exhausted for model {} (required={} bytes, largest_slot={} bytes, layout={})",
+                                        model_id,
                                         result_size,
-                                        tensor_allocator.largest_slot_size(),
+                                        tensor_allocator.largest_slot_size_for_model(model_id),
                                         tensor_allocator.layout_summary()
                                     );
                                     log::warn!("{}", msg);
-                                    let error_offset = write_error_to_shm(
+                                    let error_offset = write_error_to_shm_for_model(
                                         shm.as_ptr(),
                                         tensor_allocator.as_ref(),
+                                        model_id,
                                         shm_pool_metrics.as_deref(),
                                         &msg,
                                     )
@@ -466,9 +528,10 @@ impl ShmServer {
                                 }
                             }
                             Err(e) => {
-                                let error_offset = write_error_to_shm(
+                                let error_offset = write_error_to_shm_for_model(
                                     shm.as_ptr(),
                                     tensor_allocator.as_ref(),
+                                    model_id,
                                     shm_pool_metrics.as_deref(),
                                     &e.to_string(),
                                 )
@@ -586,6 +649,7 @@ unsafe fn push_response_and_notify(shm: &ShmManager, response: ShmResponse) {
     }
 }
 
+#[allow(dead_code)]
 fn allocate_pool_slot(
     allocator: &(impl ShmPoolAllocator + ?Sized),
     required_size: usize,
@@ -603,8 +667,28 @@ fn allocate_pool_slot(
     offset
 }
 
+/// Allocate from the model's dedicated sub-pool (with shared pool fallback).
+fn allocate_pool_slot_for_model(
+    allocator: &PerModelShmAllocator,
+    model_id: u32,
+    required_size: usize,
+    metrics: Option<&ShmPoolMetrics>,
+) -> Option<usize> {
+    let offset = allocator.try_allocate(model_id, required_size);
+    if offset.is_none() {
+        if let Some(m) = metrics {
+            m.on_exhausted();
+        }
+    }
+    if let Some(m) = metrics {
+        m.update_from_snapshot(allocator.snapshot());
+    }
+    offset
+}
+
 /// Write error message to shared memory.
 /// Layout: `[u64 error_len][error bytes]`.
+#[allow(dead_code)]
 fn write_error_to_shm(
     base: *mut u8,
     allocator: &(impl ShmPoolAllocator + ?Sized),
@@ -614,6 +698,26 @@ fn write_error_to_shm(
     let bytes = error.as_bytes();
     let total_size = ERROR_LEN_PREFIX_BYTES + bytes.len();
     let offset = allocate_pool_slot(allocator, total_size, metrics)?;
+    unsafe {
+        let len_ptr = base.add(offset) as *mut u64;
+        std::ptr::write(len_ptr, bytes.len() as u64);
+        let ptr = base.add(offset + ERROR_LEN_PREFIX_BYTES);
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
+    }
+    Some(offset)
+}
+
+/// Write error message using the per-model sub-pool allocator.
+fn write_error_to_shm_for_model(
+    base: *mut u8,
+    allocator: &PerModelShmAllocator,
+    model_id: u32,
+    metrics: Option<&ShmPoolMetrics>,
+    error: &str,
+) -> Option<usize> {
+    let bytes = error.as_bytes();
+    let total_size = ERROR_LEN_PREFIX_BYTES + bytes.len();
+    let offset = allocate_pool_slot_for_model(allocator, model_id, total_size, metrics)?;
     unsafe {
         let len_ptr = base.add(offset) as *mut u64;
         std::ptr::write(len_ptr, bytes.len() as u64);

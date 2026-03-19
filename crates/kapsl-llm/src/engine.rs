@@ -6,7 +6,7 @@ This file is adapted from the original implementation and preserves the engine's
 behavior while making the KV geometry configurable at model-load time.
 */
 
-use crate::block_manager::BlockManager;
+use crate::block_manager::{BlockManager, SharedBlockAllocator};
 use crate::kv_cache::{KvCache, KvCacheConfig, KvCacheMode, KvEvictionPolicy};
 use crate::llm_metrics::LLMMetrics;
 use crate::model_paths::{find_model_asset, find_model_root};
@@ -860,6 +860,10 @@ pub struct LLMEngine {
     max_session_tokens: usize,
     kv_layout: KvLayout,
     kv_admission_soft_limit_bytes: Option<usize>,
+    /// Per-replica cap on KV cache total_blocks set by the auto-scaler.
+    /// Overrides the value from metadata/env when set, so that memory is divided
+    /// fairly across replicas sharing the same device.
+    kv_blocks_cap: Option<usize>,
     kv_admission_hard_limit_bytes: Option<usize>,
     // Detected vocabulary size (optional). Populated at load() when available.
     vocab_size: Option<usize>,
@@ -1003,6 +1007,7 @@ impl LLMEngine {
             kv_layout: KvLayout::SeqFirst,
             kv_admission_soft_limit_bytes: None,
             kv_admission_hard_limit_bytes: None,
+            kv_blocks_cap: None,
             vocab_size: None,
             bos_token_id: None,
             use_kv_cache: true,
@@ -1013,6 +1018,34 @@ impl LLMEngine {
             prefill_items_pool: Vec::new(),
             decode_items_pool: Vec::new(),
         }
+    }
+
+    /// Replace the private block allocator with a shared one so this engine
+    /// draws from the same GPU KV block pool as other engines.
+    ///
+    /// Must be called **before** `load()`.  Engines sharing the same
+    /// `SharedBlockAllocator` form a unified KV block pool: blocks freed by
+    /// any engine become immediately available to all others.
+    pub fn with_shared_pool(mut self, allocator: SharedBlockAllocator) -> Self {
+        let block_size = self._block_size;
+        let block_manager = BlockManager::new_shared(allocator, block_size);
+        let scheduler = LLMScheduler::new(
+            SchedulerConfig {
+                max_num_batched_tokens: self.scheduler.config_max_num_batched_tokens(),
+                max_num_seqs: self.scheduler.config_max_num_seqs(),
+                max_paddings: self.scheduler.config_max_paddings(),
+            },
+            block_manager,
+        );
+        self.scheduler = scheduler;
+        self
+    }
+
+    /// Cap the KV cache `total_blocks` to `cap` during the next `load()` call.
+    /// Called by the runtime when creating additional replicas so that each
+    /// replica receives a proportional share of the device's block budget.
+    pub fn set_kv_blocks_cap(&mut self, cap: usize) {
+        self.kv_blocks_cap = Some(cap);
     }
 
     /// Load model and capture its input names and shapes. Detect KV geometry
@@ -1320,6 +1353,19 @@ impl LLMEngine {
                 if parsed > 0 {
                     kv_cache_config.total_blocks = parsed;
                 }
+            }
+        }
+        // Apply per-replica block cap set by the auto-scaler. The env var above
+        // acts as an absolute override; this cap is a soft upper bound that the
+        // auto-scaler uses to distribute the block budget across replicas.
+        if let Some(cap) = self.kv_blocks_cap {
+            if cap > 0 && kv_cache_config.total_blocks > cap {
+                log::info!(
+                    "KV cache total_blocks reduced from {} to {} (per-replica cap)",
+                    kv_cache_config.total_blocks,
+                    cap,
+                );
+                kv_cache_config.total_blocks = cap;
             }
         }
         if let Some(eviction) =
@@ -1731,31 +1777,31 @@ impl LLMEngine {
             input_shapes_map = shapes;
             input_types_map = types;
             output_names_set = outputs;
-            session = Some(built_session);
 
             if let Some(decode_name) = decode_model_file.as_deref() {
-                if let Some(decode_path) = resolve_stage_path(&model_root, model_path, decode_name)
+                if let Some(decode_path) =
+                    resolve_stage_path(&model_root, model_path, decode_name)
                 {
                     if decode_path != model_path {
                         ensure_external_data_near_model(&decode_path, &model_root);
                         match build_session(&decode_path, preferred_device_id) {
                             Ok(built_decode_session) => {
-                                let (names, shapes, types, _) =
+                                let (dn, dsh, dt, _) =
                                     capture_session_io(&built_decode_session);
-                                decode_input_names_set = names;
-                                decode_input_shapes_map = shapes;
-                                decode_input_types_map = types;
-                                decode_session = Some(built_decode_session);
+                                decode_input_names_set = dn;
+                                decode_input_shapes_map = dsh;
+                                decode_input_types_map = dt;
                                 log::info!(
                                     "Loaded dedicated decode session from {}",
                                     decode_path.display()
                                 );
+                                decode_session = Some(built_decode_session);
                             }
-                            Err(error) => {
+                            Err(e) => {
                                 log::warn!(
                                     "Failed to load dedicated decode model {}: {}. Falling back to primary session.",
                                     decode_path.display(),
-                                    error
+                                    e
                                 );
                             }
                         }
@@ -1767,6 +1813,8 @@ impl LLMEngine {
                     );
                 }
             }
+
+            session = Some(built_session);
         }
 
         log::info!(
@@ -2092,6 +2140,7 @@ impl LLMEngine {
         metrics.kv_cache_evicted_blocks = stats.evicted_blocks;
         metrics.kv_cache_evicted_sequences = stats.evicted_sequences;
         metrics.kv_cache_packed_layers = stats.packed_layers;
+        metrics.kv_cache_cpu_offloaded_blocks = stats.cpu_offloaded_blocks;
     }
 
     fn kv_bytes_per_token(&self) -> Option<usize> {
@@ -2835,11 +2884,12 @@ impl LLMEngine {
             }
         }
 
-        let outputs = {
-            let sess = self.session.as_mut().ok_or(EngineError::ModelNotLoaded)?;
-            sess.run(inputs)
-                .map_err(|e| EngineError::backend(e.to_string()))?
-        };
+        let outputs = self
+            .session
+            .as_mut()
+            .ok_or(EngineError::ModelNotLoaded)?
+            .run(inputs)
+            .map_err(|e| EngineError::backend(e.to_string()))?;
 
         // === Store present KV for each sequence ===
         // Expected present shape: [batch, num_heads, prompt_len, head_dim] (SeqFirst)
@@ -3517,12 +3567,17 @@ impl LLMEngine {
             .map(|started| started.elapsed().as_secs_f64() * 1000.0)
             .unwrap_or(0.0);
         let ort_started = profile_decode.then(Instant::now);
-        let outputs = if let Some(sess) = self.decode_session.as_mut() {
-            sess.run(inputs)
+        let outputs = if self.decode_session.is_some() {
+            self.decode_session
+                .as_mut()
+                .unwrap()
+                .run(inputs)
                 .map_err(|e| EngineError::backend(e.to_string()))?
         } else {
-            let sess = self.session.as_mut().ok_or(EngineError::ModelNotLoaded)?;
-            sess.run(inputs)
+            self.session
+                .as_mut()
+                .ok_or(EngineError::ModelNotLoaded)?
+                .run(inputs)
                 .map_err(|e| EngineError::backend(e.to_string()))?
         };
         let ort_run_ms = ort_started
@@ -4403,17 +4458,18 @@ impl LLMEngine {
                     }
                 }
 
-                // Run inference (acquire mutable session only for run)
+                // Run inference.
                 let outputs = if use_dedicated_decode_session {
-                    let sess = self
-                        .decode_session
+                    self.decode_session
                         .as_mut()
-                        .ok_or(EngineError::ModelNotLoaded)?;
-                    sess.run(inputs)
+                        .ok_or(EngineError::ModelNotLoaded)?
+                        .run(inputs)
                         .map_err(|e| EngineError::backend(e.to_string()))?
                 } else {
-                    let sess = self.session.as_mut().ok_or(EngineError::ModelNotLoaded)?;
-                    sess.run(inputs)
+                    self.session
+                        .as_mut()
+                        .ok_or(EngineError::ModelNotLoaded)?
+                        .run(inputs)
                         .map_err(|e| EngineError::backend(e.to_string()))?
                 };
 

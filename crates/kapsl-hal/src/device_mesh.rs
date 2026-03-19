@@ -513,6 +513,7 @@ mod tests {
                 memory_mb: 16000,
                 compute_units: 80,
                 pci_bus_id: None,
+                partition_id: None,
                 driver_version: None,
                 compute_capability: None,
                 utilization_gpu_pct: None,
