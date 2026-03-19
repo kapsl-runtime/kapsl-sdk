@@ -39,25 +39,6 @@ use std::time::Instant;
 use tokenizers::Tokenizer;
 use tokio::sync::mpsc;
 
-/// Shared model graph: holds `Arc<Session>` references so multiple `LLMEngine`
-/// instances can reference the same ONNX graph without re-loading model weights.
-struct SharedGraphInner {
-    session: Arc<Session>,
-    decode_session: Option<Arc<Session>>,
-}
-
-/// Static weak cache: model file path → shared graph.
-/// Uses `Weak` so memory is freed when no engines reference the graph.
-static SESSION_CACHE: OnceLock<
-    Mutex<std::collections::HashMap<std::path::PathBuf, std::sync::Weak<SharedGraphInner>>>,
-> = OnceLock::new();
-
-fn session_cache() -> &'static Mutex<
-    std::collections::HashMap<std::path::PathBuf, std::sync::Weak<SharedGraphInner>>,
-> {
-    SESSION_CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
-}
-
 // === DEFAULTS (used until model loads and detection happens) ===
 // These are conservative defaults; they will be overridden at load() time when
 // the model declares its input shapes.
@@ -837,10 +818,8 @@ pub struct LLMEngine {
     _kernel_backend: Box<dyn KernelBackend>,
     request_rx: mpsc::Receiver<SequenceGroup>,
     sessions: HashMap<String, Arc<Mutex<Sequence>>>,
-    session: Option<Arc<Session>>,
-    decode_session: Option<Arc<Session>>,
-    /// Keeps the shared graph allocation alive for the lifetime of this engine.
-    _graph_anchor: Option<Arc<SharedGraphInner>>,
+    session: Option<Session>,
+    decode_session: Option<Session>,
     tokenizer: Option<Tokenizer>,
     tokenizer_path: Option<PathBuf>,
     model_path: Option<PathBuf>,
@@ -1001,7 +980,6 @@ impl LLMEngine {
             sessions: HashMap::new(),
             session: None,
             decode_session: None,
-            _graph_anchor: None,
             tokenizer: None,
             tokenizer_path: None,
             model_path: None,
@@ -1721,8 +1699,8 @@ impl LLMEngine {
         let mut decode_input_shapes_map: HashMap<String, Vec<i64>> = HashMap::new();
         let mut decode_input_types_map: HashMap<String, TensorElementType> = HashMap::new();
         let mut pipeline_stages: Option<Vec<PipelineStage>> = None;
-        let mut session: Option<Arc<Session>> = None;
-        let mut decode_session: Option<Arc<Session>> = None;
+        let mut session: Option<Session> = None;
+        let mut decode_session: Option<Session> = None;
 
         if !pipeline_stage_files.is_empty() {
             if decode_model_file.is_some() {
@@ -1793,97 +1771,50 @@ impl LLMEngine {
 
             pipeline_stages = Some(stages);
         } else {
-            // Check whether a sibling replica already built this model's session graph.
-            let model_path_key = model_path.to_path_buf();
-            let cached = session_cache()
-                .lock()
-                .unwrap()
-                .get(&model_path_key)
-                .and_then(|w| w.upgrade());
+            let built_session = build_session(model_path, preferred_device_id)?;
+            let (names, shapes, types, outputs) = capture_session_io(&built_session);
+            input_names_set = names;
+            input_shapes_map = shapes;
+            input_types_map = types;
+            output_names_set = outputs;
 
-            let graph = if let Some(shared) = cached {
-                log::info!(
-                    "Reusing shared ONNX session for {} (replica sharing graph)",
-                    model_path.display()
-                );
-                // Repopulate IO metadata from the shared session (cheap, no GPU work).
-                let (names, shapes, types, outputs) = capture_session_io(&shared.session);
-                input_names_set = names;
-                input_shapes_map = shapes;
-                input_types_map = types;
-                output_names_set = outputs;
-                if let Some(ref ds) = shared.decode_session {
-                    let (dn, dsh, dt, _) = capture_session_io(ds);
-                    decode_input_names_set = dn;
-                    decode_input_shapes_map = dsh;
-                    decode_input_types_map = dt;
-                }
-                shared
-            } else {
-                let built_session = build_session(model_path, preferred_device_id)?;
-                let (names, shapes, types, outputs) = capture_session_io(&built_session);
-                input_names_set = names;
-                input_shapes_map = shapes;
-                input_types_map = types;
-                output_names_set = outputs;
-
-                let decode_arc = if let Some(decode_name) = decode_model_file.as_deref() {
-                    if let Some(decode_path) =
-                        resolve_stage_path(&model_root, model_path, decode_name)
-                    {
-                        if decode_path != model_path {
-                            ensure_external_data_near_model(&decode_path, &model_root);
-                            match build_session(&decode_path, preferred_device_id) {
-                                Ok(built_decode_session) => {
-                                    let (dn, dsh, dt, _) =
-                                        capture_session_io(&built_decode_session);
-                                    decode_input_names_set = dn;
-                                    decode_input_shapes_map = dsh;
-                                    decode_input_types_map = dt;
-                                    log::info!(
-                                        "Loaded dedicated decode session from {}",
-                                        decode_path.display()
-                                    );
-                                    Some(Arc::new(built_decode_session))
-                                }
-                                Err(e) => {
-                                    log::warn!(
-                                        "Failed to load dedicated decode model {}: {}. Falling back to primary session.",
-                                        decode_path.display(),
-                                        e
-                                    );
-                                    None
-                                }
+            if let Some(decode_name) = decode_model_file.as_deref() {
+                if let Some(decode_path) =
+                    resolve_stage_path(&model_root, model_path, decode_name)
+                {
+                    if decode_path != model_path {
+                        ensure_external_data_near_model(&decode_path, &model_root);
+                        match build_session(&decode_path, preferred_device_id) {
+                            Ok(built_decode_session) => {
+                                let (dn, dsh, dt, _) =
+                                    capture_session_io(&built_decode_session);
+                                decode_input_names_set = dn;
+                                decode_input_shapes_map = dsh;
+                                decode_input_types_map = dt;
+                                log::info!(
+                                    "Loaded dedicated decode session from {}",
+                                    decode_path.display()
+                                );
+                                decode_session = Some(built_decode_session);
                             }
-                        } else {
-                            None
+                            Err(e) => {
+                                log::warn!(
+                                    "Failed to load dedicated decode model {}: {}. Falling back to primary session.",
+                                    decode_path.display(),
+                                    e
+                                );
+                            }
                         }
-                    } else {
-                        log::warn!(
-                            "Dedicated decode model '{}' was configured but could not be resolved; falling back to primary session.",
-                            decode_name
-                        );
-                        None
                     }
                 } else {
-                    None
-                };
+                    log::warn!(
+                        "Dedicated decode model '{}' was configured but could not be resolved; falling back to primary session.",
+                        decode_name
+                    );
+                }
+            }
 
-                let g = Arc::new(SharedGraphInner {
-                    session: Arc::new(built_session),
-                    decode_session: decode_arc,
-                });
-                // Register in cache so future replicas can reuse this graph.
-                session_cache()
-                    .lock()
-                    .unwrap()
-                    .insert(model_path_key, Arc::downgrade(&g));
-                g
-            };
-
-            session = Some(graph.session.clone());
-            decode_session = graph.decode_session.clone();
-            self._graph_anchor = Some(graph);
+            session = Some(built_session);
         }
 
         log::info!(
@@ -2953,10 +2884,12 @@ impl LLMEngine {
             }
         }
 
-        let outputs = {
-            let sess_arc = self.session.as_ref().ok_or(EngineError::ModelNotLoaded)?;
-            sess_arc.run(inputs).map_err(|e| EngineError::backend(e.to_string()))?
-        };
+        let outputs = self
+            .session
+            .as_mut()
+            .ok_or(EngineError::ModelNotLoaded)?
+            .run(inputs)
+            .map_err(|e| EngineError::backend(e.to_string()))?;
 
         // === Store present KV for each sequence ===
         // Expected present shape: [batch, num_heads, prompt_len, head_dim] (SeqFirst)
@@ -3634,11 +3567,18 @@ impl LLMEngine {
             .map(|started| started.elapsed().as_secs_f64() * 1000.0)
             .unwrap_or(0.0);
         let ort_started = profile_decode.then(Instant::now);
-        let outputs = if let Some(sess_arc) = self.decode_session.as_ref() {
-            sess_arc.run(inputs).map_err(|e| EngineError::backend(e.to_string()))?
+        let outputs = if self.decode_session.is_some() {
+            self.decode_session
+                .as_mut()
+                .unwrap()
+                .run(inputs)
+                .map_err(|e| EngineError::backend(e.to_string()))?
         } else {
-            let sess_arc = self.session.as_ref().ok_or(EngineError::ModelNotLoaded)?;
-            sess_arc.run(inputs).map_err(|e| EngineError::backend(e.to_string()))?
+            self.session
+                .as_mut()
+                .ok_or(EngineError::ModelNotLoaded)?
+                .run(inputs)
+                .map_err(|e| EngineError::backend(e.to_string()))?
         };
         let ort_run_ms = ort_started
             .map(|started| started.elapsed().as_secs_f64() * 1000.0)
@@ -4518,16 +4458,19 @@ impl LLMEngine {
                     }
                 }
 
-                // Run inference — Arc<Session> derefs to Session; ort 2.0 Session::run is &self.
+                // Run inference.
                 let outputs = if use_dedicated_decode_session {
-                    let sess_arc = self
-                        .decode_session
-                        .as_ref()
-                        .ok_or(EngineError::ModelNotLoaded)?;
-                    sess_arc.run(inputs).map_err(|e| EngineError::backend(e.to_string()))?
+                    self.decode_session
+                        .as_mut()
+                        .ok_or(EngineError::ModelNotLoaded)?
+                        .run(inputs)
+                        .map_err(|e| EngineError::backend(e.to_string()))?
                 } else {
-                    let sess_arc = self.session.as_ref().ok_or(EngineError::ModelNotLoaded)?;
-                    sess_arc.run(inputs).map_err(|e| EngineError::backend(e.to_string()))?
+                    self.session
+                        .as_mut()
+                        .ok_or(EngineError::ModelNotLoaded)?
+                        .run(inputs)
+                        .map_err(|e| EngineError::backend(e.to_string()))?
                 };
 
                 // === Write delta KV into production cache ===
