@@ -200,7 +200,7 @@ impl GpuPreference {
             return Some(Self::PciBusId(trimmed.to_string()));
         }
 
-        Some(Self::NameContains(trimmed.to_string()))
+        Some(Self::NameContains(trimmed.to_ascii_lowercase()))
     }
 
     /// Returns `true` if this preference matches the given device.
