@@ -160,15 +160,16 @@ impl KvTensor {
 
     #[inline(always)]
     pub fn write_head(&mut self, head: usize, pos: usize, values: &[f16]) {
+        self.grow_to(pos + 1);
         let base = self.index(head, pos, 0);
         self.data[base..base + self.head_dim].copy_from_slice(values);
     }
 
     #[inline(always)]
     pub fn write_head_range(&mut self, head: usize, pos_start: usize, values: &[f16]) {
-        debug_assert!(pos_start < self.allocated_seq_len);
         debug_assert!(values.len().is_multiple_of(self.head_dim));
         let num_positions = values.len() / self.head_dim;
+        self.grow_to(pos_start + num_positions);
         debug_assert!(pos_start + num_positions <= self.allocated_seq_len);
         let base = self.index(head, pos_start, 0);
         let end = base + values.len();
