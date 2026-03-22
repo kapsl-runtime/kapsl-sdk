@@ -220,6 +220,50 @@ impl Scheduler {
         }
     }
 
+    /// Non-blocking infer: returns `Err(EngineError::overloaded)` immediately if
+    /// the target queue (GPU) is full or the CPU pool is saturated, instead of
+    /// waiting for capacity. Intended for background / cron callers that should
+    /// skip a firing rather than blocking the async executor.
+    pub async fn try_infer(
+        &self,
+        input: InferenceRequest,
+        priority: Priority,
+        force_cpu: bool,
+    ) -> Result<BinaryTensorPacket, EngineError> {
+        if force_cpu {
+            // Reject immediately when every rayon thread is already busy.
+            let active = self
+                .cpu_active_count
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if active >= self.cpu_pool.current_num_threads() {
+                return Err(EngineError::overloaded(
+                    "CPU pool saturated".to_string(),
+                ));
+            }
+            // Pool has capacity — fall through to the normal blocking path.
+            return self.infer(input, priority, true).await;
+        }
+
+        // GPU path: attempt a non-blocking push.
+        let (response_tx, response_rx) = oneshot::channel();
+        let worker_idx = self.get_worker_index(&input.session_id);
+        let request = Request { input, response_tx };
+
+        let queue = match priority {
+            Priority::LatencyCritical => &self.gpu_high_priority_queues[worker_idx],
+            Priority::Throughput => &self.gpu_low_priority_queues[worker_idx],
+        };
+
+        queue
+            .try_push_drop_newest(request)
+            .map_err(|_| EngineError::overloaded("GPU queue full".to_string()))?;
+
+        response_rx.await.map_err(|_| EngineError::InferenceError {
+            reason: "GPU execution failed".to_string(),
+            source: None,
+        })?
+    }
+
     pub fn get_queue_depth(&self) -> (usize, usize) {
         let cpu_depth = self
             .cpu_active_count

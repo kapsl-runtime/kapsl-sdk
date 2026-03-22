@@ -1,3 +1,4 @@
+pub mod cron_scheduler;
 pub mod gpu_executor;
 pub mod mesh_routing;
 pub mod priority;
@@ -7,6 +8,7 @@ pub mod request_metadata;
 pub mod scheduler;
 
 // Re-export main types
+pub use cron_scheduler::{CronCallback, CronError, CronJob, CronJobInfo, CronSchedule, CronScheduler};
 pub use priority::Priority;
 pub use replica_pool::{PoolStrategy, ReplicaPool, ReplicaScheduler, ReplicaStats};
 pub use request_metadata::{determine_priority, RequestMetadata};
