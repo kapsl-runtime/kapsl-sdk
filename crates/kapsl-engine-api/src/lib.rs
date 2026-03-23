@@ -102,6 +102,10 @@ impl EngineError {
         }
     }
 
+    pub fn is_overloaded(&self) -> bool {
+        matches!(self, EngineError::Overloaded { .. })
+    }
+
     pub fn timeout(message: impl Into<String>) -> Self {
         EngineError::TimeoutError {
             message: message.into(),
