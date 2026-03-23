@@ -41,6 +41,7 @@ mod tests {
             model_file: model_file.to_string(),
             metadata: None,
             hardware_requirements: HardwareRequirements::default(),
+            cron_jobs: Vec::new(),
         }
     }
 
@@ -175,6 +176,7 @@ mod tests {
                 model_file: "model.onnx".to_string(),
                 metadata: None,
                 hardware_requirements: HardwareRequirements::default(),
+                cron_jobs: Vec::new(),
             };
             let manifest_bytes = serde_json::to_vec(&manifest).expect("serialize manifest");
             for (path, data) in vec![
