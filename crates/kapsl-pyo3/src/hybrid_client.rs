@@ -184,20 +184,25 @@ impl KapslHybridClient {
     }
 }
 
-struct RequestSlotLease<'a> {
-    allocator: &'a TieredShmAllocator,
+struct RequestSlotLease {
+    allocator: *const TieredShmAllocator,
     offset: usize,
 }
 
-impl<'a> RequestSlotLease<'a> {
-    fn new(allocator: &'a TieredShmAllocator, offset: usize) -> Self {
-        Self { allocator, offset }
+// Safety: RequestSlotLease is always created and dropped within a single
+// `infer` call on `&mut self`, so the pointer is never accessed concurrently.
+unsafe impl Send for RequestSlotLease {}
+
+impl RequestSlotLease {
+    fn new(allocator: &TieredShmAllocator, offset: usize) -> Self {
+        Self { allocator: allocator as *const _, offset }
     }
 }
 
-impl Drop for RequestSlotLease<'_> {
+impl Drop for RequestSlotLease {
     fn drop(&mut self) {
-        let _ = self.allocator.release(self.offset);
+        // Safety: allocator outlives the lease (both live within the same `infer` call).
+        let _ = unsafe { &*self.allocator }.release(self.offset);
     }
 }
 

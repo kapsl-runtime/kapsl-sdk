@@ -2,14 +2,69 @@ use flate2::read::GzDecoder;
 use fs2::available_space;
 use std::collections::HashSet;
 use std::fs::{self, File};
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use tar::Archive;
 use tempfile::TempDir;
 use thiserror::Error;
 
 use crate::requirements::HardwareRequirements;
+use kapsl_engine_api::{BinaryTensorPacket, NamedTensor};
 use serde::{Deserialize, Serialize};
+
+/// Schedule for a cron job: a fixed interval in seconds or a cron expression.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CronScheduleDef {
+    /// Cron expression in `<sec> <min> <hour> <dom> <mon> <dow>` format.
+    Expression(String),
+    /// Fire every N seconds.
+    Interval { interval_secs: u64 },
+}
+
+/// What to do when the scheduler queues are full at firing time.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CronOverflowPolicyDef {
+    /// Skip this firing and increment `missed_count` (default).
+    #[default]
+    SkipIfBusy,
+    /// Block until the queue has capacity.
+    Block,
+}
+
+/// Scheduling priority for a cron job.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CronPriorityDef {
+    /// Best-effort background priority (default).
+    #[default]
+    Throughput,
+    /// Low-latency priority.
+    LatencyCritical,
+}
+
+/// A cron job definition as declared in `metadata.json`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CronJobDef {
+    /// Unique identifier for this job within the package.
+    pub id: String,
+    /// When to fire — interval in seconds or a cron expression.
+    pub schedule: CronScheduleDef,
+    /// The inference request sent each time the job fires.
+    pub input: BinaryTensorPacket,
+    /// Additional named inputs sent with each firing.
+    #[serde(default)]
+    pub additional_inputs: Vec<NamedTensor>,
+    /// Scheduling priority (default: `throughput`).
+    #[serde(default)]
+    pub priority: CronPriorityDef,
+    /// If `true`, route to CPU pool; otherwise GPU queues (default: `false`).
+    #[serde(default)]
+    pub force_cpu: bool,
+    /// Behaviour when the scheduler is busy (default: `skip_if_busy`).
+    #[serde(default)]
+    pub overflow_policy: CronOverflowPolicyDef,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
@@ -24,6 +79,10 @@ pub struct Manifest {
     /// Hardware requirements for this model
     #[serde(default)]
     pub hardware_requirements: HardwareRequirements,
+
+    /// Periodic inference jobs registered when this package is loaded.
+    #[serde(default)]
+    pub cron_jobs: Vec<CronJobDef>,
 }
 
 #[derive(Error, Debug)]
@@ -153,12 +212,10 @@ impl PackageLoader {
             model_file: model_file_name,
             metadata: None,
             hardware_requirements: HardwareRequirements::default(),
+            cron_jobs: Vec::new(),
         };
 
-        let extracted_path = model_path
-            .parent()
-            .unwrap_or(Path::new("."))
-            .to_path_buf();
+        let extracted_path = model_path.parent().unwrap_or(Path::new(".")).to_path_buf();
 
         // A dummy TempDir satisfies the struct contract without touching the actual model file.
         let temp_dir = tempfile::tempdir()?;
@@ -221,6 +278,7 @@ struct CacheEntry {
 struct ModelAsset {
     source_path: PathBuf,
     target_name: String,
+    source_size: u64,
 }
 
 fn persist_model_file(
@@ -228,20 +286,22 @@ fn persist_model_file(
     model_file: &str,
     source_model_path: &Path,
 ) -> Result<PathBuf, LoaderError> {
-    use std::collections::hash_map::DefaultHasher;
+    use sha2::{Digest, Sha256};
 
-    let mut hasher = DefaultHasher::new();
-    package_path.hash(&mut hasher);
-    model_file.hash(&mut hasher);
+    let mut hasher = Sha256::new();
+    hasher.update(package_path.to_string_lossy().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(model_file.as_bytes());
     if let Ok(meta) = fs::metadata(package_path) {
-        meta.len().hash(&mut hasher);
+        hasher.update(meta.len().to_le_bytes());
         if let Ok(modified) = meta.modified() {
             if let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH) {
-                duration.as_nanos().hash(&mut hasher);
+                hasher.update(duration.as_nanos().to_le_bytes());
             }
         }
     }
-    let package_hash = hasher.finish();
+    let hash_bytes = hasher.finalize();
+    let package_hash = hex::encode(&hash_bytes[..8]);
 
     let file_name = Path::new(model_file)
         .file_name()
@@ -249,7 +309,7 @@ fn persist_model_file(
         .filter(|name| !name.is_empty())
         .unwrap_or("model.bin");
     let cache_root = resolve_model_cache_root(package_path);
-    let cache_dir = cache_root.join(format!("{:016x}", package_hash));
+    let cache_dir = cache_root.join(&package_hash);
     let cache_policy = CachePolicy::from_env();
     persist_model_assets(
         source_model_path,
@@ -299,7 +359,7 @@ fn persist_model_assets(
     )?;
 
     for asset in assets {
-        copy_if_needed(&asset.source_path, &cache_dir.join(asset.target_name))?;
+        copy_if_needed(&asset.source_path, asset.source_size, &cache_dir.join(asset.target_name))?;
     }
 
     Ok(cache_dir.join(file_name))
@@ -312,9 +372,11 @@ fn collect_model_assets(
     let mut assets = Vec::new();
     let mut seen_targets = HashSet::new();
 
+    let source_size = fs::metadata(source_model_path)?.len();
     assets.push(ModelAsset {
         source_path: source_model_path.to_path_buf(),
         target_name: model_target_name.to_string(),
+        source_size,
     });
     seen_targets.insert(model_target_name.to_string());
 
@@ -325,10 +387,11 @@ fn collect_model_assets(
 
     for entry in fs::read_dir(source_dir)? {
         let entry = entry?;
-        let path = entry.path();
-        if !path.is_file() {
+        let metadata = entry.metadata()?;
+        if !metadata.is_file() {
             continue;
         }
+        let path = entry.path();
         if path.file_name() == main_model_name {
             continue;
         }
@@ -342,6 +405,7 @@ fn collect_model_assets(
         assets.push(ModelAsset {
             source_path: path,
             target_name,
+            source_size: metadata.len(),
         });
     }
 
@@ -354,10 +418,9 @@ fn estimate_required_copy_bytes(
 ) -> Result<u64, LoaderError> {
     let mut required_bytes = 0u64;
     for asset in assets {
-        let source_meta = fs::metadata(&asset.source_path)?;
         let target_path = cache_dir.join(&asset.target_name);
-        if should_copy_file(source_meta.len(), &target_path)? {
-            required_bytes = required_bytes.saturating_add(source_meta.len());
+        if should_copy_file(asset.source_size, &target_path)? {
+            required_bytes = required_bytes.saturating_add(asset.source_size);
         }
     }
     Ok(required_bytes)
@@ -376,8 +439,7 @@ fn should_copy_file(source_size: u64, target_path: &Path) -> Result<bool, Loader
     Ok(metadata.len() != source_size)
 }
 
-fn copy_if_needed(source_path: &Path, target_path: &Path) -> Result<(), LoaderError> {
-    let source_size = fs::metadata(source_path)?.len();
+fn copy_if_needed(source_path: &Path, source_size: u64, target_path: &Path) -> Result<(), LoaderError> {
     if !should_copy_file(source_size, target_path)? {
         return Ok(());
     }

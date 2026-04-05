@@ -521,11 +521,8 @@ impl PerModelShmAllocator {
 
         // Remaining bytes become the shared overflow pool.
         let shared_bytes = total_end.saturating_sub(cursor);
-        let shared_pool = TieredShmAllocator::new_with_default_classes(
-            cursor,
-            shared_bytes.max(1),
-            lease_ttl,
-        );
+        let shared_pool =
+            TieredShmAllocator::new_with_default_classes(cursor, shared_bytes.max(1), lease_ttl);
         let shared_pool_end = cursor.saturating_add(shared_bytes);
 
         Self {

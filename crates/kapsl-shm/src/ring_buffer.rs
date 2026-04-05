@@ -175,12 +175,7 @@ impl<T: Copy> LockFreeRingBuffer<T> {
             let next_tail = (tail + 1) % self.capacity;
             if unsafe {
                 (*self.tail)
-                    .compare_exchange_weak(
-                        tail,
-                        next_tail,
-                        Ordering::Release,
-                        Ordering::Relaxed,
-                    )
+                    .compare_exchange_weak(tail, next_tail, Ordering::Release, Ordering::Relaxed)
                     .is_ok()
             } {
                 let item = unsafe { std::ptr::read(self.buffer.add(tail)) };

@@ -729,10 +729,7 @@ impl DeviceInfo {
             // UUID is a stable per-device identifier (e.g. "GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx")
             // that survives index reordering. For MIG compute instances NVML would return a
             // MIG-scoped UUID here instead. Used as partition_id for selector matching.
-            let partition_id = dev
-                .uuid()
-                .ok()
-                .filter(|s| !s.trim().is_empty());
+            let partition_id = dev.uuid().ok().filter(|s| !s.trim().is_empty());
 
             let (supports_fp16, supports_int8) =
                 match cc.as_deref().and_then(Self::parse_compute_capability) {
@@ -795,9 +792,9 @@ impl DeviceInfo {
     }
 
     pub fn best_gpu_with_preference(&self, preference: &GpuPreference) -> Option<&Device> {
-        self.devices.iter().find(|d| {
-            !matches!(d.backend, DeviceBackend::Cpu) && preference.matches(d)
-        })
+        self.devices
+            .iter()
+            .find(|d| !matches!(d.backend, DeviceBackend::Cpu) && preference.matches(d))
     }
 
     pub fn cuda_devices(&self) -> Vec<&Device> {
