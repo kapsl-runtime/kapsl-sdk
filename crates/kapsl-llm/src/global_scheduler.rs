@@ -209,8 +209,7 @@ impl GlobalKvScheduler {
             .sum::<u64>()
             .max(1);
 
-        let cap_tokens = (self.global_max_tokens as u64
-            * self.max_single_engine_permille as u64
+        let cap_tokens = (self.global_max_tokens as u64 * self.max_single_engine_permille as u64
             / 1000) as usize;
 
         let mut budgets: Vec<EngineTokenBudget> = Vec::with_capacity(self.engines.len());
@@ -365,8 +364,16 @@ mod global_scheduler_tests {
         // Engine 0 weight 1, engine 1 weight 3 → 25% / 75%.
         let sched = make_scheduler(1000, &[(0, 1, true), (1, 3, true)]);
         let budgets = sched.allocate_budgets();
-        let b0 = budgets.iter().find(|b| b.engine_id == 0).unwrap().max_tokens;
-        let b1 = budgets.iter().find(|b| b.engine_id == 1).unwrap().max_tokens;
+        let b0 = budgets
+            .iter()
+            .find(|b| b.engine_id == 0)
+            .unwrap()
+            .max_tokens;
+        let b1 = budgets
+            .iter()
+            .find(|b| b.engine_id == 1)
+            .unwrap()
+            .max_tokens;
         // Allow ±1 for integer rounding.
         assert!(b0 >= 249 && b0 <= 251, "b0={b0}");
         assert!(b1 >= 749 && b1 <= 751, "b1={b1}");
@@ -377,7 +384,11 @@ mod global_scheduler_tests {
     fn idle_engine_gets_zero() {
         let sched = make_scheduler(1000, &[(0, 1, true), (1, 1, false)]);
         let budgets = sched.allocate_budgets();
-        let b1 = budgets.iter().find(|b| b.engine_id == 1).unwrap().max_tokens;
+        let b1 = budgets
+            .iter()
+            .find(|b| b.engine_id == 1)
+            .unwrap()
+            .max_tokens;
         assert_eq!(b1, 0, "idle engine should get zero budget");
     }
 
@@ -385,7 +396,11 @@ mod global_scheduler_tests {
     fn active_engine_absorbs_idle_share() {
         let sched = make_scheduler(1000, &[(0, 1, true), (1, 1, false)]);
         let budgets = sched.allocate_budgets();
-        let b0 = budgets.iter().find(|b| b.engine_id == 0).unwrap().max_tokens;
+        let b0 = budgets
+            .iter()
+            .find(|b| b.engine_id == 0)
+            .unwrap()
+            .max_tokens;
         // Active engine should absorb the idle engine's share (all 1000).
         assert_eq!(b0, 1000);
     }

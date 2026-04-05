@@ -17,6 +17,23 @@ members = [
     "crates/kapsl-shm",
     "crates/kapsl-transport",
 ]
+default-members = [
+    "crates/kapsl-backends",
+    "crates/kapsl-core",
+    "crates/kapsl-engine-api",
+    "crates/kapsl-hal",
+    "crates/kapsl-ipc",
+    "crates/kapsl-kernels",
+    "crates/kapsl-llm",
+    "crates/kapsl-monitor",
+    "crates/kapsl-optimizer",
+    "crates/kapsl-quantization",
+    "crates/kapsl-rag",
+    "crates/kapsl-rag-sdk",
+    "crates/kapsl-scheduler",
+    "crates/kapsl-shm",
+    "crates/kapsl-transport",
+]
 
 resolver = "2"
 

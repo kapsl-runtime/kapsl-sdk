@@ -77,7 +77,12 @@ fn run_client() {
 
     let resp_header = ResponseHeader {
         status: u32::from_le_bytes([header_buf[0], header_buf[1], header_buf[2], header_buf[3]]),
-        payload_size: u32::from_le_bytes([header_buf[4], header_buf[5], header_buf[6], header_buf[7]]),
+        payload_size: u32::from_le_bytes([
+            header_buf[4],
+            header_buf[5],
+            header_buf[6],
+            header_buf[7],
+        ]),
     };
 
     if resp_header.status == STATUS_OK {
@@ -196,10 +201,7 @@ async fn run_client_async() {
     }
     let mut size_buf = [0u8; 4];
     if let Err(e) = stream.read_exact(&mut size_buf).await {
-        println!(
-            " Failed to read response payload size: {}",
-            e
-        );
+        println!(" Failed to read response payload size: {}", e);
         return;
     }
 

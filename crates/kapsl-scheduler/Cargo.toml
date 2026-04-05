@@ -1,8 +1,3 @@
-[package]
-name = "kapsl-scheduler"
-version = "0.1.0"
-edition = "2021"
-
 [dependencies]
 kapsl-engine-api = { path = "../kapsl-engine-api" }
 tokio = { version = "1.0", features = ["full"] }
@@ -12,16 +7,5 @@ rayon = "1.11.0"
 async-trait = "0.1"
 futures = "0.3.31"
 kapsl-hal = { path = "../kapsl-hal" }
-cron = "0.12"
 chrono = "0.4"
-kapsl-core = { path = "../kapsl-core" }
-serde = { version = "1.0", features = ["derive"] }
-
-[dev-dependencies]
-criterion = { version = "0.5", features = ["async_tokio"] }
-tokio = { version = "1.0", features = ["full"] }
-async-trait = "0.1"
-
-[[bench]]
-name = "cron_scheduler"
-harness = false
+cron = "0.12"

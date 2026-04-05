@@ -52,10 +52,7 @@ mod tests {
         assert_eq!(view.key[idx(1, 0, 1, seq_len, head_dim)].to_f32(), 0.0);
         assert_eq!(view.key[idx(1, 0, 2, seq_len, head_dim)].to_f32(), 0.0);
 
-        assert_eq!(
-            view.value[idx(1, 0, 2, seq_len, head_dim)].to_f32(),
-            15.0
-        );
+        assert_eq!(view.value[idx(1, 0, 2, seq_len, head_dim)].to_f32(), 15.0);
     }
 
     #[test]

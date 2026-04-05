@@ -285,7 +285,14 @@ impl DenseKvCache {
         head_dim: usize,
         free_list_cap: usize,
     ) -> Self {
-        Self::new_with_config(num_layers, num_heads, max_seq_len, head_dim, free_list_cap, 256)
+        Self::new_with_config(
+            num_layers,
+            num_heads,
+            max_seq_len,
+            head_dim,
+            free_list_cap,
+            256,
+        )
     }
 
     pub fn new_with_config(
@@ -559,8 +566,10 @@ impl DenseKvCache {
         let val_slice = layer.value.as_slice();
         for h in 0..self.num_heads {
             let src = h * stride;
-            self.scratch_key_compact.extend_from_slice(&key_slice[src..src + compact_per_head]);
-            self.scratch_val_compact.extend_from_slice(&val_slice[src..src + compact_per_head]);
+            self.scratch_key_compact
+                .extend_from_slice(&key_slice[src..src + compact_per_head]);
+            self.scratch_val_compact
+                .extend_from_slice(&val_slice[src..src + compact_per_head]);
         }
 
         Some(KvView {
@@ -967,17 +976,15 @@ impl PagedKvCache {
         };
 
         // Capture block IDs and sequence metadata before mutably borrowing storage.
-        let (block_ids, current_len, priority): (Vec<usize>, usize, u8) = match self
-            .sequences
-            .get(&victim_id)
-        {
-            Some(seq) => (
-                seq.blocks.iter().copied().collect(),
-                seq.current_len,
-                seq.priority,
-            ),
-            None => return false,
-        };
+        let (block_ids, current_len, priority): (Vec<usize>, usize, u8) =
+            match self.sequences.get(&victim_id) {
+                Some(seq) => (
+                    seq.blocks.iter().copied().collect(),
+                    seq.current_len,
+                    seq.priority,
+                ),
+                None => return false,
+            };
 
         if block_ids.is_empty() {
             return false;
@@ -1893,7 +1900,9 @@ impl KvCache {
     /// No-op in dense mode.
     pub fn restore_offloaded_sequence(&mut self, sequence_id: u64) -> bool {
         if let KvCacheInner::Paged(cache) = &mut self.inner {
-            return cache.restore_offloaded_sequence_inner(sequence_id).is_some();
+            return cache
+                .restore_offloaded_sequence_inner(sequence_id)
+                .is_some();
         }
         false
     }

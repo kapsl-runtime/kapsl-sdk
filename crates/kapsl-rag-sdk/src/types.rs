@@ -39,6 +39,11 @@ pub struct DocumentPayload {
     pub acl: ExternalAcl,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromptTransformResult {
+    pub prompt: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ExternalAcl {
     pub allow_users: Vec<String>,

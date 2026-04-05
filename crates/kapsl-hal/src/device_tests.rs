@@ -137,19 +137,13 @@ fn gpu_preference_parse_name_contains() {
 #[test]
 fn gpu_preference_parse_mig_prefix() {
     let pref = GpuPreference::parse("mig:GPU-abc123/0/0").unwrap();
-    assert_eq!(
-        pref,
-        GpuPreference::Partition("GPU-abc123/0/0".to_string())
-    );
+    assert_eq!(pref, GpuPreference::Partition("GPU-abc123/0/0".to_string()));
 }
 
 #[test]
 fn gpu_preference_parse_partition_prefix() {
     let pref = GpuPreference::parse("partition:GPU-xyz/1/0").unwrap();
-    assert_eq!(
-        pref,
-        GpuPreference::Partition("GPU-xyz/1/0".to_string())
-    );
+    assert_eq!(pref, GpuPreference::Partition("GPU-xyz/1/0".to_string()));
 }
 
 #[test]
@@ -234,11 +228,7 @@ fn best_gpu_with_preference_partition() {
     dev0.partition_id = Some("GPU-aaa".to_string());
     let mut dev1 = make_device(1, DeviceBackend::Cuda, 8_000);
     dev1.partition_id = Some("GPU-bbb".to_string());
-    let info = make_info(vec![
-        make_device(0, DeviceBackend::Cpu, 1024),
-        dev0,
-        dev1,
-    ]);
+    let info = make_info(vec![make_device(0, DeviceBackend::Cpu, 1024), dev0, dev1]);
 
     let found = info
         .best_gpu_with_preference(&GpuPreference::Partition("GPU-bbb".to_string()))

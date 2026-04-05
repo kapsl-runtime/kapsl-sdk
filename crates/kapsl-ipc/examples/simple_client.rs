@@ -65,8 +65,18 @@ fn run_benchmark() {
                 stream.read_exact(&mut header_buf).unwrap();
 
                 let resp_header = ResponseHeader {
-                    status: u32::from_le_bytes([header_buf[0], header_buf[1], header_buf[2], header_buf[3]]),
-                    payload_size: u32::from_le_bytes([header_buf[4], header_buf[5], header_buf[6], header_buf[7]]),
+                    status: u32::from_le_bytes([
+                        header_buf[0],
+                        header_buf[1],
+                        header_buf[2],
+                        header_buf[3],
+                    ]),
+                    payload_size: u32::from_le_bytes([
+                        header_buf[4],
+                        header_buf[5],
+                        header_buf[6],
+                        header_buf[7],
+                    ]),
                 };
 
                 if resp_header.status == STATUS_OK {
@@ -150,8 +160,18 @@ async fn run_benchmark_async() {
                 stream.read_exact(&mut header_buf).await.unwrap();
 
                 let resp_header = ResponseHeader {
-                    status: u32::from_le_bytes([header_buf[0], header_buf[1], header_buf[2], header_buf[3]]),
-                    payload_size: u32::from_le_bytes([header_buf[4], header_buf[5], header_buf[6], header_buf[7]]),
+                    status: u32::from_le_bytes([
+                        header_buf[0],
+                        header_buf[1],
+                        header_buf[2],
+                        header_buf[3],
+                    ]),
+                    payload_size: u32::from_le_bytes([
+                        header_buf[4],
+                        header_buf[5],
+                        header_buf[6],
+                        header_buf[7],
+                    ]),
                 };
 
                 if resp_header.status == STATUS_OK {

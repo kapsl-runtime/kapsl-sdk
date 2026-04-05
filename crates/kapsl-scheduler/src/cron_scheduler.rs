@@ -6,7 +6,6 @@ use cron::Schedule;
 use kapsl_engine_api::{BinaryTensorPacket, EngineError, InferenceRequest};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -49,8 +48,7 @@ pub enum CronSchedule {
 }
 
 /// Callback invoked after each cron job fires, receiving the inference result.
-pub type CronCallback =
-    Arc<dyn Fn(String, Result<BinaryTensorPacket, EngineError>) + Send + Sync>;
+pub type CronCallback = Arc<dyn Fn(String, Result<BinaryTensorPacket, EngineError>) + Send + Sync>;
 
 /// Definition of a periodic inference job.
 pub struct CronJob {
@@ -189,7 +187,7 @@ impl CronScheduler {
 
         // Validate cron expression eagerly so the error surfaces at registration time.
         if let CronSchedule::Expression(ref expr) = job.schedule {
-            Schedule::from_str(expr)
+            expr.parse::<Schedule>()
                 .map_err(|e| CronError::InvalidExpression(e.to_string()))?;
         }
 
@@ -330,7 +328,7 @@ impl CronScheduler {
                 }
                 CronSchedule::Expression(expr) => {
                     // Safety: validated at registration time.
-                    let parsed = Schedule::from_str(&expr).expect("already validated");
+                    let parsed = expr.parse::<Schedule>().expect("already validated");
                     for next in parsed.upcoming(Utc) {
                         let now = Utc::now();
                         if next <= now {

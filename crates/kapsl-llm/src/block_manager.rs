@@ -106,10 +106,7 @@ impl BlockManagerAllocator {
     fn allocate(&mut self) -> Option<PhysicalTokenBlock> {
         match self {
             Self::Owned(a) => a.allocate(),
-            Self::Shared(a) => a
-                .lock()
-                .expect("SharedBlockAllocator poisoned")
-                .allocate(),
+            Self::Shared(a) => a.lock().expect("SharedBlockAllocator poisoned").allocate(),
         }
     }
 

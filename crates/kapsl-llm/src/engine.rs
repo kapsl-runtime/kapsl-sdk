@@ -1779,15 +1779,13 @@ impl LLMEngine {
             output_names_set = outputs;
 
             if let Some(decode_name) = decode_model_file.as_deref() {
-                if let Some(decode_path) =
-                    resolve_stage_path(&model_root, model_path, decode_name)
+                if let Some(decode_path) = resolve_stage_path(&model_root, model_path, decode_name)
                 {
                     if decode_path != model_path {
                         ensure_external_data_near_model(&decode_path, &model_root);
                         match build_session(&decode_path, preferred_device_id) {
                             Ok(built_decode_session) => {
-                                let (dn, dsh, dt, _) =
-                                    capture_session_io(&built_decode_session);
+                                let (dn, dsh, dt, _) = capture_session_io(&built_decode_session);
                                 decode_input_names_set = dn;
                                 decode_input_shapes_map = dsh;
                                 decode_input_types_map = dt;
