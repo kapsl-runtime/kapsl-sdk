@@ -6,7 +6,6 @@ pub mod replica_pool;
 pub mod request;
 pub mod request_metadata;
 pub mod scheduler;
-pub mod cron_scheduler;
 
 // Re-export main types
 pub use cron_scheduler::{CronCallback, CronError, CronJob, CronJobInfo, CronSchedule, CronScheduler};
