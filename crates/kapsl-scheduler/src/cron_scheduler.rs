@@ -316,9 +316,7 @@ impl CronScheduler {
         match &result {
             // Scheduler was full and we're configured to skip — count the miss
             // but don't invoke the callback (there is no result to report).
-            Err(EngineError::Overloaded { .. })
-                if overflow_policy == CronOverflowPolicy::SkipIfBusy =>
-            {
+            Err(e) if overflow_policy == CronOverflowPolicy::SkipIfBusy && e.is_overloaded() => {
                 missed_count.fetch_add(1, Ordering::Relaxed);
                 log::debug!("[cron:{id}] firing skipped — scheduler busy");
                 return;
