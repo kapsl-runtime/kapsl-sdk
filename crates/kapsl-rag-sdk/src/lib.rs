@@ -9,6 +9,6 @@ pub use protocol::{
 };
 pub use server::{serve_stdio, Connector, ConnectorError};
 pub use types::{
-    ConnectorConfig, DocumentDelta, DocumentPayload, ExternalAcl, SourceDescriptor, SyncCursor,
-    SyncRequest,
+    ConnectorConfig, DocumentDelta, DocumentPayload, ExternalAcl, PromptTransformResult,
+    SourceDescriptor, SyncCursor, SyncRequest,
 };

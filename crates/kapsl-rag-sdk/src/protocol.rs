@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::types::{
-    ConnectorConfig, DocumentDelta, DocumentPayload, ExternalAcl, SourceDescriptor,
+    ConnectorConfig, DocumentDelta, DocumentPayload, ExternalAcl, PromptTransformResult,
+    SourceDescriptor,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,6 +35,10 @@ pub enum ConnectorRequestKind {
     FetchDocument {
         document_id: String,
     },
+    TransformPrompt {
+        config: ConnectorConfig,
+        prompt: String,
+    },
     ResolveAcl {
         acl: ExternalAcl,
     },
@@ -62,6 +67,7 @@ pub enum ConnectorResult {
     Sources(Vec<SourceDescriptor>),
     Deltas(Vec<DocumentDelta>),
     Document(DocumentPayload),
+    PromptTransform(PromptTransformResult),
     Acl(ExternalAcl),
     Health(String),
 }

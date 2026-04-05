@@ -481,8 +481,7 @@ impl ShmServer {
                                         model_id,
                                         result_size,
                                         shm_pool_metrics.as_deref(),
-                                    )
-                                {
+                                    ) {
                                     unsafe {
                                         write_tensor_to_shm(shm.as_ptr(), result_offset, &output);
                                     }

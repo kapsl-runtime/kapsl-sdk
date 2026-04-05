@@ -12,5 +12,5 @@ rayon = "1.11.0"
 async-trait = "0.1"
 futures = "0.3.31"
 kapsl-hal = { path = "../kapsl-hal" }
-cron = "0.12"
 chrono = "0.4"
+cron = "0.12"

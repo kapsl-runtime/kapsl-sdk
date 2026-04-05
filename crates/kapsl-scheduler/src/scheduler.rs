@@ -236,9 +236,7 @@ impl Scheduler {
                 .cpu_active_count
                 .load(std::sync::atomic::Ordering::Relaxed);
             if active >= self.cpu_pool.current_num_threads() {
-                return Err(EngineError::overloaded(
-                    "CPU pool saturated".to_string(),
-                ));
+                return Err(EngineError::overloaded("CPU pool saturated".to_string()));
             }
             // Pool has capacity — fall through to the normal blocking path.
             return self.infer(input, priority, true).await;
@@ -263,7 +261,6 @@ impl Scheduler {
             source: None,
         })?
     }
-
     pub fn get_queue_depth(&self) -> (usize, usize) {
         let cpu_depth = self
             .cpu_active_count

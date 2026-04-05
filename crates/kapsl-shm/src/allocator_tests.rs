@@ -173,11 +173,7 @@ mod tests {
 
     // ── PerModelShmAllocator tests ────────────────────────────────────────────
 
-    fn make_pool(
-        base: usize,
-        total: usize,
-        model_bytes: &[(u32, usize)],
-    ) -> PerModelShmAllocator {
+    fn make_pool(base: usize, total: usize, model_bytes: &[(u32, usize)]) -> PerModelShmAllocator {
         let configs: Vec<ModelSubPoolConfig> = model_bytes
             .iter()
             .map(|(id, bytes)| ModelSubPoolConfig {
@@ -207,7 +203,10 @@ mod tests {
         let off2 = pool.try_allocate(2, 100).expect("model 2 slot");
 
         // The two offsets must be in different regions (model 1 starts at 0, model 2 at 512 KiB).
-        assert!(off1 < 512 * 1024, "model 1 offset should be in its sub-pool");
+        assert!(
+            off1 < 512 * 1024,
+            "model 1 offset should be in its sub-pool"
+        );
         assert!(
             off2 >= 512 * 1024 && off2 < 1024 * 1024,
             "model 2 offset should be in its sub-pool"
@@ -228,7 +227,9 @@ mod tests {
         let pool = PerModelShmAllocator::new(0, 4 * 1024 * 1024, configs, Duration::from_secs(30));
 
         // Exhaust the model pool.
-        let _first = pool.try_allocate(1, 200).expect("first slot from model pool");
+        let _first = pool
+            .try_allocate(1, 200)
+            .expect("first slot from model pool");
 
         // Second allocation must come from the shared pool (offset beyond model-1 range).
         let second = pool
@@ -261,7 +262,9 @@ mod tests {
     fn test_per_model_allocator_unknown_model_uses_shared_pool() {
         let pool = make_pool(0, 4 * 1024 * 1024, &[(1, 512 * 1024)]);
         // model 99 has no dedicated pool — should still allocate from shared.
-        let off = pool.try_allocate(99, 100).expect("shared pool slot for unknown model");
+        let off = pool
+            .try_allocate(99, 100)
+            .expect("shared pool slot for unknown model");
         assert!(off >= 512 * 1024, "unknown model must use shared pool");
     }
 
@@ -269,9 +272,18 @@ mod tests {
     fn test_per_model_allocator_layout_summary_contains_model_and_shared() {
         let pool = make_pool(0, 4 * 1024 * 1024, &[(3, 512 * 1024), (7, 512 * 1024)]);
         let summary = pool.layout_summary();
-        assert!(summary.contains("model3:"), "summary should include model 3");
-        assert!(summary.contains("model7:"), "summary should include model 7");
-        assert!(summary.contains("shared:"), "summary should include shared pool");
+        assert!(
+            summary.contains("model3:"),
+            "summary should include model 3"
+        );
+        assert!(
+            summary.contains("model7:"),
+            "summary should include model 7"
+        );
+        assert!(
+            summary.contains("shared:"),
+            "summary should include shared pool"
+        );
     }
 
     #[test]

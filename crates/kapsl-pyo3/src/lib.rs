@@ -438,8 +438,18 @@ impl KapslClient {
         stream.read_exact(&mut header_buf)?;
 
         let resp_header = ResponseHeader {
-            status: u32::from_le_bytes([header_buf[0], header_buf[1], header_buf[2], header_buf[3]]),
-            payload_size: u32::from_le_bytes([header_buf[4], header_buf[5], header_buf[6], header_buf[7]]),
+            status: u32::from_le_bytes([
+                header_buf[0],
+                header_buf[1],
+                header_buf[2],
+                header_buf[3],
+            ]),
+            payload_size: u32::from_le_bytes([
+                header_buf[4],
+                header_buf[5],
+                header_buf[6],
+                header_buf[7],
+            ]),
         };
 
         let mut payload = vec![0u8; resp_header.payload_size as usize];
@@ -466,7 +476,15 @@ impl KapslClient {
         session_id: Option<String>,
     ) -> PyResult<BinaryTensorPacket> {
         let mut stream = self.checkout_connection().map_err(PyErr::from)?;
-        match self.infer_impl(&mut stream, model_id, shape, dtype, data, extra.clone(), session_id.clone()) {
+        match self.infer_impl(
+            &mut stream,
+            model_id,
+            shape,
+            dtype,
+            data,
+            extra.clone(),
+            session_id.clone(),
+        ) {
             Ok(output) => {
                 self.return_connection(stream);
                 Ok(output)
@@ -649,8 +667,18 @@ impl StreamIterator {
         }
 
         let resp_header = ResponseHeader {
-            status: u32::from_le_bytes([header_buf[0], header_buf[1], header_buf[2], header_buf[3]]),
-            payload_size: u32::from_le_bytes([header_buf[4], header_buf[5], header_buf[6], header_buf[7]]),
+            status: u32::from_le_bytes([
+                header_buf[0],
+                header_buf[1],
+                header_buf[2],
+                header_buf[3],
+            ]),
+            payload_size: u32::from_le_bytes([
+                header_buf[4],
+                header_buf[5],
+                header_buf[6],
+                header_buf[7],
+            ]),
         };
 
         if resp_header.payload_size > 0 {

@@ -7,7 +7,8 @@ use crate::protocol::{
     ConnectorResult,
 };
 use crate::types::{
-    ConnectorConfig, DocumentDelta, DocumentPayload, ExternalAcl, SourceDescriptor,
+    ConnectorConfig, DocumentDelta, DocumentPayload, ExternalAcl, PromptTransformResult,
+    SourceDescriptor,
 };
 
 #[derive(thiserror::Error, Debug)]
@@ -55,6 +56,15 @@ pub trait Connector: Send + Sync {
         cursor: Option<String>,
     ) -> Result<Vec<DocumentDelta>, ConnectorError>;
     async fn fetch_document(&self, document_id: String) -> Result<DocumentPayload, ConnectorError>;
+    async fn transform_prompt(
+        &self,
+        _config: ConnectorConfig,
+        _prompt: String,
+    ) -> Result<PromptTransformResult, ConnectorError> {
+        Err(ConnectorError::Unsupported(
+            "prompt transformation is not implemented".to_string(),
+        ))
+    }
     async fn resolve_acl(&self, acl: ExternalAcl) -> Result<ExternalAcl, ConnectorError>;
     async fn health(&self) -> Result<String, ConnectorError> {
         Ok("ok".to_string())
@@ -105,6 +115,10 @@ async fn dispatch<C: Connector>(connector: &C, request: ConnectorRequest) -> Con
             .fetch_document(document_id)
             .await
             .map(ConnectorResult::Document),
+        ConnectorRequestKind::TransformPrompt { config, prompt } => connector
+            .transform_prompt(config, prompt)
+            .await
+            .map(ConnectorResult::PromptTransform),
         ConnectorRequestKind::ResolveAcl { acl } => {
             connector.resolve_acl(acl).await.map(ConnectorResult::Acl)
         }
@@ -120,4 +134,90 @@ async fn dispatch<C: Connector>(connector: &C, request: ConnectorRequest) -> Con
     };
 
     ConnectorResponse { id, kind }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::{ConnectorRequest, ConnectorRequestKind, ConnectorResponseKind};
+    use crate::types::{ConnectorConfig, ExternalAcl};
+    use serde_json::json;
+
+    struct MockConnector;
+
+    #[async_trait]
+    impl Connector for MockConnector {
+        async fn validate_config(&self, _config: ConnectorConfig) -> Result<(), ConnectorError> {
+            Ok(())
+        }
+
+        async fn auth_start(&self, _config: ConnectorConfig) -> Result<String, ConnectorError> {
+            Err(ConnectorError::Unsupported("auth".to_string()))
+        }
+
+        async fn auth_callback(
+            &self,
+            _code: String,
+            _state: Option<String>,
+        ) -> Result<(), ConnectorError> {
+            Err(ConnectorError::Unsupported("auth".to_string()))
+        }
+
+        async fn list_sources(
+            &self,
+            _config: ConnectorConfig,
+        ) -> Result<Vec<crate::types::SourceDescriptor>, ConnectorError> {
+            Ok(Vec::new())
+        }
+
+        async fn sync(
+            &self,
+            _source_id: String,
+            _cursor: Option<String>,
+        ) -> Result<Vec<crate::types::DocumentDelta>, ConnectorError> {
+            Ok(Vec::new())
+        }
+
+        async fn fetch_document(
+            &self,
+            _document_id: String,
+        ) -> Result<crate::types::DocumentPayload, ConnectorError> {
+            Err(ConnectorError::Unsupported("fetch".to_string()))
+        }
+
+        async fn transform_prompt(
+            &self,
+            _config: ConnectorConfig,
+            prompt: String,
+        ) -> Result<PromptTransformResult, ConnectorError> {
+            Ok(PromptTransformResult {
+                prompt: format!("<wrapped>{}</wrapped>", prompt),
+            })
+        }
+
+        async fn resolve_acl(&self, acl: ExternalAcl) -> Result<ExternalAcl, ConnectorError> {
+            Ok(acl)
+        }
+    }
+
+    #[test]
+    fn dispatch_transform_prompt_returns_transformed_prompt() {
+        let response = block_on(dispatch(
+            &MockConnector,
+            ConnectorRequest {
+                id: "req-1".to_string(),
+                kind: ConnectorRequestKind::TransformPrompt {
+                    config: json!({"format":"custom"}),
+                    prompt: "hello".to_string(),
+                },
+            },
+        ));
+
+        match response.kind {
+            ConnectorResponseKind::Ok(ConnectorResult::PromptTransform(result)) => {
+                assert_eq!(result.prompt, "<wrapped>hello</wrapped>");
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+    }
 }

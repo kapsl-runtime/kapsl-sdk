@@ -327,15 +327,16 @@ mod tests {
 
         // Build pool and check layout: model 2 (8× concurrency) should have a
         // proportionally larger sub-pool than model 1 (1× concurrency).
-        let pool = build_per_model_pool(
-            &schedulers,
-            0,
-            512 * 1024 * 1024,
-            Duration::from_secs(30),
-        );
+        let pool = build_per_model_pool(&schedulers, 0, 512 * 1024 * 1024, Duration::from_secs(30));
         let summary = pool.layout_summary();
-        assert!(summary.contains("model1:"), "model 1 should have a sub-pool");
-        assert!(summary.contains("model2:"), "model 2 should have a sub-pool");
+        assert!(
+            summary.contains("model1:"),
+            "model 1 should have a sub-pool"
+        );
+        assert!(
+            summary.contains("model2:"),
+            "model 2 should have a sub-pool"
+        );
     }
 
     #[test]
@@ -356,8 +357,12 @@ mod tests {
         schedulers.insert(1, Arc::new(MetadataScheduler { info }));
 
         let pool_bytes = 128 * 1024 * 1024; // 128 MiB
-        let pool =
-            build_per_model_pool(&schedulers, 0, pool_bytes, std::time::Duration::from_secs(30));
+        let pool = build_per_model_pool(
+            &schedulers,
+            0,
+            pool_bytes,
+            std::time::Duration::from_secs(30),
+        );
 
         let summary = pool.layout_summary();
         assert!(

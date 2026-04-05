@@ -317,7 +317,11 @@ impl BackendFactory {
                 if !device_info.has_metal {
                     return Err(format!(
                         "{} not available on this system",
-                        if provider_lower == "metal" { "Metal" } else { "CoreML" }
+                        if provider_lower == "metal" {
+                            "Metal"
+                        } else {
+                            "CoreML"
+                        }
                     ));
                 }
                 if !CoreMLExecutionProvider::default()
@@ -336,9 +340,7 @@ impl BackendFactory {
                 // can cause layout issues and runtime errors on Apple Silicon.
                 let coreml_opt_level = match opt_level {
                     GraphOptimizationLevel::Level2 | GraphOptimizationLevel::Level3 => {
-                        log::info!(
-                            "   Capping optimization level to Level1 for CoreML backend"
-                        );
+                        log::info!("   Capping optimization level to Level1 for CoreML backend");
                         GraphOptimizationLevel::Level1
                     }
                     other => other,
