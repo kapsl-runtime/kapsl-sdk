@@ -18,7 +18,11 @@ The package ships pre-compiled wheels for Linux (x86_64, aarch64), macOS (x86_64
 If you need to build from the monorepo:
 
 ```bash
-# Requires Rust 1.75+ and maturin
+# Rust crates in the workspace
+cd kapsl-sdk
+cargo build --release
+
+# Python extension module (requires Rust 1.75+ and maturin)
 pip install maturin
 cd kapsl-sdk/crates/kapsl-pyo3
 maturin develop --release

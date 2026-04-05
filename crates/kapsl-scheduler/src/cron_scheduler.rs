@@ -4,7 +4,6 @@ use chrono::Utc;
 use cron::Schedule;
 use kapsl_engine_api::{BinaryTensorPacket, EngineError, InferenceRequest};
 use std::collections::HashMap;
-use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -178,7 +177,8 @@ impl CronScheduler {
 
         // Validate cron expression eagerly so the error surfaces at registration time.
         if let CronSchedule::Expression(ref expr) = job.schedule {
-            Schedule::from_str(expr).map_err(|e| CronError::InvalidExpression(e.to_string()))?;
+            expr.parse::<Schedule>()
+                .map_err(|e| CronError::InvalidExpression(e.to_string()))?;
         }
 
         let fired_count = Arc::new(AtomicU64::new(0));
@@ -268,7 +268,7 @@ impl CronScheduler {
                 }
                 CronSchedule::Expression(expr) => {
                     // Safety: validated at registration time.
-                    let parsed = Schedule::from_str(&expr).expect("already validated");
+                    let parsed = expr.parse::<Schedule>().expect("already validated");
                     for next in parsed.upcoming(Utc) {
                         let now = Utc::now();
                         if next <= now {
@@ -316,7 +316,9 @@ impl CronScheduler {
         match &result {
             // Scheduler was full and we're configured to skip — count the miss
             // but don't invoke the callback (there is no result to report).
-            Err(e) if overflow_policy == CronOverflowPolicy::SkipIfBusy && e.is_overloaded() => {
+            Err(EngineError::Overloaded { .. })
+                if overflow_policy == CronOverflowPolicy::SkipIfBusy =>
+            {
                 missed_count.fetch_add(1, Ordering::Relaxed);
                 log::debug!("[cron:{id}] firing skipped — scheduler busy");
                 return;
