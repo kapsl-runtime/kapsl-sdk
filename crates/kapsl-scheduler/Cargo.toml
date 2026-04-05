@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 kapsl-engine-api = { path = "../kapsl-engine-api" }
+kapsl-core = { path = "../kapsl-core" }
 tokio = { version = "1.0", features = ["full"] }
 log = "0.4"
 parking_lot = "0.12"
@@ -13,4 +14,14 @@ async-trait = "0.1"
 futures = "0.3.31"
 kapsl-hal = { path = "../kapsl-hal" }
 chrono = "0.4"
+serde = { version = "1.0", features = ["derive"] }
 cron = "0.12"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["async_tokio"] }
+tokio = { version = "1.0", features = ["full"] }
+async-trait = "0.1"
+
+[[bench]]
+name = "cron_scheduler"
+harness = false

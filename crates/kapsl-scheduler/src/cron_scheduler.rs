@@ -1,37 +1,47 @@
 use crate::priority::Priority;
 use crate::scheduler::Scheduler;
+use kapsl_core::{CronJobDef, CronOverflowPolicyDef, CronPriorityDef, CronScheduleDef, Manifest};
 use chrono::Utc;
 use cron::Schedule;
 use kapsl_engine_api::{BinaryTensorPacket, EngineError, InferenceRequest};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 
+mod duration_serde {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::time::Duration;
+
+    pub fn serialize<S: Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
+        d.as_secs_f64().serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
+        f64::deserialize(d).map(Duration::from_secs_f64)
+    }
+}
+
 /// How a cron job behaves when the scheduler queues are full at firing time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum CronOverflowPolicy {
     /// If the queue is full, skip this firing and increment `missed_count`.
     /// Appropriate for all background / best-effort cron jobs (the default).
+    #[default]
     SkipIfBusy,
     /// Wait until the queue has capacity before dispatching.
     /// Use only for jobs that must not miss a beat even under load.
     Block,
 }
 
-impl Default for CronOverflowPolicy {
-    fn default() -> Self {
-        Self::SkipIfBusy
-    }
-}
-
 /// A cron job schedule: either a fixed interval or a cron expression.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CronSchedule {
     /// Fire every fixed duration (e.g. every 30 seconds).
-    Interval(Duration),
+    Interval(#[serde(with = "duration_serde")] Duration),
     /// Fire according to a cron expression (e.g. `"0 */5 * * * *"` = every 5 minutes).
     /// Expects the 6-field `<sec> <min> <hour> <dom> <mon> <dow>` format.
     Expression(String),
@@ -47,7 +57,7 @@ pub struct CronJob {
     /// When to fire the job.
     pub schedule: CronSchedule,
     /// The inference request sent each time the job fires.
-    pub request: InferenceRequest,
+    pub request: Arc<InferenceRequest>,
     /// Scheduling priority passed to the underlying [`Scheduler`].
     pub priority: Priority,
     /// If `true`, route to CPU pool; otherwise GPU queues.
@@ -152,7 +162,7 @@ impl JobEntry {
 /// ```
 pub struct CronScheduler {
     scheduler: Arc<Scheduler>,
-    jobs: Arc<Mutex<HashMap<String, JobEntry>>>,
+    jobs: Arc<RwLock<HashMap<String, JobEntry>>>,
 }
 
 impl CronScheduler {
@@ -160,7 +170,7 @@ impl CronScheduler {
     pub fn new(scheduler: Arc<Scheduler>) -> Self {
         Self {
             scheduler,
-            jobs: Arc::new(Mutex::new(HashMap::new())),
+            jobs: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -169,7 +179,7 @@ impl CronScheduler {
     /// Returns [`CronError::DuplicateId`] if a job with the same ID already
     /// exists, or [`CronError::InvalidExpression`] for a bad cron expression.
     pub async fn register(&self, job: CronJob) -> Result<(), CronError> {
-        let mut jobs = self.jobs.lock().await;
+        let mut jobs = self.jobs.write().await;
 
         if jobs.contains_key(&job.id) {
             return Err(CronError::DuplicateId(job.id));
@@ -205,7 +215,7 @@ impl CronScheduler {
 
     /// Stop and remove a job by ID.  Returns `true` if found, `false` otherwise.
     pub async fn unregister(&self, job_id: &str) -> bool {
-        let mut jobs = self.jobs.lock().await;
+        let mut jobs = self.jobs.write().await;
         if let Some(entry) = jobs.remove(job_id) {
             entry.handle.abort();
             true
@@ -216,12 +226,62 @@ impl CronScheduler {
 
     /// Return a snapshot of all registered jobs (including live counters).
     pub async fn list_jobs(&self) -> Vec<CronJobInfo> {
-        self.jobs.lock().await.values().map(|e| e.info()).collect()
+        self.jobs.read().await.values().map(|e| e.info()).collect()
     }
 
     /// Return info for a single job, or `None` if not found.
     pub async fn job_info(&self, job_id: &str) -> Option<CronJobInfo> {
-        self.jobs.lock().await.get(job_id).map(|e| e.info())
+        self.jobs.read().await.get(job_id).map(|e| e.info())
+    }
+
+    /// Register a cron job from a manifest [`CronJobDef`].
+    ///
+    /// Converts the JSON-serializable definition into a live [`CronJob`] and
+    /// registers it.  The `on_result` callback is `None`; callers that need
+    /// result notifications should register the job manually via [`register`].
+    pub async fn register_from_def(&self, def: CronJobDef) -> Result<(), CronError> {
+        let schedule = match def.schedule {
+            CronScheduleDef::Expression(expr) => CronSchedule::Expression(expr),
+            CronScheduleDef::Interval { interval_secs } => {
+                CronSchedule::Interval(Duration::from_secs(interval_secs))
+            }
+        };
+        let priority = match def.priority {
+            CronPriorityDef::Throughput => Priority::Throughput,
+            CronPriorityDef::LatencyCritical => Priority::LatencyCritical,
+        };
+        let overflow_policy = match def.overflow_policy {
+            CronOverflowPolicyDef::SkipIfBusy => CronOverflowPolicy::SkipIfBusy,
+            CronOverflowPolicyDef::Block => CronOverflowPolicy::Block,
+        };
+        let request = Arc::new(InferenceRequest {
+            input: def.input,
+            additional_inputs: def.additional_inputs,
+            session_id: None,
+            metadata: None,
+            cancellation: None,
+        });
+        self.register(CronJob {
+            id: def.id,
+            schedule,
+            request,
+            priority,
+            force_cpu: def.force_cpu,
+            overflow_policy,
+            on_result: None,
+        })
+        .await
+    }
+
+    /// Register all cron jobs declared in a [`Manifest`].
+    ///
+    /// Calls [`register_from_def`] for each entry in `manifest.cron_jobs`.
+    /// Returns the first error encountered, if any.
+    pub async fn register_from_manifest(&self, manifest: Manifest) -> Result<(), CronError> {
+        for def in manifest.cron_jobs {
+            self.register_from_def(def).await?;
+        }
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -236,7 +296,7 @@ impl CronScheduler {
     ) -> JoinHandle<()> {
         let scheduler = self.scheduler.clone();
         let schedule = job.schedule.clone();
-        let request = job.request.clone();
+        let request = Arc::clone(&job.request);
         let priority = job.priority;
         let force_cpu = job.force_cpu;
         let overflow_policy = job.overflow_policy;
@@ -255,7 +315,7 @@ impl CronScheduler {
                         Self::fire(
                             &scheduler,
                             &id,
-                            request.clone(),
+                            Arc::clone(&request),
                             priority,
                             force_cpu,
                             overflow_policy,
@@ -279,7 +339,7 @@ impl CronScheduler {
                         Self::fire(
                             &scheduler,
                             &id,
-                            request.clone(),
+                            Arc::clone(&request),
                             priority,
                             force_cpu,
                             overflow_policy,
@@ -298,7 +358,7 @@ impl CronScheduler {
     async fn fire(
         scheduler: &Scheduler,
         id: &str,
-        request: InferenceRequest,
+        request: Arc<InferenceRequest>,
         priority: Priority,
         force_cpu: bool,
         overflow_policy: CronOverflowPolicy,
@@ -306,6 +366,9 @@ impl CronScheduler {
         fired_count: &AtomicU64,
         missed_count: &AtomicU64,
     ) {
+        // Unwrap the Arc without cloning when we hold the only reference (the common case),
+        // falling back to a clone only if other Arc handles exist.
+        let request = Arc::try_unwrap(request).unwrap_or_else(|arc| (*arc).clone());
         let result = match overflow_policy {
             CronOverflowPolicy::SkipIfBusy => {
                 scheduler.try_infer(request, priority, force_cpu).await
@@ -399,7 +462,7 @@ mod tests {
         cron.register(CronJob {
             id: "job1".to_string(),
             schedule: CronSchedule::Interval(Duration::from_secs(60)),
-            request: make_request(),
+            request: Arc::new(make_request()),
             priority: Priority::Throughput,
             force_cpu: true,
             overflow_policy: CronOverflowPolicy::SkipIfBusy,
@@ -422,7 +485,7 @@ mod tests {
         cron.register(CronJob {
             id: "dup".to_string(),
             schedule: CronSchedule::Interval(Duration::from_secs(60)),
-            request: make_request(),
+            request: Arc::new(make_request()),
             priority: Priority::Throughput,
             force_cpu: true,
             overflow_policy: CronOverflowPolicy::default(),
@@ -435,7 +498,7 @@ mod tests {
             .register(CronJob {
                 id: "dup".to_string(),
                 schedule: CronSchedule::Interval(Duration::from_secs(60)),
-                request: make_request(),
+                request: Arc::new(make_request()),
                 priority: Priority::Throughput,
                 force_cpu: true,
                 overflow_policy: CronOverflowPolicy::default(),
@@ -454,7 +517,7 @@ mod tests {
             .register(CronJob {
                 id: "bad".to_string(),
                 schedule: CronSchedule::Expression("not a cron expression".to_string()),
-                request: make_request(),
+                request: Arc::new(make_request()),
                 priority: Priority::Throughput,
                 force_cpu: true,
                 overflow_policy: CronOverflowPolicy::default(),
@@ -472,7 +535,7 @@ mod tests {
         cron.register(CronJob {
             id: "removable".to_string(),
             schedule: CronSchedule::Interval(Duration::from_secs(60)),
-            request: make_request(),
+            request: Arc::new(make_request()),
             priority: Priority::Throughput,
             force_cpu: true,
             overflow_policy: CronOverflowPolicy::default(),
@@ -495,7 +558,7 @@ mod tests {
         cron.register(CronJob {
             id: "fast".to_string(),
             schedule: CronSchedule::Interval(Duration::from_millis(50)),
-            request: make_request(),
+            request: Arc::new(make_request()),
             priority: Priority::Throughput,
             force_cpu: true,
             overflow_policy: CronOverflowPolicy::SkipIfBusy,
@@ -526,7 +589,7 @@ mod tests {
         cron.register(CronJob {
             id: "counter-test".to_string(),
             schedule: CronSchedule::Interval(Duration::from_millis(40)),
-            request: make_request(),
+            request: Arc::new(make_request()),
             priority: Priority::Throughput,
             force_cpu: true,
             overflow_policy: CronOverflowPolicy::SkipIfBusy,
@@ -556,7 +619,7 @@ mod tests {
         cron.register(CronJob {
             id: "every-sec".to_string(),
             schedule: CronSchedule::Expression("* * * * * *".to_string()),
-            request: make_request(),
+            request: Arc::new(make_request()),
             priority: Priority::Throughput,
             force_cpu: true,
             overflow_policy: CronOverflowPolicy::default(),
@@ -586,7 +649,7 @@ mod tests {
         cron.register(CronJob {
             id: "busy-test".to_string(),
             schedule: CronSchedule::Interval(Duration::from_millis(10)),
-            request: make_request(),
+            request: Arc::new(make_request()),
             priority: Priority::Throughput,
             force_cpu: false, // GPU path — tiny queue will fill
             overflow_policy: CronOverflowPolicy::SkipIfBusy,
