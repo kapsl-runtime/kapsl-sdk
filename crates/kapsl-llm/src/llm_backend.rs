@@ -417,11 +417,7 @@ impl Engine for LLMBackend {
             let llm_meta = std::fs::File::open(&meta_path)
                 .ok()
                 .and_then(|f| serde_json::from_reader::<_, serde_json::Value>(f).ok())
-                .and_then(|meta| {
-                    meta.get("metadata")
-                        .and_then(|m| m.get("llm"))
-                        .cloned()
-                });
+                .and_then(|meta| meta.get("metadata").and_then(|m| m.get("llm")).cloned());
 
             let get_usize = |llm: &serde_json::Value, key: &str| -> Option<usize> {
                 llm.get(key)
@@ -444,12 +440,8 @@ impl Engine for LLMBackend {
                     max_paddings: sched
                         .and_then(|s| get_usize(s, "max_paddings"))
                         .unwrap_or(32),
-                    block_size: kv
-                        .and_then(|k| get_usize(k, "block_size"))
-                        .unwrap_or(16),
-                    num_gpu_blocks: kv
-                        .and_then(|k| get_usize(k, "total_blocks"))
-                        .unwrap_or(128),
+                    block_size: kv.and_then(|k| get_usize(k, "block_size")).unwrap_or(16),
+                    num_gpu_blocks: kv.and_then(|k| get_usize(k, "total_blocks")).unwrap_or(128),
                 }
             } else {
                 ManifestHints {

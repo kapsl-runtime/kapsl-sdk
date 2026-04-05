@@ -230,9 +230,8 @@ impl Engine for GgufBackend {
             for (i, &token) in tokens.iter().enumerate() {
                 let is_last = i == tokens.len() - 1;
                 if let Err(e) = batch.add(token, i as i32, &[0], is_last) {
-                    let _ = tx.blocking_send(Err(EngineError::backend(format!(
-                        "Batch add error: {e}"
-                    ))));
+                    let _ = tx
+                        .blocking_send(Err(EngineError::backend(format!("Batch add error: {e}"))));
                     return;
                 }
             }
@@ -251,8 +250,7 @@ impl Engine for GgufBackend {
 
             // Decode loop
             for _ in 0..max_tokens {
-                let next_token =
-                    LlamaSampler::greedy().sample(&ctx, batch.n_tokens() - 1);
+                let next_token = LlamaSampler::greedy().sample(&ctx, batch.n_tokens() - 1);
 
                 if next_token == eos_token {
                     break;
@@ -277,9 +275,8 @@ impl Engine for GgufBackend {
                 // Prepare next batch with just the new token
                 batch.clear();
                 if let Err(e) = batch.add(next_token, n_cur, &[0], true) {
-                    let _ = tx.blocking_send(Err(EngineError::backend(format!(
-                        "Batch add error: {e}"
-                    ))));
+                    let _ = tx
+                        .blocking_send(Err(EngineError::backend(format!("Batch add error: {e}"))));
                     return;
                 }
 

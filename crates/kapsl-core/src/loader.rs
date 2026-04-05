@@ -155,10 +155,7 @@ impl PackageLoader {
             hardware_requirements: HardwareRequirements::default(),
         };
 
-        let extracted_path = model_path
-            .parent()
-            .unwrap_or(Path::new("."))
-            .to_path_buf();
+        let extracted_path = model_path.parent().unwrap_or(Path::new(".")).to_path_buf();
 
         // A dummy TempDir satisfies the struct contract without touching the actual model file.
         let temp_dir = tempfile::tempdir()?;
