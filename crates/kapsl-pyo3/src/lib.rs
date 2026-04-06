@@ -641,7 +641,7 @@ impl KapslClient {
     }
 }
 
-#[pyclass]
+#[pyclass(unsendable)]
 struct StreamIterator {
     stream: ClientConnection,
 }
