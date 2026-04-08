@@ -2,30 +2,61 @@
 
 `infer_stream` sends a request and receives output as an iterator of chunks. This is designed for LLMs that generate tokens one at a time, giving the caller each token as soon as it is produced rather than waiting for the full response.
 
-## Basic usage
+## Basic usage — text in, text out
+
+For LLMs that accept a raw text prompt and stream back text chunks (e.g. GGUF models):
 
 ```python
 from kapsl_sdk import KapslClient
 
 client = KapslClient()
 
-# Encode prompt as token IDs
-prompt_tokens = tokenizer.encode("What is the capital of France?")
+prompt = "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n"
+
+stream = client.infer_stream(
+    model_id=0,
+    shape=[1, 1],
+    dtype="string",
+    data=prompt.encode("utf-8"),
+)
+
+# Print tokens as they arrive
+for chunk in stream:
+    print(chunk.decode("utf-8"), end="", flush=True)
+
+print()  # newline after generation
+```
+
+To collect the full response instead of printing:
+
+```python
+full_response = b"".join(stream)
+print(full_response.decode("utf-8"))
+```
+
+## Basic usage — token IDs in, token IDs out
+
+For ONNX-based LLMs that operate on integer token arrays:
+
+```python
 import numpy as np
+from kapsl_sdk import KapslClient
+
+client = KapslClient()
+
+prompt_tokens = tokenizer.encode("What is the capital of France?")
 token_array = np.array([prompt_tokens], dtype=np.int64)
 
-# Stream the response
 for chunk in client.infer_stream(
     model_id=0,
     shape=list(token_array.shape),
     dtype="int64",
     data=token_array.tobytes(),
 ):
-    # Each chunk is raw bytes for one output token
     token_id = int(np.frombuffer(chunk, dtype=np.int64)[0])
     print(tokenizer.decode([token_id]), end="", flush=True)
 
-print()  # newline after generation
+print()
 ```
 
 ## Parameters
