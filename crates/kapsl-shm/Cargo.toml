@@ -1,12 +1,15 @@
 [package]
 name = "kapsl-shm"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared memory transport for high-throughput inter-process tensor transfer in Kapsl"
 
 [dependencies]
-kapsl-transport = { path = "../kapsl-transport" }
-kapsl-engine-api = { path = "../kapsl-engine-api" }
-kapsl-scheduler = { path = "../kapsl-scheduler" }
+kapsl-transport = { version = "0.1.0", path = "../kapsl-transport" }
+kapsl-engine-api = { version = "0.1.0", path = "../kapsl-engine-api" }
+kapsl-scheduler = { version = "0.1.0", path = "../kapsl-scheduler" }
 shared_memory = "0.12"
 memmap2 = "0.9"
 crossbeam = "0.8"

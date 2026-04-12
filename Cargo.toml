@@ -37,7 +37,8 @@ default-members = [
 
 resolver = "2"
 
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
 license = "Apache-2.0"
-
-[patch.crates-io]
-esaxx-rs = { path = "patches/esaxx-rs" }
+repository = "https://github.com/kapsl-runtime/kapsl-sdk"
