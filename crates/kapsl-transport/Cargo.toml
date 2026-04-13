@@ -1,10 +1,13 @@
 [package]
 name = "kapsl-transport"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Async transport layer for inter-process communication in Kapsl"
 
 [dependencies]
-kapsl-engine-api = { path = "../kapsl-engine-api" }
+kapsl-engine-api = { version = "0.1.0", path = "../kapsl-engine-api" }
 async-trait = "0.1"
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "1.0"

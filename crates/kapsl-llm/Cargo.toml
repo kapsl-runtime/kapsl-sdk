@@ -1,13 +1,16 @@
 [package]
 name = "kapsl-llm"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Large language model inference with GGUF and ONNX backend support for Kapsl"
 
 [dependencies]
-kapsl-core = { path = "../kapsl-core" }
-kapsl-engine-api = { path = "../kapsl-engine-api" }
-kapsl-quantization = { path = "../kapsl-quantization" }
-kapsl-kernels = { path = "../kapsl-kernels" }
+kapsl-core = { version = "0.1.0", path = "../kapsl-core" }
+kapsl-engine-api = { version = "0.1.0", path = "../kapsl-engine-api" }
+kapsl-quantization = { version = "0.1.0", path = "../kapsl-quantization" }
+kapsl-kernels = { version = "0.1.0", path = "../kapsl-kernels" }
 tokio = { version = "1.32", features = ["full"] }
 tracing = "0.1"
 uuid = { version = "1.4", features = ["v4"] }

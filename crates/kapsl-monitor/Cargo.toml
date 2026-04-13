@@ -1,10 +1,13 @@
 [package]
 name = "kapsl-monitor"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
+license.workspace = true
+repository.workspace = true
+description = "Prometheus metrics and monitoring for the Kapsl inference engine"
 
 [dependencies]
-kapsl-engine-api = { path = "../kapsl-engine-api" }
+kapsl-engine-api = { version = "0.1.0", path = "../kapsl-engine-api" }
 prometheus = "0.14"
 anyhow = "1.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }

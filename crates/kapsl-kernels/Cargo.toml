@@ -1,10 +1,13 @@
 [package]
 name = "kapsl-kernels"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Compute kernels for matrix operations and attention in Kapsl"
 
 [dependencies]
-kapsl-hal = { path = "../kapsl-hal" }
+kapsl-hal = { version = "0.1.0", path = "../kapsl-hal" }
 thiserror = "1.0"
 log = "0.4"
 rayon = "1.11.0"
