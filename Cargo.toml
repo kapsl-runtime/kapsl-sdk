@@ -37,6 +37,11 @@ default-members = [
 
 resolver = "2"
 
+[patch.crates-io]
+# Patch esaxx-rs to use dynamic CRT (/MD) on Windows MSVC, matching llama-cpp-sys-2.
+# Without this, the linker fails with LNK2038 (RuntimeLibrary mismatch).
+esaxx-rs = { path = "patches/esaxx-rs" }
+
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
