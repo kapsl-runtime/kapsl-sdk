@@ -1,7 +1,10 @@
 [package]
 name = "kapsl-hal"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Hardware abstraction layer for CPU, CUDA, and ROCm devices in Kapsl"
 
 [dependencies]
 sys-info = "0.9"

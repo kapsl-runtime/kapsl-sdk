@@ -1,10 +1,13 @@
 [package]
 name = "kapsl-rag"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Retrieval-augmented generation implementation with vector store and WASM plugins for Kapsl"
 
 [dependencies]
-kapsl-rag-sdk = { path = "../kapsl-rag-sdk" }
+kapsl-rag-sdk = { version = "0.1.0", path = "../kapsl-rag-sdk" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "1.0"

@@ -1,11 +1,14 @@
 [package]
 name = "kapsl-optimizer"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Inference optimization strategies and graph transformations for Kapsl"
 
 [dependencies]
-kapsl-core = { path = "../kapsl-core" }
-kapsl-engine-api = { path = "../kapsl-engine-api" }
+kapsl-core = { version = "0.1.0", path = "../kapsl-core" }
+kapsl-engine-api = { version = "0.1.0", path = "../kapsl-engine-api" }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

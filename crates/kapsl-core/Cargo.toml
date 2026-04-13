@@ -1,7 +1,10 @@
 [package]
 name = "kapsl-core"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core model loading, configuration, and caching for the Kapsl inference engine"
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
@@ -16,4 +19,4 @@ log = "0.4"
 serde_json = "1.0.145"
 parking_lot = "0.12"
 fs2 = "0.4"
-kapsl-engine-api = { path = "../kapsl-engine-api" }
+kapsl-engine-api = { version = "0.1.0", path = "../kapsl-engine-api" }
