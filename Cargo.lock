@@ -933,8 +933,6 @@ dependencies = [
 [[package]]
 name = "esaxx-rs"
 version = "0.1.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d817e038c30374a4bcb22f94d0a8a0e216958d4c3dcde369b1439fec4bdda6e6"
 dependencies = [
  "cc",
 ]
@@ -1799,6 +1797,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
+ "turboquant-rs",
 ]
 
 [[package]]
@@ -3418,6 +3417,16 @@ checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 dependencies = [
  "once_cell",
  "valuable",
+]
+
+[[package]]
+name = "turboquant-rs"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "70b40b47dd129bd875499ffbc0b5a86872ca9a95e8d1d5323a41c67a87128ad6"
+dependencies = [
+ "half",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

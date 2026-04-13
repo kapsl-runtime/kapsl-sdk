@@ -14,3 +14,4 @@ thiserror = "1.0"
 half = { version = "2.3", features = ["serde"] }
 log = "0.4"
 anyhow = "1.0"
+turboquant_rs = { package = "turboquant-rs", version = "0.3.1" }
