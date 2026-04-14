@@ -51,6 +51,7 @@ impl ModelLoader for Int8Loader {
                                 weight: Arc::new(data),
                                 scale,
                                 zero_point,
+                                symmetric: zero_point == 0,
                                 shape: tensor.shape().to_vec(),
                             });
 
