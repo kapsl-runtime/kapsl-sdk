@@ -191,6 +191,7 @@ impl PackageLoader {
         let framework = match ext.as_str() {
             "gguf" => "gguf",
             "onnx" => "onnx",
+            "safetensors" => "safetensors",
             _ => "onnx",
         };
 
@@ -226,6 +227,74 @@ impl PackageLoader {
             manifest,
             persisted_model_path: model_path.to_path_buf(),
         })
+    }
+
+    /// Creates a synthetic PackageLoader for a directory that contains
+    /// safetensors weight files (HuggingFace-style layout with `config.json`).
+    ///
+    /// Looks for `model.safetensors` or any `model-*-of-*.safetensors` shard.
+    /// If none are found, falls back to `from_raw_file` on `metadata.json`
+    /// inside the directory if present, or returns `ManifestMissing`.
+    pub fn from_directory(dir: &Path) -> Result<Self, LoaderError> {
+        if !dir.is_dir() {
+            return Err(LoaderError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("{} is not a directory", dir.display()),
+            )));
+        }
+
+        // Prefer an explicit metadata.json if the user already wrote one.
+        let metadata_path = dir.join("metadata.json");
+        if metadata_path.exists() {
+            // Reuse load() logic but for an already-extracted directory.
+            let manifest_file = File::open(&metadata_path)?;
+            let manifest: Manifest = serde_json::from_reader(manifest_file)
+                .map_err(LoaderError::Json)?;
+            let temp_dir = tempfile::tempdir()?;
+            let persisted = dir.join(&manifest.model_file);
+            return Ok(Self {
+                _temp_dir: temp_dir,
+                extracted_path: dir.to_path_buf(),
+                manifest,
+                persisted_model_path: persisted,
+            });
+        }
+
+        // Auto-detect safetensors shards.
+        let has_safetensors = fs::read_dir(dir)?.any(|e| {
+            e.ok()
+                .and_then(|e| e.path().extension().map(|x| x == "safetensors"))
+                .unwrap_or(false)
+        });
+
+        if has_safetensors {
+            let project_name = dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("model")
+                .to_string();
+            let manifest = Manifest {
+                project_name,
+                framework: "safetensors".to_string(),
+                version: "1.0.0".to_string(),
+                created_at: String::new(),
+                // model_file is not used for directory-based loading but must
+                // be non-empty for the struct to serialise cleanly.
+                model_file: "model.safetensors".to_string(),
+                metadata: None,
+                hardware_requirements: HardwareRequirements::default(),
+                cron_jobs: Vec::new(),
+            };
+            let temp_dir = tempfile::tempdir()?;
+            return Ok(Self {
+                _temp_dir: temp_dir,
+                extracted_path: dir.to_path_buf(),
+                manifest,
+                persisted_model_path: dir.to_path_buf(),
+            });
+        }
+
+        Err(LoaderError::ManifestMissing)
     }
 
     pub fn get_model_path(&self) -> PathBuf {

@@ -11,10 +11,15 @@ sys-info = "0.9"
 thiserror = "2.0.17"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-cudarc = { version = "0.12", features = ["nccl"], optional = true }
+half = "2.0"
+log = "0.4"
+cudarc = { version = "0.12", optional = true }
 nvml-wrapper = { version = "0.10", optional = true }
 
 [features]
 default = []
-nccl = ["cudarc"]
+cuda = ["dep:cudarc"]
+cublas = ["cuda", "cudarc/cublas"]
+nvrtc = ["cuda", "cudarc/nvrtc"]
+nccl = ["cuda", "cudarc/nccl"]
 nvml = ["dep:nvml-wrapper"]

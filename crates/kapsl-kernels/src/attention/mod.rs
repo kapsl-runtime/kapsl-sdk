@@ -99,7 +99,8 @@ impl AttentionKernel for CpuAttention {
     }
 }
 
-// Future: CudaAttention, RocmAttention implementations
+#[cfg(feature = "cuda")]
+pub mod cuda;
 
 struct AttentionDims {
     batch: usize,

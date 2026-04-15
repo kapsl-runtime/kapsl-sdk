@@ -42,6 +42,9 @@ pub struct LLMBackend {
     /// Optional per-replica cap on KV cache total_blocks. Set by the runtime
     /// when scaling to multiple replicas to divide the block budget fairly.
     kv_blocks_cap: Option<usize>,
+    /// TurboQuant KV-cache compression bit-width (2, 3, or 4). When set,
+    /// overrides any value from metadata.json / KAPSL_LLM_KV_COMPRESSION_BITS.
+    kv_compression_bits: Option<u8>,
 }
 
 #[derive(Clone)]
@@ -336,6 +339,7 @@ impl LLMBackend {
             device_ids_override: None,
             shared_pool: None,
             kv_blocks_cap: None,
+            kv_compression_bits: None,
         }
     }
 
@@ -351,6 +355,13 @@ impl LLMBackend {
     /// across all engines on the same device.
     pub fn with_kv_blocks_cap(mut self, cap: usize) -> Self {
         self.kv_blocks_cap = Some(cap);
+        self
+    }
+
+    /// Enable TurboQuant KV-cache compression at `bits` bits per value (2–4).
+    /// Overrides the value in `metadata.json` and `KAPSL_LLM_KV_COMPRESSION_BITS`.
+    pub fn with_kv_compression_bits(mut self, bits: u8) -> Self {
+        self.kv_compression_bits = Some(bits);
         self
     }
 
@@ -468,6 +479,7 @@ impl Engine for LLMBackend {
         let engine_num_gpu_blocks = hints.num_gpu_blocks;
         let shared_pool = self.shared_pool.clone();
         let kv_blocks_cap = self.kv_blocks_cap;
+        let kv_compression_bits = self.kv_compression_bits;
         tokio::spawn(async move {
             let mut engine = LLMEngine::new(
                 config,
@@ -488,6 +500,10 @@ impl Engine for LLMBackend {
             // Apply per-replica block cap if set.
             if let Some(cap) = kv_blocks_cap {
                 engine.set_kv_blocks_cap(cap);
+            }
+            // Apply TurboQuant KV-cache compression bit-width if set.
+            if let Some(bits) = kv_compression_bits {
+                engine.set_kv_compression_bits(bits);
             }
             let load_result = engine.load(&engine_path).await;
             if let Err(e) = load_tx.send(load_result) {
