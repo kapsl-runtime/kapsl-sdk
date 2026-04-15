@@ -659,6 +659,34 @@ pub trait Engine: Send + Sync {
 
     /// Check if the model is healthy.
     fn health_check(&self) -> Result<(), EngineError>;
+
+    /// Whether this backend supports live weight hot-swap.
+    fn supports_swap(&self) -> bool {
+        false
+    }
+
+    /// Whether this backend currently has weights staged in CPU RAM and ready
+    /// for a `swap()` call.  Always `false` for backends that don't support swap.
+    fn is_staged(&self) -> bool {
+        false
+    }
+
+    /// Pre-load a model from `path` into CPU staging RAM so a future `swap()`
+    /// only needs the PCIe transfer, not the disk read.
+    async fn stage(&self, _path: &std::path::Path) -> Result<(), EngineError> {
+        Err(EngineError::backend(
+            "hot-swap staging not supported by this backend",
+        ))
+    }
+
+    /// Atomically replace the live GPU weights with the previously staged model.
+    /// All active sessions are invalidated; in-flight requests must be drained
+    /// by the caller before calling this.
+    async fn swap(&self) -> Result<(), EngineError> {
+        Err(EngineError::backend(
+            "hot-swap not supported by this backend",
+        ))
+    }
 }
 
 #[async_trait]
@@ -722,6 +750,22 @@ impl Engine for Box<dyn Engine> {
 
     fn health_check(&self) -> Result<(), EngineError> {
         (**self).health_check()
+    }
+
+    fn supports_swap(&self) -> bool {
+        (**self).supports_swap()
+    }
+
+    fn is_staged(&self) -> bool {
+        (**self).is_staged()
+    }
+
+    async fn stage(&self, path: &std::path::Path) -> Result<(), EngineError> {
+        (**self).stage(path).await
+    }
+
+    async fn swap(&self) -> Result<(), EngineError> {
+        (**self).swap().await
     }
 }
 
