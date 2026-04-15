@@ -11,7 +11,9 @@ kapsl-hal = { version = "0.1.0", path = "../kapsl-hal" }
 thiserror = "1.0"
 log = "0.4"
 rayon = "1.11.0"
+half = "2.0"
+cudarc = { version = "0.12", features = ["nvrtc", "cublas"], optional = true }
 
 [features]
-cuda = []
+cuda = ["dep:cudarc", "kapsl-hal/cuda", "kapsl-hal/nvrtc", "kapsl-hal/cublas"]
 rocm = []

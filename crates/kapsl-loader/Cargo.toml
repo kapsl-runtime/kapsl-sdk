@@ -1,0 +1,21 @@
+[package]
+name = "kapsl-loader"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Safetensors weight loader and model config parser for the Kapsl native inference path"
+
+[dependencies]
+kapsl-hal = { version = "0.1.0", path = "../kapsl-hal" }
+half = "2.0"
+safetensors = "0.4"
+memmap2 = "0.9"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+log = "0.4"
+
+[features]
+default = []
+cuda = ["kapsl-hal/cuda"]

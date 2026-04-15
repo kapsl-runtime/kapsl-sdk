@@ -20,6 +20,7 @@
 //! ```
 
 use anyhow::{anyhow, Result};
+use half::f16;
 use turboquant_rs::{QuantizedKVCache, TurboQuantConfig};
 
 // ---------------------------------------------------------------------------
@@ -156,6 +157,83 @@ impl KvCacheQuantizer {
     /// Return the configuration this quantizer was created with.
     pub fn config(&self) -> KvCacheConfig {
         self.config
+    }
+
+    /// Push a packed f16 KV layer (head-first layout: `[num_heads, length, head_dim]`)
+    /// into `layer`, splitting into per-position vectors for TurboQuant.
+    ///
+    /// Called from the engine's `set_packed_layer` path when TQ compression is enabled.
+    pub fn push_packed_layer(
+        &mut self,
+        layer: usize,
+        length: usize,
+        num_heads: usize,
+        head_dim: usize,
+        key_f16: &[f16],
+        value_f16: &[f16],
+    ) -> Result<()> {
+        // Convert f16 head-first layout → per-position f32 vectors of dim num_heads*head_dim
+        let total_dim = num_heads * head_dim;
+        let mut keys: Vec<Vec<f32>> = Vec::with_capacity(length);
+        let mut values: Vec<Vec<f32>> = Vec::with_capacity(length);
+
+        for pos in 0..length {
+            let mut k = vec![0.0f32; total_dim];
+            let mut v = vec![0.0f32; total_dim];
+            for h in 0..num_heads {
+                let src = h * length * head_dim + pos * head_dim;
+                let dst = h * head_dim;
+                for d in 0..head_dim {
+                    k[dst + d] = key_f16[src + d].to_f32();
+                    v[dst + d] = value_f16[src + d].to_f32();
+                }
+            }
+            keys.push(k);
+            values.push(v);
+        }
+
+        let key_refs: Vec<&[f32]> = keys.iter().map(|k| k.as_slice()).collect();
+        let val_refs: Vec<&[f32]> = values.iter().map(|v| v.as_slice()).collect();
+        self.push_batch(layer, &key_refs, &val_refs)
+    }
+
+    /// Decompress all stored KV entries for `layer` back to packed f16 head-first layout
+    /// `[num_heads, entry_count, head_dim]`. Returns `(key_f16, value_f16, length)`.
+    ///
+    /// Called from the engine's `get_packed_layer` path when TQ compression is enabled.
+    pub fn dequantize_packed_layer(
+        &self,
+        layer: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) -> Result<(Vec<f16>, Vec<f16>, usize)> {
+        let keys_f32 = self
+            .inner
+            .dequantize_all_keys(layer)
+            .map_err(|e| anyhow!("dequantize keys failed: {e}"))?;
+        let values_f32 = self
+            .inner
+            .dequantize_all_values(layer)
+            .map_err(|e| anyhow!("dequantize values failed: {e}"))?;
+
+        let length = keys_f32.len();
+        let total = num_heads * length * head_dim;
+        let mut key_out = vec![f16::ZERO; total];
+        let mut val_out = vec![f16::ZERO; total];
+
+        // Convert per-position f32 vectors → head-first f16 layout
+        for (pos, (k, v)) in keys_f32.iter().zip(values_f32.iter()).enumerate() {
+            for h in 0..num_heads {
+                let src = h * head_dim;
+                let dst = h * length * head_dim + pos * head_dim;
+                for d in 0..head_dim {
+                    key_out[dst + d] = f16::from_f32(k[src + d]);
+                    val_out[dst + d] = f16::from_f32(v[src + d]);
+                }
+            }
+        }
+
+        Ok((key_out, val_out, length))
     }
 }
 

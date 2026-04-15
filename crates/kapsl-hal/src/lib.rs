@@ -1,6 +1,10 @@
 pub mod device;
 pub mod device_mesh;
 pub mod distributed_ops;
+#[cfg(feature = "cuda")]
+pub mod gpu_arena;
+#[cfg(feature = "cuda")]
+pub mod gpu_tensor;
 pub mod kernel;
 pub mod mock_comm;
 #[cfg(feature = "nccl")]

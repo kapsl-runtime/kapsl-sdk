@@ -1,5 +1,6 @@
 use crate::radix_tree::RadixTree;
 use half::f16;
+use kapsl_quantization::kv_cache::{KvCacheConfig as TqConfig, KvCacheQuantizer};
 use ndarray::Array4;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -33,6 +34,10 @@ pub struct KvCacheConfig {
     /// dynamically up to max_seq_len. Tuned per-model via metadata.json
     /// `kv_cache.initial_seq_len`. Default: 256.
     pub initial_seq_len: usize,
+    /// When set, compress KV entries using TurboQuant at this bit width (2, 3, or 4).
+    /// Reduces peak memory for long contexts at the cost of decompression overhead
+    /// per decode step. Only applies when `head_dim` is a power of two.
+    pub tq_compression_bits: Option<u8>,
 }
 
 impl Default for KvCacheConfig {
@@ -44,6 +49,7 @@ impl Default for KvCacheConfig {
             eviction_policy: KvEvictionPolicy::LruInactive,
             dense_free_list_cap: 32,
             initial_seq_len: 256,
+            tq_compression_bits: None,
         }
     }
 }
@@ -271,6 +277,10 @@ pub struct DenseKvCache {
     num_layers: usize,
     num_heads: usize,
     head_dim: usize,
+    /// Per-sequence TurboQuant KV quantizers. Populated lazily when
+    /// `tq_compression_bits` is set and `head_dim` is a power of two.
+    tq_quantizers: HashMap<u64, KvCacheQuantizer>,
+    tq_compression_bits: Option<u8>,
 }
 
 impl DenseKvCache {
@@ -303,6 +313,26 @@ impl DenseKvCache {
         free_list_cap: usize,
         initial_seq_len: usize,
     ) -> Self {
+        Self::new_with_full_config(
+            num_layers,
+            num_heads,
+            max_seq_len,
+            head_dim,
+            free_list_cap,
+            initial_seq_len,
+            None,
+        )
+    }
+
+    pub fn new_with_full_config(
+        num_layers: usize,
+        num_heads: usize,
+        max_seq_len: usize,
+        head_dim: usize,
+        free_list_cap: usize,
+        initial_seq_len: usize,
+        tq_compression_bits: Option<u8>,
+    ) -> Self {
         let expected = num_heads * head_dim;
         Self {
             sequences: HashMap::new(),
@@ -317,7 +347,32 @@ impl DenseKvCache {
             max_seq_len,
             initial_seq_len,
             head_dim,
+            tq_quantizers: HashMap::new(),
+            tq_compression_bits,
         }
+    }
+
+    /// Returns true if TurboQuant compression is active for this cache.
+    fn tq_enabled(&self) -> bool {
+        let total_dim = self.num_heads * self.head_dim;
+        self.tq_compression_bits.is_some()
+            && total_dim > 0
+            && total_dim.is_power_of_two()
+    }
+
+    /// Get or create a TQ quantizer for a sequence.
+    fn get_or_create_tq(&mut self, sequence_id: u64) -> Option<&mut KvCacheQuantizer> {
+        let bits = self.tq_compression_bits?;
+        let total_dim = self.num_heads * self.head_dim;
+        if !total_dim.is_power_of_two() {
+            return None;
+        }
+        let num_layers = self.num_layers;
+        Some(self.tq_quantizers.entry(sequence_id).or_insert_with(|| {
+            let cfg = TqConfig::new(bits, total_dim, num_layers)
+                .expect("tq_compression_bits and head_dim already validated");
+            KvCacheQuantizer::new(cfg, 0)
+        }))
     }
 
     pub fn allocate_sequence(
@@ -413,10 +468,6 @@ impl DenseKvCache {
         key: &[f16],
         value: &[f16],
     ) {
-        let seq = self
-            .sequences
-            .get_mut(&sequence_id)
-            .expect("sequence not allocated");
         let expected = self.num_heads * self.head_dim * length;
         if key.len() != expected || value.len() != expected {
             log::warn!(
@@ -429,6 +480,28 @@ impl DenseKvCache {
             );
             return;
         }
+
+        // TurboQuant compression path.
+        if self.tq_enabled() {
+            let num_heads = self.num_heads;
+            let head_dim = self.head_dim;
+            if let Some(tq) = self.get_or_create_tq(sequence_id) {
+                tq.clear();
+                match tq.push_packed_layer(layer_index, length, num_heads, head_dim, key, value) {
+                    Ok(()) => return,
+                    Err(e) => log::warn!(
+                        "TQ push_packed_layer failed for seq {} layer {}: {}; falling back to f16",
+                        sequence_id, layer_index, e
+                    ),
+                }
+            }
+        }
+
+        // Raw f16 storage path.
+        let seq = self
+            .sequences
+            .get_mut(&sequence_id)
+            .expect("sequence not allocated");
         if layer_index >= seq.packed_layers.len() {
             return;
         }
@@ -448,6 +521,26 @@ impl DenseKvCache {
     }
 
     pub fn get_packed_layer(&self, sequence_id: u64, layer_index: usize) -> Option<PackedKvView> {
+        // TurboQuant decompression path.
+        if let Some(tq) = self.tq_quantizers.get(&sequence_id) {
+            if tq.entry_count(layer_index) > 0 {
+                match tq.dequantize_packed_layer(layer_index, self.num_heads, self.head_dim) {
+                    Ok((key, value, length)) => {
+                        return Some(PackedKvView {
+                            key: Arc::from(key.as_slice()),
+                            value: Arc::from(value.as_slice()),
+                            length,
+                        });
+                    }
+                    Err(e) => log::warn!(
+                        "TQ dequantize failed for seq {} layer {}: {}; falling back to f16",
+                        sequence_id, layer_index, e
+                    ),
+                }
+            }
+        }
+
+        // Raw f16 path.
         let seq = self.sequences.get(&sequence_id)?;
         let packed = seq.packed_layers.get(layer_index)?.as_ref()?;
         Some(PackedKvView {
@@ -518,6 +611,7 @@ impl DenseKvCache {
     }
 
     pub fn remove_sequence(&mut self, sequence_id: u64) {
+        self.tq_quantizers.remove(&sequence_id);
         if let Some(seq) = self.sequences.remove(&sequence_id) {
             if self.free_list.len() < self.free_list_cap {
                 self.free_list.push(seq);

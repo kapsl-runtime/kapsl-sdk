@@ -864,6 +864,9 @@ pub struct LLMEngine {
     /// Overrides the value from metadata/env when set, so that memory is divided
     /// fairly across replicas sharing the same device.
     kv_blocks_cap: Option<usize>,
+    /// TurboQuant KV-cache compression bit-width override (2–4). When set,
+    /// takes precedence over metadata.json and KAPSL_LLM_KV_COMPRESSION_BITS.
+    kv_compression_bits_override: Option<u8>,
     kv_admission_hard_limit_bytes: Option<usize>,
     // Detected vocabulary size (optional). Populated at load() when available.
     vocab_size: Option<usize>,
@@ -1008,6 +1011,7 @@ impl LLMEngine {
             kv_admission_soft_limit_bytes: None,
             kv_admission_hard_limit_bytes: None,
             kv_blocks_cap: None,
+            kv_compression_bits_override: None,
             vocab_size: None,
             bos_token_id: None,
             use_kv_cache: true,
@@ -1046,6 +1050,15 @@ impl LLMEngine {
     /// replica receives a proportional share of the device's block budget.
     pub fn set_kv_blocks_cap(&mut self, cap: usize) {
         self.kv_blocks_cap = Some(cap);
+    }
+
+    /// Override the TurboQuant KV-cache compression bit-width for this engine.
+    /// Takes precedence over `metadata.json` and `KAPSL_LLM_KV_COMPRESSION_BITS`.
+    /// `bits` must be 2, 3, or 4; other values are silently ignored.
+    pub fn set_kv_compression_bits(&mut self, bits: u8) {
+        if (2..=4).contains(&bits) {
+            self.kv_compression_bits_override = Some(bits);
+        }
     }
 
     /// Load model and capture its input names and shapes. Detect KV geometry
@@ -1187,6 +1200,16 @@ impl LLMEngine {
                     if let Some(v) = kv.get("dense_free_list_cap").and_then(|v| v.as_u64()) {
                         if v > 0 {
                             kv_cache_config.dense_free_list_cap = v as usize;
+                        }
+                    }
+                    if let Some(bits) = kv.get("tq_compression_bits").and_then(|v| v.as_u64()) {
+                        if (2..=4).contains(&bits) {
+                            kv_cache_config.tq_compression_bits = Some(bits as u8);
+                        } else {
+                            log::warn!(
+                                "Invalid tq_compression_bits {} in metadata (must be 2, 3, or 4); ignoring",
+                                bits
+                            );
                         }
                     }
                     if let Some(v) = kv
@@ -1400,6 +1423,23 @@ impl LLMEngine {
             }
         }
         if let Some(v) = env_var_alias(
+            "KAPSL_LLM_KV_COMPRESSION_BITS",
+            "KAPSL_LLM_KV_COMPRESSION_BITS",
+        ) {
+            match v.trim() {
+                "0" | "off" | "none" => kv_cache_config.tq_compression_bits = None,
+                s => match s.parse::<u8>() {
+                    Ok(bits) if (2..=4).contains(&bits) => {
+                        kv_cache_config.tq_compression_bits = Some(bits);
+                    }
+                    _ => log::warn!(
+                        "Invalid KAPSL_LLM_KV_COMPRESSION_BITS '{}' (must be 2, 3, or 4); ignoring",
+                        v
+                    ),
+                },
+            }
+        }
+        if let Some(v) = env_var_alias(
             "KAPSL_LLM_KV_ADMISSION_SOFT_LIMIT_BYTES",
             "KAPSL_LLM_KV_ADMISSION_SOFT_LIMIT_BYTES",
         ) {
@@ -1418,6 +1458,11 @@ impl LLMEngine {
                     kv_admission_hard_limit_bytes = Some(parsed);
                 }
             }
+        }
+        // Programmatic override (highest precedence — set via LLMBackend::with_kv_compression_bits
+        // or LLMEngine::set_kv_compression_bits, e.g. from the CLI --kv-compression-bits flag).
+        if let Some(bits) = self.kv_compression_bits_override {
+            kv_cache_config.tq_compression_bits = Some(bits);
         }
         let tokenizer_path = find_model_asset(model_path, "tokenizer.json").ok_or_else(|| {
             EngineError::backend(format!(

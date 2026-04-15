@@ -143,6 +143,16 @@ impl BackendFactory {
             return Ok(Box::new(GgufBackend::new()));
         }
 
+        // Native CUDA: safetensors models use custom kernel backend.
+        #[cfg(feature = "native")]
+        if manifest.framework == "native" || manifest.framework == "safetensors" {
+            let device_id = manifest.hardware_requirements.device_id.unwrap_or(0);
+            log::info!("✓ Using NativeBackend (custom CUDA kernels), device {}", device_id);
+            return crate::native::NativeBackend::new(device_id)
+                .map(|b| Box::new(b) as Box<dyn Engine>)
+                .map_err(|e| format!("NativeBackend init failed: {e}"));
+        }
+
         // Check for LLM framework
         if manifest.framework == "llm" {
             let requirements = &manifest.hardware_requirements;
@@ -232,6 +242,15 @@ impl BackendFactory {
         device_info: &DeviceInfo,
         tuning: &OnnxRuntimeTuning,
     ) -> Result<Box<dyn Engine>, String> {
+        // Native safetensors: route to custom CUDA kernel backend
+        #[cfg(feature = "native")]
+        if manifest.framework == "native" || manifest.framework == "safetensors" {
+            log::info!("✓ Using NativeBackend (custom CUDA kernels) on device {}", device_id);
+            return NativeBackend::new(device_id as i32)
+                .map(|b| Box::new(b) as Box<dyn Engine>)
+                .map_err(|e| format!("NativeBackend init failed: {e}"));
+        }
+
         // GGUF: route to the llama.cpp-backed GgufBackend
         if manifest.framework == "gguf" {
             log::info!("✓ Using GgufBackend (llama.cpp)");

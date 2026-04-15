@@ -10,8 +10,12 @@ description = "Pluggable inference backends (ONNX, llama.cpp) for the Kapsl engi
 kapsl-core = { version = "0.1.0", path = "../kapsl-core" }
 kapsl-engine-api = { version = "0.1.0", path = "../kapsl-engine-api" }
 kapsl-hal = { version = "0.1.0", path = "../kapsl-hal" }
+kapsl-kernels = { version = "0.1.0", path = "../kapsl-kernels", optional = true }
+kapsl-loader = { version = "0.1.0", path = "../kapsl-loader", optional = true }
 kapsl-llm = { version = "0.1.0", path = "../kapsl-llm", features = ["gguf"] }
+cudarc = { version = "0.12", features = ["cublas"], optional = true }
 half = "2.0"
+rand = "0.8"
 thiserror = "1.0"
 log = "0.4"
 lru = "0.12"
@@ -20,6 +24,17 @@ futures = "0.3"
 ndarray = "0.17"
 async-trait = "0.1.89"
 serde = { version = "1.0", features = ["derive"] }
+
+[features]
+default = []
+native = [
+    "dep:kapsl-kernels",
+    "dep:kapsl-loader",
+    "dep:cudarc",
+    "kapsl-kernels/cuda",
+    "kapsl-hal/cuda",
+    "kapsl-hal/cublas",
+]
 
 [target.'cfg(windows)'.dependencies]
 ort = { version = "=2.0.0-rc.11", features = ["download-binaries", "directml", "cuda", "tensorrt", "rocm", "coreml", "openvino", "half", "ndarray"] }
