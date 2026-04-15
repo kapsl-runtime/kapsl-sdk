@@ -325,6 +325,22 @@ impl<E: Engine> Engine for MonitoringMiddleware<E> {
     fn health_check(&self) -> Result<(), EngineError> {
         self.inner.health_check()
     }
+
+    fn supports_swap(&self) -> bool {
+        self.inner.supports_swap()
+    }
+
+    fn is_staged(&self) -> bool {
+        self.inner.is_staged()
+    }
+
+    async fn stage(&self, path: &std::path::Path) -> Result<(), EngineError> {
+        self.inner.stage(path).await
+    }
+
+    async fn swap(&self) -> Result<(), EngineError> {
+        self.inner.swap().await
+    }
 }
 
 #[cfg(test)]

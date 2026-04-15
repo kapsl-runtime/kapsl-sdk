@@ -138,6 +138,8 @@ mod inner {
         /// Session ID → preserved KV state for multi-turn conversations.
         sessions: HashMap<String, SessionState>,
         rng: rand::rngs::SmallRng,
+        /// Next model weights pre-loaded into CPU RAM, ready for fast GPU swap.
+        staged: Option<ModelWeights>,
     }
 
     impl BackendInner {
@@ -169,6 +171,48 @@ mod inner {
             for lt in block_tables {
                 for &p in lt { self.block_pool.free_block(p as u32); }
             }
+        }
+
+        // ── Hot-swap ──────────────────────────────────────────────────────────
+
+        /// Transfer staged CPU weights to the GPU and replace the live weights.
+        /// Invalidates all sessions — the KV cache layout is tied to the old weights.
+        fn activate_staged(&mut self) -> Result<(), EngineError> {
+            let staged = self.staged.take()
+                .ok_or_else(|| EngineError::backend("no model staged; call stage() first"))?;
+
+            // Configs must be compatible (same arch, heads, hidden size).
+            let sc = &staged.config;
+            let cc = &self.config;
+            if sc.num_hidden_layers != cc.num_hidden_layers
+                || sc.hidden_size != cc.hidden_size
+                || sc.num_attention_heads != cc.num_attention_heads
+            {
+                return Err(EngineError::backend(format!(
+                    "staged model architecture mismatch: \
+                     layers {}/{}, hidden {}/{}, heads {}/{}",
+                    sc.num_hidden_layers, cc.num_hidden_layers,
+                    sc.hidden_size, cc.hidden_size,
+                    sc.num_attention_heads, cc.num_attention_heads,
+                )));
+            }
+
+            log::info!("NativeBackend: activating staged weights (PCIe transfer)…");
+            let new_weights = upload_weights(&self.device, &staged)?;
+            self.weights = new_weights;
+            self.config = staged.config;
+
+            // Invalidate all KV state — block contents reference old weights.
+            let all_bts: Vec<_> = self.sessions.values()
+                .map(|s| s.block_tables.clone())
+                .collect();
+            for bt in all_bts {
+                self.free_block_tables(&bt);
+            }
+            self.sessions.clear();
+
+            log::info!("NativeBackend: swap complete");
+            Ok(())
         }
 
         // ── Sampling ─────────────────────────────────────────────────────
@@ -787,6 +831,7 @@ mod inner {
                 v_buf:        alloc(nkv * hd)?,
                 sessions:     HashMap::new(),
                 rng:          rand::rngs::SmallRng::from_entropy(),
+                staged:       None,
             };
             *self.inner.lock().unwrap() = Some(backend);
             log::info!("NativeBackend: ready");
@@ -908,6 +953,52 @@ mod inner {
         fn health_check(&self) -> Result<(), EngineError> {
             if self.inner.lock().unwrap().is_some() { Ok(()) }
             else { Err(EngineError::ModelNotLoaded) }
+        }
+
+        fn supports_swap(&self) -> bool { true }
+
+        fn is_staged(&self) -> bool {
+            self.inner.lock().unwrap()
+                .as_ref()
+                .map(|b| b.staged.is_some())
+                .unwrap_or(false)
+        }
+
+        async fn stage(&self, path: &Path) -> Result<(), EngineError> {
+            let path = path.to_owned();
+            let inner = Arc::clone(&self.inner);
+
+            tokio::task::spawn_blocking(move || {
+                let dir = if path.is_dir() {
+                    path.clone()
+                } else {
+                    path.parent().unwrap_or(&path).to_path_buf()
+                };
+                log::info!("NativeBackend: staging model from {:?} into CPU RAM…", dir);
+                let weights = load_safetensors(&dir)
+                    .map_err(|e| EngineError::backend(format!("stage load: {e}")))?;
+                log::info!(
+                    "NativeBackend: staged {} layers into CPU RAM",
+                    weights.layers.len()
+                );
+                let mut guard = inner.lock().unwrap();
+                let b = guard.as_mut().ok_or(EngineError::ModelNotLoaded)?;
+                b.staged = Some(weights);
+                Ok(())
+            })
+            .await
+            .map_err(|e| EngineError::backend(format!("stage task: {e}")))?
+        }
+
+        async fn swap(&self) -> Result<(), EngineError> {
+            let inner = Arc::clone(&self.inner);
+            tokio::task::spawn_blocking(move || {
+                let mut guard = inner.lock().unwrap();
+                let b = guard.as_mut().ok_or(EngineError::ModelNotLoaded)?;
+                b.activate_staged()
+            })
+            .await
+            .map_err(|e| EngineError::backend(format!("swap task: {e}")))?
         }
     }
 
