@@ -31,6 +31,7 @@ native = [
     "dep:kapsl-kernels",
     "dep:kapsl-loader",
     "dep:cudarc",
+    "cudarc/cuda-version-from-build-system",
     "kapsl-kernels/cuda",
     "kapsl-hal/cuda",
     "kapsl-hal/cublas",
