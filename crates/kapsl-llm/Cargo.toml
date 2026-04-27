@@ -36,10 +36,15 @@ ort = { version = "=2.0.0-rc.11", features = ["ndarray", "half", "download-binar
 default = ["gguf"]
 gguf = ["dep:llama-cpp-2"]
 
-[dependencies.llama-cpp-2]
+[target.'cfg(target_os = "macos")'.dependencies.llama-cpp-2]
 version = "0.1"
 optional = true
 features = ["metal"]
+
+[target.'cfg(not(target_os = "macos"))'.dependencies.llama-cpp-2]
+version = "0.1"
+optional = true
+features = ["cuda"]
 
 [dev-dependencies]
 env_logger = "0.10"
