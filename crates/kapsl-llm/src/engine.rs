@@ -3174,7 +3174,9 @@ impl LLMEngine {
                 seq.kv_cached_len = seq.kv_cached_len.saturating_add(item.input_len);
                 seq.rng_state = rng_state;
                 seq.append_token_id(next, 0.0);
-                if sampling_params.stop_token_ids.contains(&next) {
+                if sampling_params.stop_token_ids.contains(&next)
+                    && seq.generated_this_turn >= sampling_params.min_tokens
+                {
                     seq.status = SequenceStatus::Finished(FinishReason::Stop);
                     finish_reason = Some(FinishReason::Stop);
                 } else if seq.generated_this_turn >= sampling_params.max_tokens {
@@ -3896,7 +3898,9 @@ impl LLMEngine {
                 seq.kv_cached_len = seq.kv_cached_len.saturating_add(1);
                 seq.rng_state = rng_state;
                 seq.append_token_id(next, 0.0);
-                if sampling_params.stop_token_ids.contains(&next) {
+                if sampling_params.stop_token_ids.contains(&next)
+                    && seq.generated_this_turn >= sampling_params.min_tokens
+                {
                     seq.status = SequenceStatus::Finished(FinishReason::Stop);
                     finish_reason = Some(FinishReason::Stop);
                 } else if seq.generated_this_turn >= sampling_params.max_tokens {
@@ -4872,7 +4876,9 @@ impl LLMEngine {
 
                         seq.rng_state = rng_state;
                         seq.append_token_id(next, 0.0);
-                        if sampling_params.stop_token_ids.contains(&next) {
+                        if sampling_params.stop_token_ids.contains(&next)
+                            && seq.generated_this_turn >= sampling_params.min_tokens
+                        {
                             seq.status = SequenceStatus::Finished(FinishReason::Stop);
                             finish_reason = Some(FinishReason::Stop);
                         } else if seq.generated_this_turn >= sampling_params.max_tokens {
@@ -5820,7 +5826,9 @@ impl LLMEngine {
 
                         seq.rng_state = rng_state;
                         seq.append_token_id(next, 0.0);
-                        if sampling_params.stop_token_ids.contains(&next) {
+                        if sampling_params.stop_token_ids.contains(&next)
+                            && seq.generated_this_turn >= sampling_params.min_tokens
+                        {
                             seq.status = SequenceStatus::Finished(FinishReason::Stop);
                             finish_reason = Some(FinishReason::Stop);
                         } else if seq.generated_this_turn >= sampling_params.max_tokens {
