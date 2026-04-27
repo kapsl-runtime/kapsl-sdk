@@ -137,7 +137,18 @@ impl BackendFactory {
         device_info: &DeviceInfo,
         tuning: &OnnxRuntimeTuning,
     ) -> Result<Box<dyn Engine>, String> {
-        // GGUF: route to the llama.cpp-backed GgufBackend
+        // GGUF: prefer native CUDA kernels when gguf-native feature is compiled in.
+        #[cfg(feature = "gguf-native")]
+        if manifest.framework == "gguf" {
+            let device_id = manifest.hardware_requirements.device_id.unwrap_or(0);
+            log::info!("✓ Using GgufNativeBackend (GGUF loader + native CUDA), device {}", device_id);
+            return crate::gguf_native::GgufNativeBackend::new(device_id as i32)
+                .map(|b| Box::new(b) as Box<dyn Engine>)
+                .map_err(|e| format!("GgufNativeBackend init failed: {e}"));
+        }
+
+        // GGUF: fallback to llama.cpp-backed GgufBackend.
+        #[cfg(not(feature = "gguf-native"))]
         if manifest.framework == "gguf" {
             log::info!("✓ Using GgufBackend (llama.cpp)");
             return Ok(Box::new(GgufBackend::new()));
@@ -251,7 +262,17 @@ impl BackendFactory {
                 .map_err(|e| format!("NativeBackend init failed: {e}"));
         }
 
-        // GGUF: route to the llama.cpp-backed GgufBackend
+        // GGUF: prefer native CUDA kernels when gguf-native feature is compiled in.
+        #[cfg(feature = "gguf-native")]
+        if manifest.framework == "gguf" {
+            log::info!("✓ Using GgufNativeBackend (GGUF loader + native CUDA), device {}", device_id);
+            return crate::gguf_native::GgufNativeBackend::new(device_id as i32)
+                .map(|b| Box::new(b) as Box<dyn Engine>)
+                .map_err(|e| format!("GgufNativeBackend init failed: {e}"));
+        }
+
+        // GGUF: fallback to llama.cpp-backed GgufBackend.
+        #[cfg(not(feature = "gguf-native"))]
         if manifest.framework == "gguf" {
             log::info!("✓ Using GgufBackend (llama.cpp)");
             return Ok(Box::new(GgufBackend::new()));

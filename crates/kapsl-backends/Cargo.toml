@@ -23,6 +23,7 @@ tokio = { version = "1", features = ["sync", "rt", "macros"] }
 futures = "0.3"
 ndarray = "0.17"
 async-trait = "0.1.89"
+async-stream = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 
 [features]
@@ -36,9 +37,29 @@ native = [
     "kapsl-hal/cuda",
     "kapsl-hal/cublas",
 ]
+gguf-native = [
+    "dep:kapsl-kernels",
+    "dep:kapsl-loader",
+    "dep:cudarc",
+    "cudarc/cuda-version-from-build-system",
+    "kapsl-kernels/cuda",
+    "kapsl-hal/cuda",
+    "kapsl-hal/cublas",
+    "dep:llama-cpp-2",
+]
 
 [target.'cfg(windows)'.dependencies]
 ort = { version = "=2.0.0-rc.11", features = ["download-binaries", "directml", "cuda", "tensorrt", "rocm", "coreml", "openvino", "half", "ndarray"] }
 
 [target.'cfg(not(windows))'.dependencies]
 ort = { version = "=2.0.0-rc.11", features = ["download-binaries", "cuda", "tensorrt", "rocm", "coreml", "openvino", "half", "ndarray"] }
+
+[target.'cfg(target_os = "macos")'.dependencies.llama-cpp-2]
+version = "0.1"
+optional = true
+features = ["metal"]
+
+[target.'cfg(not(target_os = "macos"))'.dependencies.llama-cpp-2]
+version = "0.1"
+optional = true
+features = ["cuda"]

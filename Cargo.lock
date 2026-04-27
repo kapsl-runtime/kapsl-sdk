@@ -1631,6 +1631,7 @@ dependencies = [
 name = "kapsl-backends"
 version = "0.1.0"
 dependencies = [
+ "async-stream",
  "async-trait",
  "cudarc",
  "futures",
@@ -1641,6 +1642,7 @@ dependencies = [
  "kapsl-kernels",
  "kapsl-llm",
  "kapsl-loader",
+ "llama-cpp-2",
  "log",
  "lru",
  "ndarray",
