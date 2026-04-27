@@ -198,6 +198,7 @@ impl SequenceGroup {
 #[derive(Debug, Clone)]
 pub struct SamplingParams {
     pub max_tokens: usize,
+    pub min_tokens: usize,
     pub temperature: f32,
     pub top_p: f32,
     pub top_k: usize,

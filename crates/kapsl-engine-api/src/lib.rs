@@ -477,6 +477,8 @@ pub struct RequestMetadata {
     // === Optional LLM overrides ===
     #[serde(default, alias = "max_tokens")]
     pub max_new_tokens: Option<u32>,
+    #[serde(default, alias = "min_tokens")]
+    pub min_new_tokens: Option<u32>,
     #[serde(default)]
     pub temperature: Option<f32>,
     #[serde(default)]

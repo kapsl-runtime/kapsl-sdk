@@ -1015,5 +1015,90 @@ __global__ void batch_kv_write(
     }
 }
 
+// ── GPU greedy-sampling (argmax) ─────────────────────────────────────────
+
+#[cfg(feature = "cuda")]
+mod argmax_inner {
+    use cudarc::driver::{CudaDevice, CudaSlice, LaunchAsync, LaunchConfig};
+    use cudarc::nvrtc::compile_ptx;
+    use half::f16;
+    use std::sync::Arc;
+
+    /// Parallel argmax over a single row of f16 logits stored in GPU memory.
+    ///
+    /// Grid: (1,1,1), Block: (256,1,1).  Each thread sweeps vocab/256 elements
+    /// (serial phase), then the 256 partial winners are reduced in shared memory
+    /// (parallel phase).  Only one u32 is transferred back to CPU.
+    const ARGMAX_SRC: &str = r#"
+#include <cuda_fp16.h>
+
+extern "C"
+__global__ void argmax_f16(
+    const __half* __restrict__ input,
+    unsigned int* __restrict__ output,
+    const int                  vocab_size
+) {
+    __shared__ float       s_val[256];
+    __shared__ unsigned int s_idx[256];
+
+    const int tid    = threadIdx.x;
+    const int stride = blockDim.x;
+
+    float        best_val = -1.0e30f;
+    unsigned int best_idx = 0;
+
+    for (int i = tid; i < vocab_size; i += stride) {
+        float v = __half2float(input[i]);
+        if (v > best_val) { best_val = v; best_idx = (unsigned int)i; }
+    }
+
+    s_val[tid] = best_val;
+    s_idx[tid] = best_idx;
+    __syncthreads();
+
+    for (int s = stride >> 1; s > 0; s >>= 1) {
+        if (tid < s && s_val[tid + s] > s_val[tid]) {
+            s_val[tid] = s_val[tid + s];
+            s_idx[tid] = s_idx[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) output[0] = s_idx[0];
+}
+"#;
+
+    static ARGMAX_MODULE: &str = "kapsl_argmax";
+    static ARGMAX_KERNEL: &str = "argmax_f16";
+
+    pub struct ArgmaxParams<'a> {
+        pub input:      &'a CudaSlice<f16>,
+        pub output:     &'a mut CudaSlice<u32>,
+        pub vocab_size: u32,
+    }
+
+    pub fn launch_argmax(
+        device: &Arc<CudaDevice>,
+        p: &mut ArgmaxParams<'_>,
+    ) -> Result<(), String> {
+        if device.get_func(ARGMAX_MODULE, ARGMAX_KERNEL).is_none() {
+            let ptx = compile_ptx(ARGMAX_SRC)
+                .map_err(|e| format!("NVRTC argmax compile: {e}"))?;
+            device.load_ptx(ptx, ARGMAX_MODULE, &[ARGMAX_KERNEL])
+                .map_err(|e| format!("PTX load: {e}"))?;
+        }
+        let func = device.get_func(ARGMAX_MODULE, ARGMAX_KERNEL).ok_or("argmax not found")?;
+        let cfg = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        unsafe {
+            func.clone()
+                .launch(cfg, (p.input, p.output, p.vocab_size as i32))
+                .map_err(|e| format!("argmax launch: {e}"))?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(feature = "cuda")]
 pub use inner::*;
+#[cfg(feature = "cuda")]
+pub use argmax_inner::{launch_argmax, ArgmaxParams};

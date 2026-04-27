@@ -58,6 +58,7 @@ struct ModelRuntimeConfig {
 fn default_sampling_params() -> SamplingParams {
     SamplingParams {
         max_tokens: 512,
+        min_tokens: 0,
         temperature: 0.7,
         top_p: 0.9,
         top_k: 40,
@@ -629,6 +630,9 @@ impl Engine for LLMBackend {
                 if max_new > 0 {
                     sampling_params.max_tokens = max_new as usize;
                 }
+            }
+            if let Some(min_new) = meta.min_new_tokens {
+                sampling_params.min_tokens = min_new as usize;
             }
             if let Some(temp) = meta.temperature {
                 sampling_params.temperature = temp;
