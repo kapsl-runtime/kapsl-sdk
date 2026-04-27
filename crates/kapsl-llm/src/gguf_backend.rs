@@ -22,7 +22,7 @@ use llama_cpp_2::{
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 
-const MAX_CONCURRENT_DEFAULT: usize = 8;
+const MAX_CONCURRENT_DEFAULT: usize = 32;
 const N_CTX_PER_SEQ_DEFAULT: u32 = 2048;
 
 #[cfg(feature = "gguf")]
@@ -249,33 +249,36 @@ fn run_scheduler(
             continue;
         }
 
-        // ── 4. Build batch: one prefill (if any) + all active decode tokens ───
+        // ── 4. Build batch: multiple prefills (if any) + all active decode tokens ───
+        // Reserve `active.len()` slots for decode tokens so prefills don't crowd them out.
         batch.clear();
-        let mut prefill_item: Option<PendingPrefill> = None;
-        let mut prefill_last_batch_pos: i32 = -1;
+        let mut prefill_items: Vec<PendingPrefill> = Vec::new();
+        let mut prefill_last_batch_positions: Vec<i32> = Vec::new();
 
-        if let Some(pref) = pending.front() {
-            // Check it fits alongside the decode tokens that will follow.
-            if pref.tokens.len() + active.len() <= batch_cap {
-                let pref = pending.pop_front().unwrap();
-                let n = pref.tokens.len();
-                let mut add_ok = true;
-                for (i, &tok) in pref.tokens.iter().enumerate() {
-                    if batch.add(tok, i as i32, &[pref.seq_id], i == n - 1).is_err() {
-                        add_ok = false;
-                        break;
-                    }
+        while let Some(pref) = pending.front() {
+            let slots_used: usize = prefill_items.iter().map(|p| p.tokens.len()).sum();
+            let slots_remaining = batch_cap.saturating_sub(slots_used + active.len());
+            if pref.tokens.len() > slots_remaining {
+                break; // next prefill doesn't fit alongside decode tokens; defer it
+            }
+            let pref = pending.pop_front().unwrap();
+            let n = pref.tokens.len();
+            let mut add_ok = true;
+            for (i, &tok) in pref.tokens.iter().enumerate() {
+                if batch.add(tok, i as i32, &[pref.seq_id], i == n - 1).is_err() {
+                    add_ok = false;
+                    break;
                 }
-                if add_ok {
-                    prefill_last_batch_pos = batch.n_tokens() - 1;
-                    prefill_item = Some(pref);
-                } else {
-                    let _ = pref
-                        .response_tx
-                        .send(Err(EngineError::backend("batch capacity exceeded")));
-                    let _ = ctx.clear_kv_cache_seq(Some(pref.seq_id as u32), None, None);
-                    available_ids.push(pref.seq_id);
-                }
+            }
+            if add_ok {
+                prefill_last_batch_positions.push(batch.n_tokens() - 1);
+                prefill_items.push(pref);
+            } else {
+                let _ = pref
+                    .response_tx
+                    .send(Err(EngineError::backend("batch capacity exceeded")));
+                let _ = ctx.clear_kv_cache_seq(Some(pref.seq_id as u32), None, None);
+                available_ids.push(pref.seq_id);
             }
         }
 
@@ -301,50 +304,59 @@ fn run_scheduler(
                 let _ = ctx.clear_kv_cache_seq(Some(seq.seq_id as u32), None, None);
                 available_ids.push(seq.seq_id);
             }
-            if let Some(pref) = prefill_item {
+            for pref in prefill_items.drain(..) {
                 let _ = pref
                     .response_tx
                     .send(Err(EngineError::backend("decode failed")));
                 let _ = ctx.clear_kv_cache_seq(Some(pref.seq_id as u32), None, None);
                 available_ids.push(pref.seq_id);
             }
+            prefill_last_batch_positions.clear();
             continue;
         }
 
-        // ── 6. Sample the newly prefilled sequence and move it to active ──────
-        if let Some(pref) = prefill_item {
-            let first_tok = LlamaSampler::greedy().sample(&ctx, prefill_last_batch_pos);
+        // ── 6. Sample each newly prefilled sequence and move it to active ──────
+        for (pref, &last_pos) in prefill_items.drain(..).zip(prefill_last_batch_positions.iter()) {
+            let first_tok = LlamaSampler::greedy().sample(&ctx, last_pos);
             let prompt_len = pref.tokens.len() as i32;
 
-            let is_eos = first_tok == eos_token && 0 >= pref.min_tokens;
-            if is_eos || pref.max_tokens <= 0 {
+            // Retire immediately if max_tokens==0 or EOS when min_tokens==0
+            let immediate_eos = first_tok == eos_token && pref.min_tokens <= 0;
+            if pref.max_tokens <= 0 || immediate_eos {
                 let _ = ctx.clear_kv_cache_seq(Some(pref.seq_id as u32), None, None);
                 available_ids.push(pref.seq_id);
-            } else {
+                continue;
+            }
+
+            // EOS suppressed by min_tokens: don't emit the token but keep the sequence alive
+            let suppress_eos = first_tok == eos_token && 1 <= pref.min_tokens;
+            if !suppress_eos {
                 let piece = model
                     .token_to_str(first_tok, Special::Tokenize)
                     .unwrap_or_default();
                 if pref.response_tx.send(Ok(piece)).is_err() {
-                    // Client dropped
                     let _ = ctx.clear_kv_cache_seq(Some(pref.seq_id as u32), None, None);
                     available_ids.push(pref.seq_id);
-                } else if pref.max_tokens <= 1 {
-                    // Requested only 1 token — done
-                    let _ = ctx.clear_kv_cache_seq(Some(pref.seq_id as u32), None, None);
-                    available_ids.push(pref.seq_id);
-                } else {
-                    active.push(ActiveSeq {
-                        seq_id: pref.seq_id,
-                        pos: prompt_len,
-                        n_generated: 1,
-                        max_tokens: pref.max_tokens,
-                        min_tokens: pref.min_tokens,
-                        last_token: first_tok,
-                        response_tx: pref.response_tx,
-                    });
+                    continue;
                 }
             }
+
+            if pref.max_tokens <= 1 && !suppress_eos {
+                let _ = ctx.clear_kv_cache_seq(Some(pref.seq_id as u32), None, None);
+                available_ids.push(pref.seq_id);
+            } else {
+                active.push(ActiveSeq {
+                    seq_id: pref.seq_id,
+                    pos: prompt_len,
+                    n_generated: if suppress_eos { 0 } else { 1 },
+                    max_tokens: pref.max_tokens,
+                    min_tokens: pref.min_tokens,
+                    last_token: first_tok,
+                    response_tx: pref.response_tx,
+                });
+            }
         }
+        prefill_last_batch_positions.clear();
 
         // ── 7. Sample each active sequence and advance or retire it ──────────
         let mut to_retire: Vec<usize> = Vec::new();
@@ -356,11 +368,15 @@ fn run_scheduler(
             let next_tok = LlamaSampler::greedy().sample(&ctx, batch_pos);
             seq.pos += 1;
 
-            let done = (next_tok == eos_token && seq.n_generated >= seq.min_tokens)
-                || seq.n_generated >= seq.max_tokens;
+            let eos_and_ready = next_tok == eos_token && seq.n_generated >= seq.min_tokens;
+            let max_reached = seq.n_generated >= seq.max_tokens;
 
-            if done {
+            if eos_and_ready || max_reached {
                 to_retire.push(i);
+            } else if next_tok == eos_token {
+                // EOS suppressed by min_tokens: advance position, don't emit, count the step
+                seq.last_token = next_tok;
+                seq.n_generated += 1;
             } else {
                 let piece = model
                     .token_to_str(next_tok, Special::Tokenize)
