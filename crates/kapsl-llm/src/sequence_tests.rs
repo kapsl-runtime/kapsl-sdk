@@ -26,6 +26,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(1);
         let sampling = SamplingParams {
             max_tokens: 4,
+            min_tokens: 0,
             temperature: 0.7,
             top_p: 0.9,
             top_k: 40,

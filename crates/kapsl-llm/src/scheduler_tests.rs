@@ -14,6 +14,7 @@ mod tests {
             vec![0u32; prompt_len],
             SamplingParams {
                 max_tokens: 8,
+                min_tokens: 0,
                 temperature: 0.7,
                 top_p: 0.9,
                 top_k: 40,
