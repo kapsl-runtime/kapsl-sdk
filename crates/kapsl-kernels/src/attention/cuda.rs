@@ -1096,9 +1096,205 @@ __global__ void argmax_f16(
         }
         Ok(())
     }
+
+    // ─── Batch Decode RoPE ───────────────────────────────────────────────
+    // Per-sequence RoPE for a decode batch.  Each sequence contributes exactly
+    // one token whose absolute position differs from all others.
+    //
+    // Grid:  (batch_size, max(num_q_heads, num_kv_heads), 1)
+    // Block: (head_dim / 2, 1, 1)
+
+    const BATCH_DECODE_ROPE_SRC: &str = r#"
+#include <cuda_fp16.h>
+
+extern "C"
+__global__ void batch_decode_rope(
+    __half* __restrict__  q,               // [batch, num_q_heads,  head_dim]
+    __half* __restrict__  k,               // [batch, num_kv_heads, head_dim]
+    const int* __restrict__ positions,     // [batch]
+    const int             num_q_heads,
+    const int             num_kv_heads,
+    const int             head_dim,
+    const float           theta
+) {
+    const int batch_idx = blockIdx.x;
+    const int head_idx  = blockIdx.y;
+    const int pair      = threadIdx.x;   // 0 .. head_dim/2 - 1
+    if (pair >= head_dim / 2) return;
+
+    const int pos = positions[batch_idx];
+    const float freq = __powf(theta, -2.0f * (float)pair / (float)head_dim);
+    const float angle = (float)pos * freq;
+    const float cos_val = cosf(angle);
+    const float sin_val = sinf(angle);
+
+    // Rotate Q (if head_idx < num_q_heads)
+    if (head_idx < num_q_heads) {
+        const int base = (batch_idx * num_q_heads + head_idx) * head_dim + pair * 2;
+        const float x0 = __half2float(q[base]);
+        const float x1 = __half2float(q[base + 1]);
+        q[base]     = __float2half(x0 * cos_val - x1 * sin_val);
+        q[base + 1] = __float2half(x0 * sin_val + x1 * cos_val);
+    }
+
+    // Rotate K (if head_idx < num_kv_heads)
+    if (head_idx < num_kv_heads) {
+        const int base = (batch_idx * num_kv_heads + head_idx) * head_dim + pair * 2;
+        const float x0 = __half2float(k[base]);
+        const float x1 = __half2float(k[base + 1]);
+        k[base]     = __float2half(x0 * cos_val - x1 * sin_val);
+        k[base + 1] = __float2half(x0 * sin_val + x1 * cos_val);
+    }
+}
+"#;
+
+    static BATCH_DECODE_ROPE_MODULE: &str = "kapsl_batch_decode_rope";
+    static BATCH_DECODE_ROPE_KERNEL: &str = "batch_decode_rope";
+
+    pub struct BatchDecodeRopeParams<'a> {
+        pub q:            &'a mut CudaSlice<f16>,
+        pub k:            &'a mut CudaSlice<f16>,
+        pub positions:    &'a CudaSlice<i32>,
+        pub batch_size:   u32,
+        pub num_q_heads:  u32,
+        pub num_kv_heads: u32,
+        pub head_dim:     u32,
+        pub theta:        f32,
+    }
+
+    pub fn launch_batch_decode_rope(
+        device: &Arc<CudaDevice>,
+        p: &mut BatchDecodeRopeParams<'_>,
+    ) -> Result<(), String> {
+        if device.get_func(BATCH_DECODE_ROPE_MODULE, BATCH_DECODE_ROPE_KERNEL).is_none() {
+            let ptx = compile_ptx(BATCH_DECODE_ROPE_SRC)
+                .map_err(|e| format!("NVRTC batch_decode_rope compile: {e}"))?;
+            device
+                .load_ptx(ptx, BATCH_DECODE_ROPE_MODULE, &[BATCH_DECODE_ROPE_KERNEL])
+                .map_err(|e| format!("PTX load: {e}"))?;
+        }
+        let func = device
+            .get_func(BATCH_DECODE_ROPE_MODULE, BATCH_DECODE_ROPE_KERNEL)
+            .ok_or("batch_decode_rope not found")?;
+
+        let max_heads = p.num_q_heads.max(p.num_kv_heads);
+        let cfg = LaunchConfig {
+            grid_dim:        (p.batch_size, max_heads, 1),
+            block_dim:       (p.head_dim / 2, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            func.clone()
+                .launch(
+                    cfg,
+                    (
+                        p.q,
+                        p.k,
+                        p.positions,
+                        p.num_q_heads as i32,
+                        p.num_kv_heads as i32,
+                        p.head_dim as i32,
+                        p.theta,
+                    ),
+                )
+                .map_err(|e| format!("batch_decode_rope launch: {e}"))?;
+        }
+        Ok(())
+    }
+
+    // ─── Batch Argmax ────────────────────────────────────────────────────
+    // GPU greedy sampling over a batch of logit rows.
+    //
+    // Grid:  (batch_size, 1, 1)
+    // Block: (256, 1, 1)
+    // Input:  logits[batch, vocab_size]   (row-major)
+    // Output: argmax[batch]
+
+    const BATCH_ARGMAX_SRC: &str = r#"
+#include <cuda_fp16.h>
+
+extern "C"
+__global__ void batch_argmax_f16(
+    const __half* __restrict__ input,      // [batch, vocab_size]
+    unsigned int* __restrict__ output,     // [batch]
+    const int                  vocab_size
+) {
+    __shared__ float        s_val[256];
+    __shared__ unsigned int s_idx[256];
+
+    const int batch_idx = blockIdx.x;
+    const int tid       = threadIdx.x;
+    const int stride    = blockDim.x;
+
+    const __half* row = input + (long long)batch_idx * vocab_size;
+
+    float        best_val = -1.0e30f;
+    unsigned int best_idx = 0;
+
+    for (int i = tid; i < vocab_size; i += stride) {
+        float v = __half2float(row[i]);
+        if (v > best_val) { best_val = v; best_idx = (unsigned int)i; }
+    }
+
+    s_val[tid] = best_val;
+    s_idx[tid] = best_idx;
+    __syncthreads();
+
+    for (int s = stride >> 1; s > 0; s >>= 1) {
+        if (tid < s && s_val[tid + s] > s_val[tid]) {
+            s_val[tid] = s_val[tid + s];
+            s_idx[tid] = s_idx[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) output[batch_idx] = s_idx[0];
+}
+"#;
+
+    static BATCH_ARGMAX_MODULE: &str = "kapsl_batch_argmax";
+    static BATCH_ARGMAX_KERNEL: &str = "batch_argmax_f16";
+
+    pub struct BatchArgmaxParams<'a> {
+        pub input:      &'a CudaSlice<f16>,
+        pub output:     &'a mut CudaSlice<u32>,
+        pub batch_size: u32,
+        pub vocab_size: u32,
+    }
+
+    pub fn launch_batch_argmax(
+        device: &Arc<CudaDevice>,
+        p: &mut BatchArgmaxParams<'_>,
+    ) -> Result<(), String> {
+        if device.get_func(BATCH_ARGMAX_MODULE, BATCH_ARGMAX_KERNEL).is_none() {
+            let ptx = compile_ptx(BATCH_ARGMAX_SRC)
+                .map_err(|e| format!("NVRTC batch_argmax compile: {e}"))?;
+            device
+                .load_ptx(ptx, BATCH_ARGMAX_MODULE, &[BATCH_ARGMAX_KERNEL])
+                .map_err(|e| format!("PTX load: {e}"))?;
+        }
+        let func = device
+            .get_func(BATCH_ARGMAX_MODULE, BATCH_ARGMAX_KERNEL)
+            .ok_or("batch_argmax not found")?;
+        let cfg = LaunchConfig {
+            grid_dim:        (p.batch_size, 1, 1),
+            block_dim:       (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            func.clone()
+                .launch(cfg, (p.input, p.output, p.vocab_size as i32))
+                .map_err(|e| format!("batch_argmax launch: {e}"))?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(feature = "cuda")]
 pub use inner::*;
 #[cfg(feature = "cuda")]
-pub use argmax_inner::{launch_argmax, ArgmaxParams};
+pub use argmax_inner::{
+    launch_argmax, ArgmaxParams,
+    launch_batch_decode_rope, BatchDecodeRopeParams,
+    launch_batch_argmax, BatchArgmaxParams,
+};
