@@ -2655,6 +2655,44 @@ impl LLMEngine {
         }
     }
 
+    fn group_is_batched_decode_eligible(
+        group_arc: &Arc<Mutex<SequenceGroup>>,
+        use_kv_cache: bool,
+    ) -> bool {
+        if !use_kv_cache {
+            return false;
+        }
+
+        let (seqs, already_finished, cancelled) = {
+            let group = group_arc.lock().unwrap();
+            (
+                group.sequences.values().cloned().collect::<Vec<_>>(),
+                group.is_finished(),
+                group
+                    .cancellation
+                    .as_ref()
+                    .is_some_and(|token| token.is_cancelled()),
+            )
+        };
+        if already_finished || cancelled {
+            return false;
+        }
+
+        let mut active_count = 0usize;
+        for seq_arc in seqs {
+            let seq = seq_arc.lock().unwrap();
+            if seq.is_finished() {
+                continue;
+            }
+            active_count += 1;
+            if seq.get_len() <= 1 || Self::compute_input_tokens(&seq, true).len() != 1 {
+                return false;
+            }
+        }
+
+        active_count > 0
+    }
+
     fn try_execute_batched_prefill_step(
         &mut self,
         groups: &[Arc<Mutex<SequenceGroup>>],
@@ -3983,7 +4021,36 @@ impl LLMEngine {
             return Ok(());
         }
 
-        if self.try_execute_batched_decode_step(
+        let mut fallback_groups: Vec<Arc<Mutex<SequenceGroup>>> = groups.to_vec();
+        if use_kv_cache && groups.len() > 1 {
+            let mut decode_groups = Vec::new();
+            let mut non_decode_groups = Vec::new();
+            for group_arc in groups {
+                if Self::group_is_batched_decode_eligible(group_arc, use_kv_cache) {
+                    decode_groups.push(group_arc.clone());
+                } else {
+                    non_decode_groups.push(group_arc.clone());
+                }
+            }
+
+            if !decode_groups.is_empty() && non_decode_groups.is_empty() {
+                if self.try_execute_batched_decode_step(
+                    &decode_groups,
+                    &decode_model_input_names,
+                    &decode_model_input_types,
+                )? {
+                    return Ok(());
+                }
+            } else if !decode_groups.is_empty()
+                && self.try_execute_batched_decode_step(
+                    &decode_groups,
+                    &decode_model_input_names,
+                    &decode_model_input_types,
+                )?
+            {
+                fallback_groups = non_decode_groups;
+            }
+        } else if self.try_execute_batched_decode_step(
             groups,
             &decode_model_input_names,
             &decode_model_input_types,
@@ -3991,7 +4058,7 @@ impl LLMEngine {
             return Ok(());
         }
 
-        for group_arc in groups {
+        for group_arc in &fallback_groups {
             if Self::cancel_group_if_needed(group_arc) {
                 continue;
             }
