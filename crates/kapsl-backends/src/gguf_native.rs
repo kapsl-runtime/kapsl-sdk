@@ -169,7 +169,7 @@ mod inner {
         blas: Arc<CudaBlas>,
         config: ModelConfig,
         weights: GpuModelWeights,
-        block_pool: GpuBlockPool,
+        block_pool: Arc<GpuBlockPool>,
         // Tokenizer (llama.cpp — model loaded for token↔text conversion only)
         llm_backend: Arc<LlamaBackend>,
         llm_model: Arc<LlamaModel>,
@@ -760,13 +760,32 @@ mod inner {
     pub struct GgufNativeBackend {
         device_id: i32,
         inner: Arc<Mutex<Option<BackendInner>>>,
+        /// Pool to inject before load(); also populated after load() for sharing.
+        pool_slot: Arc<Mutex<Option<Arc<GpuBlockPool>>>>,
     }
 
     impl GgufNativeBackend {
         pub fn new(device_id: i32) -> Result<Self, EngineError> {
             CudaDevice::new(device_id as usize)
                 .map_err(|e| EngineError::backend(format!("CUDA device {device_id}: {e}")))?;
-            Ok(Self { device_id, inner: Arc::new(Mutex::new(None)) })
+            Ok(Self {
+                device_id,
+                inner: Arc::new(Mutex::new(None)),
+                pool_slot: Arc::new(Mutex::new(None)),
+            })
+        }
+
+        /// Inject a shared pool before calling load(). If the pool geometry is
+        /// incompatible with the model, load() will create a private pool instead.
+        pub fn with_block_pool(self, pool: Arc<GpuBlockPool>) -> Self {
+            *self.pool_slot.lock().unwrap() = Some(pool);
+            self
+        }
+
+        /// Return the active block pool after load(), usable as a shared pool
+        /// for subsequently loaded backends with the same KV geometry.
+        pub fn block_pool(&self) -> Option<Arc<GpuBlockPool>> {
+            self.pool_slot.lock().unwrap().clone()
         }
 
         fn extract_prompt(request: &InferenceRequest) -> Result<String, EngineError> {
@@ -794,6 +813,7 @@ mod inner {
             let path = model_path.to_owned();
             let device_id = self.device_id;
             let inner_arc = Arc::clone(&self.inner);
+            let pool_slot = Arc::clone(&self.pool_slot);
 
             tokio::task::spawn_blocking(move || {
                 // ── Load GGUF weights → dequantize to f16 ──────────────────
@@ -826,17 +846,42 @@ mod inner {
 
                 // ── Block pool ───────────────────────────────────────────────
                 let block_size = 16usize;
-                let effective_ctx = std::env::var("KAPSL_KV_MAX_CTX")
-                    .ok()
-                    .and_then(|v| v.parse::<usize>().ok())
-                    .unwrap_or(config.max_position_embeddings)
-                    .min(config.max_position_embeddings);
-                let bps = (effective_ctx + block_size - 1) / block_size;
-                let num_blocks = config.num_hidden_layers * 8 * bps;
-                let block_pool = GpuBlockPool::new(
-                    device.clone(), num_blocks, block_size,
-                    config.num_kv_heads(), config.head_dim(),
-                ).map_err(|e| EngineError::backend(format!("block pool: {e}")))?;
+                let block_pool: Arc<GpuBlockPool> = {
+                    let mut slot = pool_slot.lock().unwrap();
+                    if let Some(ref existing) = *slot {
+                        if existing.is_compatible(config.num_kv_heads(), config.head_dim()) {
+                            log::info!("[gguf-native] Attaching to shared GpuBlockPool ({} blocks free)", existing.free_count());
+                            existing.clone()
+                        } else {
+                            log::warn!("[gguf-native] Injected pool geometry mismatch ({}h×{}d vs {}h×{}d), creating private pool",
+                                existing.num_kv_heads(), existing.head_dim(),
+                                config.num_kv_heads(), config.head_dim());
+                            let effective_ctx = std::env::var("KAPSL_KV_MAX_CTX")
+                                .ok().and_then(|v| v.parse::<usize>().ok())
+                                .unwrap_or(config.max_position_embeddings)
+                                .min(config.max_position_embeddings);
+                            let bps = (effective_ctx + block_size - 1) / block_size;
+                            let num_blocks = config.num_hidden_layers * 8 * bps;
+                            let p = Arc::new(GpuBlockPool::new(device.clone(), num_blocks, block_size,
+                                config.num_kv_heads(), config.head_dim())
+                                .map_err(|e| EngineError::backend(format!("block pool: {e}")))?);
+                            *slot = Some(p.clone());
+                            p
+                        }
+                    } else {
+                        let effective_ctx = std::env::var("KAPSL_KV_MAX_CTX")
+                            .ok().and_then(|v| v.parse::<usize>().ok())
+                            .unwrap_or(config.max_position_embeddings)
+                            .min(config.max_position_embeddings);
+                        let bps = (effective_ctx + block_size - 1) / block_size;
+                        let num_blocks = config.num_hidden_layers * 8 * bps;
+                        let p = Arc::new(GpuBlockPool::new(device.clone(), num_blocks, block_size,
+                            config.num_kv_heads(), config.head_dim())
+                            .map_err(|e| EngineError::backend(format!("block pool: {e}")))?);
+                        *slot = Some(p.clone());
+                        p
+                    }
+                };
 
                 let h = config.hidden_size;
                 let nq = config.num_attention_heads;

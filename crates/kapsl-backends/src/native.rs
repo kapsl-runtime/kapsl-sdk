@@ -280,7 +280,7 @@ mod inner {
         blas: Arc<CudaBlas>,
         config: ModelConfig,
         weights: GpuModelWeights,
-        block_pool: GpuBlockPool,
+        block_pool: Arc<GpuBlockPool>,
         // Prefill path reuses these small single-row buffers.
         norm_buf: CudaSlice<f16>,     // [h]
         logits_buf: CudaSlice<f16>,   // [vocab]
@@ -322,6 +322,7 @@ mod inner {
                 for &p in lt { self.block_pool.free_block(p as u32); }
             }
         }
+
 
         // ── Hot-swap ──────────────────────────────────────────────────────
 
@@ -1163,13 +1164,32 @@ mod inner {
     pub struct NativeBackend {
         device_id: i32,
         state: Arc<Mutex<Option<BackendState>>>,
+        /// Pool to inject before load(); also populated after load() for sharing.
+        pool_slot: Arc<Mutex<Option<Arc<GpuBlockPool>>>>,
     }
 
     impl NativeBackend {
         pub fn new(device_id: i32) -> Result<Self, EngineError> {
             CudaDevice::new(device_id as usize)
                 .map_err(|e| EngineError::backend(format!("CUDA device {device_id}: {e}")))?;
-            Ok(Self { device_id, state: Arc::new(Mutex::new(None)) })
+            Ok(Self {
+                device_id,
+                state: Arc::new(Mutex::new(None)),
+                pool_slot: Arc::new(Mutex::new(None)),
+            })
+        }
+
+        /// Inject a shared pool before calling load(). If the pool geometry is
+        /// incompatible with the model, load() will create a private pool instead.
+        pub fn with_block_pool(self, pool: Arc<GpuBlockPool>) -> Self {
+            *self.pool_slot.lock().unwrap() = Some(pool);
+            self
+        }
+
+        /// Return the active block pool after load(), usable as a shared pool
+        /// for subsequently loaded backends with the same KV geometry.
+        pub fn block_pool(&self) -> Option<Arc<GpuBlockPool>> {
+            self.pool_slot.lock().unwrap().clone()
         }
 
         fn get_tx(&self) -> Result<std::sync::mpsc::SyncSender<SchedulerCmd>, EngineError> {
@@ -1230,12 +1250,35 @@ mod inner {
             drop(cpu);
 
             let block_size = 16usize;
-            let bps = (config.max_position_embeddings + block_size - 1) / block_size;
-            let num_blocks = config.num_hidden_layers * MAX_BATCH * bps;
-            let block_pool = GpuBlockPool::new(
-                device.clone(), num_blocks, block_size,
-                config.num_kv_heads(), config.head_dim(),
-            ).map_err(|e| EngineError::backend(format!("block pool: {e}")))?;
+            let pool_slot = Arc::clone(&self.pool_slot);
+            let block_pool: Arc<GpuBlockPool> = {
+                let mut slot = pool_slot.lock().unwrap();
+                if let Some(ref existing) = *slot {
+                    if existing.is_compatible(config.num_kv_heads(), config.head_dim()) {
+                        log::info!("[native] Attaching to shared GpuBlockPool ({} blocks free)", existing.free_count());
+                        existing.clone()
+                    } else {
+                        log::warn!("[native] Injected pool geometry mismatch ({}h×{}d vs {}h×{}d), creating private pool",
+                            existing.num_kv_heads(), existing.head_dim(),
+                            config.num_kv_heads(), config.head_dim());
+                        let bps = (config.max_position_embeddings + block_size - 1) / block_size;
+                        let num_blocks = config.num_hidden_layers * MAX_BATCH * bps;
+                        let p = Arc::new(GpuBlockPool::new(device.clone(), num_blocks, block_size,
+                            config.num_kv_heads(), config.head_dim())
+                            .map_err(|e| EngineError::backend(format!("block pool: {e}")))?);
+                        *slot = Some(p.clone());
+                        p
+                    }
+                } else {
+                    let bps = (config.max_position_embeddings + block_size - 1) / block_size;
+                    let num_blocks = config.num_hidden_layers * MAX_BATCH * bps;
+                    let p = Arc::new(GpuBlockPool::new(device.clone(), num_blocks, block_size,
+                        config.num_kv_heads(), config.head_dim())
+                        .map_err(|e| EngineError::backend(format!("block pool: {e}")))?);
+                    *slot = Some(p.clone());
+                    p
+                }
+            };
 
             let h     = config.hidden_size;
             let nq    = config.num_attention_heads;

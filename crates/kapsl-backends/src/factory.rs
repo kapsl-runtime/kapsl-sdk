@@ -1,10 +1,18 @@
 use crate::onnx::{ExecutionProvider, OnnxBackend, OnnxBackendBuilder};
+#[cfg(feature = "gguf-native")]
+use crate::gguf_native::GgufNativeBackend;
+#[cfg(feature = "native")]
+use crate::native::NativeBackend;
 use kapsl_core::loader::Manifest;
 use kapsl_core::HardwareRequirements;
 use kapsl_engine_api::Engine;
+#[cfg(any(feature = "gguf-native", feature = "native"))]
+use kapsl_hal::gpu_arena::GpuBlockPool;
 use kapsl_hal::device::DeviceInfo;
 use kapsl_llm::llm_backend::LLMBackend;
 use kapsl_llm::GgufBackend;
+#[cfg(any(feature = "gguf-native", feature = "native"))]
+use std::sync::Arc;
 #[cfg(target_os = "windows")]
 use ort::execution_providers::DirectMLExecutionProvider;
 use ort::execution_providers::ExecutionProvider as _;
@@ -448,6 +456,40 @@ impl BackendFactory {
 
             _ => Err(format!("Unknown provider: {}", provider)),
         }
+    }
+
+    /// Create a GgufNativeBackend with an optional pre-shared block pool.
+    ///
+    /// Returns the concrete (unboxed) backend so callers can retrieve
+    /// `backend.block_pool()` after `load()` and share it with the next model.
+    #[cfg(feature = "gguf-native")]
+    pub fn create_gguf_native(
+        device_id: i32,
+        pool: Option<Arc<GpuBlockPool>>,
+    ) -> Result<GgufNativeBackend, String> {
+        let mut b = GgufNativeBackend::new(device_id)
+            .map_err(|e| format!("GgufNativeBackend init failed: {e}"))?;
+        if let Some(p) = pool {
+            b = b.with_block_pool(p);
+        }
+        Ok(b)
+    }
+
+    /// Create a NativeBackend with an optional pre-shared block pool.
+    ///
+    /// Returns the concrete (unboxed) backend so callers can retrieve
+    /// `backend.block_pool()` after `load()` and share it with the next model.
+    #[cfg(feature = "native")]
+    pub fn create_native(
+        device_id: i32,
+        pool: Option<Arc<GpuBlockPool>>,
+    ) -> Result<NativeBackend, String> {
+        let mut b = NativeBackend::new(device_id)
+            .map_err(|e| format!("NativeBackend init failed: {e}"))?;
+        if let Some(p) = pool {
+            b = b.with_block_pool(p);
+        }
+        Ok(b)
     }
 
     /// Validate that hardware meets minimum requirements
