@@ -7,12 +7,10 @@ use kapsl_core::loader::Manifest;
 use kapsl_core::HardwareRequirements;
 use kapsl_engine_api::Engine;
 #[cfg(any(feature = "gguf-native", feature = "native"))]
-use kapsl_hal::gpu_arena::GpuBlockPool;
+use kapsl_hal::gpu_arena::GpuPoolHandle;
 use kapsl_hal::device::DeviceInfo;
 use kapsl_llm::llm_backend::LLMBackend;
 use kapsl_llm::GgufBackend;
-#[cfg(any(feature = "gguf-native", feature = "native"))]
-use std::sync::Arc;
 #[cfg(target_os = "windows")]
 use ort::execution_providers::DirectMLExecutionProvider;
 use ort::execution_providers::ExecutionProvider as _;
@@ -458,36 +456,36 @@ impl BackendFactory {
         }
     }
 
-    /// Create a GgufNativeBackend with an optional pre-shared block pool.
+    /// Create a GgufNativeBackend with an optional pre-shared pool handle.
     ///
-    /// Returns the concrete (unboxed) backend so callers can retrieve
-    /// `backend.block_pool()` after `load()` and share it with the next model.
+    /// Returns the concrete (unboxed) backend so callers can call
+    /// `backend.pool_handle()` after `load()` to register the pool for sharing.
     #[cfg(feature = "gguf-native")]
     pub fn create_gguf_native(
         device_id: i32,
-        pool: Option<Arc<GpuBlockPool>>,
+        handle: Option<GpuPoolHandle>,
     ) -> Result<GgufNativeBackend, String> {
         let mut b = GgufNativeBackend::new(device_id)
             .map_err(|e| format!("GgufNativeBackend init failed: {e}"))?;
-        if let Some(p) = pool {
-            b = b.with_block_pool(p);
+        if let Some(h) = handle {
+            b = b.with_pool_handle(h);
         }
         Ok(b)
     }
 
-    /// Create a NativeBackend with an optional pre-shared block pool.
+    /// Create a NativeBackend with an optional pre-shared pool handle.
     ///
-    /// Returns the concrete (unboxed) backend so callers can retrieve
-    /// `backend.block_pool()` after `load()` and share it with the next model.
+    /// Returns the concrete (unboxed) backend so callers can call
+    /// `backend.pool_handle()` after `load()` to register the pool for sharing.
     #[cfg(feature = "native")]
     pub fn create_native(
         device_id: i32,
-        pool: Option<Arc<GpuBlockPool>>,
+        handle: Option<GpuPoolHandle>,
     ) -> Result<NativeBackend, String> {
         let mut b = NativeBackend::new(device_id)
             .map_err(|e| format!("NativeBackend init failed: {e}"))?;
-        if let Some(p) = pool {
-            b = b.with_block_pool(p);
+        if let Some(h) = handle {
+            b = b.with_pool_handle(h);
         }
         Ok(b)
     }
