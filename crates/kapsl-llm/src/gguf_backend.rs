@@ -17,7 +17,7 @@ use llama_cpp_2::{
     llama_batch::LlamaBatch,
     model::{params::LlamaModelParams, AddBos, LlamaModel, Special},
     sampling::LlamaSampler,
-    token::LlamaToken,
+    token::{logit_bias::LlamaLogitBias, LlamaToken},
 };
 
 // ─── Configuration ────────────────────────────────────────────────────────────
@@ -65,6 +65,29 @@ fn gguf_weights_cache() -> &'static std::sync::Mutex<
 > {
     GGUF_WEIGHTS_CACHE
         .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+// Global LlamaBackend singleton — llama.cpp allows only one backend per process.
+#[cfg(feature = "gguf")]
+static GGUF_BACKEND: std::sync::OnceLock<Arc<LlamaBackend>> = std::sync::OnceLock::new();
+
+#[cfg(feature = "gguf")]
+static GGUF_BACKEND_INIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(feature = "gguf")]
+fn global_gguf_backend() -> Result<Arc<LlamaBackend>, EngineError> {
+    if let Some(b) = GGUF_BACKEND.get() {
+        return Ok(Arc::clone(b));
+    }
+    let _lock = GGUF_BACKEND_INIT_LOCK.lock().unwrap();
+    if let Some(b) = GGUF_BACKEND.get() {
+        return Ok(Arc::clone(b));
+    }
+    let backend = LlamaBackend::init()
+        .map_err(|e| EngineError::backend(format!("llama backend init failed: {e}")))?;
+    let arc = Arc::new(backend);
+    let _ = GGUF_BACKEND.set(Arc::clone(&arc));
+    Ok(arc)
 }
 
 // ─── Scheduler types ──────────────────────────────────────────────────────────
@@ -156,6 +179,29 @@ impl Default for GgufBackend {
 
 // ─── Scheduler loop ───────────────────────────────────────────────────────────
 
+/// Sample the next token, banning `eos_token` from the output distribution when needed.
+/// Using a logit-bias of -inf forces the model to emit the next best non-EOS token
+/// instead of silently suppressing EOS and feeding it back (which just produces more EOS).
+#[cfg(feature = "gguf")]
+fn sample_token(
+    ctx: &llama_cpp_2::context::LlamaContext,
+    batch_pos: i32,
+    eos_token: LlamaToken,
+    n_vocab: i32,
+    ban_eos: bool,
+) -> LlamaToken {
+    if ban_eos {
+        let bias = [LlamaLogitBias::new(eos_token, f32::NEG_INFINITY)];
+        let mut sampler = LlamaSampler::chain_simple([
+            LlamaSampler::logit_bias(n_vocab, &bias),
+            LlamaSampler::greedy(),
+        ]);
+        sampler.sample(ctx, batch_pos)
+    } else {
+        LlamaSampler::greedy().sample(ctx, batch_pos)
+    }
+}
+
 /// Runs on a dedicated OS thread. Holds the single `LlamaContext` and multiplexes
 /// all concurrent requests through one batched decode loop, matching the vLLM
 /// continuous-batching pattern.
@@ -194,6 +240,7 @@ fn run_scheduler(
     log::info!("[gguf] Shared context ready (n_ctx={total_ctx}, max_concurrent={max_concurrent})");
 
     let eos_token = model.token_eos();
+    let n_vocab = model.n_vocab();
     let batch_cap = n_batch as usize;
     let mut batch = LlamaBatch::new(batch_cap, 1);
 
@@ -317,38 +364,35 @@ fn run_scheduler(
 
         // ── 6. Sample each newly prefilled sequence and move it to active ──────
         for (pref, &last_pos) in prefill_items.drain(..).zip(prefill_last_batch_positions.iter()) {
-            let first_tok = LlamaSampler::greedy().sample(&ctx, last_pos);
+            // EOS is banned via logit_bias(-inf) when min_tokens > 0, so first_tok is
+            // guaranteed to be a real content token whenever min_tokens is nonzero.
+            let first_tok = sample_token(&ctx, last_pos, eos_token, n_vocab, pref.min_tokens > 0);
             let prompt_len = pref.tokens.len() as i32;
 
-            // Retire immediately if max_tokens==0 or EOS when min_tokens==0
-            let immediate_eos = first_tok == eos_token && pref.min_tokens <= 0;
-            if pref.max_tokens <= 0 || immediate_eos {
+            // Retire immediately on max_tokens==0, or on natural EOS when min_tokens==0.
+            if pref.max_tokens <= 0 || (first_tok == eos_token && pref.min_tokens <= 0) {
                 let _ = ctx.clear_kv_cache_seq(Some(pref.seq_id as u32), None, None);
                 available_ids.push(pref.seq_id);
                 continue;
             }
 
-            // EOS suppressed by min_tokens: don't emit the token but keep the sequence alive
-            let suppress_eos = first_tok == eos_token && 1 <= pref.min_tokens;
-            if !suppress_eos {
-                let piece = model
-                    .token_to_str(first_tok, Special::Tokenize)
-                    .unwrap_or_default();
-                if pref.response_tx.send(Ok(piece)).is_err() {
-                    let _ = ctx.clear_kv_cache_seq(Some(pref.seq_id as u32), None, None);
-                    available_ids.push(pref.seq_id);
-                    continue;
-                }
+            let piece = model
+                .token_to_str(first_tok, Special::Tokenize)
+                .unwrap_or_default();
+            if pref.response_tx.send(Ok(piece)).is_err() {
+                let _ = ctx.clear_kv_cache_seq(Some(pref.seq_id as u32), None, None);
+                available_ids.push(pref.seq_id);
+                continue;
             }
 
-            if pref.max_tokens <= 1 && !suppress_eos {
+            if pref.max_tokens <= 1 {
                 let _ = ctx.clear_kv_cache_seq(Some(pref.seq_id as u32), None, None);
                 available_ids.push(pref.seq_id);
             } else {
                 active.push(ActiveSeq {
                     seq_id: pref.seq_id,
                     pos: prompt_len,
-                    n_generated: if suppress_eos { 0 } else { 1 },
+                    n_generated: 1,
                     max_tokens: pref.max_tokens,
                     min_tokens: pref.min_tokens,
                     last_token: first_tok,
@@ -365,7 +409,15 @@ fn run_scheduler(
                 continue; // this sequence was not in the batch this step
             }
 
-            let next_tok = LlamaSampler::greedy().sample(&ctx, batch_pos);
+            // Ban EOS when min_tokens not yet reached so the model is forced to emit
+            // real tokens instead of cycling on suppressed EOS indefinitely.
+            let next_tok = sample_token(
+                &ctx,
+                batch_pos,
+                eos_token,
+                n_vocab,
+                seq.n_generated < seq.min_tokens,
+            );
             seq.pos += 1;
 
             let eos_and_ready = next_tok == eos_token && seq.n_generated >= seq.min_tokens;
@@ -373,10 +425,6 @@ fn run_scheduler(
 
             if eos_and_ready || max_reached {
                 to_retire.push(i);
-            } else if next_tok == eos_token {
-                // EOS suppressed by min_tokens: advance position, don't emit, count the step
-                seq.last_token = next_tok;
-                seq.n_generated += 1;
             } else {
                 let piece = model
                     .token_to_str(next_tok, Special::Tokenize)
@@ -422,23 +470,21 @@ impl Engine for GgufBackend {
             shared
         } else {
             let model_path_load = model_path_key.clone();
-            let (backend, model, n_ctx_train) = tokio::task::spawn_blocking(move || {
-                let backend = LlamaBackend::init().map_err(|e| {
-                    EngineError::backend(format!("llama backend init failed: {e}"))
-                })?;
+            let backend_for_load = global_gguf_backend()?;
+            let backend_for_closure = Arc::clone(&backend_for_load);
+            let (model, n_ctx_train) = tokio::task::spawn_blocking(move || {
                 let params = LlamaModelParams::default().with_n_gpu_layers(99);
                 let model =
-                    LlamaModel::load_from_file(&backend, &model_path_load, &params).map_err(
-                        |e| EngineError::backend(format!("GGUF load failed: {e}")),
-                    )?;
+                    LlamaModel::load_from_file(&backend_for_closure, &model_path_load, &params)
+                        .map_err(|e| EngineError::backend(format!("GGUF load failed: {e}")))?;
                 let n_ctx_train = model.n_ctx_train();
-                Ok::<_, EngineError>((backend, model, n_ctx_train))
+                Ok::<_, EngineError>((model, n_ctx_train))
             })
             .await
             .map_err(|e| EngineError::backend(format!("spawn_blocking join error: {e}")))??;
 
             let arc = Arc::new(GgufWeights {
-                backend: Arc::new(backend),
+                backend: backend_for_load,
                 model: Arc::new(model),
                 n_ctx_train: n_ctx_train as u32,
             });

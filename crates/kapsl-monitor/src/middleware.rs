@@ -27,6 +27,7 @@ struct MetricStream {
     start: Instant,
     finished: bool,
     saw_error: bool,
+    first_token_seen: bool,
     auto_tune: Arc<ConcurrencyAutoTuneState>,
 }
 
@@ -124,6 +125,7 @@ impl MetricStream {
             start,
             finished: false,
             saw_error: false,
+            first_token_seen: false,
             auto_tune,
         }
     }
@@ -160,8 +162,34 @@ impl Stream for MetricStream {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         match this.inner.as_mut().poll_next(cx) {
-            Poll::Ready(Some(Ok(item))) => Poll::Ready(Some(Ok(item))),
+            Poll::Ready(Some(Ok(item))) => {
+                if !this.first_token_seen {
+                    this.first_token_seen = true;
+                    let ttft = this.start.elapsed().as_secs_f64();
+                    this.metrics
+                        .ttft_latency
+                        .with_label_values(&[
+                            this.model_id.as_str(),
+                            this.version.as_str(),
+                            "ok",
+                        ])
+                        .observe(ttft);
+                }
+                Poll::Ready(Some(Ok(item)))
+            }
             Poll::Ready(Some(Err(err))) => {
+                if !this.first_token_seen {
+                    this.first_token_seen = true;
+                    let ttft = this.start.elapsed().as_secs_f64();
+                    this.metrics
+                        .ttft_latency
+                        .with_label_values(&[
+                            this.model_id.as_str(),
+                            this.version.as_str(),
+                            "err",
+                        ])
+                        .observe(ttft);
+                }
                 this.saw_error = true;
                 Poll::Ready(Some(Err(err)))
             }
