@@ -5,6 +5,7 @@ use std::sync::Arc;
 pub struct KapslMetrics {
     pub registry: Arc<Registry>,
     pub inference_latency: HistogramVec,
+    pub ttft_latency: HistogramVec,
     pub inference_count: IntCounterVec,
     pub active_inferences: IntGaugeVec,
     pub batch_size_hist: HistogramVec,
@@ -34,6 +35,18 @@ impl KapslMetrics {
             )
             .buckets(vec![
                 0.001, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0,
+            ]),
+            &["model", "version", "status"],
+        )
+        .unwrap();
+
+        let ttft_latency = HistogramVec::new(
+            HistogramOpts::new(
+                "kapsl_ttft_seconds",
+                "Time to first token (seconds)",
+            )
+            .buckets(vec![
+                0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0,
             ]),
             &["model", "version", "status"],
         )
@@ -160,6 +173,9 @@ impl KapslMetrics {
             .register(Box::new(inference_latency.clone()))
             .expect("Failed to register inference_latency");
         registry
+            .register(Box::new(ttft_latency.clone()))
+            .expect("Failed to register ttft_latency");
+        registry
             .register(Box::new(inference_count.clone()))
             .expect("Failed to register inference_count");
         registry
@@ -211,6 +227,7 @@ impl KapslMetrics {
         Self {
             registry: registry.clone(),
             inference_latency,
+            ttft_latency,
             inference_count,
             active_inferences,
             batch_size_hist,
