@@ -29,7 +29,9 @@ const MAX_CONCURRENT_DEFAULT: usize = 32;
 const N_CTX_PER_SEQ_DEFAULT: u32 = 2048;
 const GGUF_QUEUE_DELAY_US_DEFAULT: u64 = 1_000;
 const GGUF_PREFILL_CHUNK_SIZE_DEFAULT: usize = 512;
-const GGUF_EXACT_PROMPT_KV_REUSE_DEFAULT: bool = true;
+// llama.cpp sequence-copy asserts unless the context uses a full/unified KV buffer.
+// Keep this opt-in until we can detect that mode safely at runtime.
+const GGUF_EXACT_PROMPT_KV_REUSE_DEFAULT: bool = false;
 
 #[cfg(feature = "gguf")]
 fn max_concurrent() -> usize {
