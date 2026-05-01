@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use std::num::NonZeroU32;
 use std::path::Path;
 use std::sync::mpsc as std_mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "gguf")]
@@ -27,6 +27,7 @@ use llama_cpp_sys_2::LLAMA_FLASH_ATTN_TYPE_AUTO;
 
 const MAX_CONCURRENT_DEFAULT: usize = 32;
 const N_CTX_PER_SEQ_DEFAULT: u32 = 2048;
+const GGUF_TARGET_CONCURRENCY_ENV: &str = "KAPSL_GGUF_TARGET_CONCURRENCY";
 const GGUF_QUEUE_DELAY_US_DEFAULT: u64 = 1_000;
 const GGUF_PREFILL_CHUNK_SIZE_DEFAULT: usize = 512;
 // llama.cpp sequence-copy asserts unless the context uses a full/unified KV buffer.
@@ -35,7 +36,15 @@ const GGUF_EXACT_PROMPT_KV_REUSE_DEFAULT: bool = false;
 
 #[cfg(feature = "gguf")]
 fn max_concurrent() -> usize {
-    std::env::var("KAPSL_GGUF_MAX_CONCURRENT")
+    if let Some(value) = std::env::var("KAPSL_GGUF_MAX_CONCURRENT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+    {
+        return value;
+    }
+
+    std::env::var(GGUF_TARGET_CONCURRENCY_ENV)
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&v| v > 0)
@@ -78,6 +87,62 @@ fn gguf_exact_prompt_kv_reuse() -> bool {
             !matches!(v.as_str(), "0" | "false" | "no" | "off")
         })
         .unwrap_or(GGUF_EXACT_PROMPT_KV_REUSE_DEFAULT)
+}
+
+#[cfg(feature = "gguf")]
+#[derive(Clone, Copy, Debug)]
+struct GgufServingConfig {
+    max_concurrent: usize,
+    ctx_per_seq: u32,
+    queue_delay: Duration,
+    prefill_chunk_size: usize,
+    exact_prompt_kv_reuse: bool,
+    kv_bytes_per_cell: usize,
+}
+
+#[cfg(feature = "gguf")]
+impl GgufServingConfig {
+    fn from_model(model: &LlamaModel, n_ctx_train: u32) -> Self {
+        let max_concurrent = max_concurrent();
+        let ctx_per_seq = n_ctx_per_seq().min(n_ctx_train);
+        let n_batch = ctx_per_seq + max_concurrent as u32;
+        Self {
+            max_concurrent,
+            ctx_per_seq,
+            queue_delay: gguf_queue_delay(),
+            prefill_chunk_size: gguf_prefill_chunk_size()
+                .min(n_batch as usize)
+                .max(1),
+            exact_prompt_kv_reuse: gguf_exact_prompt_kv_reuse(),
+            kv_bytes_per_cell: estimate_kv_bytes_per_cell(model),
+        }
+    }
+
+    fn total_ctx(self) -> usize {
+        self.max_concurrent * self.ctx_per_seq as usize
+    }
+
+    fn n_batch(self) -> u32 {
+        self.ctx_per_seq + self.max_concurrent as u32
+    }
+}
+
+#[cfg(feature = "gguf")]
+fn estimate_kv_bytes_per_cell(model: &LlamaModel) -> usize {
+    let n_embd = model.n_embd().max(0) as usize;
+    let n_head = model.n_head().max(1) as usize;
+    let n_head_kv = model.n_head_kv().max(1) as usize;
+    let n_embd_gqa = n_embd.saturating_mul(n_head_kv) / n_head;
+
+    // llama.cpp reports this path as K/V f16 in the load log. Treat one KV cell
+    // as K + V for every layer so Prometheus/admission logic has a comparable
+    // capacity signal to the native/ONNX paths.
+    model
+        .n_layer()
+        .max(1) as usize
+        * n_embd_gqa
+        * 2
+        * std::mem::size_of::<u16>()
 }
 
 // ─── Shared model weights cache ───────────────────────────────────────────────
@@ -209,7 +274,7 @@ struct ActiveSeq {
 pub struct GgufBackend {
     #[cfg(feature = "gguf")]
     inner: Option<GgufInner>,
-    metrics: EngineMetrics,
+    metrics: Arc<Mutex<EngineMetrics>>,
 }
 
 #[cfg(feature = "gguf")]
@@ -224,8 +289,15 @@ impl GgufBackend {
         Self {
             #[cfg(feature = "gguf")]
             inner: None,
-            metrics: EngineMetrics::new(),
+            metrics: Arc::new(Mutex::new(EngineMetrics::new())),
         }
+    }
+
+    fn metrics_snapshot(&self) -> EngineMetrics {
+        self.metrics
+            .lock()
+            .map(|m| m.clone())
+            .unwrap_or_else(|_| EngineMetrics::new())
     }
 
     fn extract_prompt(request: &InferenceRequest) -> Result<String, EngineError> {
@@ -407,6 +479,39 @@ fn fail_pending_prefill(
     }
 }
 
+#[cfg(feature = "gguf")]
+fn update_gguf_metrics(
+    metrics: &Arc<Mutex<EngineMetrics>>,
+    config: GgufServingConfig,
+    waiting: &VecDeque<GgufRequest>,
+    pending: &VecDeque<PendingPrefill>,
+    active: &[ActiveSeq],
+    batch_tokens: usize,
+) {
+    let total_cells = config.total_ctx();
+    let pending_cells = pending
+        .iter()
+        .map(|pref| pref.next_token.min(pref.tokens.len()))
+        .sum::<usize>();
+    let active_cells = active
+        .iter()
+        .map(|seq| seq.pos.max(0) as usize)
+        .sum::<usize>();
+    let used_cells = pending_cells.saturating_add(active_cells).min(total_cells);
+    let capacity_bytes = total_cells.saturating_mul(config.kv_bytes_per_cell);
+
+    if let Ok(mut snapshot) = metrics.lock() {
+        snapshot.batch_size = batch_tokens;
+        snapshot.queue_depth = waiting.len() + pending.len();
+        snapshot.kv_cache_blocks_total = total_cells;
+        snapshot.kv_cache_blocks_free = total_cells.saturating_sub(used_cells);
+        snapshot.kv_cache_sequences = pending.len() + active.len();
+        snapshot.kv_cache_bytes_capacity = capacity_bytes;
+        snapshot.kv_cache_bytes_used = used_cells.saturating_mul(config.kv_bytes_per_cell);
+        snapshot.refresh_timestamp();
+    }
+}
+
 /// Runs on a dedicated OS thread. Holds the single `LlamaContext` and multiplexes
 /// all concurrent requests through one batched decode loop, matching the vLLM
 /// continuous-batching pattern.
@@ -415,28 +520,24 @@ fn run_scheduler(
     model: Arc<LlamaModel>,
     backend: Arc<LlamaBackend>,
     request_rx: std_mpsc::Receiver<GgufRequest>,
-    max_concurrent: usize,
-    ctx_per_seq: u32,
+    config: GgufServingConfig,
+    metrics: Arc<Mutex<EngineMetrics>>,
 ) {
-    let total_ctx = max_concurrent as u32 * ctx_per_seq;
-    let n_ctx = match NonZeroU32::new(total_ctx) {
+    let total_ctx = config.total_ctx();
+    let n_ctx = match NonZeroU32::new(total_ctx as u32) {
         Some(v) => v,
         None => {
             log::error!("[gguf] invalid total_ctx=0");
             return;
         }
     };
-    // n_batch: upper bound for prefill work plus all active decode tokens.
-    let n_batch = ctx_per_seq + max_concurrent as u32;
-    let queue_delay = gguf_queue_delay();
-    let prefill_chunk_size = gguf_prefill_chunk_size().min(n_batch as usize).max(1);
-    let exact_prompt_kv_reuse = gguf_exact_prompt_kv_reuse();
+    let n_batch = config.n_batch();
 
     let ctx_params = LlamaContextParams::default()
         .with_n_ctx(Some(n_ctx))
         .with_n_batch(n_batch)
         .with_n_ubatch(n_batch)
-        .with_n_seq_max(max_concurrent as u32)
+        .with_n_seq_max(config.max_concurrent as u32)
         .with_offload_kqv(true)
         .with_flash_attention_policy(LLAMA_FLASH_ATTN_TYPE_AUTO);
 
@@ -447,19 +548,31 @@ fn run_scheduler(
             return;
         }
     };
-    log::info!("[gguf] Shared context ready (n_ctx={total_ctx}, max_concurrent={max_concurrent})");
-    log::info!("[gguf] Prefill chunk size={prefill_chunk_size}");
-    log::info!("[gguf] Exact prompt KV reuse={exact_prompt_kv_reuse}");
+    log::info!(
+        "[gguf] Shared context ready (n_ctx={total_ctx}, max_concurrent={})",
+        config.max_concurrent
+    );
+    log::info!("[gguf] Prefill chunk size={}", config.prefill_chunk_size);
+    log::info!(
+        "[gguf] Exact prompt KV reuse={}",
+        config.exact_prompt_kv_reuse
+    );
+    log::info!(
+        "[gguf] Estimated KV capacity={} MiB ({} bytes/cell)",
+        total_ctx.saturating_mul(config.kv_bytes_per_cell) / (1024 * 1024),
+        config.kv_bytes_per_cell
+    );
 
     let eos_token = model.token_eos();
     let batch_cap = n_batch as usize;
     let mut batch = LlamaBatch::new(batch_cap, 1);
 
     // seq_id pool: 0..max_concurrent are valid sequence identifiers for the KV cache.
-    let mut available_ids: Vec<i32> = (0..max_concurrent as i32).rev().collect();
+    let mut available_ids: Vec<i32> = (0..config.max_concurrent as i32).rev().collect();
     let mut waiting: VecDeque<GgufRequest> = VecDeque::new();
     let mut pending: VecDeque<PendingPrefill> = VecDeque::new();
-    let mut active: Vec<ActiveSeq> = Vec::with_capacity(max_concurrent);
+    let mut active: Vec<ActiveSeq> = Vec::with_capacity(config.max_concurrent);
+    update_gguf_metrics(&metrics, config, &waiting, &pending, &active, 0);
 
     'main: loop {
         // ── 1. Drain the request channel ──────────────────────────────────────
@@ -482,10 +595,11 @@ fn run_scheduler(
             let req = waiting.pop_front().unwrap();
             let seq_id = available_ids.pop().unwrap();
 
-            if req.tokens.len() as u32 > ctx_per_seq {
+            if req.tokens.len() as u32 > config.ctx_per_seq {
                 req.response.send_error(EngineError::invalid_input(format!(
-                    "prompt has {} tokens, exceeding ctx_per_seq={ctx_per_seq}",
-                    req.tokens.len()
+                    "prompt has {} tokens, exceeding ctx_per_seq={}",
+                    req.tokens.len(),
+                    config.ctx_per_seq
                 )));
                 available_ids.push(seq_id);
                 continue;
@@ -507,6 +621,7 @@ fn run_scheduler(
                 copies: Vec::new(),
             });
         }
+        update_gguf_metrics(&metrics, config, &waiting, &pending, &active, 0);
 
         // ── 3. If completely idle, block for the next request ─────────────────
         if waiting.is_empty() && pending.is_empty() && active.is_empty() {
@@ -514,9 +629,9 @@ fn run_scheduler(
                 Ok(req) => waiting.push_back(req),
                 Err(_) => break 'main,
             }
-            if !queue_delay.is_zero() {
-                let deadline = Instant::now() + queue_delay;
-                while waiting.len() < max_concurrent {
+            if !config.queue_delay.is_zero() {
+                let deadline = Instant::now() + config.queue_delay;
+                while waiting.len() < config.max_concurrent {
                     let now = Instant::now();
                     if now >= deadline {
                         break;
@@ -528,6 +643,7 @@ fn run_scheduler(
                     }
                 }
             }
+            update_gguf_metrics(&metrics, config, &waiting, &pending, &active, 0);
             continue;
         }
 
@@ -546,13 +662,13 @@ fn run_scheduler(
 
             let slots_remaining = prefill_budget - prefill_slots_used;
             let mut pref = pending.pop_front().unwrap();
-            if exact_prompt_kv_reuse {
+            if config.exact_prompt_kv_reuse {
                 coalesce_exact_prompt_copies(&mut pref, &mut pending);
             }
 
             let remaining_prompt = pref.tokens.len().saturating_sub(pref.next_token);
             let chunk_len = remaining_prompt
-                .min(prefill_chunk_size)
+                .min(config.prefill_chunk_size)
                 .min(slots_remaining);
 
             if chunk_len == 0 {
@@ -624,8 +740,17 @@ fn run_scheduler(
         }
 
         if batch.n_tokens() == 0 {
+            update_gguf_metrics(&metrics, config, &waiting, &pending, &active, 0);
             continue;
         }
+        update_gguf_metrics(
+            &metrics,
+            config,
+            &waiting,
+            &pending,
+            &active,
+            batch.n_tokens().max(0) as usize,
+        );
 
         // ── 5. Execute one forward pass for all sequences in the batch ────────
         if let Err(e) = ctx.decode(&mut batch) {
@@ -642,6 +767,7 @@ fn run_scheduler(
             for (pref, _) in completed_prefills.drain(..) {
                 fail_pending_prefill(&mut ctx, &mut available_ids, pref, "decode failed");
             }
+            update_gguf_metrics(&metrics, config, &waiting, &pending, &active, 0);
             continue;
         }
 
@@ -809,6 +935,7 @@ fn run_scheduler(
                 done.response.finish(done.output);
             }
         }
+        update_gguf_metrics(&metrics, config, &waiting, &pending, &active, 0);
     }
 
     log::info!("[gguf] Scheduler thread exiting");
@@ -861,24 +988,34 @@ impl Engine for GgufBackend {
             arc
         };
 
-        let max_conc = max_concurrent();
-        let ctx_per_seq = n_ctx_per_seq().min(weights.n_ctx_train);
+        let config = GgufServingConfig::from_model(&weights.model, weights.n_ctx_train);
+        if let Ok(mut snapshot) = self.metrics.lock() {
+            snapshot.kv_cache_blocks_total = config.total_ctx();
+            snapshot.kv_cache_blocks_free = config.total_ctx();
+            snapshot.kv_cache_bytes_capacity =
+                config.total_ctx().saturating_mul(config.kv_bytes_per_cell);
+            snapshot.kv_cache_bytes_used = 0;
+            snapshot.refresh_timestamp();
+        }
 
         let (tx, rx) = std_mpsc::channel::<GgufRequest>();
         let model_clone = Arc::clone(&weights.model);
         let backend_clone = Arc::clone(&weights.backend);
+        let metrics = Arc::clone(&self.metrics);
         std::thread::spawn(move || {
-            run_scheduler(model_clone, backend_clone, rx, max_conc, ctx_per_seq);
+            run_scheduler(model_clone, backend_clone, rx, config, metrics);
         });
 
         log::info!(
-            "[gguf] Scheduler started: max_concurrent={max_conc}, ctx_per_seq={ctx_per_seq}"
+            "[gguf] Scheduler started: max_concurrent={}, ctx_per_seq={}",
+            config.max_concurrent,
+            config.ctx_per_seq
         );
 
         self.inner = Some(GgufInner {
             weights,
             request_tx: tx,
-            max_concurrent: max_conc,
+            max_concurrent: config.max_concurrent,
         });
         Ok(())
     }
@@ -976,11 +1113,14 @@ impl Engine for GgufBackend {
 
     fn unload(&mut self) {
         self.inner = None; // drops request_tx → scheduler thread exits
+        if let Ok(mut metrics) = self.metrics.lock() {
+            *metrics = EngineMetrics::new();
+        }
         log::info!("[gguf] Backend unloaded");
     }
 
     fn metrics(&self) -> EngineMetrics {
-        self.metrics.clone()
+        self.metrics_snapshot()
     }
 
     fn health_check(&self) -> Result<(), EngineError> {
@@ -1035,7 +1175,7 @@ impl Engine for GgufBackend {
     fn unload(&mut self) {}
 
     fn metrics(&self) -> EngineMetrics {
-        self.metrics.clone()
+        self.metrics_snapshot()
     }
 
     fn health_check(&self) -> Result<(), EngineError> {
