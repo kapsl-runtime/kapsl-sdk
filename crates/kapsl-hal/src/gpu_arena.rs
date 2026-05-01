@@ -21,9 +21,9 @@ use cudarc::driver::{CudaDevice, CudaSlice, DeviceSlice};
 #[cfg(feature = "cuda")]
 use std::cell::UnsafeCell;
 #[cfg(feature = "cuda")]
-use std::sync::{Arc, Mutex};
-#[cfg(feature = "cuda")]
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(feature = "cuda")]
+use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "cuda")]
 use thiserror::Error;
@@ -85,8 +85,10 @@ impl GpuArena {
 
     /// Upload host data to a previously allocated region at `offset`.
     pub fn upload(&self, offset: usize, data: &[u8]) -> Result<(), ArenaError> {
-        self.device
-            .htod_copy_into(data.to_vec(), &mut self.buffer.slice(offset..offset + data.len()))?;
+        self.device.htod_copy_into(
+            data.to_vec(),
+            &mut self.buffer.slice(offset..offset + data.len()),
+        )?;
         Ok(())
     }
 
@@ -189,7 +191,11 @@ impl GpuBlockPool {
 
     /// Allocate a free physical block. Returns the block index.
     pub fn alloc_block(&self) -> Result<u32, ArenaError> {
-        self.free_stack.lock().unwrap().pop().ok_or(ArenaError::NoFreeBlocks)
+        self.free_stack
+            .lock()
+            .unwrap()
+            .pop()
+            .ok_or(ArenaError::NoFreeBlocks)
     }
 
     /// Release a physical block back to the free pool.
@@ -268,8 +274,14 @@ impl GpuBlockPool {
         let val_offset = base + half_block;
 
         let storage = self.storage_mut();
-        self.device.htod_sync_copy_into(host_key, &mut storage.slice(key_offset..key_offset + half_block))?;
-        self.device.htod_sync_copy_into(host_val, &mut storage.slice(val_offset..val_offset + half_block))?;
+        self.device.htod_sync_copy_into(
+            host_key,
+            &mut storage.slice(key_offset..key_offset + half_block),
+        )?;
+        self.device.htod_sync_copy_into(
+            host_val,
+            &mut storage.slice(val_offset..val_offset + half_block),
+        )?;
         Ok(())
     }
 }
@@ -278,9 +290,10 @@ impl GpuBlockPool {
 //
 // A handle to a (possibly shared) GpuBlockPool plus a dynamic per-engine quota.
 //
-// `blocks_per_engine` is backed by a shared AtomicUsize so that when new
-// backends attach to the same pool, all existing holders see the updated cap
-// without any extra message-passing.
+// `blocks_per_engine` is intentionally stored per handle. Cloning a handle
+// shares the same quota, while `for_engine()` creates a new handle for the same
+// physical pool with an independent quota. Runtime policy can then rebalance
+// per-model caps by updating each engine's own atomic.
 
 #[cfg(feature = "cuda")]
 #[derive(Clone)]
@@ -296,14 +309,28 @@ impl GpuPoolHandle {
     /// Wrap a freshly-created private pool (cap = all blocks).
     pub fn private(pool: Arc<GpuBlockPool>) -> Self {
         let cap = pool.total_blocks();
+        Self::with_cap(pool, cap)
+    }
+
+    /// Wrap an existing pool with an explicit per-engine cap.
+    pub fn with_cap(pool: Arc<GpuBlockPool>, cap: usize) -> Self {
         Self {
             pool,
-            blocks_per_engine: Arc::new(AtomicUsize::new(cap)),
+            blocks_per_engine: Arc::new(AtomicUsize::new(cap.max(1))),
         }
+    }
+
+    /// Create a new per-engine handle for the same physical pool.
+    pub fn for_engine(&self, cap: usize) -> Self {
+        Self::with_cap(self.pool.clone(), cap)
     }
 
     pub fn cap(&self) -> usize {
         self.blocks_per_engine.load(Ordering::Relaxed)
+    }
+
+    pub fn set_cap(&self, cap: usize) {
+        self.blocks_per_engine.store(cap.max(1), Ordering::Relaxed);
     }
 }
 

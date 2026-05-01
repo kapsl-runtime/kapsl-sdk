@@ -70,10 +70,7 @@ impl GpuTensor<half::f16> {
 #[cfg(feature = "cuda")]
 impl<T: cudarc::driver::DeviceRepr + Default + Clone> GpuTensor<T> {
     /// Download tensor to host.
-    pub fn to_host(
-        &self,
-        device: &Arc<CudaDevice>,
-    ) -> Result<Vec<T>, cudarc::driver::DriverError> {
+    pub fn to_host(&self, device: &Arc<CudaDevice>) -> Result<Vec<T>, cudarc::driver::DriverError> {
         device.dtoh_sync_copy(&self.data)
     }
 }
@@ -81,6 +78,11 @@ impl<T: cudarc::driver::DeviceRepr + Default + Clone> GpuTensor<T> {
 #[cfg(feature = "cuda")]
 impl<T: cudarc::driver::DeviceRepr> std::fmt::Debug for GpuTensor<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "GpuTensor<{}>({:?})", std::any::type_name::<T>(), self.shape)
+        write!(
+            f,
+            "GpuTensor<{}>({:?})",
+            std::any::type_name::<T>(),
+            self.shape
+        )
     }
 }

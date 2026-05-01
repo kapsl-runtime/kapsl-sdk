@@ -482,7 +482,7 @@ impl Engine for LLMBackend {
         let kv_blocks_cap = self.kv_blocks_cap;
         let kv_compression_bits = self.kv_compression_bits;
         tokio::spawn(async move {
-            let mut engine = LLMEngine::new(
+            let engine = LLMEngine::new(
                 config,
                 engine_block_size,
                 engine_num_gpu_blocks,
