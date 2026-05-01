@@ -35,6 +35,9 @@ ort = { version = "=2.0.0-rc.11", features = ["ndarray", "half", "download-binar
 [features]
 default = ["gguf"]
 gguf = ["dep:llama-cpp-2", "dep:llama-cpp-sys-2"]
+# Opt-in CUDA acceleration for GGUF. Keep default CPU/Metal portable so Linux
+# machines without a CUDA toolkit can still build.
+gguf-cuda = ["gguf", "llama-cpp-2/cuda"]
 
 [target.'cfg(target_os = "macos")'.dependencies.llama-cpp-2]
 version = "0.1"
@@ -48,7 +51,6 @@ optional = true
 [target.'cfg(not(target_os = "macos"))'.dependencies.llama-cpp-2]
 version = "0.1"
 optional = true
-features = ["cuda"]
 
 [target.'cfg(not(target_os = "macos"))'.dependencies.llama-cpp-sys-2]
 version = "0.1"

@@ -355,9 +355,7 @@ impl DenseKvCache {
     /// Returns true if TurboQuant compression is active for this cache.
     fn tq_enabled(&self) -> bool {
         let total_dim = self.num_heads * self.head_dim;
-        self.tq_compression_bits.is_some()
-            && total_dim > 0
-            && total_dim.is_power_of_two()
+        self.tq_compression_bits.is_some() && total_dim > 0 && total_dim.is_power_of_two()
     }
 
     /// Get or create a TQ quantizer for a sequence.
@@ -489,10 +487,12 @@ impl DenseKvCache {
                 tq.clear();
                 match tq.push_packed_layer(layer_index, length, num_heads, head_dim, key, value) {
                     Ok(()) => return,
-                    Err(e) => log::warn!(
+                    Err(e) => {
+                        log::warn!(
                         "TQ push_packed_layer failed for seq {} layer {}: {}; falling back to f16",
                         sequence_id, layer_index, e
-                    ),
+                    )
+                    }
                 }
             }
         }
@@ -534,7 +534,9 @@ impl DenseKvCache {
                     }
                     Err(e) => log::warn!(
                         "TQ dequantize failed for seq {} layer {}: {}; falling back to f16",
-                        sequence_id, layer_index, e
+                        sequence_id,
+                        layer_index,
+                        e
                     ),
                 }
             }

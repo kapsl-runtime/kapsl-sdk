@@ -110,9 +110,7 @@ impl GgufServingConfig {
             max_concurrent,
             ctx_per_seq,
             queue_delay: gguf_queue_delay(),
-            prefill_chunk_size: gguf_prefill_chunk_size()
-                .min(n_batch as usize)
-                .max(1),
+            prefill_chunk_size: gguf_prefill_chunk_size().min(n_batch as usize).max(1),
             exact_prompt_kv_reuse: gguf_exact_prompt_kv_reuse(),
             kv_bytes_per_cell: estimate_kv_bytes_per_cell(model),
         }
@@ -137,12 +135,7 @@ fn estimate_kv_bytes_per_cell(model: &LlamaModel) -> usize {
     // llama.cpp reports this path as K/V f16 in the load log. Treat one KV cell
     // as K + V for every layer so Prometheus/admission logic has a comparable
     // capacity signal to the native/ONNX paths.
-    model
-        .n_layer()
-        .max(1) as usize
-        * n_embd_gqa
-        * 2
-        * std::mem::size_of::<u16>()
+    model.n_layer().max(1) as usize * n_embd_gqa * 2 * std::mem::size_of::<u16>()
 }
 
 // ─── Shared model weights cache ───────────────────────────────────────────────
