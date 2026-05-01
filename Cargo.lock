@@ -1742,6 +1742,7 @@ dependencies = [
  "kapsl-kernels",
  "kapsl-quantization",
  "llama-cpp-2",
+ "llama-cpp-sys-2",
  "log",
  "ndarray",
  "ort",
