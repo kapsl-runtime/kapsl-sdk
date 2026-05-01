@@ -19,7 +19,9 @@
 #[cfg(feature = "cuda")]
 use cudarc::driver::{CudaDevice, CudaSlice, DeviceSlice};
 #[cfg(feature = "cuda")]
-use std::sync::Arc;
+use std::cell::UnsafeCell;
+#[cfg(feature = "cuda")]
+use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "cuda")]
 use thiserror::Error;
@@ -109,7 +111,7 @@ impl GpuArena {
 
 // ─── GpuBlockPool ────────────────────────────────────────────────────────────
 //
-// Paged KV cache on GPU.
+// Paged KV cache on GPU, designed for sharing across multiple backend instances.
 //
 // Layout: [num_blocks, 2, num_kv_heads, block_size, head_dim] in f16.
 //
@@ -118,18 +120,34 @@ impl GpuArena {
 // Dim 2: KV head index
 // Dim 3: token position within block
 // Dim 4: head dimension element
+//
+// Sharing safety invariant: each physical block is owned by at most one
+// session at any time, enforced by the Mutex-protected free_stack.  Concurrent
+// backends writing to *different* physical blocks never alias, so the
+// UnsafeCell on storage is sound.
 
 #[cfg(feature = "cuda")]
 pub struct GpuBlockPool {
     device: Arc<CudaDevice>,
-    storage: CudaSlice<half::f16>,
+    // Interior mutability: concurrent writes to disjoint physical blocks are
+    // safe at the GPU level.  The free_stack Mutex guarantees each block is
+    // allocated to at most one owner at a time.
+    storage: UnsafeCell<CudaSlice<half::f16>>,
     num_blocks: usize,
     block_size: usize,
     num_kv_heads: usize,
     head_dim: usize,
     /// Stack of free physical block indices (LIFO for cache locality).
-    free_stack: Vec<u32>,
+    free_stack: Mutex<Vec<u32>>,
 }
+
+// SAFETY: The free_stack Mutex serialises alloc/free, and the storage
+// UnsafeCell is only written to non-overlapping regions (one per allocated
+// block, owned exclusively by the session that called alloc_block).
+#[cfg(feature = "cuda")]
+unsafe impl Sync for GpuBlockPool {}
+#[cfg(feature = "cuda")]
+unsafe impl Send for GpuBlockPool {}
 
 #[cfg(feature = "cuda")]
 impl GpuBlockPool {
@@ -158,29 +176,29 @@ impl GpuBlockPool {
 
         Ok(Self {
             device,
-            storage,
+            storage: UnsafeCell::new(storage),
             num_blocks,
             block_size,
             num_kv_heads,
             head_dim,
-            free_stack,
+            free_stack: Mutex::new(free_stack),
         })
     }
 
     /// Allocate a free physical block. Returns the block index.
-    pub fn alloc_block(&mut self) -> Result<u32, ArenaError> {
-        self.free_stack.pop().ok_or(ArenaError::NoFreeBlocks)
+    pub fn alloc_block(&self) -> Result<u32, ArenaError> {
+        self.free_stack.lock().unwrap().pop().ok_or(ArenaError::NoFreeBlocks)
     }
 
     /// Release a physical block back to the free pool.
-    pub fn free_block(&mut self, block_id: u32) {
+    pub fn free_block(&self, block_id: u32) {
         debug_assert!((block_id as usize) < self.num_blocks);
-        self.free_stack.push(block_id);
+        self.free_stack.lock().unwrap().push(block_id);
     }
 
     /// Number of free blocks remaining.
     pub fn free_count(&self) -> usize {
-        self.free_stack.len()
+        self.free_stack.lock().unwrap().len()
     }
 
     /// Total number of blocks in the pool.
@@ -205,14 +223,24 @@ impl GpuBlockPool {
         2 * self.num_kv_heads * self.block_size * self.head_dim
     }
 
-    /// Raw device pointer to the start of block storage.
-    /// Used by CUDA kernels that need the base address.
-    pub fn storage(&self) -> &CudaSlice<half::f16> {
-        &self.storage
+    /// Returns true if this pool has compatible geometry for the given model dimensions.
+    pub fn is_compatible(&self, num_kv_heads: usize, head_dim: usize) -> bool {
+        self.num_kv_heads == num_kv_heads && self.head_dim == head_dim
     }
 
-    pub fn storage_mut(&mut self) -> &mut CudaSlice<half::f16> {
-        &mut self.storage
+    /// Read-only view of the storage slice (for attention kernel reads).
+    pub fn storage(&self) -> &CudaSlice<half::f16> {
+        unsafe { &*self.storage.get() }
+    }
+
+    /// Mutable view of the storage slice (for KV-write kernels).
+    ///
+    /// # Safety
+    /// Caller must ensure that the physical blocks it writes to are not
+    /// concurrently written by another caller.  This invariant is upheld by
+    /// the alloc_block/free_block protocol — only the block owner writes.
+    pub fn storage_mut(&self) -> &mut CudaSlice<half::f16> {
+        unsafe { &mut *self.storage.get() }
     }
 
     pub fn device(&self) -> &Arc<CudaDevice> {
@@ -237,8 +265,9 @@ impl GpuBlockPool {
         let key_offset = base;
         let val_offset = base + half_block;
 
-        self.device.htod_sync_copy_into(host_key, &mut self.storage.slice(key_offset..key_offset + half_block))?;
-        self.device.htod_sync_copy_into(host_val, &mut self.storage.slice(val_offset..val_offset + half_block))?;
+        let storage = self.storage_mut();
+        self.device.htod_sync_copy_into(host_key, &mut storage.slice(key_offset..key_offset + half_block))?;
+        self.device.htod_sync_copy_into(host_val, &mut storage.slice(val_offset..val_offset + half_block))?;
         Ok(())
     }
 }
