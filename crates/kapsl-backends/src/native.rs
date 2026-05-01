@@ -20,7 +20,7 @@ mod inner {
     use std::collections::{HashMap, HashSet};
     use std::path::Path;
     use std::sync::{Arc, Mutex};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use async_trait::async_trait;
     use cudarc::cublas::{CudaBlas, Gemm};
@@ -32,7 +32,7 @@ mod inner {
         BinaryTensorPacket, EngineError, EngineMetrics, EngineModelInfo, EngineStream,
         InferenceRequest, RequestMetadata, TensorDtype,
     };
-    use kapsl_hal::gpu_arena::GpuBlockPool;
+    use kapsl_hal::gpu_arena::{GpuBlockPool, GpuPoolHandle};
     use kapsl_kernels::cuda_kernels::{
         launch_argmax, launch_batch_kv_write, launch_batch_rope, launch_fused_swiglu,
         launch_paged_attention, launch_prefill_attention, launch_residual_add, launch_rms_norm,
@@ -281,6 +281,10 @@ mod inner {
         config: ModelConfig,
         weights: GpuModelWeights,
         block_pool: Arc<GpuBlockPool>,
+        /// Shared cap; other backends on the same device may lower this via an atomic store.
+        pool_cap: Arc<AtomicUsize>,
+        /// Physical blocks currently held across all active sessions of this backend.
+        allocated_blocks: usize,
         // Prefill path reuses these small single-row buffers.
         norm_buf: CudaSlice<f16>,     // [h]
         logits_buf: CudaSlice<f16>,   // [vocab]
@@ -308,10 +312,18 @@ mod inner {
                 block_tables.resize(num_layers, Vec::new());
             }
             if block_tables[0].len() <= logical {
+                let cap = self.pool_cap.load(Ordering::Relaxed);
+                if self.allocated_blocks + num_layers > cap {
+                    return Err(EngineError::backend(format!(
+                        "KV block quota exceeded: {}/{} blocks used",
+                        self.allocated_blocks, cap,
+                    )));
+                }
                 for l in 0..num_layers {
                     let phys = self.block_pool.alloc_block()
                         .map_err(|e| EngineError::backend(format!("block alloc: {e}")))?;
                     block_tables[l].push(phys as i32);
+                    self.allocated_blocks += 1;
                 }
             }
             Ok(())
@@ -319,7 +331,10 @@ mod inner {
 
         fn free_block_tables(&mut self, block_tables: &[Vec<i32>]) {
             for lt in block_tables {
-                for &p in lt { self.block_pool.free_block(p as u32); }
+                for &p in lt {
+                    self.block_pool.free_block(p as u32);
+                    self.allocated_blocks = self.allocated_blocks.saturating_sub(1);
+                }
             }
         }
 
@@ -1164,8 +1179,8 @@ mod inner {
     pub struct NativeBackend {
         device_id: i32,
         state: Arc<Mutex<Option<BackendState>>>,
-        /// Pool to inject before load(); also populated after load() for sharing.
-        pool_slot: Arc<Mutex<Option<Arc<GpuBlockPool>>>>,
+        /// Pool handle to inject before load(); also populated after load() for sharing.
+        pool_slot: Arc<Mutex<Option<GpuPoolHandle>>>,
     }
 
     impl NativeBackend {
@@ -1179,16 +1194,15 @@ mod inner {
             })
         }
 
-        /// Inject a shared pool before calling load(). If the pool geometry is
-        /// incompatible with the model, load() will create a private pool instead.
-        pub fn with_block_pool(self, pool: Arc<GpuBlockPool>) -> Self {
-            *self.pool_slot.lock().unwrap() = Some(pool);
+        /// Inject a shared pool handle before calling load(). If the pool geometry
+        /// is incompatible with the model, load() will create a private pool instead.
+        pub fn with_pool_handle(self, handle: GpuPoolHandle) -> Self {
+            *self.pool_slot.lock().unwrap() = Some(handle);
             self
         }
 
-        /// Return the active block pool after load(), usable as a shared pool
-        /// for subsequently loaded backends with the same KV geometry.
-        pub fn block_pool(&self) -> Option<Arc<GpuBlockPool>> {
+        /// Return the active pool handle after load(), for registration and sharing.
+        pub fn pool_handle(&self) -> Option<GpuPoolHandle> {
             self.pool_slot.lock().unwrap().clone()
         }
 
@@ -1251,23 +1265,26 @@ mod inner {
 
             let block_size = 16usize;
             let pool_slot = Arc::clone(&self.pool_slot);
-            let block_pool: Arc<GpuBlockPool> = {
+            let (block_pool, pool_cap): (Arc<GpuBlockPool>, Arc<AtomicUsize>) = {
                 let mut slot = pool_slot.lock().unwrap();
-                if let Some(ref existing) = *slot {
-                    if existing.is_compatible(config.num_kv_heads(), config.head_dim()) {
-                        log::info!("[native] Attaching to shared GpuBlockPool ({} blocks free)", existing.free_count());
-                        existing.clone()
+                if let Some(ref handle) = *slot {
+                    if handle.pool.is_compatible(config.num_kv_heads(), config.head_dim()) {
+                        log::info!("[native] Attaching to shared GpuBlockPool ({} free, cap {})",
+                            handle.pool.free_count(), handle.cap());
+                        (handle.pool.clone(), handle.blocks_per_engine.clone())
                     } else {
-                        log::warn!("[native] Injected pool geometry mismatch ({}h×{}d vs {}h×{}d), creating private pool",
-                            existing.num_kv_heads(), existing.head_dim(),
+                        log::warn!("[native] Pool geometry mismatch ({}h×{}d vs {}h×{}d), creating private pool",
+                            handle.pool.num_kv_heads(), handle.pool.head_dim(),
                             config.num_kv_heads(), config.head_dim());
                         let bps = (config.max_position_embeddings + block_size - 1) / block_size;
                         let num_blocks = config.num_hidden_layers * MAX_BATCH * bps;
                         let p = Arc::new(GpuBlockPool::new(device.clone(), num_blocks, block_size,
                             config.num_kv_heads(), config.head_dim())
                             .map_err(|e| EngineError::backend(format!("block pool: {e}")))?);
-                        *slot = Some(p.clone());
-                        p
+                        let h = GpuPoolHandle::private(p.clone());
+                        let cap = h.blocks_per_engine.clone();
+                        *slot = Some(h);
+                        (p, cap)
                     }
                 } else {
                     let bps = (config.max_position_embeddings + block_size - 1) / block_size;
@@ -1275,8 +1292,10 @@ mod inner {
                     let p = Arc::new(GpuBlockPool::new(device.clone(), num_blocks, block_size,
                         config.num_kv_heads(), config.head_dim())
                         .map_err(|e| EngineError::backend(format!("block pool: {e}")))?);
-                    *slot = Some(p.clone());
-                    p
+                    let h = GpuPoolHandle::private(p.clone());
+                    let cap = h.blocks_per_engine.clone();
+                    *slot = Some(h);
+                    (p, cap)
                 }
             };
 
@@ -1294,7 +1313,8 @@ mod inner {
             let batch   = BatchDecodeScratch::new(&device, MAX_BATCH, h, nq * hd, nkv * hd, inter, vocab)?;
 
             let inner = BackendInner {
-                device: device.clone(), blas, weights, block_pool, config,
+                device: device.clone(), blas, weights, block_pool, pool_cap,
+                allocated_blocks: 0, config,
                 norm_buf:   alloc1(h)?,
                 logits_buf: alloc1(vocab)?,
                 argmax_buf: device.alloc_zeros::<u32>(1)

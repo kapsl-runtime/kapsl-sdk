@@ -22,6 +22,8 @@ use cudarc::driver::{CudaDevice, CudaSlice, DeviceSlice};
 use std::cell::UnsafeCell;
 #[cfg(feature = "cuda")]
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "cuda")]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(feature = "cuda")]
 use thiserror::Error;
@@ -269,6 +271,39 @@ impl GpuBlockPool {
         self.device.htod_sync_copy_into(host_key, &mut storage.slice(key_offset..key_offset + half_block))?;
         self.device.htod_sync_copy_into(host_val, &mut storage.slice(val_offset..val_offset + half_block))?;
         Ok(())
+    }
+}
+
+// ─── GpuPoolHandle ───────────────────────────────────────────────────────────
+//
+// A handle to a (possibly shared) GpuBlockPool plus a dynamic per-engine quota.
+//
+// `blocks_per_engine` is backed by a shared AtomicUsize so that when new
+// backends attach to the same pool, all existing holders see the updated cap
+// without any extra message-passing.
+
+#[cfg(feature = "cuda")]
+#[derive(Clone)]
+pub struct GpuPoolHandle {
+    pub pool: Arc<GpuBlockPool>,
+    /// Maximum blocks this engine may hold simultaneously.
+    /// Shared across all engines on the same device; updated on attach/detach.
+    pub blocks_per_engine: Arc<AtomicUsize>,
+}
+
+#[cfg(feature = "cuda")]
+impl GpuPoolHandle {
+    /// Wrap a freshly-created private pool (cap = all blocks).
+    pub fn private(pool: Arc<GpuBlockPool>) -> Self {
+        let cap = pool.total_blocks();
+        Self {
+            pool,
+            blocks_per_engine: Arc::new(AtomicUsize::new(cap)),
+        }
+    }
+
+    pub fn cap(&self) -> usize {
+        self.blocks_per_engine.load(Ordering::Relaxed)
     }
 }
 
