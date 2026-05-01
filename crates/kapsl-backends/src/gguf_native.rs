@@ -826,7 +826,12 @@ mod inner {
 
                 // ── Block pool ───────────────────────────────────────────────
                 let block_size = 16usize;
-                let bps = (config.max_position_embeddings + block_size - 1) / block_size;
+                let effective_ctx = std::env::var("KAPSL_KV_MAX_CTX")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(config.max_position_embeddings)
+                    .min(config.max_position_embeddings);
+                let bps = (effective_ctx + block_size - 1) / block_size;
                 let num_blocks = config.num_hidden_layers * 8 * bps;
                 let block_pool = GpuBlockPool::new(
                     device.clone(), num_blocks, block_size,
