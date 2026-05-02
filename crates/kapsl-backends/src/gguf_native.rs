@@ -663,7 +663,7 @@ mod inner {
             }
 
             launch_rms_norm(&self.device, &mut RmsNormParams {
-                out: &mut self.norm_buf, input: &self.hidden_buf,
+                out: &mut self.norm_buf, input: self.hidden_buf.slice(..),
                 weight: &self.weights.norm, rows: 1, dim: h as u32, eps,
             }).map_err(e)?;
 
