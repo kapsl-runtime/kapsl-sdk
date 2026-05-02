@@ -9,7 +9,7 @@
 
 #[cfg(feature = "cuda")]
 mod inner {
-    use cudarc::driver::{CudaDevice, CudaFunction, CudaSlice, LaunchAsync, LaunchConfig};
+    use cudarc::driver::{CudaDevice, CudaFunction, CudaSlice, CudaView, LaunchAsync, LaunchConfig};
     use cudarc::nvrtc::compile_ptx;
     use half::f16;
     use std::sync::{Arc, OnceLock};
@@ -295,7 +295,7 @@ __global__ void rms_norm(
 
     pub struct RmsNormParams<'a> {
         pub out: &'a mut CudaSlice<f16>,
-        pub input: &'a CudaSlice<f16>,
+        pub input: CudaView<'a, f16>,
         pub weight: &'a CudaSlice<f16>,
         pub rows: u32,
         pub dim: u32,
