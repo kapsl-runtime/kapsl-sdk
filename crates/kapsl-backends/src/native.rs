@@ -545,7 +545,7 @@ mod inner {
                 let layer = &self.weights.layers[layer_idx];
 
                 launch_rms_norm(&self.device, &mut RmsNormParams {
-                    out: &mut self.prefill.norm, input: &self.prefill.hidden,
+                    out: &mut self.prefill.norm, input: self.prefill.hidden.slice(..),
                     weight: &layer.input_layernorm,
                     rows: n as u32, dim: h as u32, eps,
                 }).map_err(e)?;
@@ -601,7 +601,7 @@ mod inner {
 
                 let layer = &self.weights.layers[layer_idx];
                 launch_rms_norm(&self.device, &mut RmsNormParams {
-                    out: &mut self.prefill.ffn_input, input: &self.prefill.residual,
+                    out: &mut self.prefill.ffn_input, input: self.prefill.residual.slice(..),
                     weight: &layer.post_attention_layernorm,
                     rows: n as u32, dim: h as u32, eps,
                 }).map_err(e)?;
@@ -627,9 +627,8 @@ mod inner {
             }
 
             let last_off = (n - 1) * h;
-            let last_hidden = self.prefill.hidden.slice(last_off..last_off + h);
             launch_rms_norm(&self.device, &mut RmsNormParams {
-                out: &mut self.norm_buf, input: &last_hidden,
+                out: &mut self.norm_buf, input: self.prefill.hidden.slice(last_off..last_off + h),
                 weight: &self.weights.norm,
                 rows: 1, dim: h as u32, eps,
             }).map_err(e)?;
@@ -726,7 +725,7 @@ mod inner {
 
                 // RMS norm over B rows.
                 launch_rms_norm(&self.device, &mut RmsNormParams {
-                    out: &mut self.batch.norm, input: &self.batch.hidden,
+                    out: &mut self.batch.norm, input: self.batch.hidden.slice(..),
                     weight: &layer.input_layernorm,
                     rows: b as u32, dim: h as u32, eps,
                 }).map_err(e)?;
@@ -805,7 +804,7 @@ mod inner {
 
                 let layer = &self.weights.layers[layer_idx];
                 launch_rms_norm(&self.device, &mut RmsNormParams {
-                    out: &mut self.batch.ffn_input, input: &self.batch.residual,
+                    out: &mut self.batch.ffn_input, input: self.batch.residual.slice(..),
                     weight: &layer.post_attention_layernorm,
                     rows: b as u32, dim: h as u32, eps,
                 }).map_err(e)?;

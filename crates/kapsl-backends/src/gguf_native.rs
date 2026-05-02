@@ -352,14 +352,21 @@ mod inner {
         ) -> Result<(), EngineError> {
             unsafe {
                 blas.gemm(
-                    cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_T,
-                    cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
-                    out_dim, batch, in_dim,
-                    &f16::from_f32(1.0),
-                    weight, lda,
-                    input,  ldb,
-                    &f16::from_f32(0.0),
-                    out,    ldc,
+                    cudarc::cublas::GemmConfig {
+                        transa: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_T,
+                        transb: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
+                        m: out_dim,
+                        n: batch,
+                        k: in_dim,
+                        alpha: f16::from_f32(1.0),
+                        lda,
+                        ldb,
+                        beta: f16::from_f32(0.0),
+                        ldc,
+                    },
+                    weight,
+                    input,
+                    out,
                 )
                 .map_err(|e| EngineError::backend(format!("{label} gemm: {e}")))
             }
@@ -405,7 +412,7 @@ mod inner {
                 let layer = &self.weights.layers[layer_idx];
 
                 launch_rms_norm(&self.device, &mut RmsNormParams {
-                    out: &mut self.prefill.norm, input: &self.prefill.hidden,
+                    out: &mut self.prefill.norm, input: self.prefill.hidden.slice(..),
                     weight: &layer.input_layernorm,
                     rows: n as u32, dim: h as u32, eps,
                 }).map_err(e)?;
@@ -463,7 +470,7 @@ mod inner {
 
                 let layer = &self.weights.layers[layer_idx];
                 launch_rms_norm(&self.device, &mut RmsNormParams {
-                    out: &mut self.prefill.ffn_input, input: &self.prefill.residual,
+                    out: &mut self.prefill.ffn_input, input: self.prefill.residual.slice(..),
                     weight: &layer.post_attention_layernorm,
                     rows: n as u32, dim: h as u32, eps,
                 }).map_err(e)?;
@@ -489,9 +496,8 @@ mod inner {
             }
 
             let last_off = (n - 1) * h;
-            let last_hidden = self.prefill.hidden.slice(last_off..last_off + h);
             launch_rms_norm(&self.device, &mut RmsNormParams {
-                out: &mut self.norm_buf, input: &last_hidden,
+                out: &mut self.norm_buf, input: self.prefill.hidden.slice(last_off..last_off + h),
                 weight: &self.weights.norm,
                 rows: 1, dim: h as u32, eps,
             }).map_err(e)?;
@@ -575,7 +581,7 @@ mod inner {
                 let layer = &self.weights.layers[layer_idx];
 
                 launch_rms_norm(&self.device, &mut RmsNormParams {
-                    out: &mut self.norm_buf, input: &self.hidden_buf,
+                    out: &mut self.norm_buf, input: self.hidden_buf.slice(..),
                     weight: &layer.input_layernorm,
                     rows: 1, dim: h as u32, eps,
                 }).map_err(e)?;
@@ -631,7 +637,7 @@ mod inner {
 
                 let layer = &self.weights.layers[layer_idx];
                 launch_rms_norm(&self.device, &mut RmsNormParams {
-                    out: &mut self.ffn_input_buf, input: &self.residual_buf,
+                    out: &mut self.ffn_input_buf, input: self.residual_buf.slice(..),
                     weight: &layer.post_attention_layernorm,
                     rows: 1, dim: h as u32, eps,
                 }).map_err(e)?;
@@ -905,34 +911,33 @@ mod inner {
                 let hd = config.head_dim();
                 let inter = config.intermediate_size;
                 let vocab = config.vocab_size;
-                let alloc = |n: usize| device.alloc_zeros::<f16>(n)
-                    .map_err(|e| EngineError::backend(format!("alloc: {e}")));
-
                 let ctx_scalar_buf = device.htod_sync_copy(&[0i32])
                     .map_err(|e| EngineError::backend(format!("ctx buf: {e}")))?;
                 let prefill = PrefillScratch::new(&device, h, nq * hd, nkv * hd, inter)?;
                 let argmax_buf = device.alloc_zeros::<u32>(1)
                     .map_err(|e| EngineError::backend(format!("argmax buf: {e}")))?;
+                let hidden_buf    = device.alloc_zeros::<f16>(h)        .map_err(|e| EngineError::backend(format!("alloc: {e}")))?;
+                let norm_buf      = device.alloc_zeros::<f16>(h)        .map_err(|e| EngineError::backend(format!("alloc: {e}")))?;
+                let residual_buf  = device.alloc_zeros::<f16>(h)        .map_err(|e| EngineError::backend(format!("alloc: {e}")))?;
+                let q_buf         = device.alloc_zeros::<f16>(nq * hd)  .map_err(|e| EngineError::backend(format!("alloc: {e}")))?;
+                let k_buf         = device.alloc_zeros::<f16>(nkv * hd) .map_err(|e| EngineError::backend(format!("alloc: {e}")))?;
+                let v_buf         = device.alloc_zeros::<f16>(nkv * hd) .map_err(|e| EngineError::backend(format!("alloc: {e}")))?;
+                let attn_buf      = device.alloc_zeros::<f16>(nq * hd)  .map_err(|e| EngineError::backend(format!("alloc: {e}")))?;
+                let gate_buf      = device.alloc_zeros::<f16>(inter)    .map_err(|e| EngineError::backend(format!("alloc: {e}")))?;
+                let up_buf        = device.alloc_zeros::<f16>(inter)    .map_err(|e| EngineError::backend(format!("alloc: {e}")))?;
+                let swiglu_buf    = device.alloc_zeros::<f16>(inter)    .map_err(|e| EngineError::backend(format!("alloc: {e}")))?;
+                let ffn_input_buf = device.alloc_zeros::<f16>(h)        .map_err(|e| EngineError::backend(format!("alloc: {e}")))?;
+                let ffn_out_buf   = device.alloc_zeros::<f16>(h)        .map_err(|e| EngineError::backend(format!("alloc: {e}")))?;
+                let o_proj_buf    = device.alloc_zeros::<f16>(h)        .map_err(|e| EngineError::backend(format!("alloc: {e}")))?;
+                let logits_buf    = device.alloc_zeros::<f16>(vocab)    .map_err(|e| EngineError::backend(format!("alloc: {e}")))?;
 
                 let backend = BackendInner {
                     device, blas, config, weights, block_pool, pool_cap, allocated_blocks: 0,
                     llm_backend: Arc::new(llm_backend),
                     llm_model: Arc::new(llm_model),
                     eos_token,
-                    hidden_buf:     alloc(h)?,
-                    norm_buf:       alloc(h)?,
-                    residual_buf:   alloc(h)?,
-                    q_buf:          alloc(nq * hd)?,
-                    k_buf:          alloc(nkv * hd)?,
-                    v_buf:          alloc(nkv * hd)?,
-                    attn_buf:       alloc(nq * hd)?,
-                    gate_buf:       alloc(inter)?,
-                    up_buf:         alloc(inter)?,
-                    swiglu_buf:     alloc(inter)?,
-                    ffn_input_buf:  alloc(h)?,
-                    ffn_out_buf:    alloc(h)?,
-                    o_proj_buf:     alloc(h)?,
-                    logits_buf:     alloc(vocab)?,
+                    hidden_buf, norm_buf, residual_buf, q_buf, k_buf, v_buf, attn_buf,
+                    gate_buf, up_buf, swiglu_buf, ffn_input_buf, ffn_out_buf, o_proj_buf, logits_buf,
                     ctx_scalar_buf,
                     gpu_block_tables:    Vec::new(),
                     gpu_block_table_len: 0,
@@ -1067,6 +1072,7 @@ mod inner {
                 kv_cache_blocks_total: total, kv_cache_blocks_free: free,
                 kv_cache_sequences: sessions,
                 kv_cache_evicted_blocks: 0, kv_cache_evicted_sequences: 0,
+                kv_cache_packed_layers: 0,
             }
         }
 
