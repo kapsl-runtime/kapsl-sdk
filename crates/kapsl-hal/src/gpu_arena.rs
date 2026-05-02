@@ -84,10 +84,10 @@ impl GpuArena {
     }
 
     /// Upload host data to a previously allocated region at `offset`.
-    pub fn upload(&self, offset: usize, data: &[u8]) -> Result<(), ArenaError> {
-        self.device.htod_copy_into(
-            data.to_vec(),
-            &mut self.buffer.slice(offset..offset + data.len()),
+    pub fn upload(&mut self, offset: usize, data: &[u8]) -> Result<(), ArenaError> {
+        self.device.htod_sync_copy_into(
+            data,
+            &mut self.buffer.slice_mut(offset..offset + data.len()),
         )?;
         Ok(())
     }
@@ -276,11 +276,11 @@ impl GpuBlockPool {
         let storage = self.storage_mut();
         self.device.htod_sync_copy_into(
             host_key,
-            &mut storage.slice(key_offset..key_offset + half_block),
+            &mut storage.slice_mut(key_offset..key_offset + half_block),
         )?;
         self.device.htod_sync_copy_into(
             host_val,
-            &mut storage.slice(val_offset..val_offset + half_block),
+            &mut storage.slice_mut(val_offset..val_offset + half_block),
         )?;
         Ok(())
     }

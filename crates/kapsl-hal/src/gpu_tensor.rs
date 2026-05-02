@@ -21,7 +21,10 @@ impl<T: cudarc::driver::DeviceRepr> GpuTensor<T> {
     pub fn zeros(
         device: &Arc<CudaDevice>,
         shape: &[usize],
-    ) -> Result<Self, cudarc::driver::DriverError> {
+    ) -> Result<Self, cudarc::driver::DriverError>
+    where
+        T: cudarc::driver::ValidAsZeroBits,
+    {
         let numel: usize = shape.iter().product();
         let data = device.alloc_zeros::<T>(numel)?;
         Ok(Self {

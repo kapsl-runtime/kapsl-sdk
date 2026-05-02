@@ -18,7 +18,7 @@ nvml-wrapper = { version = "0.10", optional = true }
 
 [features]
 default = []
-cuda = ["dep:cudarc"]
+cuda = ["dep:cudarc", "cudarc/f16"]
 cublas = ["cuda", "cudarc/cublas"]
 nvrtc = ["cuda", "cudarc/nvrtc"]
 nccl = ["cuda", "cudarc/nccl"]
