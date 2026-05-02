@@ -229,7 +229,7 @@ __global__ void paged_attention_v1(
                 .launch(
                     cfg,
                     (
-                        params.out,
+                        &mut *params.out,
                         params.q,
                         params.kv_cache,
                         params.block_tables,
@@ -329,7 +329,7 @@ __global__ void rms_norm(
                 .launch(
                     cfg,
                     (
-                        params.out,
+                        &mut *params.out,
                         params.input,
                         params.weight,
                         params.dim as i32,
@@ -492,8 +492,8 @@ __global__ void rope_forward(
                 .launch(
                     cfg,
                     (
-                        params.q,
-                        params.k,
+                        &mut *params.q,
+                        &mut *params.k,
                         params.num_q_heads as i32,
                         params.num_kv_heads as i32,
                         params.head_dim as i32,
@@ -586,7 +586,7 @@ __global__ void write_kv_to_pool(
                 .launch(
                     cfg,
                     (
-                        params.kv_cache,
+                        &mut *params.kv_cache,
                         params.k_vec,
                         params.v_vec,
                         params.physical_block as i32,
@@ -746,8 +746,8 @@ __global__ void batch_rope_forward(
                 .launch(
                     cfg,
                     (
-                        p.q,
-                        p.k,
+                        &mut *p.q,
+                        &mut *p.k,
                         p.num_q_heads as i32,
                         p.num_kv_heads as i32,
                         p.head_dim as i32,
@@ -898,7 +898,7 @@ __global__ void prefill_attention(
                 .launch(
                     cfg,
                     (
-                        p.out,
+                        &mut *p.out,
                         p.q,
                         p.k,
                         p.v,
@@ -999,7 +999,7 @@ __global__ void batch_kv_write(
                 .launch(
                     cfg,
                     (
-                        p.kv_cache,
+                        &mut *p.kv_cache,
                         p.k,
                         p.v,
                         p.physical_blocks,
@@ -1091,7 +1091,7 @@ __global__ void argmax_f16(
         let cfg = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
         unsafe {
             func.clone()
-                .launch(cfg, (p.input, p.output, p.vocab_size as i32))
+                .launch(cfg, (p.input, &mut *p.output, p.vocab_size as i32))
                 .map_err(|e| format!("argmax launch: {e}"))?;
         }
         Ok(())
@@ -1188,8 +1188,8 @@ __global__ void batch_decode_rope(
                 .launch(
                     cfg,
                     (
-                        p.q,
-                        p.k,
+                        &mut *p.q,
+                        &mut *p.k,
                         p.positions,
                         p.num_q_heads as i32,
                         p.num_kv_heads as i32,
@@ -1283,7 +1283,7 @@ __global__ void batch_argmax_f16(
         };
         unsafe {
             func.clone()
-                .launch(cfg, (p.input, p.output, p.vocab_size as i32))
+                .launch(cfg, (p.input, &mut *p.output, p.vocab_size as i32))
                 .map_err(|e| format!("batch_argmax launch: {e}"))?;
         }
         Ok(())
