@@ -330,7 +330,7 @@ __global__ void rms_norm(
                     cfg,
                     (
                         &mut *params.out,
-                        params.input,
+                        &params.input,
                         params.weight,
                         params.dim as i32,
                         params.eps,
