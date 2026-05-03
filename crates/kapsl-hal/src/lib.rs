@@ -1,6 +1,9 @@
+pub mod cpu_block_store;
 pub mod device;
 pub mod device_mesh;
 pub mod distributed_ops;
+#[cfg(feature = "cuda")]
+pub mod cross_device_scheduler;
 #[cfg(feature = "cuda")]
 pub mod gpu_arena;
 #[cfg(feature = "cuda")]

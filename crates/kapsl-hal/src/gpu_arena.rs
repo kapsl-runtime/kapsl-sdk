@@ -256,6 +256,29 @@ impl GpuBlockPool {
         self.num_kv_heads == num_kv_heads && self.head_dim == head_dim
     }
 
+    /// Download one block from GPU to a host Vec.
+    /// Returned layout: `[K_data || V_data]` where each half is
+    /// `[num_kv_heads * block_size * head_dim]` f16 elements.
+    pub fn download_block(&self, block_id: u32) -> Result<Vec<half::f16>, ArenaError> {
+        let elems = self.elems_per_block();
+        let base  = block_id as usize * elems;
+        let storage = self.storage();
+        Ok(self.device.dtoh_sync_copy(&storage.slice(base..base + elems))?)
+    }
+
+    /// Copy one block from this pool to a block in another pool (same or different device).
+    /// Routes through host memory — works over PCIe without peer access.
+    pub fn copy_block_to_pool(
+        &self,
+        src_block: u32,
+        dst_pool: &GpuBlockPool,
+        dst_block: u32,
+    ) -> Result<(), ArenaError> {
+        let data     = self.download_block(src_block)?;
+        let half_len = data.len() / 2;
+        dst_pool.upload_block(dst_block, &data[..half_len], &data[half_len..])
+    }
+
     /// Read-only view of the storage slice (for attention kernel reads).
     pub fn storage(&self) -> &CudaSlice<half::f16> {
         unsafe { &*self.storage.get() }
