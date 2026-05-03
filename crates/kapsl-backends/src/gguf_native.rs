@@ -13,7 +13,7 @@
 mod inner {
     use std::collections::HashMap;
     use std::path::Path;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, OnceLock};
 
     use async_stream::stream;
     use async_trait::async_trait;
@@ -777,6 +777,17 @@ mod inner {
         }
     }
 
+    // llama.cpp backend is a global singleton — can only be initialized once per process.
+    static LLAMA_BACKEND: OnceLock<Arc<LlamaBackend>> = OnceLock::new();
+
+    fn get_llama_backend() -> Result<Arc<LlamaBackend>, EngineError> {
+        LLAMA_BACKEND.get_or_try_init(|| {
+            LlamaBackend::init()
+                .map(Arc::new)
+                .map_err(|e| EngineError::backend(format!("llama backend: {e}")))
+        }).cloned()
+    }
+
     // ── GgufNativeBackend ─────────────────────────────────────────────────────
 
     pub struct GgufNativeBackend {
@@ -850,8 +861,7 @@ mod inner {
 
                 // ── Initialise llama.cpp backend for tokenization only ──────
                 log::info!("[gguf-native] Loading llama.cpp model for tokenization");
-                let llm_backend = LlamaBackend::init()
-                    .map_err(|e| EngineError::backend(format!("llama backend: {e}")))?;
+                let llm_backend = get_llama_backend()?;
                 let params = LlamaModelParams::default().with_n_gpu_layers(0); // CPU-only; no inference
                 let llm_model = LlamaModel::load_from_file(&llm_backend, &path, &params)
                     .map_err(|e| EngineError::backend(format!("llama model (tokenizer): {e}")))?;
@@ -933,7 +943,7 @@ mod inner {
 
                 let backend = BackendInner {
                     device, blas, config, weights, block_pool, pool_cap, allocated_blocks: 0,
-                    llm_backend: Arc::new(llm_backend),
+                    llm_backend,
                     llm_model: Arc::new(llm_model),
                     eos_token,
                     hidden_buf, norm_buf, residual_buf, q_buf, k_buf, v_buf, attn_buf,
