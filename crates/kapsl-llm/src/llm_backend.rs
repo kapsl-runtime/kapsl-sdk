@@ -772,6 +772,7 @@ impl Engine for LLMBackend {
             kv_cache_evicted_blocks: m.kv_cache_evicted_blocks,
             kv_cache_evicted_sequences: m.kv_cache_evicted_sequences,
             kv_cache_packed_layers: m.kv_cache_packed_layers,
+            kv_cache_cpu_offloaded_blocks: m.kv_cache_cpu_offloaded_blocks,
             ..EngineMetrics::default()
         }
     }

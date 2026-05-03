@@ -24,6 +24,7 @@ pub struct KapslMetrics {
     pub kv_cache_evicted_blocks: IntGaugeVec,
     pub kv_cache_evicted_sequences: IntGaugeVec,
     pub kv_cache_packed_layers: IntGaugeVec,
+    pub kv_cache_cpu_offloaded_blocks: IntGaugeVec,
 }
 
 impl KapslMetrics {
@@ -168,6 +169,14 @@ impl KapslMetrics {
             &["model"],
         )
         .unwrap();
+        let kv_cache_cpu_offloaded_blocks = IntGaugeVec::new(
+            Opts::new(
+                "kapsl_kv_cache_cpu_offloaded_blocks",
+                "KV cache blocks currently offloaded to CPU memory",
+            ),
+            &["model"],
+        )
+        .unwrap();
 
         registry
             .register(Box::new(inference_latency.clone()))
@@ -223,6 +232,9 @@ impl KapslMetrics {
         registry
             .register(Box::new(kv_cache_packed_layers.clone()))
             .expect("Failed to register kv_cache_packed_layers");
+        registry
+            .register(Box::new(kv_cache_cpu_offloaded_blocks.clone()))
+            .expect("Failed to register kv_cache_cpu_offloaded_blocks");
 
         Self {
             registry: registry.clone(),
@@ -244,7 +256,38 @@ impl KapslMetrics {
             kv_cache_evicted_blocks,
             kv_cache_evicted_sequences,
             kv_cache_packed_layers,
+            kv_cache_cpu_offloaded_blocks,
         }
+    }
+
+    pub fn set_kv_cache_metrics(&self, model: &str, metrics: &kapsl_engine_api::EngineMetrics) {
+        self.kv_cache_bytes_used
+            .with_label_values(&[model])
+            .set(metrics.kv_cache_bytes_used as i64);
+        self.kv_cache_bytes_capacity
+            .with_label_values(&[model])
+            .set(metrics.kv_cache_bytes_capacity as i64);
+        self.kv_cache_blocks_total
+            .with_label_values(&[model])
+            .set(metrics.kv_cache_blocks_total as i64);
+        self.kv_cache_blocks_free
+            .with_label_values(&[model])
+            .set(metrics.kv_cache_blocks_free as i64);
+        self.kv_cache_sequences
+            .with_label_values(&[model])
+            .set(metrics.kv_cache_sequences as i64);
+        self.kv_cache_evicted_blocks
+            .with_label_values(&[model])
+            .set(metrics.kv_cache_evicted_blocks as i64);
+        self.kv_cache_evicted_sequences
+            .with_label_values(&[model])
+            .set(metrics.kv_cache_evicted_sequences as i64);
+        self.kv_cache_packed_layers
+            .with_label_values(&[model])
+            .set(metrics.kv_cache_packed_layers as i64);
+        self.kv_cache_cpu_offloaded_blocks
+            .with_label_values(&[model])
+            .set(metrics.kv_cache_cpu_offloaded_blocks as i64);
     }
 }
 

@@ -1414,12 +1414,8 @@ mod inner {
             // Metrics are approximate — reading from the scheduler thread would require
             // a round-trip.  Return zeros for now; a future PR can add atomic counters.
             EngineMetrics {
-                inference_time: 0.0, memory_usage: 0, gpu_utilization: 0.0,
-                throughput: 0.0, batch_size: MAX_BATCH as u32, queue_depth: 0, error_rate: 0.0,
-                collected_at_ms: 0, kv_cache_bytes_used: 0, kv_cache_bytes_capacity: 0,
-                kv_cache_blocks_total: 0, kv_cache_blocks_free: 0,
-                kv_cache_sequences: 0,
-                kv_cache_evicted_blocks: 0, kv_cache_evicted_sequences: 0,
+                batch_size: MAX_BATCH,
+                ..EngineMetrics::default()
             }
         }
 

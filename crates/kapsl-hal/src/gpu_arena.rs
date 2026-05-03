@@ -231,6 +231,26 @@ impl GpuBlockPool {
         2 * self.num_kv_heads * self.block_size * self.head_dim
     }
 
+    /// Bytes per physical block.
+    pub fn bytes_per_block(&self) -> usize {
+        self.elems_per_block() * std::mem::size_of::<half::f16>()
+    }
+
+    /// Total byte capacity owned by this pool.
+    pub fn capacity_bytes(&self) -> usize {
+        self.num_blocks.saturating_mul(self.bytes_per_block())
+    }
+
+    /// Number of physical blocks currently allocated from the pool.
+    pub fn used_count(&self) -> usize {
+        self.num_blocks.saturating_sub(self.free_count())
+    }
+
+    /// Bytes currently allocated from the pool.
+    pub fn used_bytes(&self) -> usize {
+        self.used_count().saturating_mul(self.bytes_per_block())
+    }
+
     /// Returns true if this pool has compatible geometry for the given model dimensions.
     pub fn is_compatible(&self, num_kv_heads: usize, head_dim: usize) -> bool {
         self.num_kv_heads == num_kv_heads && self.head_dim == head_dim

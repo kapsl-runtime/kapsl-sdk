@@ -113,6 +113,74 @@ mod inner {
         fn greedy() -> Self { Self { temperature: 0.0, top_k: 0, top_p: 1.0 } }
     }
 
+    fn env_usize(name: &str) -> Option<usize> {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|v| *v > 0)
+    }
+
+    fn parse_byte_size(value: &str) -> Option<usize> {
+        let lower = value.trim().to_ascii_lowercase();
+        if lower.is_empty() {
+            return None;
+        }
+        let (number, multiplier) = if let Some(number) = lower.strip_suffix("gib") {
+            (number, 1024usize.pow(3))
+        } else if let Some(number) = lower.strip_suffix("mib") {
+            (number, 1024usize.pow(2))
+        } else if let Some(number) = lower.strip_suffix("gb") {
+            (number, 1000usize.pow(3))
+        } else if let Some(number) = lower.strip_suffix("mb") {
+            (number, 1000usize.pow(2))
+        } else if let Some(number) = lower.strip_suffix('b') {
+            (number, 1)
+        } else {
+            (lower.as_str(), 1)
+        };
+        number.trim().parse::<usize>().ok().and_then(|n| n.checked_mul(multiplier))
+    }
+
+    fn env_byte_size(name: &str) -> Option<usize> {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| parse_byte_size(&v))
+            .filter(|v| *v > 0)
+    }
+
+    fn kv_max_ctx(config: &ModelConfig) -> usize {
+        env_usize("KAPSL_KV_MAX_CTX")
+            .unwrap_or(config.max_position_embeddings)
+            .min(config.max_position_embeddings)
+            .max(1)
+    }
+
+    fn kv_pool_block_count(config: &ModelConfig, block_size: usize) -> usize {
+        let num_layers = config.num_hidden_layers.max(1);
+        if let Some(blocks) = env_usize("KAPSL_GGUF_NATIVE_KV_POOL_BLOCKS") {
+            return blocks.max(num_layers);
+        }
+
+        let bytes_per_block = 2usize
+            .saturating_mul(config.num_kv_heads())
+            .saturating_mul(block_size)
+            .saturating_mul(config.head_dim())
+            .saturating_mul(std::mem::size_of::<f16>());
+        if let Some(bytes) = env_byte_size("KAPSL_GGUF_NATIVE_KV_POOL_BYTES") {
+            return (bytes / bytes_per_block.max(1)).max(num_layers);
+        }
+        if let Some(mib) = env_usize("KAPSL_GGUF_NATIVE_KV_POOL_MIB") {
+            let bytes = mib.saturating_mul(1024 * 1024);
+            return (bytes / bytes_per_block.max(1)).max(num_layers);
+        }
+
+        let max_sequences = env_usize("KAPSL_GGUF_NATIVE_KV_POOL_SEQS").unwrap_or(8);
+        let blocks_per_sequence = kv_max_ctx(config).div_ceil(block_size);
+        num_layers
+            .saturating_mul(max_sequences.max(1))
+            .saturating_mul(blocks_per_sequence.max(1))
+    }
+
     // ── Session state ─────────────────────────────────────────────────────────
 
     struct SessionState {
@@ -222,7 +290,13 @@ mod inner {
             if block_tables.is_empty() {
                 block_tables.resize(num_layers, Vec::new());
             }
-            if block_tables[0].len() <= logical {
+            let current_blocks = block_tables.first().map_or(0, Vec::len);
+            if block_tables.iter().any(|table| table.len() != current_blocks) {
+                return Err(EngineError::backend(
+                    "inconsistent KV block table lengths; refusing to allocate",
+                ));
+            }
+            if current_blocks <= logical {
                 let cap = self.pool_cap.load(Ordering::Relaxed);
                 if self.allocated_blocks + num_layers > cap {
                     return Err(EngineError::backend(format!(
@@ -230,12 +304,24 @@ mod inner {
                         self.allocated_blocks, cap,
                     )));
                 }
-                for l in 0..num_layers {
-                    let phys = self.block_pool.alloc_block()
-                        .map_err(|e| EngineError::backend(format!("block alloc: {e}")))?;
-                    block_tables[l].push(phys as i32);
-                    self.allocated_blocks += 1;
+
+                let mut allocated = Vec::with_capacity(num_layers);
+                for _ in 0..num_layers {
+                    match self.block_pool.alloc_block() {
+                        Ok(phys) => allocated.push(phys),
+                        Err(e) => {
+                            for phys in allocated {
+                                self.block_pool.free_block(phys);
+                            }
+                            return Err(EngineError::backend(format!("block alloc: {e}")));
+                        }
+                    }
                 }
+
+                for (table, phys) in block_tables.iter_mut().zip(allocated) {
+                    table.push(phys as i32);
+                }
+                self.allocated_blocks += num_layers;
             }
             Ok(())
         }
@@ -1207,10 +1293,6 @@ mod inner {
 
                 // ── Block pool ───────────────────────────────────────────────
                 let block_size = 16usize;
-                let kv_max_ctx = || std::env::var("KAPSL_KV_MAX_CTX")
-                    .ok().and_then(|v| v.parse::<usize>().ok())
-                    .unwrap_or(config.max_position_embeddings)
-                    .min(config.max_position_embeddings);
                 let (block_pool, pool_cap): (Arc<GpuBlockPool>, Arc<AtomicUsize>) = {
                     let mut slot = pool_slot.lock().unwrap();
                     if let Some(ref handle) = *slot {
@@ -1222,8 +1304,7 @@ mod inner {
                             log::warn!("[gguf-native] Pool geometry mismatch ({}h×{}d vs {}h×{}d), creating private pool",
                                 handle.pool.num_kv_heads(), handle.pool.head_dim(),
                                 config.num_kv_heads(), config.head_dim());
-                            let bps = (kv_max_ctx() + block_size - 1) / block_size;
-                            let num_blocks = config.num_hidden_layers * 8 * bps;
+                            let num_blocks = kv_pool_block_count(&config, block_size);
                             let p = Arc::new(GpuBlockPool::new(device.clone(), num_blocks, block_size,
                                 config.num_kv_heads(), config.head_dim())
                                 .map_err(|e| EngineError::backend(format!("block pool: {e}")))?);
@@ -1233,8 +1314,7 @@ mod inner {
                             (p, cap)
                         }
                     } else {
-                        let bps = (kv_max_ctx() + block_size - 1) / block_size;
-                        let num_blocks = config.num_hidden_layers * 8 * bps;
+                        let num_blocks = kv_pool_block_count(&config, block_size);
                         let p = Arc::new(GpuBlockPool::new(device.clone(), num_blocks, block_size,
                             config.num_kv_heads(), config.head_dim())
                             .map_err(|e| EngineError::backend(format!("block pool: {e}")))?);
@@ -1500,17 +1580,27 @@ mod inner {
         fn metrics(&self) -> EngineMetrics {
             let active = self.batch_dec.active_count();
             let g = self.inner.lock().unwrap();
-            let (total, free, sessions) = g.as_ref()
-                .map(|b| (b.block_pool.total_blocks(), b.block_pool.free_count(), b.sessions.len()))
-                .unwrap_or((0, 0, 0));
+            let (total, free, sessions, used_bytes, capacity_bytes) = g.as_ref()
+                .map(|b| {
+                    (
+                        b.block_pool.total_blocks(),
+                        b.block_pool.free_count(),
+                        b.sessions.len(),
+                        b.block_pool.used_bytes(),
+                        b.block_pool.capacity_bytes(),
+                    )
+                })
+                .unwrap_or((0, 0, 0, 0, 0));
             EngineMetrics {
-                inference_time: 0.0, memory_usage: 0, gpu_utilization: 0.0,
-                throughput: 0.0, batch_size: active.max(1) as u32, queue_depth: 0, error_rate: 0.0,
-                collected_at_ms: 0, kv_cache_bytes_used: 0, kv_cache_bytes_capacity: 0,
+                memory_usage: used_bytes,
+                batch_size: active.max(1),
+                kv_cache_bytes_used: used_bytes,
+                kv_cache_bytes_capacity: capacity_bytes,
                 kv_cache_blocks_total: total, kv_cache_blocks_free: free,
                 kv_cache_sequences: sessions + active,
                 kv_cache_evicted_blocks: 0, kv_cache_evicted_sequences: 0,
                 kv_cache_packed_layers: 0,
+                ..EngineMetrics::new()
             }
         }
 

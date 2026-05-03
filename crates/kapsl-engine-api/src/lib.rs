@@ -145,6 +145,7 @@ pub struct EngineMetrics {
     pub kv_cache_evicted_blocks: u64,
     pub kv_cache_evicted_sequences: u64,
     pub kv_cache_packed_layers: usize,
+    pub kv_cache_cpu_offloaded_blocks: u64,
 }
 
 impl EngineMetrics {
@@ -166,6 +167,7 @@ impl EngineMetrics {
             kv_cache_evicted_blocks: 0,
             kv_cache_evicted_sequences: 0,
             kv_cache_packed_layers: 0,
+            kv_cache_cpu_offloaded_blocks: 0,
         }
     }
 
