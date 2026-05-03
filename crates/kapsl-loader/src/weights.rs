@@ -29,16 +29,34 @@ pub enum DType {
     BF16,
     I8,
     U8,
+    /// Q8_0: 34 raw bytes per 32 elements — [f16 scale, i8 qs[32]]
+    Q8_0,
+    /// Q4_K: 144 raw bytes per 256 elements — [f16 d, f16 dmin, u8 scales[12], u8 qs[128]]
+    Q4_K,
 }
 
 impl DType {
-    /// Bytes per element.
+    /// Bytes per element for non-quantized types. Panics for quantized types — use raw_bytes_for_numel.
     pub fn byte_size(self) -> usize {
         match self {
             DType::F32 => 4,
             DType::F16 | DType::BF16 => 2,
             DType::I8 | DType::U8 => 1,
+            DType::Q8_0 | DType::Q4_K => panic!("byte_size() not valid for quantized dtype {:?} — use raw_bytes_for_numel()", self),
         }
+    }
+
+    /// Total raw byte count for a tensor with this dtype and the given number of elements.
+    pub fn raw_bytes_for_numel(self, numel: usize) -> usize {
+        match self {
+            DType::Q8_0 => (numel / 32) * 34,
+            DType::Q4_K => (numel / 256) * 144,
+            _ => numel * self.byte_size(),
+        }
+    }
+
+    pub fn is_quantized(self) -> bool {
+        matches!(self, DType::Q8_0 | DType::Q4_K)
     }
 
     pub fn from_str(s: &str) -> Option<Self> {
@@ -73,6 +91,11 @@ impl TensorData {
 
     pub fn numel(&self) -> usize {
         self.shape.iter().product()
+    }
+
+    /// Raw byte count accounting for quantized block layouts.
+    pub fn raw_byte_len(&self) -> usize {
+        self.dtype.raw_bytes_for_numel(self.numel())
     }
 
     /// View as f16 slice (panics if dtype is not F16).

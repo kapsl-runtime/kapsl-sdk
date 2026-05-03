@@ -1,7 +1,9 @@
-//! GGUF file parser and weight dequantizer.
+//! GGUF file parser and weight loader.
 //!
-//! Reads GGUF v1/v2/v3 and dequantizes all tensor data to f16, producing a
-//! `ModelWeights` compatible with the native CUDA backend.
+//! Reads GGUF v1/v2/v3.  Projection weights (Q/K/V/O, gate/up/down) are kept
+//! in their native Q8_0 or Q4_K format so the GPU backend can dequantize
+//! on-the-fly during inference.  All other tensors (norms, embeddings, lm_head,
+//! and unsupported quant formats) are dequantized to f16 on load.
 //!
 //! Supported quantization types: F32, F16, BF16, Q4_0, Q4_1, Q8_0,
 //! Q4_K, Q5_K, Q6_K.
@@ -362,6 +364,28 @@ impl GgufFile {
         Ok(TensorData::new(bytes, DType::F16, info.shape.clone()))
     }
 
+    /// Like `tensor()` but preserves Q8_0 and Q4_K in their native quantized form.
+    /// Other quantization formats are still dequantized to f16.
+    fn tensor_raw(&self, name: &str) -> Result<TensorData, GgufError> {
+        let info = self.tensors.get(name)
+            .ok_or_else(|| GgufError::MissingTensor(name.into()))?;
+        let (elems_per_blk, bytes_per_blk) = info.dtype.block_params();
+        let start = self.data_start + info.offset as usize;
+        match info.dtype {
+            GgmlType::Q8_0 => {
+                let nbytes = (info.numel / elems_per_blk) * bytes_per_blk;
+                let raw = self.mmap[start..start + nbytes].to_vec();
+                Ok(TensorData::new(raw, DType::Q8_0, info.shape.clone()))
+            }
+            GgmlType::Q4K => {
+                let nbytes = (info.numel / elems_per_blk) * bytes_per_blk;
+                let raw = self.mmap[start..start + nbytes].to_vec();
+                Ok(TensorData::new(raw, DType::Q4_K, info.shape.clone()))
+            }
+            _ => self.tensor(name),
+        }
+    }
+
     // ── Weight assembly ──────────────────────────────────────────────────────
 
     pub fn load_weights(&self, config: &ModelConfig) -> Result<ModelWeights, GgufError> {
@@ -374,17 +398,19 @@ impl GgufFile {
 
         let mut layers = Vec::with_capacity(n);
         for i in 0..n {
-            log::info!("[gguf_loader] dequantizing layer {}/{n}", i + 1);
+            log::info!("[gguf_loader] loading layer {}/{n}", i + 1);
             layers.push(LayerWeights {
+                // Norm weights are element-wise scalars — always keep as f16.
                 input_layernorm:          self.tensor(&format!("blk.{i}.attn_norm.weight"))?,
-                q_proj:                   self.tensor(&format!("blk.{i}.attn_q.weight"))?,
-                k_proj:                   self.tensor(&format!("blk.{i}.attn_k.weight"))?,
-                v_proj:                   self.tensor(&format!("blk.{i}.attn_v.weight"))?,
-                o_proj:                   self.tensor(&format!("blk.{i}.attn_output.weight"))?,
                 post_attention_layernorm: self.tensor(&format!("blk.{i}.ffn_norm.weight"))?,
-                gate_proj:                self.tensor(&format!("blk.{i}.ffn_gate.weight"))?,
-                up_proj:                  self.tensor(&format!("blk.{i}.ffn_up.weight"))?,
-                down_proj:                self.tensor(&format!("blk.{i}.ffn_down.weight"))?,
+                // Projection weights: preserve Q8_0/Q4_K for on-device dequant.
+                q_proj:    self.tensor_raw(&format!("blk.{i}.attn_q.weight"))?,
+                k_proj:    self.tensor_raw(&format!("blk.{i}.attn_k.weight"))?,
+                v_proj:    self.tensor_raw(&format!("blk.{i}.attn_v.weight"))?,
+                o_proj:    self.tensor_raw(&format!("blk.{i}.attn_output.weight"))?,
+                gate_proj: self.tensor_raw(&format!("blk.{i}.ffn_gate.weight"))?,
+                up_proj:   self.tensor_raw(&format!("blk.{i}.ffn_up.weight"))?,
+                down_proj: self.tensor_raw(&format!("blk.{i}.ffn_down.weight"))?,
             });
         }
 

@@ -31,7 +31,9 @@ mod inner {
         InferenceRequest, RequestMetadata, TensorDtype,
     };
     use kapsl_hal::gpu_arena::{GpuBlockPool, GpuPoolHandle};
+    use kapsl_loader::weights::DType;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use kapsl_kernels::cuda_quant_kernels::{launch_q4_k_gemv, launch_q8_0_gemv, QuantGemvParams};
     use kapsl_kernels::cuda_kernels::{
         launch_argmax, launch_batch_argmax, launch_batch_decode_rope, launch_batch_kv_write,
         launch_batch_rope, launch_fused_swiglu, launch_paged_attention, launch_prefill_attention,
@@ -43,16 +45,25 @@ mod inner {
 
     // ── GPU weights ──────────────────────────────────────────────────────────
 
+    /// A weight matrix on the GPU — either fp16 or in a native quantized format.
+    enum GpuWeight {
+        F16(CudaSlice<f16>),
+        Q8_0(CudaSlice<u8>),
+        Q4_K(CudaSlice<u8>),
+    }
+
     struct GpuLayerWeights {
-        input_layernorm: CudaSlice<f16>,
-        q_proj: CudaSlice<f16>,
-        k_proj: CudaSlice<f16>,
-        v_proj: CudaSlice<f16>,
-        o_proj: CudaSlice<f16>,
+        // Norm weights are element-wise scalars — always f16.
+        input_layernorm:          CudaSlice<f16>,
         post_attention_layernorm: CudaSlice<f16>,
-        gate_proj: CudaSlice<f16>,
-        up_proj: CudaSlice<f16>,
-        down_proj: CudaSlice<f16>,
+        // Projection weights may be quantized.
+        q_proj:    GpuWeight,
+        k_proj:    GpuWeight,
+        v_proj:    GpuWeight,
+        o_proj:    GpuWeight,
+        gate_proj: GpuWeight,
+        up_proj:   GpuWeight,
+        down_proj: GpuWeight,
     }
 
     struct GpuModelWeights {
@@ -62,32 +73,46 @@ mod inner {
         lm_head: CudaSlice<f16>,
     }
 
-    fn upload_tensor(device: &Arc<CudaDevice>, t: &TensorData) -> Result<CudaSlice<f16>, EngineError> {
+    fn upload_f16(device: &Arc<CudaDevice>, t: &TensorData) -> Result<CudaSlice<f16>, EngineError> {
         device
             .htod_sync_copy(&t.to_f16_vec())
-            .map_err(|e| EngineError::backend(format!("GPU upload: {e}")))
+            .map_err(|e| EngineError::backend(format!("GPU upload f16: {e}")))
+    }
+
+    fn upload_weight(device: &Arc<CudaDevice>, t: &TensorData) -> Result<GpuWeight, EngineError> {
+        match t.dtype {
+            DType::Q8_0 => device
+                .htod_sync_copy::<u8>(&t.bytes)
+                .map(GpuWeight::Q8_0)
+                .map_err(|e| EngineError::backend(format!("GPU upload Q8_0: {e}"))),
+            DType::Q4_K => device
+                .htod_sync_copy::<u8>(&t.bytes)
+                .map(GpuWeight::Q4_K)
+                .map_err(|e| EngineError::backend(format!("GPU upload Q4_K: {e}"))),
+            _ => upload_f16(device, t).map(GpuWeight::F16),
+        }
     }
 
     fn upload_weights(
         device: &Arc<CudaDevice>,
         w: &kapsl_loader::ModelWeights,
     ) -> Result<GpuModelWeights, EngineError> {
-        let embed_tokens = upload_tensor(device, &w.embed_tokens)?;
-        let norm = upload_tensor(device, &w.norm)?;
-        let lm_head = upload_tensor(device, &w.lm_head)?;
+        let embed_tokens = upload_f16(device, &w.embed_tokens)?;
+        let norm         = upload_f16(device, &w.norm)?;
+        let lm_head      = upload_f16(device, &w.lm_head)?;
         let mut layers = Vec::with_capacity(w.layers.len());
         for (i, l) in w.layers.iter().enumerate() {
             log::info!("[gguf-native] Uploading layer {}/{}", i + 1, w.layers.len());
             layers.push(GpuLayerWeights {
-                input_layernorm:          upload_tensor(device, &l.input_layernorm)?,
-                q_proj:                   upload_tensor(device, &l.q_proj)?,
-                k_proj:                   upload_tensor(device, &l.k_proj)?,
-                v_proj:                   upload_tensor(device, &l.v_proj)?,
-                o_proj:                   upload_tensor(device, &l.o_proj)?,
-                post_attention_layernorm: upload_tensor(device, &l.post_attention_layernorm)?,
-                gate_proj:                upload_tensor(device, &l.gate_proj)?,
-                up_proj:                  upload_tensor(device, &l.up_proj)?,
-                down_proj:                upload_tensor(device, &l.down_proj)?,
+                input_layernorm:          upload_f16(device, &l.input_layernorm)?,
+                post_attention_layernorm: upload_f16(device, &l.post_attention_layernorm)?,
+                q_proj:    upload_weight(device, &l.q_proj)?,
+                k_proj:    upload_weight(device, &l.k_proj)?,
+                v_proj:    upload_weight(device, &l.v_proj)?,
+                o_proj:    upload_weight(device, &l.o_proj)?,
+                gate_proj: upload_weight(device, &l.gate_proj)?,
+                up_proj:   upload_weight(device, &l.up_proj)?,
+                down_proj: upload_weight(device, &l.down_proj)?,
             });
         }
         Ok(GpuModelWeights { embed_tokens, layers, norm, lm_head })
@@ -447,7 +472,7 @@ mod inner {
             (probs.len() - 1) as u32
         }
 
-        // ── cuBLAS GEMM helper ────────────────────────────────────────────────
+        // ── cuBLAS GEMM helper (fp16 weights) ────────────────────────────────
 
         fn gemm(
             blas: &CudaBlas,
@@ -476,6 +501,33 @@ mod inner {
                     out,
                 )
                 .map_err(|e| EngineError::backend(format!("{label} gemm: {e}")))
+            }
+        }
+
+        // ── Dispatching GEMM — fp16 via cuBLAS, quantized via fused kernel ───
+
+        fn gemm_w(
+            device: &Arc<CudaDevice>,
+            blas: &CudaBlas,
+            out_dim: i32, batch: i32, in_dim: i32,
+            weight: &GpuWeight,
+            input: &CudaSlice<f16>,
+            out: &mut CudaSlice<f16>,
+            label: &str,
+        ) -> Result<(), EngineError> {
+            match weight {
+                GpuWeight::F16(w) => Self::gemm(
+                    blas, out_dim, batch, in_dim,
+                    w, in_dim, input, in_dim, out, out_dim, label,
+                ),
+                GpuWeight::Q8_0(w) => launch_q8_0_gemv(device, &mut QuantGemvParams {
+                    out, w, x: input,
+                    m: out_dim as u32, k: in_dim as u32, b: batch as u32,
+                }).map_err(|e| EngineError::backend(format!("{label} q8_0: {e}"))),
+                GpuWeight::Q4_K(w) => launch_q4_k_gemv(device, &mut QuantGemvParams {
+                    out, w, x: input,
+                    m: out_dim as u32, k: in_dim as u32, b: batch as u32,
+                }).map_err(|e| EngineError::backend(format!("{label} q4_k: {e}"))),
             }
         }
 
@@ -524,15 +576,15 @@ mod inner {
                     rows: n as u32, dim: h as u32, eps,
                 }).map_err(e)?;
 
-                Self::gemm(&blas, (num_q * head_dim) as i32, n as i32, h as i32,
-                    &layer.q_proj, h as i32, &self.prefill.norm, h as i32,
-                    &mut self.prefill.q_all, (num_q * head_dim) as i32, "Q")?;
-                Self::gemm(&blas, (num_kv * head_dim) as i32, n as i32, h as i32,
-                    &layer.k_proj, h as i32, &self.prefill.norm, h as i32,
-                    &mut self.prefill.k_all, (num_kv * head_dim) as i32, "K")?;
-                Self::gemm(&blas, (num_kv * head_dim) as i32, n as i32, h as i32,
-                    &layer.v_proj, h as i32, &self.prefill.norm, h as i32,
-                    &mut self.prefill.v_all, (num_kv * head_dim) as i32, "V")?;
+                Self::gemm_w(&self.device, &blas, (num_q * head_dim) as i32, n as i32, h as i32,
+                    &layer.q_proj, &self.prefill.norm,
+                    &mut self.prefill.q_all, "Q")?;
+                Self::gemm_w(&self.device, &blas, (num_kv * head_dim) as i32, n as i32, h as i32,
+                    &layer.k_proj, &self.prefill.norm,
+                    &mut self.prefill.k_all, "K")?;
+                Self::gemm_w(&self.device, &blas, (num_kv * head_dim) as i32, n as i32, h as i32,
+                    &layer.v_proj, &self.prefill.norm,
+                    &mut self.prefill.v_all, "V")?;
 
                 launch_batch_rope(&self.device, &mut BatchRopeParams {
                     q: &mut self.prefill.q_all, k: &mut self.prefill.k_all,
@@ -567,10 +619,9 @@ mod inner {
                 }).map_err(e)?;
 
                 let layer = &self.weights.layers[layer_idx];
-                Self::gemm(&blas, h as i32, n as i32, (num_q * head_dim) as i32,
-                    &layer.o_proj, (num_q * head_dim) as i32,
-                    &self.prefill.attn_out, (num_q * head_dim) as i32,
-                    &mut self.prefill.o_out, h as i32, "O")?;
+                Self::gemm_w(&self.device, &blas, h as i32, n as i32, (num_q * head_dim) as i32,
+                    &layer.o_proj, &self.prefill.attn_out,
+                    &mut self.prefill.o_out, "O")?;
 
                 launch_residual_add(&self.device, &mut self.prefill.residual,
                     &self.prefill.hidden, &self.prefill.o_out, (n * h) as u32).map_err(e)?;
@@ -583,20 +634,20 @@ mod inner {
                 }).map_err(e)?;
 
                 let layer = &self.weights.layers[layer_idx];
-                Self::gemm(&blas, inter as i32, n as i32, h as i32,
-                    &layer.gate_proj, h as i32, &self.prefill.ffn_input, h as i32,
-                    &mut self.prefill.gate_out, inter as i32, "gate")?;
-                Self::gemm(&blas, inter as i32, n as i32, h as i32,
-                    &layer.up_proj, h as i32, &self.prefill.ffn_input, h as i32,
-                    &mut self.prefill.up_out, inter as i32, "up")?;
+                Self::gemm_w(&self.device, &blas, inter as i32, n as i32, h as i32,
+                    &layer.gate_proj, &self.prefill.ffn_input,
+                    &mut self.prefill.gate_out, "gate")?;
+                Self::gemm_w(&self.device, &blas, inter as i32, n as i32, h as i32,
+                    &layer.up_proj, &self.prefill.ffn_input,
+                    &mut self.prefill.up_out, "up")?;
 
                 launch_fused_swiglu(&self.device, &mut self.prefill.swiglu_out,
                     &self.prefill.gate_out, &self.prefill.up_out, (n * inter) as u32).map_err(e)?;
 
                 let layer = &self.weights.layers[layer_idx];
-                Self::gemm(&blas, h as i32, n as i32, inter as i32,
-                    &layer.down_proj, inter as i32, &self.prefill.swiglu_out, inter as i32,
-                    &mut self.prefill.ffn_out, h as i32, "down")?;
+                Self::gemm_w(&self.device, &blas, h as i32, n as i32, inter as i32,
+                    &layer.down_proj, &self.prefill.swiglu_out,
+                    &mut self.prefill.ffn_out, "down")?;
 
                 launch_residual_add(&self.device, &mut self.prefill.hidden,
                     &self.prefill.residual, &self.prefill.ffn_out, (n * h) as u32).map_err(e)?;
@@ -693,15 +744,15 @@ mod inner {
                     rows: 1, dim: h as u32, eps,
                 }).map_err(e)?;
 
-                Self::gemm(&blas, q_dim as i32, 1, h as i32,
-                    &layer.q_proj, h as i32, &self.norm_buf, h as i32,
-                    &mut self.q_buf, q_dim as i32, "Q")?;
-                Self::gemm(&blas, kv_dim as i32, 1, h as i32,
-                    &layer.k_proj, h as i32, &self.norm_buf, h as i32,
-                    &mut self.k_buf, kv_dim as i32, "K")?;
-                Self::gemm(&blas, kv_dim as i32, 1, h as i32,
-                    &layer.v_proj, h as i32, &self.norm_buf, h as i32,
-                    &mut self.v_buf, kv_dim as i32, "V")?;
+                Self::gemm_w(&self.device, &blas, q_dim as i32, 1, h as i32,
+                    &layer.q_proj, &self.norm_buf,
+                    &mut self.q_buf, "Q")?;
+                Self::gemm_w(&self.device, &blas, kv_dim as i32, 1, h as i32,
+                    &layer.k_proj, &self.norm_buf,
+                    &mut self.k_buf, "K")?;
+                Self::gemm_w(&self.device, &blas, kv_dim as i32, 1, h as i32,
+                    &layer.v_proj, &self.norm_buf,
+                    &mut self.v_buf, "V")?;
 
                 use kapsl_kernels::cuda_kernels::{launch_rope, RopeParams};
                 launch_rope(&self.device, &mut RopeParams {
@@ -735,9 +786,9 @@ mod inner {
                 }).map_err(e)?;
 
                 let layer = &self.weights.layers[layer_idx];
-                Self::gemm(&blas, h as i32, 1, q_dim as i32,
-                    &layer.o_proj, q_dim as i32, &self.attn_buf, q_dim as i32,
-                    &mut self.o_proj_buf, h as i32, "O")?;
+                Self::gemm_w(&self.device, &blas, h as i32, 1, q_dim as i32,
+                    &layer.o_proj, &self.attn_buf,
+                    &mut self.o_proj_buf, "O")?;
 
                 launch_residual_add(&self.device, &mut self.residual_buf,
                     &self.hidden_buf, &self.o_proj_buf, h as u32).map_err(e)?;
@@ -750,20 +801,20 @@ mod inner {
                 }).map_err(e)?;
 
                 let layer = &self.weights.layers[layer_idx];
-                Self::gemm(&blas, inter as i32, 1, h as i32,
-                    &layer.gate_proj, h as i32, &self.ffn_input_buf, h as i32,
-                    &mut self.gate_buf, inter as i32, "gate")?;
-                Self::gemm(&blas, inter as i32, 1, h as i32,
-                    &layer.up_proj, h as i32, &self.ffn_input_buf, h as i32,
-                    &mut self.up_buf, inter as i32, "up")?;
+                Self::gemm_w(&self.device, &blas, inter as i32, 1, h as i32,
+                    &layer.gate_proj, &self.ffn_input_buf,
+                    &mut self.gate_buf, "gate")?;
+                Self::gemm_w(&self.device, &blas, inter as i32, 1, h as i32,
+                    &layer.up_proj, &self.ffn_input_buf,
+                    &mut self.up_buf, "up")?;
 
                 launch_fused_swiglu(&self.device, &mut self.swiglu_buf,
                     &self.gate_buf, &self.up_buf, inter as u32).map_err(e)?;
 
                 let layer = &self.weights.layers[layer_idx];
-                Self::gemm(&blas, h as i32, 1, inter as i32,
-                    &layer.down_proj, inter as i32, &self.swiglu_buf, inter as i32,
-                    &mut self.ffn_out_buf, h as i32, "down")?;
+                Self::gemm_w(&self.device, &blas, h as i32, 1, inter as i32,
+                    &layer.down_proj, &self.swiglu_buf,
+                    &mut self.ffn_out_buf, "down")?;
 
                 launch_residual_add(&self.device, &mut self.hidden_buf,
                     &self.residual_buf, &self.ffn_out_buf, h as u32).map_err(e)?;
@@ -878,15 +929,15 @@ mod inner {
                     rows: b as u32, dim: h as u32, eps,
                 }).map_err(e)?;
 
-                Self::gemm(&blas, (num_q * head_dim) as i32, b as i32, h as i32,
-                    &layer.q_proj, h as i32, &self.prefill.norm, h as i32,
-                    &mut self.prefill.q_all, (num_q * head_dim) as i32, "Q")?;
-                Self::gemm(&blas, (num_kv * head_dim) as i32, b as i32, h as i32,
-                    &layer.k_proj, h as i32, &self.prefill.norm, h as i32,
-                    &mut self.prefill.k_all, (num_kv * head_dim) as i32, "K")?;
-                Self::gemm(&blas, (num_kv * head_dim) as i32, b as i32, h as i32,
-                    &layer.v_proj, h as i32, &self.prefill.norm, h as i32,
-                    &mut self.prefill.v_all, (num_kv * head_dim) as i32, "V")?;
+                Self::gemm_w(&self.device, &blas, (num_q * head_dim) as i32, b as i32, h as i32,
+                    &layer.q_proj, &self.prefill.norm,
+                    &mut self.prefill.q_all, "Q")?;
+                Self::gemm_w(&self.device, &blas, (num_kv * head_dim) as i32, b as i32, h as i32,
+                    &layer.k_proj, &self.prefill.norm,
+                    &mut self.prefill.k_all, "K")?;
+                Self::gemm_w(&self.device, &blas, (num_kv * head_dim) as i32, b as i32, h as i32,
+                    &layer.v_proj, &self.prefill.norm,
+                    &mut self.prefill.v_all, "V")?;
 
                 launch_batch_decode_rope(&self.device, &mut BatchDecodeRopeParams {
                     q: &mut self.prefill.q_all, k: &mut self.prefill.k_all,
@@ -933,10 +984,9 @@ mod inner {
                 }).map_err(e)?;
 
                 let layer = &self.weights.layers[li];
-                Self::gemm(&blas, h as i32, b as i32, (num_q * head_dim) as i32,
-                    &layer.o_proj, (num_q * head_dim) as i32,
-                    &self.prefill.attn_out, (num_q * head_dim) as i32,
-                    &mut self.prefill.o_out, h as i32, "O")?;
+                Self::gemm_w(&self.device, &blas, h as i32, b as i32, (num_q * head_dim) as i32,
+                    &layer.o_proj, &self.prefill.attn_out,
+                    &mut self.prefill.o_out, "O")?;
 
                 launch_residual_add(&self.device, &mut self.prefill.residual,
                     &self.prefill.hidden, &self.prefill.o_out, (b * h) as u32).map_err(e)?;
@@ -949,20 +999,20 @@ mod inner {
                 }).map_err(e)?;
 
                 let layer = &self.weights.layers[li];
-                Self::gemm(&blas, inter as i32, b as i32, h as i32,
-                    &layer.gate_proj, h as i32, &self.prefill.ffn_input, h as i32,
-                    &mut self.prefill.gate_out, inter as i32, "gate")?;
-                Self::gemm(&blas, inter as i32, b as i32, h as i32,
-                    &layer.up_proj, h as i32, &self.prefill.ffn_input, h as i32,
-                    &mut self.prefill.up_out, inter as i32, "up")?;
+                Self::gemm_w(&self.device, &blas, inter as i32, b as i32, h as i32,
+                    &layer.gate_proj, &self.prefill.ffn_input,
+                    &mut self.prefill.gate_out, "gate")?;
+                Self::gemm_w(&self.device, &blas, inter as i32, b as i32, h as i32,
+                    &layer.up_proj, &self.prefill.ffn_input,
+                    &mut self.prefill.up_out, "up")?;
 
                 launch_fused_swiglu(&self.device, &mut self.prefill.swiglu_out,
                     &self.prefill.gate_out, &self.prefill.up_out, (b * inter) as u32).map_err(e)?;
 
                 let layer = &self.weights.layers[li];
-                Self::gemm(&blas, h as i32, b as i32, inter as i32,
-                    &layer.down_proj, inter as i32, &self.prefill.swiglu_out, inter as i32,
-                    &mut self.prefill.ffn_out, h as i32, "down")?;
+                Self::gemm_w(&self.device, &blas, h as i32, b as i32, inter as i32,
+                    &layer.down_proj, &self.prefill.swiglu_out,
+                    &mut self.prefill.ffn_out, "down")?;
 
                 launch_residual_add(&self.device, &mut self.prefill.hidden,
                     &self.prefill.residual, &self.prefill.ffn_out, (b * h) as u32).map_err(e)?;
