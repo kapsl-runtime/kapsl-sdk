@@ -10,9 +10,20 @@
 #[cfg(feature = "cuda")]
 mod inner {
     use cudarc::driver::{CudaDevice, CudaFunction, CudaSlice, CudaView, LaunchAsync, LaunchConfig};
-    use cudarc::nvrtc::compile_ptx;
+    use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
     use half::f16;
     use std::sync::{Arc, OnceLock};
+
+    fn cuda_compile_opts() -> CompileOptions {
+        let cuda_include = std::env::var("CUDA_PATH")
+            .or_else(|_| std::env::var("CUDA_HOME"))
+            .map(|p| format!("{p}/include"))
+            .unwrap_or_else(|_| "/usr/local/cuda/include".to_string());
+        CompileOptions {
+            include_paths: vec![cuda_include],
+            ..Default::default()
+        }
+    }
 
     /// Compiled PTX module, lazily initialised.
     struct KernelModule {
@@ -169,7 +180,7 @@ __global__ void paged_attention_v1(
         if device.get_func(MODULE_NAME, KERNEL_NAME).is_some() {
             return Ok(());
         }
-        let ptx = compile_ptx(KERNEL_SRC).map_err(|e| format!("NVRTC compile failed: {e}"))?;
+        let ptx = compile_ptx_with_opts(KERNEL_SRC, cuda_compile_opts()).map_err(|e| format!("NVRTC compile failed: {e}"))?;
         device
             .load_ptx(ptx, MODULE_NAME, &[KERNEL_NAME])
             .map_err(|e| format!("PTX load failed: {e}"))?;
@@ -308,7 +319,7 @@ __global__ void rms_norm(
     ) -> Result<(), String> {
         if device.get_func(RMSNORM_MODULE, RMSNORM_KERNEL).is_none() {
             let ptx =
-                compile_ptx(RMSNORM_SRC).map_err(|e| format!("NVRTC rmsnorm compile: {e}"))?;
+                compile_ptx_with_opts(RMSNORM_SRC, cuda_compile_opts()).map_err(|e| format!("NVRTC rmsnorm compile: {e}"))?;
             device
                 .load_ptx(ptx, RMSNORM_MODULE, &[RMSNORM_KERNEL])
                 .map_err(|e| format!("PTX load: {e}"))?;
@@ -374,7 +385,7 @@ __global__ void fused_swiglu(
     ) -> Result<(), String> {
         if device.get_func(SWIGLU_MODULE, SWIGLU_KERNEL).is_none() {
             let ptx =
-                compile_ptx(SWIGLU_SRC).map_err(|e| format!("NVRTC swiglu compile: {e}"))?;
+                compile_ptx_with_opts(SWIGLU_SRC, cuda_compile_opts()).map_err(|e| format!("NVRTC swiglu compile: {e}"))?;
             device
                 .load_ptx(ptx, SWIGLU_MODULE, &[SWIGLU_KERNEL])
                 .map_err(|e| format!("PTX load: {e}"))?;
@@ -471,7 +482,7 @@ __global__ void rope_forward(
         params: &mut RopeParams<'_>,
     ) -> Result<(), String> {
         if device.get_func(ROPE_MODULE, ROPE_KERNEL).is_none() {
-            let ptx = compile_ptx(ROPE_SRC).map_err(|e| format!("NVRTC rope compile: {e}"))?;
+            let ptx = compile_ptx_with_opts(ROPE_SRC, cuda_compile_opts()).map_err(|e| format!("NVRTC rope compile: {e}"))?;
             device
                 .load_ptx(ptx, ROPE_MODULE, &[ROPE_KERNEL])
                 .map_err(|e| format!("PTX load: {e}"))?;
@@ -567,7 +578,7 @@ __global__ void write_kv_to_pool(
     ) -> Result<(), String> {
         if device.get_func(KV_WRITE_MODULE, KV_WRITE_KERNEL).is_none() {
             let ptx =
-                compile_ptx(KV_WRITE_SRC).map_err(|e| format!("NVRTC kv_write compile: {e}"))?;
+                compile_ptx_with_opts(KV_WRITE_SRC, cuda_compile_opts()).map_err(|e| format!("NVRTC kv_write compile: {e}"))?;
             device
                 .load_ptx(ptx, KV_WRITE_MODULE, &[KV_WRITE_KERNEL])
                 .map_err(|e| format!("PTX load: {e}"))?;
@@ -634,7 +645,7 @@ __global__ void residual_add(
         n: u32,
     ) -> Result<(), String> {
         if device.get_func(RESIDUAL_MODULE, RESIDUAL_KERNEL).is_none() {
-            let ptx = compile_ptx(RESIDUAL_ADD_SRC)
+            let ptx = compile_ptx_with_opts(RESIDUAL_ADD_SRC, cuda_compile_opts())
                 .map_err(|e| format!("NVRTC residual compile: {e}"))?;
             device
                 .load_ptx(ptx, RESIDUAL_MODULE, &[RESIDUAL_KERNEL])
@@ -725,7 +736,7 @@ __global__ void batch_rope_forward(
         p: &mut BatchRopeParams<'_>,
     ) -> Result<(), String> {
         if device.get_func(BATCH_ROPE_MODULE, BATCH_ROPE_KERNEL).is_none() {
-            let ptx = compile_ptx(BATCH_ROPE_SRC)
+            let ptx = compile_ptx_with_opts(BATCH_ROPE_SRC, cuda_compile_opts())
                 .map_err(|e| format!("NVRTC batch_rope compile: {e}"))?;
             device
                 .load_ptx(ptx, BATCH_ROPE_MODULE, &[BATCH_ROPE_KERNEL])
@@ -875,7 +886,7 @@ __global__ void prefill_attention(
             .get_func(PREFILL_ATTN_MODULE, PREFILL_ATTN_KERNEL)
             .is_none()
         {
-            let ptx = compile_ptx(PREFILL_ATTN_SRC)
+            let ptx = compile_ptx_with_opts(PREFILL_ATTN_SRC, cuda_compile_opts())
                 .map_err(|e| format!("NVRTC prefill_attn compile: {e}"))?;
             device
                 .load_ptx(ptx, PREFILL_ATTN_MODULE, &[PREFILL_ATTN_KERNEL])
@@ -979,7 +990,7 @@ __global__ void batch_kv_write(
             .get_func(BATCH_KV_WRITE_MODULE, BATCH_KV_WRITE_KERNEL)
             .is_none()
         {
-            let ptx = compile_ptx(BATCH_KV_WRITE_SRC)
+            let ptx = compile_ptx_with_opts(BATCH_KV_WRITE_SRC, cuda_compile_opts())
                 .map_err(|e| format!("NVRTC batch_kv_write compile: {e}"))?;
             device
                 .load_ptx(ptx, BATCH_KV_WRITE_MODULE, &[BATCH_KV_WRITE_KERNEL])
@@ -1020,9 +1031,20 @@ __global__ void batch_kv_write(
 #[cfg(feature = "cuda")]
 mod argmax_inner {
     use cudarc::driver::{CudaDevice, CudaSlice, LaunchAsync, LaunchConfig};
-    use cudarc::nvrtc::compile_ptx;
+    use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
     use half::f16;
     use std::sync::Arc;
+
+    fn cuda_compile_opts() -> CompileOptions {
+        let cuda_include = std::env::var("CUDA_PATH")
+            .or_else(|_| std::env::var("CUDA_HOME"))
+            .map(|p| format!("{p}/include"))
+            .unwrap_or_else(|_| "/usr/local/cuda/include".to_string());
+        CompileOptions {
+            include_paths: vec![cuda_include],
+            ..Default::default()
+        }
+    }
 
     /// Parallel argmax over a single row of f16 logits stored in GPU memory.
     ///
@@ -1082,7 +1104,7 @@ __global__ void argmax_f16(
         p: &mut ArgmaxParams<'_>,
     ) -> Result<(), String> {
         if device.get_func(ARGMAX_MODULE, ARGMAX_KERNEL).is_none() {
-            let ptx = compile_ptx(ARGMAX_SRC)
+            let ptx = compile_ptx_with_opts(ARGMAX_SRC, cuda_compile_opts())
                 .map_err(|e| format!("NVRTC argmax compile: {e}"))?;
             device.load_ptx(ptx, ARGMAX_MODULE, &[ARGMAX_KERNEL])
                 .map_err(|e| format!("PTX load: {e}"))?;
@@ -1167,7 +1189,7 @@ __global__ void batch_decode_rope(
         p: &mut BatchDecodeRopeParams<'_>,
     ) -> Result<(), String> {
         if device.get_func(BATCH_DECODE_ROPE_MODULE, BATCH_DECODE_ROPE_KERNEL).is_none() {
-            let ptx = compile_ptx(BATCH_DECODE_ROPE_SRC)
+            let ptx = compile_ptx_with_opts(BATCH_DECODE_ROPE_SRC, cuda_compile_opts())
                 .map_err(|e| format!("NVRTC batch_decode_rope compile: {e}"))?;
             device
                 .load_ptx(ptx, BATCH_DECODE_ROPE_MODULE, &[BATCH_DECODE_ROPE_KERNEL])
@@ -1267,7 +1289,7 @@ __global__ void batch_argmax_f16(
         p: &mut BatchArgmaxParams<'_>,
     ) -> Result<(), String> {
         if device.get_func(BATCH_ARGMAX_MODULE, BATCH_ARGMAX_KERNEL).is_none() {
-            let ptx = compile_ptx(BATCH_ARGMAX_SRC)
+            let ptx = compile_ptx_with_opts(BATCH_ARGMAX_SRC, cuda_compile_opts())
                 .map_err(|e| format!("NVRTC batch_argmax compile: {e}"))?;
             device
                 .load_ptx(ptx, BATCH_ARGMAX_MODULE, &[BATCH_ARGMAX_KERNEL])
