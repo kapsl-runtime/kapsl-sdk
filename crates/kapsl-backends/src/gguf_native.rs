@@ -33,10 +33,11 @@ mod inner {
     use kapsl_hal::gpu_arena::{GpuBlockPool, GpuPoolHandle};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use kapsl_kernels::cuda_kernels::{
-        launch_argmax, launch_batch_kv_write, launch_batch_rope, launch_fused_swiglu,
-        launch_paged_attention, launch_prefill_attention, launch_residual_add, launch_rms_norm,
-        ArgmaxParams, BatchKvWriteParams, BatchRopeParams, PagedAttentionParams, PrefillAttnParams,
-        RmsNormParams,
+        launch_argmax, launch_batch_argmax, launch_batch_decode_rope, launch_batch_kv_write,
+        launch_batch_rope, launch_fused_swiglu, launch_paged_attention, launch_prefill_attention,
+        launch_residual_add, launch_rms_norm,
+        ArgmaxParams, BatchArgmaxParams, BatchDecodeRopeParams, BatchKvWriteParams, BatchRopeParams,
+        PagedAttentionParams, PrefillAttnParams, RmsNormParams,
     };
     use kapsl_loader::{load_gguf_weights, ModelConfig, TensorData};
 
@@ -201,6 +202,12 @@ mod inner {
         rng: rand::rngs::SmallRng,
         prefill: PrefillScratch,
         argmax_buf: CudaSlice<u32>,
+        // Batch decode GPU buffers — grow-only (written by GPU kernels, sized to dec_batch_cap)
+        // Small per-step i32 uploads (positions, phys blocks, block tables) are
+        // allocated fresh each call via htod_sync_copy to avoid size-mismatch panics.
+        dec_batch_cap:    usize,
+        dec_batch_logits: CudaSlice<f16>,   // [dec_batch_cap * vocab]
+        dec_batch_norm:   CudaSlice<f16>,   // [dec_batch_cap * h]
     }
 
     impl BackendInner {
@@ -289,6 +296,20 @@ mod inner {
             self.prefill.ffn_out    = a(n * h)?;
             self.prefill.o_out      = a(n * h)?;
             self.prefill.cap = n;
+            Ok(())
+        }
+
+        // ── Batch decode scratch management ──────────────────────────────────
+
+        fn ensure_dec_scratch(&mut self, batch: usize) -> Result<(), EngineError> {
+            if batch <= self.dec_batch_cap { return Ok(()); }
+            let dev   = self.device.clone();
+            let vocab = self.config.vocab_size;
+            let h     = self.config.hidden_size;
+            let ae    = |tag: &'static str| move |e| EngineError::backend(format!("{tag}: {e}"));
+            self.dec_batch_logits = dev.alloc_zeros::<f16>(batch * vocab).map_err(ae("dec_logits"))?;
+            self.dec_batch_norm   = dev.alloc_zeros::<f16>(batch * h).map_err(ae("dec_norm"))?;
+            self.dec_batch_cap = batch;
             Ok(())
         }
 
@@ -706,6 +727,185 @@ mod inner {
             Ok(ids[0])
         }
 
+        // ── Batched single-step decode ────────────────────────────────────────
+
+        /// Run one decode step for B sequences simultaneously.
+        /// `block_tables[b][layer][block_idx]` — per-sequence per-layer blocks.
+        /// `context_lens[b]` — length AFTER this token (already incremented by caller).
+        /// Returns next-token ids in the same order.
+        fn forward_batch_decode_greedy(
+            &mut self,
+            tokens: &[u32],
+            block_tables: &[&Vec<Vec<i32>>],
+            context_lens: &[usize],
+        ) -> Result<Vec<u32>, EngineError> {
+            let b = tokens.len();
+            let h       = self.config.hidden_size;
+            let num_q   = self.config.num_attention_heads;
+            let num_kv  = self.config.num_kv_heads();
+            let head_dim = self.config.head_dim();
+            let inter   = self.config.intermediate_size;
+            let eps     = self.config.rms_norm_eps as f32;
+            let theta   = self.config.rope_theta as f32;
+            let scale   = 1.0 / (head_dim as f32).sqrt();
+            let bs      = self.block_pool.block_size();
+            let vocab   = self.config.vocab_size;
+            let nl      = self.config.num_hidden_layers;
+            let e = |s: String| EngineError::backend(s);
+
+            let max_blks = block_tables.iter()
+                .map(|bt| bt.first().map_or(0, |l| l.len()))
+                .max().unwrap_or(1)
+                .max(1);
+
+            self.ensure_prefill_scratch(b)?;
+            self.ensure_dec_scratch(b)?;
+
+            // Embed
+            for (i, &tok) in tokens.iter().enumerate() {
+                let off = tok as usize * h;
+                self.device.dtod_copy(
+                    &self.weights.embed_tokens.slice(off..off + h),
+                    &mut self.prefill.hidden.slice_mut(i * h..(i + 1) * h),
+                ).map_err(|err| e(format!("embed: {err}")))?;
+            }
+
+            // Upload per-step small CPU→GPU arrays (fresh alloc avoids size-mismatch panics)
+            let pos_cpu: Vec<i32> = context_lens.iter().map(|&c| (c - 1) as i32).collect();
+            let ctx_cpu: Vec<i32> = context_lens.iter().map(|&c| c as i32).collect();
+            let pib_cpu: Vec<i32> = context_lens.iter()
+                .map(|&c| ((c - 1) % bs) as i32).collect();
+            let pos_dev = self.device.htod_sync_copy(&pos_cpu)
+                .map_err(|err| e(format!("pos up: {err}")))?;
+            let ctx_dev = self.device.htod_sync_copy(&ctx_cpu)
+                .map_err(|err| e(format!("ctx up: {err}")))?;
+            let pib_dev = self.device.htod_sync_copy(&pib_cpu)
+                .map_err(|err| e(format!("pib up: {err}")))?;
+
+            let blas = Arc::clone(&self.blas);
+            for li in 0..nl {
+                let layer = &self.weights.layers[li];
+
+                launch_rms_norm(&self.device, &mut RmsNormParams {
+                    out: &mut self.prefill.norm, input: self.prefill.hidden.slice(..),
+                    weight: &layer.input_layernorm,
+                    rows: b as u32, dim: h as u32, eps,
+                }).map_err(e)?;
+
+                Self::gemm(&blas, (num_q * head_dim) as i32, b as i32, h as i32,
+                    &layer.q_proj, h as i32, &self.prefill.norm, h as i32,
+                    &mut self.prefill.q_all, (num_q * head_dim) as i32, "Q")?;
+                Self::gemm(&blas, (num_kv * head_dim) as i32, b as i32, h as i32,
+                    &layer.k_proj, h as i32, &self.prefill.norm, h as i32,
+                    &mut self.prefill.k_all, (num_kv * head_dim) as i32, "K")?;
+                Self::gemm(&blas, (num_kv * head_dim) as i32, b as i32, h as i32,
+                    &layer.v_proj, h as i32, &self.prefill.norm, h as i32,
+                    &mut self.prefill.v_all, (num_kv * head_dim) as i32, "V")?;
+
+                launch_batch_decode_rope(&self.device, &mut BatchDecodeRopeParams {
+                    q: &mut self.prefill.q_all, k: &mut self.prefill.k_all,
+                    positions: &pos_dev,
+                    batch_size: b as u32, num_q_heads: num_q as u32,
+                    num_kv_heads: num_kv as u32, head_dim: head_dim as u32, theta,
+                }).map_err(e)?;
+
+                // Per-layer physical block for each sequence's current KV write position
+                let phys_cpu: Vec<i32> = (0..b).map(|s| {
+                    block_tables[s][li][(context_lens[s] - 1) / bs]
+                }).collect();
+                let phys_dev = self.device.htod_sync_copy(&phys_cpu)
+                    .map_err(|err| e(format!("phys up: {err}")))?;
+
+                launch_batch_kv_write(&self.device, &mut BatchKvWriteParams {
+                    kv_cache: self.block_pool.storage_mut(),
+                    k: &self.prefill.k_all, v: &self.prefill.v_all,
+                    physical_blocks: &phys_dev,
+                    pos_in_blocks: &pib_dev,
+                    seq_len: b as u32, num_kv_heads: num_kv as u32,
+                    block_size: bs as u32, head_dim: head_dim as u32,
+                }).map_err(e)?;
+
+                // Flat block table [B * max_blks] for this layer's paged attention
+                let mut flat_bt = vec![0i32; b * max_blks];
+                for (s, bt) in block_tables.iter().enumerate() {
+                    for (bi, &blk) in bt[li].iter().enumerate() {
+                        flat_bt[s * max_blks + bi] = blk;
+                    }
+                }
+                let bt_dev = self.device.htod_sync_copy(&flat_bt)
+                    .map_err(|err| e(format!("bt up: {err}")))?;
+
+                launch_paged_attention(&self.device, &mut PagedAttentionParams {
+                    out: &mut self.prefill.attn_out, q: &self.prefill.q_all,
+                    kv_cache: self.block_pool.storage(),
+                    block_tables: &bt_dev,
+                    context_lens: &ctx_dev,
+                    scale, batch_size: b as u32,
+                    num_q_heads: num_q as u32, num_kv_heads: num_kv as u32,
+                    head_dim: head_dim as u32, block_size: bs as u32,
+                    max_blocks_per_seq: max_blks as u32,
+                }).map_err(e)?;
+
+                let layer = &self.weights.layers[li];
+                Self::gemm(&blas, h as i32, b as i32, (num_q * head_dim) as i32,
+                    &layer.o_proj, (num_q * head_dim) as i32,
+                    &self.prefill.attn_out, (num_q * head_dim) as i32,
+                    &mut self.prefill.o_out, h as i32, "O")?;
+
+                launch_residual_add(&self.device, &mut self.prefill.residual,
+                    &self.prefill.hidden, &self.prefill.o_out, (b * h) as u32).map_err(e)?;
+
+                let layer = &self.weights.layers[li];
+                launch_rms_norm(&self.device, &mut RmsNormParams {
+                    out: &mut self.prefill.ffn_input, input: self.prefill.residual.slice(..),
+                    weight: &layer.post_attention_layernorm,
+                    rows: b as u32, dim: h as u32, eps,
+                }).map_err(e)?;
+
+                let layer = &self.weights.layers[li];
+                Self::gemm(&blas, inter as i32, b as i32, h as i32,
+                    &layer.gate_proj, h as i32, &self.prefill.ffn_input, h as i32,
+                    &mut self.prefill.gate_out, inter as i32, "gate")?;
+                Self::gemm(&blas, inter as i32, b as i32, h as i32,
+                    &layer.up_proj, h as i32, &self.prefill.ffn_input, h as i32,
+                    &mut self.prefill.up_out, inter as i32, "up")?;
+
+                launch_fused_swiglu(&self.device, &mut self.prefill.swiglu_out,
+                    &self.prefill.gate_out, &self.prefill.up_out, (b * inter) as u32).map_err(e)?;
+
+                let layer = &self.weights.layers[li];
+                Self::gemm(&blas, h as i32, b as i32, inter as i32,
+                    &layer.down_proj, inter as i32, &self.prefill.swiglu_out, inter as i32,
+                    &mut self.prefill.ffn_out, h as i32, "down")?;
+
+                launch_residual_add(&self.device, &mut self.prefill.hidden,
+                    &self.prefill.residual, &self.prefill.ffn_out, (b * h) as u32).map_err(e)?;
+            }
+
+            // Final norm: all B rows
+            launch_rms_norm(&self.device, &mut RmsNormParams {
+                out: &mut self.dec_batch_norm, input: self.prefill.hidden.slice(..),
+                weight: &self.weights.norm, rows: b as u32, dim: h as u32, eps,
+            }).map_err(e)?;
+
+            // lm_head: [vocab, B]
+            Self::gemm(&blas, vocab as i32, b as i32, h as i32,
+                &self.weights.lm_head, h as i32, &self.dec_batch_norm, h as i32,
+                &mut self.dec_batch_logits, vocab as i32, "lm_head")?;
+
+            // Batch argmax — allocate exactly-B output so dtoh_sync_copy returns B elements
+            let mut argmax_dev = self.device.alloc_zeros::<u32>(b)
+                .map_err(|err| e(format!("argmax alloc: {err}")))?;
+            launch_batch_argmax(&self.device, &mut BatchArgmaxParams {
+                input: &self.dec_batch_logits,
+                output: &mut argmax_dev,
+                batch_size: b as u32, vocab_size: vocab as u32,
+            }).map_err(|s| EngineError::backend(s))?;
+
+            self.device.dtoh_sync_copy(&argmax_dev)
+                .map_err(|err| e(format!("dec argmax dl: {err}")))
+        }
+
         // ── Decode loop ───────────────────────────────────────────────────────
 
         fn token_to_str(&self, tok: u32) -> String {
@@ -788,6 +988,123 @@ mod inner {
         }).cloned()
     }
 
+    // ── Batch decode coordinator ──────────────────────────────────────────────
+
+    struct DecodeState {
+        current_token: u32,
+        block_tables:  Vec<Vec<i32>>,   // [num_layers][num_blocks]
+        context_len:   usize,
+        max_remaining: u32,
+        eos:           u32,
+        session_id:    Option<String>,
+        tx:            std::sync::mpsc::SyncSender<Result<String, EngineError>>,
+    }
+
+    struct BatchDecodeCoordinator {
+        submit_tx: std::sync::mpsc::Sender<DecodeState>,
+    }
+
+    impl BatchDecodeCoordinator {
+        fn spawn(inner: Arc<Mutex<Option<BackendInner>>>) -> Self {
+            let (submit_tx, submit_rx) = std::sync::mpsc::channel::<DecodeState>();
+            std::thread::Builder::new()
+                .name("gguf-native-dec".into())
+                .spawn(move || {
+                    let mut active: Vec<DecodeState> = Vec::new();
+                    loop {
+                        // Wait for at least one slot when idle
+                        if active.is_empty() {
+                            match submit_rx.recv() {
+                                Ok(s) => active.push(s),
+                                Err(_) => return,
+                            }
+                        }
+                        // Drain any additional newly submitted slots
+                        loop {
+                            match submit_rx.try_recv() {
+                                Ok(s) => active.push(s),
+                                Err(_) => break,
+                            }
+                        }
+
+                        let mut guard = inner.lock().unwrap();
+                        match guard.as_mut() {
+                            Some(b) => Self::step(b, &mut active),
+                            None => {
+                                for s in active.drain(..) {
+                                    let _ = s.tx.send(Err(EngineError::ModelNotLoaded));
+                                }
+                            }
+                        }
+                    }
+                })
+                .expect("spawn gguf-native-dec");
+            Self { submit_tx }
+        }
+
+        fn submit(&self, state: DecodeState) {
+            let _ = self.submit_tx.send(state);
+        }
+
+        fn step(b: &mut BackendInner, active: &mut Vec<DecodeState>) {
+            // Remove completed slots (EOS or exhausted budget)
+            let mut i = 0;
+            while i < active.len() {
+                let s = &active[i];
+                if s.current_token == s.eos || s.max_remaining == 0 {
+                    let s = active.remove(i);
+                    if let Some(sid) = s.session_id {
+                        b.sessions.insert(sid, SessionState {
+                            block_tables: s.block_tables, context_len: s.context_len,
+                        });
+                    } else {
+                        b.free_block_tables(&s.block_tables);
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            if active.is_empty() { return; }
+
+            // Emit current tokens and prepare next step
+            let mut failed: Vec<usize> = Vec::new();
+            for (i, s) in active.iter_mut().enumerate() {
+                let piece = b.token_to_str(s.current_token);
+                if s.tx.send(Ok(piece)).is_err() {
+                    failed.push(i); continue;
+                }
+                match b.ensure_block(&mut s.block_tables, s.context_len) {
+                    Ok(()) => { s.context_len += 1; s.max_remaining -= 1; }
+                    Err(e) => { let _ = s.tx.send(Err(e)); failed.push(i); }
+                }
+            }
+            for i in failed.into_iter().rev() {
+                let s = active.remove(i);
+                b.free_block_tables(&s.block_tables);
+            }
+            if active.is_empty() { return; }
+
+            // Run one batched decode step
+            let tokens: Vec<u32>           = active.iter().map(|s| s.current_token).collect();
+            let bts:    Vec<&Vec<Vec<i32>>> = active.iter().map(|s| &s.block_tables).collect();
+            let ctxs:   Vec<usize>          = active.iter().map(|s| s.context_len).collect();
+            match b.forward_batch_decode_greedy(&tokens, &bts, &ctxs) {
+                Ok(next) => {
+                    for (s, nt) in active.iter_mut().zip(next) {
+                        s.current_token = nt;
+                    }
+                }
+                Err(e) => {
+                    let msg = format!("{e}");
+                    for s in active.drain(..) {
+                        let _ = s.tx.send(Err(EngineError::backend(msg.clone())));
+                        b.free_block_tables(&s.block_tables);
+                    }
+                }
+            }
+        }
+    }
+
     // ── GgufNativeBackend ─────────────────────────────────────────────────────
 
     pub struct GgufNativeBackend {
@@ -795,16 +1112,20 @@ mod inner {
         inner: Arc<Mutex<Option<BackendInner>>>,
         /// Pool handle to inject before load(); also populated after load() for sharing.
         pool_slot: Arc<Mutex<Option<GpuPoolHandle>>>,
+        batch_dec: Arc<BatchDecodeCoordinator>,
     }
 
     impl GgufNativeBackend {
         pub fn new(device_id: i32) -> Result<Self, EngineError> {
             CudaDevice::new(device_id as usize)
                 .map_err(|e| EngineError::backend(format!("CUDA device {device_id}: {e}")))?;
+            let inner = Arc::new(Mutex::new(None));
+            let batch_dec = Arc::new(BatchDecodeCoordinator::spawn(Arc::clone(&inner)));
             Ok(Self {
                 device_id,
-                inner: Arc::new(Mutex::new(None)),
+                inner,
                 pool_slot: Arc::new(Mutex::new(None)),
+                batch_dec,
             })
         }
 
@@ -926,6 +1247,10 @@ mod inner {
                 let prefill = PrefillScratch::new(&device, h, nq * hd, nkv * hd, inter)?;
                 let argmax_buf = device.alloc_zeros::<u32>(1)
                     .map_err(|e| EngineError::backend(format!("argmax buf: {e}")))?;
+                // Batch decode GPU buffers — seeded at size 1; grow on first use
+                let dae = |tag: &'static str| move |e| EngineError::backend(format!("dec {tag}: {e}"));
+                let dec_batch_logits = device.alloc_zeros::<f16>(vocab).map_err(dae("logits"))?;
+                let dec_batch_norm   = device.alloc_zeros::<f16>(h).map_err(dae("norm"))?;
                 let hidden_buf    = device.alloc_zeros::<f16>(h)        .map_err(|e| EngineError::backend(format!("alloc: {e}")))?;
                 let norm_buf      = device.alloc_zeros::<f16>(h)        .map_err(|e| EngineError::backend(format!("alloc: {e}")))?;
                 let residual_buf  = device.alloc_zeros::<f16>(h)        .map_err(|e| EngineError::backend(format!("alloc: {e}")))?;
@@ -955,6 +1280,7 @@ mod inner {
                     rng:            rand::rngs::SmallRng::from_entropy(),
                     prefill,
                     argmax_buf,
+                    dec_batch_cap: 1, dec_batch_logits, dec_batch_norm,
                 };
                 *inner_arc.lock().unwrap() = Some(backend);
                 log::info!("[gguf-native] Ready");
@@ -965,85 +1291,177 @@ mod inner {
         }
 
         fn infer(&self, request: &InferenceRequest) -> Result<BinaryTensorPacket, EngineError> {
-            let mut guard = self.inner.lock().unwrap();
-            let inner = guard.as_mut().ok_or(EngineError::ModelNotLoaded)?;
-
             let prompt = Self::extract_prompt(request)?;
             let (max_new, sp) = Self::decode_params(request);
-            let sid = request.session_id.as_deref();
+            let greedy = sp.temperature < 1e-6;
+            let sid = request.session_id.clone();
 
-            let prompt_ids: Vec<u32> = inner.llm_model
-                .str_to_token(&prompt, AddBos::Always)
-                .map_err(|e| EngineError::invalid_input(format!("tokenize: {e}")))?
-                .into_iter().map(|t| t.0 as u32).collect();
+            // Non-greedy: single-sequence path (holds lock throughout)
+            if !greedy {
+                let mut guard = self.inner.lock().unwrap();
+                let b = guard.as_mut().ok_or(EngineError::ModelNotLoaded)?;
+                let prompt_ids = b.llm_model.str_to_token(&prompt, AddBos::Always)
+                    .map_err(|e| EngineError::invalid_input(format!("tokenize: {e}")))?
+                    .into_iter().map(|t| t.0 as u32).collect::<Vec<_>>();
+                let text = if let Some(ref sid_str) = sid {
+                    let mut sess = b.sessions.remove(sid_str.as_str())
+                        .unwrap_or(SessionState { block_tables: Vec::new(), context_len: 0 });
+                    let r = b.run_decode(&prompt_ids, &mut sess, max_new, &sp,
+                        request.cancellation.as_ref(), None);
+                    b.sessions.insert(sid_str.clone(), sess);
+                    r?
+                } else {
+                    let mut tmp = SessionState { block_tables: Vec::new(), context_len: 0 };
+                    let r = b.run_decode(&prompt_ids, &mut tmp, max_new, &sp,
+                        request.cancellation.as_ref(), None);
+                    b.free_block_tables(&tmp.block_tables);
+                    r?
+                };
+                return Self::text_to_packet(text);
+            }
 
-            let text = if let Some(sid) = sid {
-                let mut session = inner.sessions.remove(sid)
-                    .unwrap_or_else(|| SessionState { block_tables: Vec::new(), context_len: 0 });
-                let r = inner.run_decode(&prompt_ids, &mut session, max_new, &sp,
-                    request.cancellation.as_ref(), None);
-                inner.sessions.insert(sid.to_string(), session);
-                r?
-            } else {
-                let mut tmp = SessionState { block_tables: Vec::new(), context_len: 0 };
-                let r = inner.run_decode(&prompt_ids, &mut tmp, max_new, &sp,
-                    request.cancellation.as_ref(), None);
-                inner.free_block_tables(&tmp.block_tables);
-                r?
+            // Greedy: prefill under lock, then hand off decode to coordinator
+            let (first_token, block_tables, context_len, eos) = {
+                let mut guard = self.inner.lock().unwrap();
+                let b = guard.as_mut().ok_or(EngineError::ModelNotLoaded)?;
+                let prompt_ids = b.llm_model.str_to_token(&prompt, AddBos::Always)
+                    .map_err(|e| EngineError::invalid_input(format!("tokenize: {e}")))?
+                    .into_iter().map(|t| t.0 as u32).collect::<Vec<_>>();
+                let (mut block_tables, ctx) = if let Some(ref s) = sid {
+                    let sess = b.sessions.remove(s.as_str())
+                        .unwrap_or(SessionState { block_tables: Vec::new(), context_len: 0 });
+                    (sess.block_tables, sess.context_len)
+                } else {
+                    (Vec::new(), 0usize)
+                };
+                for i in 0..prompt_ids.len() {
+                    b.ensure_block(&mut block_tables, ctx + i)?;
+                }
+                let ft = b.forward_prefill_greedy(&prompt_ids, ctx as u32, &block_tables)?;
+                let new_ctx = ctx + prompt_ids.len();
+                let eos = b.eos_token as u32;
+                (ft, block_tables, new_ctx, eos)
             };
 
-            Self::text_to_packet(text)
+            if max_new == 0 {
+                let mut guard = self.inner.lock().unwrap();
+                if let Some(b) = guard.as_mut() {
+                    if let Some(ref s) = sid {
+                        b.sessions.insert(s.clone(), SessionState { block_tables, context_len });
+                    } else {
+                        b.free_block_tables(&block_tables);
+                    }
+                }
+                return Self::text_to_packet(String::new());
+            }
+
+            let (tx, rx) = std::sync::mpsc::sync_channel::<Result<String, EngineError>>(128);
+            self.batch_dec.submit(DecodeState {
+                current_token: first_token, block_tables, context_len,
+                max_remaining: max_new, eos, session_id: sid, tx,
+            });
+
+            let mut out = String::new();
+            for piece in rx { out.push_str(&piece?); }
+            Self::text_to_packet(out)
         }
 
         fn infer_stream(&self, request: &InferenceRequest) -> EngineStream {
             let inner_arc = Arc::clone(&self.inner);
+            let batch_dec = Arc::clone(&self.batch_dec);
 
             let prompt = match Self::extract_prompt(request) {
                 Ok(p) => p,
                 Err(e) => return Box::pin(stream! { yield Err(e); }),
             };
             let (max_new, sp) = Self::decode_params(request);
-            let sid = request.session_id.clone();
+            let greedy = sp.temperature < 1e-6;
+            let sid    = request.session_id.clone();
             let cancel = request.cancellation.clone();
 
             let (tx, rx) = std::sync::mpsc::channel::<Result<String, EngineError>>();
 
             std::thread::spawn(move || {
-                let mut guard = match inner_arc.lock() {
-                    Ok(g) => g,
-                    Err(_) => { let _ = tx.send(Err(EngineError::backend("mutex poisoned"))); return; }
-                };
-                let b = match guard.as_mut() {
-                    Some(b) => b,
-                    None => { let _ = tx.send(Err(EngineError::ModelNotLoaded)); return; }
-                };
-
-                let prompt_ids: Vec<u32> = match b.llm_model.str_to_token(&prompt, AddBos::Always) {
-                    Ok(ids) => ids.into_iter().map(|t| t.0 as u32).collect(),
-                    Err(e) => {
-                        let _ = tx.send(Err(EngineError::invalid_input(format!("tokenize: {e}"))));
-                        return;
-                    }
-                };
-
-                let result = if let Some(ref sid) = sid {
-                    let mut session = b.sessions.remove(sid.as_str())
-                        .unwrap_or_else(|| SessionState { block_tables: Vec::new(), context_len: 0 });
-                    let r = b.run_decode(&prompt_ids, &mut session, max_new, &sp,
-                        cancel.as_ref(), Some(&tx));
-                    b.sessions.insert(sid.clone(), session);
-                    r
-                } else {
-                    let mut tmp = SessionState { block_tables: Vec::new(), context_len: 0 };
-                    let r = b.run_decode(&prompt_ids, &mut tmp, max_new, &sp,
-                        cancel.as_ref(), Some(&tx));
-                    b.free_block_tables(&tmp.block_tables);
-                    r
-                };
-
-                if let Err(e) = result {
-                    let _ = tx.send(Err(e));
+                // Non-greedy: single-sequence path
+                if !greedy {
+                    let mut guard = match inner_arc.lock() {
+                        Ok(g) => g,
+                        Err(_) => { let _ = tx.send(Err(EngineError::backend("mutex poisoned"))); return; }
+                    };
+                    let b = match guard.as_mut() {
+                        Some(b) => b,
+                        None => { let _ = tx.send(Err(EngineError::ModelNotLoaded)); return; }
+                    };
+                    let prompt_ids = match b.llm_model.str_to_token(&prompt, AddBos::Always) {
+                        Ok(ids) => ids.into_iter().map(|t| t.0 as u32).collect::<Vec<_>>(),
+                        Err(e) => { let _ = tx.send(Err(EngineError::invalid_input(format!("tokenize: {e}")))); return; }
+                    };
+                    let result = if let Some(ref sid_str) = sid {
+                        let mut sess = b.sessions.remove(sid_str.as_str())
+                            .unwrap_or(SessionState { block_tables: Vec::new(), context_len: 0 });
+                        let r = b.run_decode(&prompt_ids, &mut sess, max_new, &sp, cancel.as_ref(), Some(&tx));
+                        b.sessions.insert(sid_str.clone(), sess);
+                        r
+                    } else {
+                        let mut tmp = SessionState { block_tables: Vec::new(), context_len: 0 };
+                        let r = b.run_decode(&prompt_ids, &mut tmp, max_new, &sp, cancel.as_ref(), Some(&tx));
+                        b.free_block_tables(&tmp.block_tables);
+                        r
+                    };
+                    if let Err(e) = result { let _ = tx.send(Err(e)); }
+                    return;
                 }
+
+                // Greedy: prefill under lock, then coordinator
+                let result: Result<(), EngineError> = (|| {
+                    let (first_token, block_tables, context_len, eos) = {
+                        let mut guard = inner_arc.lock().unwrap();
+                        let b = guard.as_mut().ok_or(EngineError::ModelNotLoaded)?;
+                        let prompt_ids = b.llm_model.str_to_token(&prompt, AddBos::Always)
+                            .map_err(|e| EngineError::invalid_input(format!("tokenize: {e}")))?
+                            .into_iter().map(|t| t.0 as u32).collect::<Vec<_>>();
+                        let (mut block_tables, ctx) = if let Some(ref s) = sid {
+                            let sess = b.sessions.remove(s.as_str())
+                                .unwrap_or(SessionState { block_tables: Vec::new(), context_len: 0 });
+                            (sess.block_tables, sess.context_len)
+                        } else {
+                            (Vec::new(), 0usize)
+                        };
+                        for i in 0..prompt_ids.len() {
+                            b.ensure_block(&mut block_tables, ctx + i)?;
+                        }
+                        let ft = b.forward_prefill_greedy(&prompt_ids, ctx as u32, &block_tables)?;
+                        let new_ctx = ctx + prompt_ids.len();
+                        let eos = b.eos_token as u32;
+                        Ok::<_, EngineError>((ft, block_tables, new_ctx, eos))
+                    }?;
+
+                    if max_new == 0 {
+                        let mut guard = inner_arc.lock().unwrap();
+                        if let Some(b) = guard.as_mut() {
+                            if let Some(ref s) = sid {
+                                b.sessions.insert(s.clone(), SessionState { block_tables, context_len });
+                            } else {
+                                b.free_block_tables(&block_tables);
+                            }
+                        }
+                        return Ok(());
+                    }
+
+                    let (dec_tx, dec_rx) = std::sync::mpsc::sync_channel::<Result<String, EngineError>>(128);
+                    batch_dec.submit(DecodeState {
+                        current_token: first_token, block_tables, context_len,
+                        max_remaining: max_new, eos, session_id: sid, tx: dec_tx,
+                    });
+                    for piece in dec_rx {
+                        match piece {
+                            Ok(p)  => { if tx.send(Ok(p)).is_err() { break; } }
+                            Err(e) => { let _ = tx.send(Err(e)); break; }
+                        }
+                    }
+                    Ok(())
+                })();
+                if let Err(e) = result { let _ = tx.send(Err(e)); }
             });
 
             // Bridge blocking std::mpsc → async stream.
