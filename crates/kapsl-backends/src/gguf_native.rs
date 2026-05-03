@@ -1001,12 +1001,15 @@ mod inner {
     }
 
     struct BatchDecodeCoordinator {
-        submit_tx: std::sync::mpsc::Sender<DecodeState>,
+        submit_tx:    std::sync::mpsc::Sender<DecodeState>,
+        active_count: Arc<AtomicUsize>,
     }
 
     impl BatchDecodeCoordinator {
         fn spawn(inner: Arc<Mutex<Option<BackendInner>>>) -> Self {
             let (submit_tx, submit_rx) = std::sync::mpsc::channel::<DecodeState>();
+            let active_count = Arc::new(AtomicUsize::new(0));
+            let active_count_thread = Arc::clone(&active_count);
             std::thread::Builder::new()
                 .name("gguf-native-dec".into())
                 .spawn(move || {
@@ -1026,6 +1029,7 @@ mod inner {
                                 Err(_) => break,
                             }
                         }
+                        active_count_thread.store(active.len(), Ordering::Relaxed);
 
                         let mut guard = inner.lock().unwrap();
                         match guard.as_mut() {
@@ -1036,10 +1040,15 @@ mod inner {
                                 }
                             }
                         }
+                        active_count_thread.store(active.len(), Ordering::Relaxed);
                     }
                 })
                 .expect("spawn gguf-native-dec");
-            Self { submit_tx }
+            Self { submit_tx, active_count }
+        }
+
+        fn active_count(&self) -> usize {
+            self.active_count.load(Ordering::Relaxed)
         }
 
         fn submit(&self, state: DecodeState) {
@@ -1489,16 +1498,17 @@ mod inner {
         }
 
         fn metrics(&self) -> EngineMetrics {
+            let active = self.batch_dec.active_count();
             let g = self.inner.lock().unwrap();
             let (total, free, sessions) = g.as_ref()
                 .map(|b| (b.block_pool.total_blocks(), b.block_pool.free_count(), b.sessions.len()))
                 .unwrap_or((0, 0, 0));
             EngineMetrics {
                 inference_time: 0.0, memory_usage: 0, gpu_utilization: 0.0,
-                throughput: 0.0, batch_size: 1, queue_depth: 0, error_rate: 0.0,
+                throughput: 0.0, batch_size: active.max(1) as u32, queue_depth: 0, error_rate: 0.0,
                 collected_at_ms: 0, kv_cache_bytes_used: 0, kv_cache_bytes_capacity: 0,
                 kv_cache_blocks_total: total, kv_cache_blocks_free: free,
-                kv_cache_sequences: sessions,
+                kv_cache_sequences: sessions + active,
                 kv_cache_evicted_blocks: 0, kv_cache_evicted_sequences: 0,
                 kv_cache_packed_layers: 0,
             }
@@ -1511,8 +1521,12 @@ mod inner {
 
         fn model_info(&self) -> Option<EngineModelInfo> {
             let g = self.inner.lock().unwrap();
-            let cfg = g.as_ref().map(|b| b.config.clone())?;
-            let arch = cfg.architectures.first().cloned().unwrap_or_else(|| "gguf".into());
+            let b = g.as_ref()?;
+            let arch = b.config.architectures.first().cloned().unwrap_or_else(|| "gguf".into());
+            let nl  = b.config.num_hidden_layers;
+            let bs  = b.block_pool.block_size();
+            let bps = (b.config.max_position_embeddings + bs - 1) / bs;
+            let peak = (b.block_pool.total_blocks() / (nl * bps).max(1)).max(1) as u32;
             Some(EngineModelInfo {
                 input_names: vec!["text".into()],
                 output_names: vec!["text".into()],
@@ -1522,7 +1536,7 @@ mod inner {
                 output_dtypes: vec!["uint8".into()],
                 framework: Some("gguf-native".into()),
                 model_version: Some(arch),
-                peak_concurrency: Some(1),
+                peak_concurrency: Some(peak),
             })
         }
     }
