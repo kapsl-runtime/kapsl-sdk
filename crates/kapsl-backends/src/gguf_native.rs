@@ -1064,14 +1064,18 @@ mod inner {
     }
 
     // llama.cpp backend is a global singleton — can only be initialized once per process.
-    static LLAMA_BACKEND: OnceLock<Arc<LlamaBackend>> = OnceLock::new();
+    static LLAMA_BACKEND: OnceLock<Result<Arc<LlamaBackend>, String>> = OnceLock::new();
 
     fn get_llama_backend() -> Result<Arc<LlamaBackend>, EngineError> {
-        LLAMA_BACKEND.get_or_try_init(|| {
-            LlamaBackend::init()
-                .map(Arc::new)
-                .map_err(|e| EngineError::backend(format!("llama backend: {e}")))
-        }).cloned()
+        LLAMA_BACKEND
+            .get_or_init(|| {
+                LlamaBackend::init()
+                    .map(Arc::new)
+                    .map_err(|e| format!("llama backend: {e}"))
+            })
+            .as_ref()
+            .map(Arc::clone)
+            .map_err(|e| EngineError::backend(e.clone()))
     }
 
     // ── Batch decode coordinator ──────────────────────────────────────────────
