@@ -169,12 +169,14 @@ fn test_metrics_aggregation() {
         memory_usage: 10,
         gpu_utilization: 0.2,
         throughput: 5.0,
+        kv_cache_cpu_offloaded_blocks: 2,
         ..EngineMetrics::default()
     }));
     let engine_b: EngineHandle = Arc::new(MockEngine::new(EngineMetrics {
         memory_usage: 20,
         gpu_utilization: 0.6,
         throughput: 7.0,
+        kv_cache_cpu_offloaded_blocks: 3,
         ..EngineMetrics::default()
     }));
     let scheduler = build_scheduler_for_queue_tests(vec![engine_a, engine_b], 5, 1);
@@ -191,5 +193,6 @@ fn test_metrics_aggregation() {
     assert_eq!(metrics.memory_usage, 30);
     assert_eq!(metrics.throughput, 12.0);
     assert_eq!(metrics.queue_depth, 3);
+    assert_eq!(metrics.kv_cache_cpu_offloaded_blocks, 5);
     assert!((metrics.gpu_utilization - 0.4).abs() < 1e-6);
 }
