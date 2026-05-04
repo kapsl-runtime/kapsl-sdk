@@ -1,7 +1,7 @@
 //! Cross-device KV block pool scheduler.
 //!
-//! Manages a fleet of `GpuBlockPool`s across multiple CUDA devices plus an
-//! optional CPU eviction tier, presenting a single admission interface to
+//! Manages a fleet of `GpuBlockPool`s across multiple CUDA devices plus a
+//! per-geometry CPU eviction tier, presenting a single admission interface to
 //! request handlers.
 //!
 //! # What this enables vs vLLM
@@ -19,11 +19,14 @@
 //!
 //! ```text
 //! Request arrives
-//!   └─► reserve_blocks()
+//!   └─► reserve_blocks() / reserve_with_prefix()
+//!         ├─ (prefix path) lookup prefix cache → borrow matching blocks
 //!         ├─ Try preferred device (most cache-warm)
 //!         ├─ Try other devices by free-block count descending
 //!         └─ If all at capacity:
-//!               evict_until_capacity() — LRU sessions → CPU
+//!               evict_until_capacity():
+//!                 Phase 1 — free zero-refcount prefix cache blocks (no transfer)
+//!                 Phase 2 — evict LRU live sessions → CPU
 //!               retry preferred device
 //! ```
 //!
@@ -33,10 +36,29 @@
 //! Device A pressure > threshold
 //!   └─► find sessions on A, sort by LRU
 //!         ├─ For each session: evict_session_to_cpu()
-//!         │     download GPU blocks → CpuBlockStore, free GPU blocks
+//!         │     release prefix borrows; download owned GPU blocks → CpuBlockStore
 //!         └─ On next request for that session:
 //!               restore_session_to_gpu() — uploads CPU blocks → GPU
 //! ```
+//!
+//! # CPU store geometry
+//!
+//! Each `CpuBlockStore` is geometry-specific: it holds blocks of exactly
+//! `2 * num_kv_heads * block_size * head_dim` f16 elements. When a pool with
+//! a new geometry is registered, a matching `CpuBlockStore` is created
+//! automatically. This ensures sessions with different KV shapes (e.g. a
+//! 7B model with 8 heads vs a 70B model with 64 heads) can each be evicted
+//! independently without size mismatches.
+//!
+//! # Prefix cache
+//!
+//! When `enable_prefix_cache` is called, `reserve_with_prefix` can reuse
+//! already-computed KV blocks for shared prompt prefixes.  Borrowed prefix
+//! blocks are reference-counted — `evict_until_capacity` reclaims
+//! zero-refcount entries before evicting live sessions to CPU.
+//!
+//! After a request completes, the runtime can call `promote_to_prefix_cache`
+//! to donate the session's newly computed blocks to the cache for future reuse.
 
 #[cfg(feature = "cuda")]
 mod inner {
@@ -46,8 +68,9 @@ mod inner {
 
     use crate::cpu_block_store::{CpuBlockStore, CpuStoreError};
     use crate::gpu_arena::{ArenaError, GpuBlockPool};
+    use crate::prefix_cache::{CachedBlockRef, PrefixBlockCache};
 
-    // ── Error ──────────────────────────────────────────────────────���──────────
+    // ── Error ─────────────────────────────────────────────────────────────────
 
     #[derive(Debug, thiserror::Error)]
     pub enum SchedulerError {
@@ -57,6 +80,8 @@ mod inner {
         SessionNotFound(u64),
         #[error("Device {0} not registered")]
         DeviceNotFound(usize),
+        #[error("No CPU store registered for geometry ({0}h × {1}d)")]
+        NoCpuStore(usize, usize),
         #[error("GPU error: {0}")]
         Gpu(#[from] ArenaError),
         #[error("CPU store error: {0}")]
@@ -75,15 +100,27 @@ mod inner {
     #[derive(Debug)]
     pub struct SessionState {
         pub tier:        KvTier,
-        /// The GPU pool that holds the blocks when `tier == Gpu`. None on CPU.
+        /// The GPU pool that owns the blocks when `tier == Gpu`.
         pub pool:        Option<Arc<GpuBlockPool>>,
-        /// Physical block indices (GPU block IDs when on GPU, CPU slot IDs when on CPU).
+        /// All block IDs.  On GPU: first `n_prefix_blocks` are borrowed from the
+        /// prefix cache; the rest are owned.  On CPU: all are owned CPU slots.
         pub blocks:      Vec<u32>,
         /// Last time this session executed a forward pass — used for LRU eviction.
         pub last_active: Instant,
+        /// KV geometry — preserved across eviction so we can find the right
+        /// `CpuBlockStore` without the pool reference.
+        pub kv_geom:     (usize, usize),
+        /// Number of leading blocks borrowed from the prefix cache.
+        /// Zero when the prefix cache is disabled or no prefix was matched.
+        pub n_prefix_blocks:   usize,
+        /// Chained block hashes for the borrowed prefix blocks (parallel to
+        /// `blocks[..n_prefix_blocks]`).  Used to release cache refcounts.
+        pub prefix_hashes:     Vec<u64>,
+        /// Model fingerprint used for prefix cache lookups and releases.
+        pub model_fingerprint: u64,
     }
 
-    // ── Reserve result ────────────────────────────────────────────────────────
+    // ── Reserve results ───────────────────────────────────────────────────────
 
     pub struct ReserveResult {
         pub device_id: usize,
@@ -91,9 +128,20 @@ mod inner {
         pub blocks:    Vec<u32>,
     }
 
+    /// Result from [`CrossDevicePoolScheduler::reserve_with_prefix`].
+    pub struct PrefixReserveResult {
+        pub device_id: usize,
+        pub pool:      Arc<GpuBlockPool>,
+        /// All block IDs for the session: `blocks[..n_prefix_hits]` are borrowed
+        /// from the prefix cache; `blocks[n_prefix_hits..]` are freshly allocated.
+        pub blocks:        Vec<u32>,
+        /// How many leading blocks came from the prefix cache.
+        pub n_prefix_hits: usize,
+    }
+
     // ── Scheduler ─────────────────────────────────────────────────────────────
 
-    /// GPU-wide KV block admission and migration controller.
+    /// GPU-wide KV block admission, migration, and prefix-cache controller.
     pub struct CrossDevicePoolScheduler {
         /// device_id → list of pools registered for that device.
         device_pools: HashMap<usize, Vec<Arc<GpuBlockPool>>>,
@@ -101,22 +149,48 @@ mod inner {
         sessions: HashMap<u64, SessionState>,
         /// Pool utilisation fraction above which LRU eviction to CPU is triggered.
         evict_threshold: f32,
+        /// Per-geometry CPU eviction stores, keyed by (num_kv_heads, head_dim).
+        cpu_stores: HashMap<(usize, usize), CpuBlockStore>,
+        /// Slot capacity used when creating a new `CpuBlockStore` for a geometry.
+        cpu_store_capacity: usize,
+        /// Optional prefix KV-block cache.
+        prefix_cache: Option<PrefixBlockCache>,
     }
 
     impl CrossDevicePoolScheduler {
-        pub fn new(evict_threshold: f32) -> Self {
+        /// Create a scheduler.
+        ///
+        /// `evict_threshold` — GPU utilisation fraction (0.5–0.99) above which
+        /// LRU sessions are offloaded to CPU to make room for new ones.
+        ///
+        /// `cpu_store_capacity` — number of block slots in each per-geometry
+        /// `CpuBlockStore` created when a new pool geometry is registered.
+        pub fn new(evict_threshold: f32, cpu_store_capacity: usize) -> Self {
             Self {
-                device_pools: HashMap::new(),
-                sessions: HashMap::new(),
-                evict_threshold: evict_threshold.clamp(0.5, 0.99),
+                device_pools:       HashMap::new(),
+                sessions:           HashMap::new(),
+                evict_threshold:    evict_threshold.clamp(0.5, 0.99),
+                cpu_stores:         HashMap::new(),
+                cpu_store_capacity,
+                prefix_cache:       None,
             }
         }
 
         // ── Pool registration ─────────────────────────────────────────────────
 
         /// Register a `GpuBlockPool` for a device.  Multiple pools per device
-        /// are allowed (e.g. one per KV geometry).
+        /// are allowed (e.g. one per KV geometry).  A matching `CpuBlockStore`
+        /// is created automatically for the pool's geometry if none exists yet.
         pub fn register_pool(&mut self, device_id: usize, pool: Arc<GpuBlockPool>) {
+            let geom = (pool.num_kv_heads(), pool.head_dim());
+            self.cpu_stores.entry(geom).or_insert_with(|| {
+                CpuBlockStore::new(
+                    self.cpu_store_capacity,
+                    pool.num_kv_heads(),
+                    pool.block_size(),
+                    pool.head_dim(),
+                )
+            });
             self.device_pools.entry(device_id).or_default().push(pool);
         }
 
@@ -125,14 +199,26 @@ mod inner {
             self.device_pools.remove(&device_id);
         }
 
+        // ── Prefix cache ──────────────────────────────────────────────────────
+
+        /// Enable the prefix block cache.
+        ///
+        /// `capacity` is the maximum number of GPU blocks the cache may hold
+        /// simultaneously.  Calling this after sessions exist is valid but
+        /// replaces the cache — any in-flight borrows are implicitly abandoned
+        /// (the GPU blocks will be freed on the next `evict_lru` call).
+        pub fn enable_prefix_cache(&mut self, capacity: usize) {
+            self.prefix_cache = Some(PrefixBlockCache::new(capacity));
+        }
+
         // ── Session lifecycle ─────────────────────────────────────────────────
 
-        /// Reserve `blocks_needed` blocks for a session.
+        /// Reserve `blocks_needed` blocks for a new session without prefix reuse.
         ///
-        /// 1. Tries `preferred_device` first.
+        /// 1. Tries `preferred_device` first (most cache-warm).
         /// 2. Falls back to other devices ordered by free-block count.
-        /// 3. If all devices are at capacity, evicts LRU sessions to `cpu_store`
-        ///    and retries on `preferred_device`.
+        /// 3. If all devices are at capacity, evicts LRU sessions to their
+        ///    geometry-matched `CpuBlockStore` and retries on `preferred_device`.
         pub fn reserve_blocks(
             &mut self,
             session_id: u64,
@@ -140,59 +226,202 @@ mod inner {
             preferred_device: Option<usize>,
             kv_heads: usize,
             head_dim: usize,
-            cpu_store: &mut CpuBlockStore,
         ) -> Result<ReserveResult, SchedulerError> {
-            // 1. Preferred device
             if let Some(dev) = preferred_device {
                 if let Some(r) = self.try_reserve_on(dev, blocks_needed, kv_heads, head_dim)? {
-                    self.record_session(session_id, r.device_id, r.pool.clone(), r.blocks.clone());
+                    self.record_session(
+                        session_id, r.device_id, r.pool.clone(), r.blocks.clone(),
+                        kv_heads, head_dim, 0, vec![], 0,
+                    );
                     return Ok(r);
                 }
             }
 
-            // 2. All other devices, most-free first
             let mut others: Vec<usize> = self.device_pools.keys()
                 .filter(|&&d| Some(d) != preferred_device)
                 .copied()
                 .collect();
-            others.sort_by_key(|&d| {
-                usize::MAX - self.device_free_blocks(d, kv_heads, head_dim)
-            });
+            others.sort_by_key(|&d| usize::MAX - self.device_free_blocks(d, kv_heads, head_dim));
+
             for dev in others {
                 if let Some(r) = self.try_reserve_on(dev, blocks_needed, kv_heads, head_dim)? {
-                    self.record_session(session_id, r.device_id, r.pool.clone(), r.blocks.clone());
+                    self.record_session(
+                        session_id, r.device_id, r.pool.clone(), r.blocks.clone(),
+                        kv_heads, head_dim, 0, vec![], 0,
+                    );
                     return Ok(r);
                 }
             }
 
-            // 3. Evict LRU to CPU, then retry preferred (or first) device
             let target = preferred_device
                 .or_else(|| self.device_pools.keys().copied().next())
                 .ok_or(SchedulerError::InsufficientCapacity { blocks_needed, kv_heads, head_dim })?;
 
-            self.evict_until_capacity(target, blocks_needed, kv_heads, head_dim, cpu_store)?;
+            self.evict_until_capacity(target, blocks_needed, kv_heads, head_dim)?;
 
             if let Some(r) = self.try_reserve_on(target, blocks_needed, kv_heads, head_dim)? {
-                self.record_session(session_id, r.device_id, r.pool.clone(), r.blocks.clone());
+                self.record_session(
+                    session_id, r.device_id, r.pool.clone(), r.blocks.clone(),
+                    kv_heads, head_dim, 0, vec![], 0,
+                );
                 return Ok(r);
             }
 
             Err(SchedulerError::InsufficientCapacity { blocks_needed, kv_heads, head_dim })
         }
 
-        /// Release all blocks held by a session (GPU or CPU).
+        /// Reserve blocks with prefix cache lookup.
         ///
-        /// `cpu_store` is only mutated if the session is on CPU.
-        pub fn release_session(&mut self, session_id: u64, cpu_store: &mut CpuBlockStore) {
+        /// 1. Looks up `prefix_hashes` in the cache, collecting a contiguous
+        ///    leading run of hits and incrementing their refcounts.
+        /// 2. Prefers the device that holds the most prefix hits.
+        /// 3. Allocates `additional_blocks` new blocks on that device.
+        /// 4. Returns a combined block list: cached prefix blocks first, then
+        ///    the newly allocated blocks.
+        ///
+        /// The session is recorded with `n_prefix_blocks = n_hits` so that
+        /// `release_session` decrements cache refcounts rather than freeing
+        /// those GPU blocks.
+        pub fn reserve_with_prefix(
+            &mut self,
+            session_id: u64,
+            model_fingerprint: u64,
+            prefix_hashes: &[u64],
+            additional_blocks: usize,
+            preferred_device: Option<usize>,
+            kv_heads: usize,
+            head_dim: usize,
+        ) -> Result<PrefixReserveResult, SchedulerError> {
+            // 1. Prefix cache lookup.
+            let hits: Vec<CachedBlockRef> = match &mut self.prefix_cache {
+                Some(cache) => cache.lookup(model_fingerprint, prefix_hashes),
+                None        => vec![],
+            };
+            let n_hits = hits.len();
+
+            // 2. Determine target device.
+            let target_device = if n_hits > 0 {
+                let mut counts: HashMap<usize, usize> = HashMap::new();
+                for h in &hits { *counts.entry(h.device_id).or_insert(0) += 1; }
+                counts.into_iter().max_by_key(|(_, c)| *c).map(|(d, _)| d).unwrap()
+            } else {
+                preferred_device
+                    .or_else(|| {
+                        self.device_pools.iter()
+                            .max_by_key(|(_, ps)| {
+                                ps.iter()
+                                    .filter(|p| p.is_compatible(kv_heads, head_dim))
+                                    .map(|p| p.free_count())
+                                    .sum::<usize>()
+                            })
+                            .map(|(&d, _)| d)
+                    })
+                    .ok_or(SchedulerError::InsufficientCapacity {
+                        blocks_needed: additional_blocks, kv_heads, head_dim,
+                    })?
+            };
+
+            // 3. Allocate additional blocks.
+            let new_result = {
+                let r = self.try_reserve_on(target_device, additional_blocks, kv_heads, head_dim)?;
+                if let Some(r) = r {
+                    r
+                } else {
+                    self.evict_until_capacity(target_device, additional_blocks, kv_heads, head_dim)?;
+                    self.try_reserve_on(target_device, additional_blocks, kv_heads, head_dim)?
+                        .ok_or(SchedulerError::InsufficientCapacity {
+                            blocks_needed: additional_blocks, kv_heads, head_dim,
+                        })?
+                }
+            };
+
+            // 4. Build combined block list and register session.
+            let mut all_blocks: Vec<u32>  = hits.iter().map(|h| h.block_id).collect();
+            let prefix_hash_vec: Vec<u64> = hits.iter().map(|h| h.block_hash).collect();
+            let pool      = new_result.pool.clone();
+            let device_id = new_result.device_id;
+            all_blocks.extend_from_slice(&new_result.blocks);
+
+            self.record_session(
+                session_id, device_id, pool.clone(), all_blocks.clone(),
+                kv_heads, head_dim,
+                n_hits, prefix_hash_vec, model_fingerprint,
+            );
+
+            Ok(PrefixReserveResult { device_id, pool, blocks: all_blocks, n_prefix_hits: n_hits })
+        }
+
+        /// Donate a session's computed KV blocks to the prefix cache.
+        ///
+        /// Transfers ownership of `blocks[n_already_prefix..n_already_prefix + n_blocks]`
+        /// from the session to the prefix cache (refcount = 1 while the session is
+        /// still live).  When `release_session` is called, refcounts drop to 0 and
+        /// the blocks become eligible for LRU eviction — but the GPU memory is
+        /// retained for future sessions with the same prefix.
+        ///
+        /// `hashes` must be the chained block hashes for the blocks being promoted,
+        /// in order.  Blocks for which `cache.insert` fails (cache full, all
+        /// entries live) are silently skipped — the session still owns them and
+        /// they will be freed on `release_session`.
+        pub fn promote_to_prefix_cache(
+            &mut self,
+            session_id: u64,
+            model_fingerprint: u64,
+            n_blocks: usize,
+            hashes: &[u64],
+        ) {
+            let Some(state) = self.sessions.get(&session_id) else { return };
+            let KvTier::Gpu { device_id } = state.tier else { return };
+            let Some(pool) = state.pool.clone() else { return };
+            let already     = state.n_prefix_blocks;
+            let promote_end = (already + n_blocks).min(state.blocks.len());
+            let blocks_copy: Vec<u32> = state.blocks[already..promote_end].to_vec();
+
+            let Some(cache) = &mut self.prefix_cache else { return };
+
+            let mut promoted = 0usize;
+            for (i, &block_id) in blocks_copy.iter().enumerate() {
+                let Some(&hash) = hashes.get(i) else { break };
+                if cache.insert(model_fingerprint, hash, device_id, pool.clone(), block_id, 1) {
+                    promoted += 1;
+                } else {
+                    break;
+                }
+            }
+
+            if promoted == 0 { return; }
+
+            let state = self.sessions.get_mut(&session_id).unwrap();
+            let new_n   = already + promoted;
+            let mut new_hashes = state.prefix_hashes.clone();
+            new_hashes.extend_from_slice(&hashes[..promoted]);
+            state.n_prefix_blocks   = new_n;
+            state.prefix_hashes     = new_hashes;
+            state.model_fingerprint = model_fingerprint;
+        }
+
+        /// Release all blocks held by a session (GPU or CPU).
+        pub fn release_session(&mut self, session_id: u64) {
             let Some(state) = self.sessions.remove(&session_id) else { return };
             match state.tier {
                 KvTier::Gpu { .. } => {
+                    // Decrement prefix cache borrows.
+                    if let Some(cache) = &mut self.prefix_cache {
+                        for &hash in &state.prefix_hashes {
+                            cache.release(state.model_fingerprint, hash);
+                        }
+                    }
+                    // Free owned blocks.
                     if let Some(pool) = state.pool {
-                        for b in state.blocks { pool.free_block(b); }
+                        for &b in &state.blocks[state.n_prefix_blocks..] {
+                            pool.free_block(b);
+                        }
                     }
                 }
                 KvTier::Cpu => {
-                    cpu_store.free_slots_bulk(&state.blocks);
+                    if let Some(store) = self.cpu_stores.get_mut(&state.kv_geom) {
+                        store.free_slots_bulk(&state.blocks);
+                    }
                 }
             }
         }
@@ -206,23 +435,39 @@ mod inner {
 
         // ── Cross-tier migration ──────────────────────────────────────────────
 
-        /// Evict a GPU session to CPU storage, freeing its GPU blocks.
+        /// Evict a GPU session to its geometry's CPU store, freeing its GPU blocks.
+        ///
+        /// If the session has prefix-borrowed blocks, their cache refcounts are
+        /// decremented first and only the owned blocks are transferred to CPU.
         pub fn evict_session_to_cpu(
             &mut self,
             session_id: u64,
-            cpu_store: &mut CpuBlockStore,
         ) -> Result<(), SchedulerError> {
             let state = self.sessions.get(&session_id)
                 .ok_or(SchedulerError::SessionNotFound(session_id))?;
 
-            // Already on CPU — nothing to do.
             if state.tier == KvTier::Cpu { return Ok(()); }
 
-            let pool       = state.pool.clone().unwrap();
-            let gpu_blocks = state.blocks.clone();
+            let pool          = state.pool.clone().unwrap();
+            let n_prefix      = state.n_prefix_blocks;
+            let prefix_hashes = state.prefix_hashes.clone();
+            let model_fp      = state.model_fingerprint;
+            let kv_geom       = state.kv_geom;
+            let owned_blocks: Vec<u32> = state.blocks[n_prefix..].to_vec();
 
-            let mut cpu_slots = Vec::with_capacity(gpu_blocks.len());
-            for &blk in &gpu_blocks {
+            // Release prefix borrows — the session is leaving GPU residency.
+            if let Some(cache) = &mut self.prefix_cache {
+                for &hash in &prefix_hashes {
+                    cache.release(model_fp, hash);
+                }
+            }
+
+            // Download only owned blocks to CPU.
+            let cpu_store = self.cpu_stores.get_mut(&kv_geom)
+                .ok_or(SchedulerError::NoCpuStore(kv_geom.0, kv_geom.1))?;
+
+            let mut cpu_slots = Vec::with_capacity(owned_blocks.len());
+            for &blk in &owned_blocks {
                 let data = pool.download_block(blk)?;
                 let slot = cpu_store.store_block(&data)?;
                 pool.free_block(blk);
@@ -230,43 +475,56 @@ mod inner {
             }
 
             let state = self.sessions.get_mut(&session_id).unwrap();
-            state.tier   = KvTier::Cpu;
-            state.pool   = None;
-            state.blocks = cpu_slots;
+            state.tier            = KvTier::Cpu;
+            state.pool            = None;
+            state.blocks          = cpu_slots;
+            state.n_prefix_blocks = 0;
+            state.prefix_hashes   = vec![];
 
             log::debug!(
                 "[xdev-sched] evicted session {} → CPU ({} blocks)",
-                session_id, gpu_blocks.len(),
+                session_id, owned_blocks.len(),
             );
             Ok(())
         }
 
         /// Restore a CPU-offloaded session to a GPU device.
+        ///
+        /// The geometry and matching `CpuBlockStore` are resolved automatically
+        /// from the session's stored `kv_geom`.  CPU slots are freed after
+        /// successful upload.
         pub fn restore_session_to_gpu(
             &mut self,
             session_id: u64,
             target_device: usize,
-            kv_heads: usize,
-            head_dim: usize,
-            cpu_store: &CpuBlockStore,
         ) -> Result<(), SchedulerError> {
             let state = self.sessions.get(&session_id)
                 .ok_or(SchedulerError::SessionNotFound(session_id))?;
 
             if state.tier != KvTier::Cpu { return Ok(()); }
 
-            let n_blocks  = state.blocks.len();
-            let cpu_slots = state.blocks.clone();
+            let n_blocks             = state.blocks.len();
+            let cpu_slots            = state.blocks.clone();
+            let kv_geom              = state.kv_geom;
+            let (kv_heads, head_dim) = kv_geom;
 
             let result = self.try_reserve_on(target_device, n_blocks, kv_heads, head_dim)?
                 .ok_or(SchedulerError::InsufficientCapacity {
-                    blocks_needed: n_blocks, kv_heads, head_dim
+                    blocks_needed: n_blocks, kv_heads, head_dim,
                 })?;
 
-            for (&gpu_blk, &cpu_slot) in result.blocks.iter().zip(&cpu_slots) {
-                let data     = cpu_store.load_block(cpu_slot)?;
-                let half_len = data.len() / 2;
-                result.pool.upload_block(gpu_blk, &data[..half_len], &data[half_len..])?;
+            {
+                let cpu_store = self.cpu_stores.get(&kv_geom)
+                    .ok_or(SchedulerError::NoCpuStore(kv_geom.0, kv_geom.1))?;
+                for (&gpu_blk, &cpu_slot) in result.blocks.iter().zip(&cpu_slots) {
+                    let data     = cpu_store.load_block(cpu_slot)?;
+                    let half_len = data.len() / 2;
+                    result.pool.upload_block(gpu_blk, &data[..half_len], &data[half_len..])?;
+                }
+            }
+
+            if let Some(store) = self.cpu_stores.get_mut(&kv_geom) {
+                store.free_slots_bulk(&cpu_slots);
             }
 
             let state = self.sessions.get_mut(&session_id).unwrap();
@@ -281,17 +539,16 @@ mod inner {
             Ok(())
         }
 
-        /// Move a session from one GPU to another.
+        /// Move a session from one GPU to another via host memory.
         ///
-        /// Blocks are copied through host memory (PCIe / NVLink, no peer access
-        /// required). On NVLink systems this completes in tens of microseconds
-        /// per block; on PCIe in hundreds.
+        /// Prefix-borrowed blocks are copied to the new device (the KV data is
+        /// preserved), but their cache borrows are released and the copies become
+        /// owned by the session.  This avoids cross-device dangling references
+        /// into the prefix cache.
         pub fn migrate_session(
             &mut self,
             session_id: u64,
             target_device: usize,
-            kv_heads: usize,
-            head_dim: usize,
         ) -> Result<(), SchedulerError> {
             let state = self.sessions.get(&session_id)
                 .ok_or(SchedulerError::SessionNotFound(session_id))?;
@@ -301,24 +558,42 @@ mod inner {
             };
             if src_device == target_device { return Ok(()); }
 
-            let n_blocks  = state.blocks.len();
-            let src_pool  = state.pool.clone().unwrap();
-            let src_blocks = state.blocks.clone();
+            let n_blocks      = state.blocks.len();
+            let n_prefix      = state.n_prefix_blocks;
+            let src_pool      = state.pool.clone().unwrap();
+            let src_blocks    = state.blocks.clone();
+            let prefix_hashes = state.prefix_hashes.clone();
+            let model_fp      = state.model_fingerprint;
+            let (kv_heads, head_dim) = state.kv_geom;
 
             let result = self.try_reserve_on(target_device, n_blocks, kv_heads, head_dim)?
                 .ok_or(SchedulerError::InsufficientCapacity {
-                    blocks_needed: n_blocks, kv_heads, head_dim
+                    blocks_needed: n_blocks, kv_heads, head_dim,
                 })?;
 
-            for (&src_blk, &dst_blk) in src_blocks.iter().zip(&result.blocks) {
+            for (i, (&src_blk, &dst_blk)) in src_blocks.iter().zip(&result.blocks).enumerate() {
                 src_pool.copy_block_to_pool(src_blk, &result.pool, dst_blk)?;
-                src_pool.free_block(src_blk);
+                // Only free source blocks that are owned by this session.
+                // Prefix-borrowed blocks belong to the cache — release the
+                // borrow below instead of freeing.
+                if i >= n_prefix {
+                    src_pool.free_block(src_blk);
+                }
+            }
+
+            // Release prefix borrows now that data is safe on the new device.
+            if let Some(cache) = &mut self.prefix_cache {
+                for &hash in &prefix_hashes {
+                    cache.release(model_fp, hash);
+                }
             }
 
             let state = self.sessions.get_mut(&session_id).unwrap();
-            state.tier   = KvTier::Gpu { device_id: target_device };
-            state.pool   = Some(result.pool);
-            state.blocks = result.blocks;
+            state.tier            = KvTier::Gpu { device_id: target_device };
+            state.pool            = Some(result.pool);
+            state.blocks          = result.blocks;
+            state.n_prefix_blocks = 0;   // all blocks now fully owned by this session
+            state.prefix_hashes   = vec![];
 
             log::info!(
                 "[xdev-sched] migrated session {} GPU {}→{} ({} blocks)",
@@ -353,14 +628,17 @@ mod inner {
             v
         }
 
-        pub fn session_count(&self)                       -> usize { self.sessions.len() }
-        pub fn sessions_on_cpu(&self)                     -> usize {
+        pub fn session_count(&self)                        -> usize { self.sessions.len() }
+        pub fn sessions_on_cpu(&self)                      -> usize {
             self.sessions.values().filter(|s| s.tier == KvTier::Cpu).count()
         }
         pub fn sessions_on_device(&self, device_id: usize) -> usize {
             self.sessions.values()
                 .filter(|s| s.tier == KvTier::Gpu { device_id })
                 .count()
+        }
+        pub fn prefix_cache_size(&self) -> usize {
+            self.prefix_cache.as_ref().map_or(0, |c| c.entry_count())
         }
 
         // ── Internal helpers ──────────────────────────────────────────────────
@@ -390,7 +668,6 @@ mod inner {
                 if ok {
                     return Ok(Some(ReserveResult { device_id, pool: pool.clone(), blocks }));
                 }
-                // Partial allocation: roll back and try next pool.
                 for b in blocks { pool.free_block(b); }
             }
             Ok(None)
@@ -402,26 +679,54 @@ mod inner {
             device_id: usize,
             pool: Arc<GpuBlockPool>,
             blocks: Vec<u32>,
+            kv_heads: usize,
+            head_dim: usize,
+            n_prefix_blocks: usize,
+            prefix_hashes: Vec<u64>,
+            model_fingerprint: u64,
         ) {
             self.sessions.insert(session_id, SessionState {
-                tier:        KvTier::Gpu { device_id },
-                pool:        Some(pool),
+                tier:             KvTier::Gpu { device_id },
+                pool:             Some(pool),
                 blocks,
-                last_active: Instant::now(),
+                last_active:      Instant::now(),
+                kv_geom:          (kv_heads, head_dim),
+                n_prefix_blocks,
+                prefix_hashes,
+                model_fingerprint,
             });
         }
 
-        /// Evict least-recently-used sessions from `device_id` until at least
-        /// `blocks_needed` blocks are free.
+        /// Evict sessions / prefix cache entries on `device_id` until at least
+        /// `blocks_needed` blocks are free for the given geometry.
+        ///
+        /// Phase 1 — free zero-refcount prefix cache entries (no CPU transfer).
+        /// Phase 2 — evict LRU live sessions to CPU (expensive, done only if
+        ///            Phase 1 was insufficient).
         fn evict_until_capacity(
             &mut self,
             device_id: usize,
             blocks_needed: usize,
             kv_heads: usize,
             head_dim: usize,
-            cpu_store: &mut CpuBlockStore,
         ) -> Result<(), SchedulerError> {
-            // Snapshot candidate session IDs (oldest first) before mutating.
+            // Phase 1: free zero-refcount prefix cache blocks — no CPU transfer.
+            if self.prefix_cache.is_some() {
+                let free_now = self.device_free_blocks(device_id, kv_heads, head_dim);
+                if free_now < blocks_needed {
+                    let to_evict = blocks_needed - free_now;
+                    // evict_lru_for_device returns owned Vec, so the mutable borrow ends here.
+                    let freed = self.prefix_cache.as_mut().unwrap()
+                        .evict_lru_for_device(device_id, to_evict);
+                    for (pool, block_id) in freed {
+                        if pool.is_compatible(kv_heads, head_dim) {
+                            pool.free_block(block_id);
+                        }
+                    }
+                }
+            }
+
+            // Phase 2: evict live sessions to CPU if still insufficient.
             let mut candidates: Vec<(u64, Instant)> = self.sessions.iter()
                 .filter(|(_, s)| {
                     s.tier == KvTier::Gpu { device_id } &&
@@ -435,7 +740,7 @@ mod inner {
                 if self.device_free_blocks(device_id, kv_heads, head_dim) >= blocks_needed {
                     break;
                 }
-                self.evict_session_to_cpu(evict_id, cpu_store)?;
+                self.evict_session_to_cpu(evict_id)?;
             }
             Ok(())
         }
@@ -443,4 +748,7 @@ mod inner {
 }
 
 #[cfg(feature = "cuda")]
-pub use inner::{CrossDevicePoolScheduler, KvTier, ReserveResult, SchedulerError, SessionState};
+pub use inner::{
+    CrossDevicePoolScheduler, KvTier, PrefixReserveResult, ReserveResult,
+    SchedulerError, SessionState,
+};

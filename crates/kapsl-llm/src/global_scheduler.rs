@@ -55,6 +55,12 @@ pub struct EngineHandle {
     /// Relative share weight.  An engine with weight 2 gets twice the token
     /// budget of one with weight 1 when both are active.
     pub share_weight: u32,
+    /// Minimum tokens always guaranteed to this engine regardless of load.
+    /// Defaults to 0 (no guarantee).
+    pub guaranteed_min_tokens: usize,
+    /// Hard cap on this engine's total token budget (elastic + guaranteed).
+    /// `None` means uncapped — the engine may absorb idle peers' shares.
+    pub max_tokens: Option<usize>,
 }
 
 /// Per-engine token budget issued by [`GlobalKvScheduler::allocate_budgets`].
@@ -97,6 +103,11 @@ struct EngineState {
     last_used_tokens: usize,
     /// Whether the engine had any pending requests in the last round.
     was_active: bool,
+    /// Elastic quota lower bound — always reserved for this engine.
+    guaranteed_min_tokens: usize,
+    /// Elastic quota upper bound — engine never exceeds this, even when
+    /// absorbing idle peers' shares.  `None` = uncapped.
+    max_tokens: Option<usize>,
 }
 
 /// Cross-model token-budget coordinator.
@@ -104,6 +115,13 @@ struct EngineState {
 /// Maintains a registry of active [`EngineHandle`]s and distributes the
 /// global token budget proportionally each scheduling round. Also accepts and
 /// routes cross-engine preemption requests.
+///
+/// ## Hard admission (Phase 2)
+///
+/// Callers use [`try_reserve_tokens`] to claim a token budget before queuing a
+/// request.  The reservation is deducted from the engine's current computed
+/// budget so that concurrent requests can't overcommit.  [`release_tokens`]
+/// returns the budget when the request completes or is cancelled.
 #[derive(Debug)]
 pub struct GlobalKvScheduler {
     /// Total tokens available per scheduling round across all engines.
@@ -115,6 +133,13 @@ pub struct GlobalKvScheduler {
     /// expressed as a per-mille value (1000 = 100 %).  Prevents monopolisation
     /// even when all other engines are idle.  Default: 900 ‰ (90 %).
     max_single_engine_permille: u32,
+    /// In-flight token reservations per engine (engine_id → tokens reserved).
+    /// Updated atomically by try_reserve_tokens / complete_tokens.
+    reserved_tokens: HashMap<u32, usize>,
+    /// Number of requests currently in-flight per engine.
+    /// Used to drive set_active: the engine is marked active when inflight 0→1
+    /// and idle when inflight 1→0, so allocate_budgets reflects real activity.
+    inflight: HashMap<u32, usize>,
 }
 
 impl GlobalKvScheduler {
@@ -125,6 +150,8 @@ impl GlobalKvScheduler {
             engines: HashMap::new(),
             engine_order: Vec::new(),
             max_single_engine_permille: 900,
+            reserved_tokens: HashMap::new(),
+            inflight: HashMap::new(),
         }
     }
 
@@ -136,10 +163,12 @@ impl GlobalKvScheduler {
     }
 
     /// Register an engine.  If the engine was already registered its weight
-    /// is updated.
+    /// and quota bounds are updated.
     pub fn register(&mut self, handle: EngineHandle) {
         if !self.engines.contains_key(&handle.engine_id) {
             self.engine_order.push(handle.engine_id);
+            // Clear any stale reservation from a previous incarnation.
+            self.reserved_tokens.remove(&handle.engine_id);
         }
         self.engines.insert(
             handle.engine_id,
@@ -147,6 +176,8 @@ impl GlobalKvScheduler {
                 share_weight: handle.share_weight.max(1),
                 last_used_tokens: 0,
                 was_active: false,
+                guaranteed_min_tokens: handle.guaranteed_min_tokens,
+                max_tokens: handle.max_tokens,
             },
         );
     }
@@ -155,6 +186,8 @@ impl GlobalKvScheduler {
     pub fn deregister(&mut self, engine_id: u32) {
         self.engines.remove(&engine_id);
         self.engine_order.retain(|&id| id != engine_id);
+        self.reserved_tokens.remove(&engine_id);
+        self.inflight.remove(&engine_id);
     }
 
     /// Mark an engine as active or idle for the coming round.
@@ -179,84 +212,106 @@ impl GlobalKvScheduler {
 
     /// Compute per-engine token budgets for the current scheduling round.
     ///
-    /// Active engines receive a share proportional to their `share_weight`;
-    /// idle engines are excluded from the distribution so their share is
-    /// redistributed among active ones.  No engine receives more than
-    /// `max_single_engine_permille ‰` of the global budget.
+    /// ## Algorithm
+    ///
+    /// 1. **Guarantee phase** — each engine receives at least its
+    ///    `guaranteed_min_tokens`, even if idle.
+    /// 2. **Elastic phase** — the remaining budget is distributed among *active*
+    ///    engines proportional to `share_weight`, capped by each engine's
+    ///    `max_tokens` and by `max_single_engine_permille ‰` of the elastic pool.
+    /// 3. **Idle donation** — elastic shares from idle engines flow to the first
+    ///    active engine (up to its cap).
+    /// 4. **Rounding correction** — integer division leftover is added to the
+    ///    first active engine.
+    ///
+    /// When all `guaranteed_min_tokens` are zero and all `max_tokens` are `None`
+    /// the output is identical to the previous proportional algorithm.
     pub fn allocate_budgets(&self) -> Vec<EngineTokenBudget> {
         if self.engines.is_empty() || self.global_max_tokens == 0 {
             return Vec::new();
         }
 
-        let active_total_weight: u64 = self
-            .engine_order
-            .iter()
+        // ── Guarantee phase ───────────────────────────────────────────────────
+        let total_guaranteed: usize = self.engine_order.iter()
+            .filter_map(|id| self.engines.get(id))
+            .map(|s| s.guaranteed_min_tokens)
+            .sum();
+
+        // Elastic pool: budget left after honouring all guarantees.
+        let elastic_pool = self.global_max_tokens.saturating_sub(total_guaranteed);
+
+        // ── Weight totals ─────────────────────────────────────────────────────
+        let active_total_weight: u64 = self.engine_order.iter()
             .filter_map(|id| self.engines.get(id))
             .filter(|s| s.was_active)
             .map(|s| s.share_weight as u64)
             .sum();
-
-        // If no engine reported itself active, treat all as active to avoid
-        // zero-budget stalls on the first round.
         let treat_all_active = active_total_weight == 0;
 
-        // Always use all-engine weights for natural shares so that an idle
-        // engine's natural share can be measured and re-distributed.
-        let all_total_weight: u64 = self
-            .engines
-            .values()
+        let all_total_weight: u64 = self.engines.values()
             .map(|s| s.share_weight as u64)
             .sum::<u64>()
             .max(1);
 
-        let cap_tokens = (self.global_max_tokens as u64 * self.max_single_engine_permille as u64
-            / 1000) as usize;
+        // Per-engine elastic cap from the permille setting.
+        let elastic_permille_cap =
+            (elastic_pool as u64 * self.max_single_engine_permille as u64 / 1000) as usize;
 
+        // ── Per-engine budget ─────────────────────────────────────────────────
         let mut budgets: Vec<EngineTokenBudget> = Vec::with_capacity(self.engines.len());
-        // Shares from idle engines that should be absorbed by active engines.
-        let mut idle_pool: usize = 0;
-        // Sum of natural (uncapped) shares; used to compute integer-rounding leftover.
-        let mut natural_sum: usize = 0;
+        let mut idle_elastic_pool: usize = 0;
+        let mut natural_elastic_sum: usize = 0;
 
         for &engine_id in &self.engine_order {
-            let Some(state) = self.engines.get(&engine_id) else {
-                continue;
-            };
-
+            let Some(state) = self.engines.get(&engine_id) else { continue };
             let is_active = state.was_active || treat_all_active;
-            let natural = (self.global_max_tokens as u64 * state.share_weight as u64
-                / all_total_weight) as usize;
-            natural_sum += natural;
 
-            let max_tokens = if is_active {
-                natural.min(cap_tokens)
+            // Natural elastic share based on weight (before caps).
+            let natural_elastic =
+                (elastic_pool as u64 * state.share_weight as u64 / all_total_weight) as usize;
+            natural_elastic_sum += natural_elastic;
+
+            let elastic_share = if is_active {
+                // Cap by per-mille limit and by the engine's own max_tokens bound.
+                let per_engine_cap = state.max_tokens
+                    .map(|m| m.saturating_sub(state.guaranteed_min_tokens))
+                    .unwrap_or(elastic_pool);
+                natural_elastic.min(elastic_permille_cap).min(per_engine_cap)
             } else {
-                idle_pool += natural;
+                idle_elastic_pool += natural_elastic;
                 0
             };
 
             budgets.push(EngineTokenBudget {
                 engine_id,
-                max_tokens,
+                max_tokens: state.guaranteed_min_tokens + elastic_share,
             });
         }
 
-        // Redistribute idle engines' natural shares to the first active engine.
-        // This is intentionally uncapped: the active engine is genuinely
-        // absorbing budget that idle peers are not using.
-        if idle_pool > 0 {
-            if let Some(budget) = budgets.iter_mut().find(|b| b.max_tokens > 0) {
-                budget.max_tokens += idle_pool;
+        // ── Idle donation ─────────────────────────────────────────────────────
+        if idle_elastic_pool > 0 {
+            if let Some(b) = budgets.iter_mut().find(|b| b.max_tokens > 0) {
+                let state = self.engines.get(&b.engine_id).unwrap();
+                let elastic_used = b.max_tokens.saturating_sub(state.guaranteed_min_tokens);
+                let per_engine_cap = state.max_tokens
+                    .map(|m| m.saturating_sub(state.guaranteed_min_tokens))
+                    .unwrap_or(elastic_pool);
+                let headroom = per_engine_cap.saturating_sub(elastic_used);
+                b.max_tokens += idle_elastic_pool.min(headroom);
             }
         }
 
-        // Distribute the integer-rounding remainder (global_max - sum of natural
-        // shares, at most n-1 tokens) to the first active engine, respecting cap.
-        let rounding = self.global_max_tokens.saturating_sub(natural_sum);
+        // ── Rounding correction ───────────────────────────────────────────────
+        let rounding = elastic_pool.saturating_sub(natural_elastic_sum);
         if rounding > 0 {
-            if let Some(budget) = budgets.iter_mut().find(|b| b.max_tokens > 0) {
-                let headroom = cap_tokens.saturating_sub(budget.max_tokens);
-                budget.max_tokens += rounding.min(headroom);
+            if let Some(b) = budgets.iter_mut().find(|b| b.max_tokens > 0) {
+                let state = self.engines.get(&b.engine_id).unwrap();
+                let elastic_used = b.max_tokens.saturating_sub(state.guaranteed_min_tokens);
+                let per_engine_cap = state.max_tokens
+                    .map(|m| m.saturating_sub(state.guaranteed_min_tokens))
+                    .unwrap_or(elastic_pool);
+                let headroom = per_engine_cap.saturating_sub(elastic_used);
+                b.max_tokens += rounding.min(headroom);
             }
         }
 
@@ -270,6 +325,82 @@ impl GlobalKvScheduler {
             .into_iter()
             .find(|b| b.engine_id == engine_id)
             .map(|b| b.max_tokens)
+    }
+
+    // ── Hard admission ────────────────────────────────────────────────────────
+
+    /// Attempt to reserve `tokens` from `engine_id`'s current budget.
+    ///
+    /// Returns `true` and:
+    /// - deducts `tokens` from the engine's reservation counter
+    /// - increments the in-flight request count
+    /// - marks the engine **active** if this is its first in-flight request
+    ///   (so `allocate_budgets` treats it as active for the next round)
+    ///
+    /// Returns `false` without mutating state if the request would exceed the
+    /// computed budget.  Callers **must** call [`complete_tokens`] when the
+    /// request finishes so budget and activity tracking stay consistent.
+    pub fn try_reserve_tokens(&mut self, engine_id: u32, tokens: usize) -> bool {
+        let budget = match self.budget_for(engine_id) {
+            Some(b) => b,
+            None    => return false,
+        };
+        let already = self.reserved_tokens.get(&engine_id).copied().unwrap_or(0);
+        if already + tokens > budget {
+            return false;
+        }
+        *self.reserved_tokens.entry(engine_id).or_insert(0) += tokens;
+
+        // Track in-flight count and mark active on first request.
+        let inflight = self.inflight.entry(engine_id).or_insert(0);
+        if *inflight == 0 {
+            self.set_active(engine_id, true);
+        }
+        *inflight += 1;
+
+        true
+    }
+
+    /// Complete a request: return `tokens` to the reservation counter, record
+    /// actual usage for future budget rounds, and mark the engine **idle** when
+    /// no more requests are in-flight.
+    ///
+    /// `tokens_actual` should be the actual tokens consumed (or the reserved
+    /// estimate if the actual count is unavailable).  Safe to call even if the
+    /// values exceed current counters (saturating arithmetic).
+    pub fn complete_tokens(&mut self, engine_id: u32, tokens_actual: usize) {
+        // Return reservation.
+        if let Some(r) = self.reserved_tokens.get_mut(&engine_id) {
+            *r = r.saturating_sub(tokens_actual);
+        }
+        // Record usage for allocate_budgets rounds.
+        self.report_usage(engine_id, tokens_actual);
+        // Decrement in-flight; mark idle when queue drains.
+        if let Some(c) = self.inflight.get_mut(&engine_id) {
+            *c = c.saturating_sub(1);
+            if *c == 0 {
+                self.set_active(engine_id, false);
+            }
+        }
+    }
+
+    /// Return `tokens` to `engine_id`'s reservation counter without touching
+    /// in-flight or activity state.  Prefer [`complete_tokens`] for normal
+    /// request teardown; use this only for partial / error rollbacks.
+    pub fn release_tokens(&mut self, engine_id: u32, tokens: usize) {
+        if let Some(r) = self.reserved_tokens.get_mut(&engine_id) {
+            *r = r.saturating_sub(tokens);
+        }
+    }
+
+    /// Current in-flight reservation for an engine (tokens, for metrics).
+    pub fn reserved_for(&self, engine_id: u32) -> usize {
+        self.reserved_tokens.get(&engine_id).copied().unwrap_or(0)
+    }
+
+    /// Number of requests currently in-flight for an engine.
+    pub fn inflight_for(&self, engine_id: u32) -> usize {
+        self.inflight.get(&engine_id).copied().unwrap_or(0)
     }
 
     /// Total number of registered engines.
@@ -340,6 +471,8 @@ mod global_scheduler_tests {
             sched.register(EngineHandle {
                 engine_id: id,
                 share_weight: weight,
+                guaranteed_min_tokens: 0,
+                max_tokens: None,
             });
             sched.set_active(id, active);
         }
@@ -411,6 +544,8 @@ mod global_scheduler_tests {
         sched.register(EngineHandle {
             engine_id: 0,
             share_weight: 1,
+            guaranteed_min_tokens: 0,
+            max_tokens: None,
         });
         sched.set_active(0, true);
         let budgets = sched.allocate_budgets();

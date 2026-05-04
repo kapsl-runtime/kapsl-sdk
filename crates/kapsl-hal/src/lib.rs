@@ -8,6 +8,8 @@ pub mod cross_device_scheduler;
 pub mod gpu_arena;
 #[cfg(feature = "cuda")]
 pub mod gpu_tensor;
+#[cfg(feature = "cuda")]
+pub mod prefix_cache;
 pub mod kernel;
 pub mod mock_comm;
 #[cfg(feature = "nccl")]

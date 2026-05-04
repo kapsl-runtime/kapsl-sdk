@@ -1,5 +1,6 @@
 use crate::block_manager::SharedBlockAllocator;
 use crate::engine::LLMEngine;
+use crate::global_scheduler::GlobalKvScheduler;
 use crate::llm_metrics::LLMMetrics;
 use crate::model_paths::{find_model_asset, find_model_root};
 use crate::scheduler::SchedulerConfig;
@@ -13,6 +14,7 @@ use kapsl_engine_api::{
 use serde_json::Value;
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use tokio::runtime::Runtime;
 use tokio::runtime::RuntimeFlavor;
@@ -45,6 +47,18 @@ pub struct LLMBackend {
     /// TurboQuant KV-cache compression bit-width (2, 3, or 4). When set,
     /// overrides any value from metadata.json / KAPSL_LLM_KV_COMPRESSION_BITS.
     kv_compression_bits: Option<u8>,
+    /// Global KV admission gate shared across all backends on the same runtime.
+    /// When set, every `infer_stream` call must successfully reserve tokens
+    /// before the request is enqueued.  Tokens are released when the stream
+    /// completes (naturally, on error, or on drop/cancellation).
+    global_scheduler: Option<Arc<Mutex<GlobalKvScheduler>>>,
+    /// Stable engine ID assigned by `SharedKvStateInner::attach_engine`.
+    /// Used as the key for `GlobalKvScheduler::try_reserve_tokens`.
+    engine_id: u32,
+    /// Live per-engine KV block cap shared with the runtime scheduler.
+    /// The runtime updates this atomic when engines are added or removed so
+    /// that block-level limits rebalance without requiring engine restarts.
+    live_kv_cap: Option<Arc<AtomicUsize>>,
 }
 
 #[derive(Clone)]
@@ -324,6 +338,24 @@ fn load_model_runtime_config(model_path: &Path) -> ModelRuntimeConfig {
     config
 }
 
+/// RAII guard that returns a token reservation to `GlobalKvScheduler` when
+/// dropped.  Created in `infer_stream` and held for the stream's lifetime, so
+/// the budget is reclaimed whether the stream ends normally, errors, or is
+/// cancelled by the caller dropping the future.
+struct GlobalTokenGuard {
+    scheduler: Arc<Mutex<GlobalKvScheduler>>,
+    engine_id: u32,
+    tokens:    usize,
+}
+
+impl Drop for GlobalTokenGuard {
+    fn drop(&mut self) {
+        if let Ok(mut sched) = self.scheduler.lock() {
+            sched.complete_tokens(self.engine_id, self.tokens);
+        }
+    }
+}
+
 impl LLMBackend {
     pub fn new() -> Self {
         Self {
@@ -341,6 +373,9 @@ impl LLMBackend {
             shared_pool: None,
             kv_blocks_cap: None,
             kv_compression_bits: None,
+            global_scheduler: None,
+            engine_id: 0,
+            live_kv_cap: None,
         }
     }
 
@@ -363,6 +398,34 @@ impl LLMBackend {
     /// Overrides the value in `metadata.json` and `KAPSL_LLM_KV_COMPRESSION_BITS`.
     pub fn with_kv_compression_bits(mut self, bits: u8) -> Self {
         self.kv_compression_bits = Some(bits);
+        self
+    }
+
+    /// Attach a live KV block cap updated by the runtime on engine join/leave.
+    ///
+    /// When set, `infer_stream` reads the current cap value and injects it into
+    /// the `GlobalKvScheduler` budget calculation on each admission check, so
+    /// that the effective block limit tracks the live fleet without an engine
+    /// restart.
+    pub fn with_live_kv_cap(mut self, cap: Arc<AtomicUsize>) -> Self {
+        self.live_kv_cap = Some(cap);
+        self
+    }
+
+    /// Attach the global KV admission gate.
+    ///
+    /// Once set, every call to `infer_stream` will call
+    /// `GlobalKvScheduler::try_reserve_tokens` before enqueuing the request.
+    /// If the global budget is exhausted the request is rejected immediately
+    /// with `EngineError::overloaded` rather than silently queuing and
+    /// potentially OOM-ing the device.
+    pub fn with_global_scheduler(
+        mut self,
+        scheduler: Arc<Mutex<GlobalKvScheduler>>,
+        engine_id: u32,
+    ) -> Self {
+        self.global_scheduler = Some(scheduler);
+        self.engine_id = engine_id;
         self
     }
 
@@ -667,6 +730,27 @@ impl Engine for LLMBackend {
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let cancellation = request.cancellation.clone();
 
+        // Estimate tokens before prompt and sampling_params are consumed.
+        // prompt.len()/4 is a conservative byte→token heuristic; actual
+        // tokenisation happens inside the engine after the request is queued.
+        let estimated_tokens =
+            sampling_params.max_tokens.saturating_add(prompt.len() / 4 + 1);
+
+        // If a live cap is set, clamp estimated_tokens to the current block cap
+        // (blocks can hold at most block_size tokens each; the live cap is in
+        // blocks).  This prevents the admission estimate from being stale when
+        // the runtime has already reduced the cap due to new models loading.
+        let estimated_tokens = if let Some(ref cap_atom) = self.live_kv_cap {
+            let cap_blocks = cap_atom.load(Ordering::Relaxed);
+            // Assume block_size=16 as a safe lower bound; over-estimates are
+            // harmless (more conservative) and avoid a runtime query for the
+            // actual block size.
+            let cap_tokens = cap_blocks.saturating_mul(16);
+            estimated_tokens.min(cap_tokens.max(1))
+        } else {
+            estimated_tokens
+        };
+
         let seq_group = SequenceGroup::new(
             request_id,
             request.session_id.clone(),
@@ -677,12 +761,41 @@ impl Engine for LLMBackend {
             response_tx,
         );
 
+        // Hard admission gate: reserve against the global budget.  If the budget
+        // is exhausted we reject immediately rather than queuing silently.
+        let global_guard: Option<GlobalTokenGuard> =
+            if let Some(ref sched) = self.global_scheduler {
+                let admitted = sched
+                    .lock()
+                    .unwrap()
+                    .try_reserve_tokens(self.engine_id, estimated_tokens);
+                if !admitted {
+                    return Box::pin(stream::once(async {
+                        Err(EngineError::overloaded(
+                            "Global KV admission rejected: budget exhausted across all models",
+                        ))
+                    }));
+                }
+                Some(GlobalTokenGuard {
+                    scheduler: sched.clone(),
+                    engine_id: self.engine_id,
+                    tokens: estimated_tokens,
+                })
+            } else {
+                None
+            };
+
         let tx_guard = self.request_tx.read().unwrap();
         if let Some(tx) = tx_guard.as_ref() {
             let tx = tx.clone();
             drop(tx_guard);
 
             let stream = stream! {
+                // Hold the reservation for the entire lifetime of this stream.
+                // Dropped (and tokens released) when the stream completes,
+                // errors, or is cancelled.
+                let _guard = global_guard;
+
                 let mut emitted = String::new();
                 if let Some(token) = cancellation.as_ref() {
                     if token.is_cancelled() {

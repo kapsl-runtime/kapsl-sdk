@@ -35,3 +35,4 @@ Use `kapsl-sdk` when your Python service or tool needs to:
 | [Streaming](./streaming.md) | Token-by-token streaming with `infer_stream()` |
 | [TTS & Voices](./tts-voices.md) | Kokoro TTS and bundled voice embeddings |
 | [API Reference](./api-reference.md) | Full method signatures and parameters |
+| [llama.cpp Shared KV Fork](./llama-cpp-shared-kv-fork.md) | Fork plan for llama.cpp + Kapsl GPU-wide KV pooling |

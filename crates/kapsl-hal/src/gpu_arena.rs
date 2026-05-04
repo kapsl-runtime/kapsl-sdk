@@ -17,7 +17,7 @@
 //! ```
 
 #[cfg(feature = "cuda")]
-use cudarc::driver::{CudaDevice, CudaSlice, DeviceSlice};
+use cudarc::driver::{CudaDevice, CudaSlice, DevicePtr, DeviceSlice};
 #[cfg(feature = "cuda")]
 use std::cell::UnsafeCell;
 #[cfg(feature = "cuda")]
@@ -282,6 +282,12 @@ impl GpuBlockPool {
     /// Read-only view of the storage slice (for attention kernel reads).
     pub fn storage(&self) -> &CudaSlice<half::f16> {
         unsafe { &*self.storage.get() }
+    }
+
+    /// Raw CUDA device pointer for FFI integrations that need to wrap the
+    /// externally-owned KV storage without taking ownership.
+    pub fn device_base_ptr(&self) -> *mut std::ffi::c_void {
+        *self.storage().device_ptr() as *mut std::ffi::c_void
     }
 
     /// Mutable view of the storage slice (for KV-write kernels).
