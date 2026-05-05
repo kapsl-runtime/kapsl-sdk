@@ -11,6 +11,16 @@ use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "gguf-cuda-shared-kv")]
+use cudarc::driver::{CudaDevice, CudaSlice, DevicePtr};
+#[cfg(feature = "gguf-cuda-shared-kv")]
+use kapsl_hal::cpu_block_store::CpuBlockStore;
+#[cfg(feature = "gguf-cuda-shared-kv")]
+use kapsl_hal::cross_device_scheduler::CrossDevicePoolScheduler;
+#[cfg(feature = "gguf-cuda-shared-kv")]
+use kapsl_hal::gpu_arena::{GpuBlockPool, GpuPoolHandle};
+#[cfg(feature = "gguf-cuda-shared-kv")]
+use kapsl_hal::prefix_cache::PrefixBlockCache;
 #[cfg(feature = "gguf")]
 use llama_cpp_2::{
     context::params::LlamaContextParams,
@@ -22,6 +32,10 @@ use llama_cpp_2::{
 };
 #[cfg(feature = "gguf")]
 use llama_cpp_sys_2::LLAMA_FLASH_ATTN_TYPE_AUTO;
+#[cfg(feature = "gguf-cuda-shared-kv")]
+use llama_cpp_sys_2::{
+    llama_kapsl_kv_pool_desc, LLAMA_KAPSL_KV_DTYPE_F16,
+};
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 
@@ -138,6 +152,26 @@ fn estimate_kv_bytes_per_cell(model: &LlamaModel) -> usize {
     model.n_layer().max(1) as usize * n_embd_gqa * 2 * std::mem::size_of::<u16>()
 }
 
+#[cfg(feature = "gguf-cuda-shared-kv")]
+fn gguf_shared_kv_block_count(
+    n_layers: usize,
+    config: GgufServingConfig,
+    block_size: usize,
+) -> usize {
+    if let Some(blocks) = std::env::var("KAPSL_GGUF_CUDA_SHARED_KV_POOL_BLOCKS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+    {
+        return blocks.max(n_layers);
+    }
+    let blocks_per_seq = (config.ctx_per_seq as usize).div_ceil(block_size.max(1)).max(1);
+    n_layers
+        .saturating_mul(config.max_concurrent.max(1))
+        .saturating_mul(blocks_per_seq)
+        .max(n_layers)
+}
+
 // ─── Shared model weights cache ───────────────────────────────────────────────
 
 #[cfg(feature = "gguf")]
@@ -165,6 +199,52 @@ static GGUF_BACKEND: std::sync::OnceLock<Arc<LlamaBackend>> = std::sync::OnceLoc
 
 #[cfg(feature = "gguf")]
 static GGUF_BACKEND_INIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+// ─── Cross-device KV scheduler singleton ──────────────────────────────────────
+
+#[cfg(feature = "gguf-cuda-shared-kv")]
+static GGUF_KV_SCHEDULER: std::sync::OnceLock<
+    std::sync::Mutex<CrossDevicePoolScheduler>
+> = std::sync::OnceLock::new();
+
+#[cfg(feature = "gguf-cuda-shared-kv")]
+fn gguf_global_kv_scheduler() -> &'static std::sync::Mutex<CrossDevicePoolScheduler> {
+    GGUF_KV_SCHEDULER.get_or_init(|| {
+        let evict_threshold = std::env::var("KAPSL_GGUF_EVICT_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .filter(|&v| v > 0.0 && v < 1.0)
+            .unwrap_or(0.85);
+        let cpu_slots = std::env::var("KAPSL_GGUF_CROSS_DEVICE_CPU_SLOTS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(512);
+        std::sync::Mutex::new(CrossDevicePoolScheduler::new(evict_threshold, cpu_slots))
+    })
+}
+
+/// Pick the registered device with the most free KV blocks for the given geometry.
+/// Falls back to `fallback_device_id` when `KAPSL_GGUF_AUTO_DEVICE` is off or when
+/// no device is registered yet (e.g. the very first pool construction).
+#[cfg(feature = "gguf-cuda-shared-kv")]
+fn gguf_select_device(fallback_device_id: usize, kv_heads: usize, head_dim: usize) -> usize {
+    if !std::env::var("KAPSL_GGUF_AUTO_DEVICE")
+        .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"))
+        .unwrap_or(false)
+    {
+        return fallback_device_id;
+    }
+    let sched = gguf_global_kv_scheduler().lock().unwrap();
+    let devices = sched.registered_devices();
+    if devices.is_empty() {
+        return fallback_device_id;
+    }
+    devices
+        .into_iter()
+        .max_by_key(|&d| sched.device_free_blocks(d, kv_heads, head_dim))
+        .unwrap_or(fallback_device_id)
+}
 
 #[cfg(feature = "gguf")]
 fn global_gguf_backend() -> Result<Arc<LlamaBackend>, EngineError> {
@@ -262,12 +342,690 @@ struct ActiveSeq {
     error: Option<EngineError>,
 }
 
+/// KV block data downloaded to CPU when the scheduler went idle.
+///
+/// Stored in `GgufSharedKvPoolState::evicted` until the next `reserve` call
+/// restores the data back to freshly allocated GPU blocks.
+#[cfg(feature = "gguf-cuda-shared-kv")]
+struct CpuEvictedState {
+    store:     CpuBlockStore,
+    /// Slot indices: `slots[layer * n_logical + pos]`
+    /// where `pos` is 0-indexed within the evicted (non-promoted) positions.
+    slots:        Vec<u32>,
+    /// Number of owned logical positions that were saved.
+    n_logical:    usize,
+    n_layers:     usize,
+    /// Original `n_logical_blocks` at eviction time, used by `needs_restore`
+    /// to tell C++ which token count to force-re-reserve.
+    n_logical_at_eviction: usize,
+}
+
+#[cfg(feature = "gguf-cuda-shared-kv")]
+struct GgufSharedKvPool {
+    state: Box<GgufSharedKvPoolState>,
+    desc: Box<llama_kapsl_kv_pool_desc>,
+}
+
+#[cfg(feature = "gguf-cuda-shared-kv")]
+struct GgufSharedKvPoolState {
+    handle: GpuPoolHandle,
+    device_id: usize,
+    n_layers: usize,
+    max_blocks_per_seq: usize,
+    /// Optional prefix block cache. When present, `reserve_prefix` and
+    /// `promote_prefix` callbacks are active.
+    prefix_cache: Option<Arc<Mutex<PrefixBlockCache>>>,
+    /// Stable model identity hash (set at pool construction time).
+    model_fingerprint: u64,
+    inner: Mutex<GgufSharedKvReservation>,
+    /// CPU-side KV block backup, populated by `evict_to_cpu()`.
+    /// Cleared by the next `reserve` call which uploads data back to GPU.
+    evicted: Mutex<Option<CpuEvictedState>>,
+    /// When true, `run_scheduler` calls `evict_to_cpu()` before blocking on
+    /// the idle receive.  Controlled by `KAPSL_GGUF_EVICT_ON_IDLE`.
+    evict_when_idle: bool,
+}
+
+/// Per-session reservation state.
+///
+/// Block layout (per-layer pools, as in llama.cpp's paged KV):
+///
+/// ```text
+/// owned_blocks[layer * n_new_logical + pos]
+/// ```
+///
+/// where `pos` is 0-indexed within the freshly allocated positions (i.e. the
+/// positions that did NOT come from the prefix cache).
+#[cfg(feature = "gguf-cuda-shared-kv")]
+#[derive(Default)]
+struct GgufSharedKvReservation {
+    /// Freshly allocated blocks (prefix-cache hits NOT included).
+    /// Layout: `owned_blocks[layer * n_new_logical + pos]`.
+    owned_blocks: Vec<u32>,
+    /// Logical positions covered by `owned_blocks` per layer.
+    n_new_logical: usize,
+    /// Chained hashes for ALL logical positions:
+    ///   `all_hashes[0..n_prefix_hits]`       — prefix-cache borrows
+    ///   `all_hashes[n_prefix_hits..]`         — newly allocated positions
+    all_hashes: Vec<u64>,
+    /// Number of leading logical positions that came from the prefix cache.
+    n_prefix_hits: usize,
+    /// How many of the new logical positions (from `n_prefix_hits` onward)
+    /// have been promoted to the prefix cache and are now cache-owned.
+    n_promoted_logical: usize,
+    model_fingerprint: u64,
+    block_table: Option<CudaSlice<u32>>,
+    n_logical_blocks: usize,
+}
+
+#[cfg(feature = "gguf-cuda-shared-kv")]
+unsafe impl Send for GgufSharedKvPool {}
+#[cfg(feature = "gguf-cuda-shared-kv")]
+unsafe impl Sync for GgufSharedKvPool {}
+
+#[cfg(feature = "gguf-cuda-shared-kv")]
+impl GgufSharedKvPool {
+    fn new(
+        handle:            GpuPoolHandle,
+        device_id:         usize,
+        n_layers:          usize,
+        max_ctx:           usize,
+        prefix_cache:      Option<Arc<Mutex<PrefixBlockCache>>>,
+        model_fingerprint: u64,
+    ) -> Self {
+        let pool_arc           = handle.pool.clone();
+        let block_size         = handle.pool.block_size().max(1);
+        let max_blocks_per_seq = max_ctx.div_ceil(block_size).max(1);
+        let has_prefix = prefix_cache.is_some();
+        let evict_when_idle = std::env::var("KAPSL_GGUF_EVICT_ON_IDLE")
+            .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"))
+            .unwrap_or(false);
+
+        let mut state = Box::new(GgufSharedKvPoolState {
+            handle,
+            device_id,
+            n_layers,
+            max_blocks_per_seq,
+            prefix_cache,
+            model_fingerprint,
+            inner:           Mutex::new(GgufSharedKvReservation::default()),
+            evicted:         Mutex::new(None),
+            evict_when_idle,
+        });
+        let state_ptr = (&mut *state) as *mut GgufSharedKvPoolState;
+        let pool = &state.handle.pool;
+        let desc = Box::new(llama_kapsl_kv_pool_desc {
+            user_data:                state_ptr.cast(),
+            device_id:                device_id as u32,
+            block_size:               pool.block_size() as u32,
+            num_blocks:               pool.total_blocks() as u32,
+            num_kv_heads:             pool.num_kv_heads() as u32,
+            head_dim:                 pool.head_dim() as u32,
+            dtype:                    LLAMA_KAPSL_KV_DTYPE_F16,
+            device_base:              pool.device_base_ptr(),
+            block_table_device:       std::ptr::null_mut(),
+            block_table_layer_stride: max_blocks_per_seq as u32,
+            n_layers:                 n_layers as u32,
+            max_blocks_per_seq:       max_blocks_per_seq as u32,
+            model_fingerprint,
+            reserve:                  Some(gguf_kapsl_kv_reserve),
+            release:                  Some(gguf_kapsl_kv_release),
+            touch:                    Some(gguf_kapsl_kv_touch),
+            reserve_prefix:  if has_prefix { Some(gguf_kapsl_kv_reserve_prefix) } else { None },
+            promote_prefix:           None, // handled via promote_if_pending() from Rust
+            needs_restore:            Some(gguf_kapsl_kv_needs_restore),
+        });
+        let kv_pool = Self { state, desc };
+        gguf_global_kv_scheduler()
+            .lock()
+            .unwrap()
+            .register_pool(device_id, pool_arc);
+        log::debug!("[gguf] registered device {device_id} pool with cross-device KV scheduler");
+        kv_pool
+    }
+
+    /// Promote newly computed KV blocks to the prefix cache.
+    ///
+    /// Must be called after a successful `ctx.decode()` when a prefill batch was
+    /// processed.  No-op when the prefix cache is disabled or there is nothing
+    /// to promote.
+    fn promote_if_pending(&mut self) {
+        let state = &mut *self.state;
+        let Some(cache) = &state.prefix_cache else { return };
+        let mut inner = state.inner.lock().unwrap();
+        let n_new = inner.n_new_logical;
+        if n_new == 0 || inner.n_promoted_logical >= n_new { return; }
+
+        let start     = inner.n_promoted_logical;
+        let fp        = inner.model_fingerprint;
+        let pool      = state.handle.pool.clone();
+        let n_layers  = state.n_layers;
+        let device_id = self.desc.device_id as usize;
+        let mut c = match cache.lock() { Ok(c) => c, Err(_) => return };
+
+        let mut promoted = start;
+        for pos in start..n_new {
+            let hash_idx = inner.n_prefix_hits + pos;
+            let Some(&hash) = inner.all_hashes.get(hash_idx) else { break };
+
+            // Build the block_ids Vec for this logical position (one block per layer).
+            let block_ids: Vec<u32> = (0..n_layers)
+                .map(|layer| inner.owned_blocks[layer * n_new + pos])
+                .collect();
+
+            if !c.insert(fp, hash, device_id, pool.clone(), block_ids, 1) {
+                break; // cache full, all entries referenced — stop
+            }
+            promoted += 1;
+        }
+        inner.n_promoted_logical = promoted;
+    }
+
+    /// Download un-promoted owned KV blocks to CPU and free their GPU slots.
+    ///
+    /// Intended to be called from `run_scheduler` when the model goes idle
+    /// (no active or pending sequences).  The freed GPU blocks become available
+    /// for other sessions/models in the shared pool.
+    ///
+    /// On the next `ctx.decode()` call, the C++ `init_batch` will detect the
+    /// eviction via `needs_restore`, force a re-reserve, and our reserve
+    /// callback will re-upload the saved data to freshly allocated GPU blocks.
+    ///
+    /// Returns `true` if blocks were actually evicted.
+    fn evict_to_cpu(&mut self) -> bool {
+        let state = &*self.state;
+
+        // Skip if already evicted.
+        if state.evicted.lock().unwrap().is_some() { return false; }
+
+        let mut inner      = state.inner.lock().unwrap();
+        let n_new          = inner.n_new_logical;
+        let n_promoted     = inner.n_promoted_logical;
+        let n_owned        = n_new.saturating_sub(n_promoted);
+        let n_logical_orig = inner.n_logical_blocks;
+
+        if n_owned == 0 { return false; }
+
+        let n_layers   = state.n_layers;
+        let pool       = &state.handle.pool;
+
+        // Download each un-promoted owned block to CPU.
+        let n_slots    = n_owned * n_layers;
+        let mut store  = CpuBlockStore::new(
+            n_slots, pool.num_kv_heads(), pool.block_size(), pool.head_dim());
+        let mut slots: Vec<u32> = Vec::with_capacity(n_slots);
+
+        for layer in 0..n_layers {
+            for pos in n_promoted..n_new {
+                let block_id = match inner.owned_blocks.get(layer * n_new + pos) {
+                    Some(&id) => id,
+                    None      => return false,
+                };
+                match pool.download_block(block_id) {
+                    Ok(data) => match store.store_block(&data) {
+                        Ok(slot) => slots.push(slot),
+                        Err(_)   => return false,
+                    },
+                    Err(_) => return false,
+                }
+            }
+        }
+
+        // Release prefix borrows + free all un-promoted GPU blocks.
+        gguf_release_reservation_inner(
+            &mut inner, &state.prefix_cache, pool, n_layers);
+        drop(inner);
+
+        *state.evicted.lock().unwrap() = Some(CpuEvictedState {
+            store,
+            slots,
+            n_logical: n_owned,
+            n_layers,
+            n_logical_at_eviction: n_logical_orig,
+        });
+
+        log::info!(
+            "[gguf] evicted {} owned positions ({} GPU blocks freed) to CPU",
+            n_owned, n_owned * n_layers
+        );
+        true
+    }
+
+    fn desc_ptr(&mut self) -> *mut llama_kapsl_kv_pool_desc {
+        (&mut *self.desc) as *mut llama_kapsl_kv_pool_desc
+    }
+}
+
+#[cfg(feature = "gguf-cuda-shared-kv")]
+impl Drop for GgufSharedKvPoolState {
+    fn drop(&mut self) {
+        let mut inner = self.inner.lock().unwrap();
+        // Release prefix cache borrows (prefix hits + promoted blocks).
+        if let Some(cache) = &self.prefix_cache {
+            if let Ok(mut c) = cache.lock() {
+                let n_borrow = inner.n_prefix_hits + inner.n_promoted_logical;
+                let fp = inner.model_fingerprint;
+                for &hash in inner.all_hashes.get(..n_borrow).unwrap_or(&[]) {
+                    c.release(fp, hash);
+                }
+            }
+        }
+        // Free un-promoted owned blocks.  Promoted blocks are now cache-owned.
+        let n_new    = inner.n_new_logical;
+        let n_layers = self.n_layers;
+        for layer in 0..n_layers {
+            for pos in inner.n_promoted_logical..n_new {
+                let block = inner.owned_blocks[layer * n_new + pos];
+                self.handle.pool.free_block(block);
+            }
+        }
+    }
+}
+
+// ── CPU-eviction needs-restore callback ──────────────────────────────────────
+
+#[cfg(feature = "gguf-cuda-shared-kv")]
+unsafe extern "C" fn gguf_kapsl_kv_needs_restore(
+    user_data: *mut std::ffi::c_void,
+    _session_id: u64,
+) -> u32 {
+    if user_data.is_null() { return 0; }
+    let state = &*(user_data as *mut GgufSharedKvPoolState);
+    match &*state.evicted.lock().unwrap() {
+        Some(e) => {
+            let block_size = state.handle.pool.block_size().max(1);
+            (e.n_logical_at_eviction * block_size) as u32
+        }
+        None => 0,
+    }
+}
+
+// ── Block allocation helper ───────────────────────────────────────────────────
+
+/// Allocate `n_needed` blocks from the pool.
+///
+/// On first-pass failure, evicts the oldest zero-refcount prefix-cache entries
+/// to free GPU blocks, then retries.  Drains and returns `false` when blocks
+/// cannot be obtained even after eviction.
+#[cfg(feature = "gguf-cuda-shared-kv")]
+fn alloc_blocks_with_cache_eviction(
+    state:    &GgufSharedKvPoolState,
+    n_needed: usize,
+    out:      &mut Vec<u32>,
+) -> bool {
+    // First pass: allocate as many blocks as are immediately available.
+    while out.len() < n_needed {
+        match state.handle.pool.alloc_block() {
+            Ok(b)  => out.push(b),
+            Err(_) => break,
+        }
+    }
+    if out.len() == n_needed { return true; }
+
+    // Evict LRU zero-refcount prefix-cache entries to reclaim GPU blocks.
+    let still_needed = n_needed - out.len();
+    if let Some(cache) = &state.prefix_cache {
+        if let Ok(mut c) = cache.lock() {
+            let freed = c.evict_lru_for_device(state.device_id, still_needed);
+            for (p, ids) in freed { for id in ids { p.free_block(id); } }
+        }
+    }
+
+    // Second pass after eviction.
+    while out.len() < n_needed {
+        match state.handle.pool.alloc_block() {
+            Ok(b)  => out.push(b),
+            Err(_) => {
+                for b in out.drain(..) { state.handle.pool.free_block(b); }
+                return false;
+            }
+        }
+    }
+    true
+}
+
+// ── CPU-restore helper ────────────────────────────────────────────────────────
+
+/// Re-allocate GPU blocks and upload KV data from a `CpuEvictedState`.
+///
+/// `logical_blocks` is the total number of logical positions the caller needs.
+/// `n_prefix_hits` cached positions (from the prefix cache) are placed first in
+/// the block table; restored + fresh positions follow.
+///
+/// On success, updates `inner` and writes the output pointers.
+/// On allocation failure, restores the evicted state so a future call can retry.
+#[cfg(feature = "gguf-cuda-shared-kv")]
+fn gguf_restore_from_cpu(
+    state:                   &GgufSharedKvPoolState,
+    evicted:                 CpuEvictedState,
+    logical_blocks:          usize,
+    n_prefix_hits:           usize,
+    prefix_hit_block_ids:    &[Vec<u32>], // per-hit, per-layer block ids; len == n_prefix_hits
+    block_table_device_out:  *mut *mut u32,
+    n_logical_out:           *mut u32,
+    n_prefix_hits_out:       *mut u32,    // may be null for non-prefix path
+) -> bool {
+    let n_layers    = state.n_layers;
+    let pool        = &state.handle.pool;
+    let n_new       = logical_blocks.saturating_sub(n_prefix_hits);
+    let n_restore   = n_new.min(evicted.n_logical);
+    let n_fresh     = n_new.saturating_sub(n_restore);
+    let total_phys  = n_new * n_layers;
+
+    let mut new_blocks: Vec<u32> = Vec::with_capacity(total_phys);
+    if !alloc_blocks_with_cache_eviction(state, total_phys, &mut new_blocks) {
+        *state.evicted.lock().unwrap() = Some(evicted);
+        return false;
+    }
+
+    // Upload saved KV data for the restored positions.
+    for layer in 0..n_layers {
+        for pos in 0..n_restore {
+            let block_id = new_blocks[layer * n_new + pos];
+            let cpu_slot = evicted.slots[layer * evicted.n_logical + pos];
+            if let Ok(data) = evicted.store.load_block(cpu_slot) {
+                let half = data.len() / 2;
+                if pool.upload_block(block_id, &data[..half], &data[half..]).is_err() {
+                    for b in new_blocks { pool.free_block(b); }
+                    *state.evicted.lock().unwrap() = Some(evicted);
+                    return false;
+                }
+            }
+        }
+    }
+    // `n_fresh` positions (after the restored ones) start with uninitialized
+    // KV data — llama.cpp will overwrite them during the forward pass.
+
+    // Build block table: prefix-hit blocks first, then restored+fresh blocks.
+    let mut host_table = vec![0u32; n_layers * state.max_blocks_per_seq];
+    for layer in 0..n_layers {
+        for (hit_pos, block_ids) in prefix_hit_block_ids.iter().enumerate() {
+            let blk = block_ids.get(layer).copied()
+                .unwrap_or_else(|| block_ids.first().copied().unwrap_or(0));
+            host_table[layer * state.max_blocks_per_seq + hit_pos] = blk;
+        }
+        for pos in 0..n_new {
+            host_table[layer * state.max_blocks_per_seq + n_prefix_hits + pos] =
+                new_blocks[layer * n_new + pos];
+        }
+    }
+
+    let table = match pool.device().htod_sync_copy(&host_table) {
+        Ok(t) => t,
+        Err(_) => {
+            for b in new_blocks { pool.free_block(b); }
+            *state.evicted.lock().unwrap() = Some(evicted);
+            return false;
+        }
+    };
+    let table_ptr = *table.device_ptr() as *mut u32;
+
+    let mut inner = state.inner.lock().unwrap();
+    gguf_release_reservation_inner(&mut inner, &state.prefix_cache, pool, n_layers);
+    inner.owned_blocks       = new_blocks;
+    inner.n_new_logical      = n_new;
+    inner.n_promoted_logical = 0;
+    inner.all_hashes         = Vec::new();
+    inner.n_prefix_hits      = n_prefix_hits;
+    inner.model_fingerprint  = state.model_fingerprint;
+    inner.block_table        = Some(table);
+    inner.n_logical_blocks   = logical_blocks;
+
+    unsafe {
+        *block_table_device_out = table_ptr;
+        *n_logical_out          = logical_blocks as u32;
+        if !n_prefix_hits_out.is_null() {
+            *n_prefix_hits_out  = n_prefix_hits as u32;
+        }
+    }
+    log::info!(
+        "[gguf] restored {} positions from CPU ({} fresh) to GPU after eviction",
+        n_restore, n_fresh
+    );
+    true
+}
+
+// ── Reserve callback (no prefix cache) ───────────────────────────────────────
+
+#[cfg(feature = "gguf-cuda-shared-kv")]
+unsafe extern "C" fn gguf_kapsl_kv_reserve(
+    user_data: *mut std::ffi::c_void,
+    _session_id: u64,
+    tokens_needed: u32,
+    block_table_device_out: *mut *mut u32,
+    n_blocks_out: *mut u32,
+) -> bool {
+    if user_data.is_null() || block_table_device_out.is_null() || n_blocks_out.is_null() {
+        return false;
+    }
+    let state = &*(user_data as *mut GgufSharedKvPoolState);
+    let block_size     = state.handle.pool.block_size().max(1);
+    let logical_blocks = (tokens_needed as usize).div_ceil(block_size).max(1);
+    if logical_blocks > state.max_blocks_per_seq { return false; }
+
+    // ── Restore path: re-upload CPU-evicted blocks ────────────────────────
+    let evicted_opt = state.evicted.lock().unwrap().take();
+    if let Some(evicted) = evicted_opt {
+        return gguf_restore_from_cpu(
+            state, evicted, logical_blocks,
+            0, &[],
+            block_table_device_out, n_blocks_out, std::ptr::null_mut(),
+        );
+    }
+
+    // ── Fresh allocation ──────────────────────────────────────────────────
+    let needed_physical = logical_blocks.saturating_mul(state.n_layers);
+    if needed_physical > state.handle.cap() { return false; }
+
+    let mut new_blocks = Vec::with_capacity(needed_physical);
+    if !alloc_blocks_with_cache_eviction(state, needed_physical, &mut new_blocks) {
+        return false;
+    }
+
+    let mut host_table = vec![0u32; state.n_layers * state.max_blocks_per_seq];
+    for layer in 0..state.n_layers {
+        for pos in 0..logical_blocks {
+            host_table[layer * state.max_blocks_per_seq + pos] =
+                new_blocks[layer * logical_blocks + pos];
+        }
+    }
+    let table = match state.handle.pool.device().htod_sync_copy(&host_table) {
+        Ok(t) => t,
+        Err(_) => { for b in new_blocks { state.handle.pool.free_block(b); } return false; }
+    };
+    let table_ptr = *table.device_ptr() as *mut u32;
+
+    let mut inner = state.inner.lock().unwrap();
+    gguf_release_reservation_inner(&mut inner, &state.prefix_cache, &state.handle.pool, state.n_layers);
+    inner.owned_blocks       = new_blocks;
+    inner.n_new_logical      = logical_blocks;
+    inner.n_promoted_logical = 0;
+    inner.all_hashes         = Vec::new();
+    inner.n_prefix_hits      = 0;
+    inner.model_fingerprint  = state.model_fingerprint;
+    inner.block_table        = Some(table);
+    inner.n_logical_blocks   = logical_blocks;
+
+    *block_table_device_out = table_ptr;
+    *n_blocks_out           = logical_blocks as u32;
+    true
+}
+
+// ── Reserve callback (with prefix cache) ─────────────────────────────────────
+
+#[cfg(feature = "gguf-cuda-shared-kv")]
+unsafe extern "C" fn gguf_kapsl_kv_reserve_prefix(
+    user_data: *mut std::ffi::c_void,
+    _session_id: u64,
+    tokens: *const i32,
+    n_tokens: u32,
+    block_table_device_out: *mut *mut u32,
+    n_logical_blocks_out: *mut u32,
+    n_prefix_hits_out: *mut u32,
+) -> bool {
+    if user_data.is_null()
+        || tokens.is_null()
+        || block_table_device_out.is_null()
+        || n_logical_blocks_out.is_null()
+        || n_prefix_hits_out.is_null()
+    {
+        return false;
+    }
+    let state = &*(user_data as *mut GgufSharedKvPoolState);
+    let Some(cache) = &state.prefix_cache else {
+        // Prefix cache disabled — fall back to plain reserve.
+        return gguf_kapsl_kv_reserve(
+            user_data, _session_id, n_tokens,
+            block_table_device_out, n_logical_blocks_out,
+        );
+    };
+
+    let token_slice = std::slice::from_raw_parts(tokens, n_tokens as usize);
+    let block_size  = state.handle.pool.block_size().max(1);
+    let fp          = state.model_fingerprint;
+
+    // 1. Compute chained hashes for all complete prefix blocks.
+    let all_hashes = PrefixBlockCache::compute_prefix_hashes_i32(fp, token_slice, block_size);
+    let n_logical  = (n_tokens as usize).div_ceil(block_size).max(1);
+    if n_logical > state.max_blocks_per_seq { return false; }
+
+    // 2. Lookup prefix cache — collect a contiguous run of hits.
+    let hits = {
+        let mut c = match cache.lock() { Ok(c) => c, Err(_) => return false };
+        c.lookup(fp, &all_hashes)
+    };
+    let n_hits = hits.len();
+
+    // 3. Check for CPU-evicted state: use restore path if available.
+    let evicted_opt = state.evicted.lock().unwrap().take();
+    if let Some(evicted) = evicted_opt {
+        // Build the per-hit block-id lists for the restore helper.
+        let hit_block_ids: Vec<Vec<u32>> = hits.iter()
+            .map(|h| h.block_ids.clone())
+            .collect();
+        return gguf_restore_from_cpu(
+            state, evicted, n_logical,
+            n_hits, &hit_block_ids,
+            block_table_device_out, n_logical_blocks_out, n_prefix_hits_out,
+        );
+    }
+
+    // 4. Allocate fresh blocks for positions that missed the cache.
+    let n_new       = n_logical.saturating_sub(n_hits);
+    let needed_phys = n_new.saturating_mul(state.n_layers);
+    if needed_phys > state.handle.cap() { return false; }
+
+    let mut new_blocks: Vec<u32> = Vec::with_capacity(needed_phys);
+    if !alloc_blocks_with_cache_eviction(state, needed_phys, &mut new_blocks) {
+        // Release prefix borrows before failing.
+        if let Ok(mut c) = cache.lock() {
+            for h in &hits { c.release(fp, h.block_hash); }
+        }
+        return false;
+    }
+
+    // 5. Build the block table: cached blocks first, then new blocks.
+    let mut host_table = vec![0u32; state.n_layers * state.max_blocks_per_seq];
+    for layer in 0..state.n_layers {
+        for (hit_pos, hit) in hits.iter().enumerate() {
+            let blk = hit.block_ids.get(layer).copied()
+                .unwrap_or_else(|| hit.block_ids.first().copied().unwrap_or(0));
+            host_table[layer * state.max_blocks_per_seq + hit_pos] = blk;
+        }
+        for new_pos in 0..n_new {
+            host_table[layer * state.max_blocks_per_seq + n_hits + new_pos] =
+                new_blocks[layer * n_new + new_pos];
+        }
+    }
+
+    let table = match state.handle.pool.device().htod_sync_copy(&host_table) {
+        Ok(t) => t,
+        Err(_) => {
+            for b in new_blocks { state.handle.pool.free_block(b); }
+            if let Ok(mut c) = cache.lock() {
+                for h in &hits { c.release(fp, h.block_hash); }
+            }
+            return false;
+        }
+    };
+    let table_ptr = *table.device_ptr() as *mut u32;
+
+    let mut inner = state.inner.lock().unwrap();
+    gguf_release_reservation_inner(&mut inner, &state.prefix_cache, &state.handle.pool, state.n_layers);
+    inner.owned_blocks       = new_blocks;
+    inner.n_new_logical      = n_new;
+    inner.n_promoted_logical = 0;
+    inner.all_hashes         = all_hashes;
+    inner.n_prefix_hits      = n_hits;
+    inner.model_fingerprint  = fp;
+    inner.block_table        = Some(table);
+    inner.n_logical_blocks   = n_logical;
+
+    *block_table_device_out = table_ptr;
+    *n_logical_blocks_out   = n_logical as u32;
+    *n_prefix_hits_out      = n_hits as u32;
+    true
+}
+
+// ── Release callback ──────────────────────────────────────────────────────────
+
+/// Inline release logic, callable with explicit pool access.
+#[cfg(feature = "gguf-cuda-shared-kv")]
+fn gguf_release_reservation_inner(
+    inner:        &mut GgufSharedKvReservation,
+    prefix_cache: &Option<Arc<Mutex<PrefixBlockCache>>>,
+    pool:         &Arc<GpuBlockPool>,
+    n_layers:     usize,
+) {
+    // Release prefix cache borrows.
+    if let Some(cache) = prefix_cache {
+        if let Ok(mut c) = cache.lock() {
+            let n_borrow = inner.n_prefix_hits + inner.n_promoted_logical;
+            let fp = inner.model_fingerprint;
+            for &hash in inner.all_hashes.get(..n_borrow).unwrap_or(&[]) {
+                c.release(fp, hash);
+            }
+        }
+    }
+    // Free un-promoted owned blocks.
+    let n_new = inner.n_new_logical;
+    for layer in 0..n_layers {
+        for pos in inner.n_promoted_logical..n_new {
+            let idx = layer * n_new + pos;
+            if let Some(&block) = inner.owned_blocks.get(idx) {
+                pool.free_block(block);
+            }
+        }
+    }
+    *inner = GgufSharedKvReservation::default();
+}
+
+#[cfg(feature = "gguf-cuda-shared-kv")]
+unsafe extern "C" fn gguf_kapsl_kv_release(user_data: *mut std::ffi::c_void, _session_id: u64) {
+    if user_data.is_null() { return; }
+    let state = &*(user_data as *mut GgufSharedKvPoolState);
+    let mut inner = state.inner.lock().unwrap();
+    gguf_release_reservation_inner(&mut inner, &state.prefix_cache, &state.handle.pool, state.n_layers);
+}
+
+#[cfg(feature = "gguf-cuda-shared-kv")]
+unsafe extern "C" fn gguf_kapsl_kv_touch(
+    user_data: *mut std::ffi::c_void,
+    _session_id: u64,
+) -> bool {
+    !user_data.is_null()
+}
+
 // ─── Backend ──────────────────────────────────────────────────────────────────
 
 pub struct GgufBackend {
     #[cfg(feature = "gguf")]
     inner: Option<GgufInner>,
     metrics: Arc<Mutex<EngineMetrics>>,
+    #[cfg(feature = "gguf-cuda-shared-kv")]
+    device_id: usize,
+    #[cfg(feature = "gguf-cuda-shared-kv")]
+    pool_slot: Arc<Mutex<Option<GpuPoolHandle>>>,
 }
 
 #[cfg(feature = "gguf")]
@@ -283,7 +1041,33 @@ impl GgufBackend {
             #[cfg(feature = "gguf")]
             inner: None,
             metrics: Arc::new(Mutex::new(EngineMetrics::new())),
+            #[cfg(feature = "gguf-cuda-shared-kv")]
+            device_id: 0,
+            #[cfg(feature = "gguf-cuda-shared-kv")]
+            pool_slot: Arc::new(Mutex::new(None)),
         }
+    }
+
+    #[cfg(feature = "gguf-cuda-shared-kv")]
+    pub fn new_cuda_shared_kv(device_id: usize, handle: Option<GpuPoolHandle>) -> Self {
+        Self {
+            #[cfg(feature = "gguf")]
+            inner: None,
+            metrics: Arc::new(Mutex::new(EngineMetrics::new())),
+            device_id,
+            pool_slot: Arc::new(Mutex::new(handle)),
+        }
+    }
+
+    #[cfg(feature = "gguf-cuda-shared-kv")]
+    pub fn with_pool_handle(mut self, handle: GpuPoolHandle) -> Self {
+        *self.pool_slot.lock().unwrap() = Some(handle);
+        self
+    }
+
+    #[cfg(feature = "gguf-cuda-shared-kv")]
+    pub fn pool_handle(&self) -> Option<GpuPoolHandle> {
+        self.pool_slot.lock().unwrap().clone()
     }
 
     fn metrics_snapshot(&self) -> EngineMetrics {
@@ -515,6 +1299,7 @@ fn run_scheduler(
     request_rx: std_mpsc::Receiver<GgufRequest>,
     config: GgufServingConfig,
     metrics: Arc<Mutex<EngineMetrics>>,
+    #[cfg(feature = "gguf-cuda-shared-kv")] mut shared_kv_pool: Option<GgufSharedKvPool>,
 ) {
     let total_ctx = config.total_ctx();
     let n_ctx = match NonZeroU32::new(total_ctx as u32) {
@@ -526,13 +1311,24 @@ fn run_scheduler(
     };
     let n_batch = config.n_batch();
 
-    let ctx_params = LlamaContextParams::default()
+    #[allow(unused_mut)]
+    let mut ctx_params = LlamaContextParams::default()
         .with_n_ctx(Some(n_ctx))
         .with_n_batch(n_batch)
         .with_n_ubatch(n_batch)
         .with_n_seq_max(config.max_concurrent as u32)
         .with_offload_kqv(true)
         .with_flash_attention_policy(LLAMA_FLASH_ATTN_TYPE_AUTO);
+    #[cfg(feature = "gguf-cuda-shared-kv")]
+    if let Some(pool) = shared_kv_pool.as_mut() {
+        ctx_params = unsafe { ctx_params.with_kapsl_kv_pool_raw(pool.desc_ptr(), 1) };
+        log::info!(
+            "[gguf] Kapsl shared KV pool attached (blocks={}, block_size={}, max_blocks_per_seq={})",
+            pool.state.handle.pool.total_blocks(),
+            pool.state.handle.pool.block_size(),
+            pool.state.max_blocks_per_seq
+        );
+    }
 
     let mut ctx = match model.new_context(&backend, ctx_params) {
         Ok(c) => c,
@@ -618,6 +1414,30 @@ fn run_scheduler(
 
         // ── 3. If completely idle, block for the next request ─────────────────
         if waiting.is_empty() && pending.is_empty() && active.is_empty() {
+            #[cfg(feature = "gguf-cuda-shared-kv")]
+            if let Some(pool) = shared_kv_pool.as_mut() {
+                if pool.state.evict_when_idle {
+                    pool.evict_to_cpu();
+                }
+                // Log cross-device pressure snapshot at debug level.
+                let kv_heads  = pool.state.handle.pool.num_kv_heads();
+                let head_dim  = pool.state.handle.pool.head_dim();
+                let device_id = pool.desc.device_id as usize;
+                let sched = gguf_global_kv_scheduler().lock().unwrap();
+                log::debug!(
+                    "[gguf] idle: device {} pressure={:.2} free_blocks={} ({}h×{}d), \
+                     cross-device registered=[{}]",
+                    device_id,
+                    sched.device_pressure(device_id),
+                    sched.device_free_blocks(device_id, kv_heads, head_dim),
+                    kv_heads,
+                    head_dim,
+                    sched.registered_devices().iter()
+                        .map(|d| d.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                );
+            }
             match request_rx.recv() {
                 Ok(req) => waiting.push_back(req),
                 Err(_) => break 'main,
@@ -766,6 +1586,12 @@ fn run_scheduler(
 
         for pref in partial_prefills.drain(..) {
             pending.push_back(pref);
+        }
+
+        // ── 5b. Promote newly computed prefix KV blocks to cache ──────────────
+        #[cfg(feature = "gguf-cuda-shared-kv")]
+        if let Some(pool) = shared_kv_pool.as_mut() {
+            pool.promote_if_pending();
         }
 
         // ── 6. Sample each newly prefilled sequence and move it to active ──────
@@ -982,6 +1808,97 @@ impl Engine for GgufBackend {
         };
 
         let config = GgufServingConfig::from_model(&weights.model, weights.n_ctx_train);
+        #[cfg(feature = "gguf-cuda-shared-kv")]
+        let shared_kv_pool = {
+            let n_layers = weights.model.n_layer().max(1) as usize;
+            let n_embd = weights.model.n_embd().max(1) as usize;
+            let n_head = weights.model.n_head().max(1) as usize;
+            let n_head_kv = weights.model.n_head_kv().max(1) as usize;
+            let head_dim = (n_embd / n_head).max(1);
+            let block_size = 16usize;
+            // Auto-select the least-loaded registered device when KAPSL_GGUF_AUTO_DEVICE=1.
+            let effective_device_id = gguf_select_device(self.device_id, n_head_kv, head_dim);
+            if effective_device_id != self.device_id {
+                log::info!(
+                    "[gguf] auto-device: selected device {} over {} (more free {n_head_kv}h×{head_dim}d blocks)",
+                    effective_device_id, self.device_id,
+                );
+            }
+            let handle = {
+                let mut slot = self.pool_slot.lock().unwrap();
+                if let Some(handle) = slot.as_ref() {
+                    if handle.pool.is_compatible(n_head_kv, head_dim) {
+                        handle.clone()
+                    } else {
+                        log::warn!(
+                            "[gguf] Shared KV pool geometry mismatch ({}h x {}d vs {}h x {}d); creating private pool",
+                            handle.pool.num_kv_heads(),
+                            handle.pool.head_dim(),
+                            n_head_kv,
+                            head_dim
+                        );
+                        let device = CudaDevice::new(effective_device_id)
+                            .map_err(|e| EngineError::backend(format!("CUDA: {e}")))?;
+                        let num_blocks = gguf_shared_kv_block_count(n_layers, config, block_size);
+                        let pool = Arc::new(
+                            GpuBlockPool::new(device, num_blocks, block_size, n_head_kv, head_dim)
+                                .map_err(|e| EngineError::backend(format!("shared KV pool: {e}")))?,
+                        );
+                        let handle = GpuPoolHandle::private(pool);
+                        *slot = Some(handle.clone());
+                        handle
+                    }
+                } else {
+                    let device = CudaDevice::new(effective_device_id)
+                        .map_err(|e| EngineError::backend(format!("CUDA: {e}")))?;
+                    let num_blocks = gguf_shared_kv_block_count(n_layers, config, block_size);
+                    let pool = Arc::new(
+                        GpuBlockPool::new(device, num_blocks, block_size, n_head_kv, head_dim)
+                            .map_err(|e| EngineError::backend(format!("shared KV pool: {e}")))?,
+                    );
+                    let handle = GpuPoolHandle::private(pool);
+                    *slot = Some(handle.clone());
+                    handle
+                }
+            };
+            {
+                // Compute a stable model fingerprint from architecture parameters.
+                let model_fingerprint = {
+                    use std::hash::{Hash, Hasher};
+                    use std::collections::hash_map::DefaultHasher;
+                    let mut h = DefaultHasher::new();
+                    n_layers.hash(&mut h);
+                    n_head_kv.hash(&mut h);
+                    head_dim.hash(&mut h);
+                    n_embd.hash(&mut h);
+                    h.finish()
+                };
+                // Build a prefix block cache sized at 1/4 of the pool's logical capacity.
+                let prefix_cache_cap = {
+                    let pool_blocks = handle.pool.total_blocks();
+                    let env_cap = std::env::var("KAPSL_GGUF_PREFIX_CACHE_BLOCKS")
+                        .ok()
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .filter(|&v| v > 0);
+                    env_cap.unwrap_or_else(|| (pool_blocks / n_layers / 4).max(1))
+                };
+                let prefix_cache = Some(Arc::new(Mutex::new(
+                    PrefixBlockCache::new(prefix_cache_cap),
+                )));
+                log::info!(
+                    "[gguf] Prefix KV cache enabled: capacity={} logical positions",
+                    prefix_cache_cap
+                );
+                Some(GgufSharedKvPool::new(
+                    handle,
+                    effective_device_id,
+                    n_layers,
+                    config.total_ctx(),
+                    prefix_cache,
+                    model_fingerprint,
+                ))
+            }
+        };
         if let Ok(mut snapshot) = self.metrics.lock() {
             snapshot.kv_cache_blocks_total = config.total_ctx();
             snapshot.kv_cache_blocks_free = config.total_ctx();
@@ -996,7 +1913,15 @@ impl Engine for GgufBackend {
         let backend_clone = Arc::clone(&weights.backend);
         let metrics = Arc::clone(&self.metrics);
         std::thread::spawn(move || {
-            run_scheduler(model_clone, backend_clone, rx, config, metrics);
+            run_scheduler(
+                model_clone,
+                backend_clone,
+                rx,
+                config,
+                metrics,
+                #[cfg(feature = "gguf-cuda-shared-kv")]
+                shared_kv_pool,
+            );
         });
 
         log::info!(

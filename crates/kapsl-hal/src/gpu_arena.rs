@@ -441,3 +441,122 @@ impl Default for BlockTable {
         Self::new()
     }
 }
+
+#[cfg(all(test, feature = "cuda"))]
+mod tests {
+    use super::*;
+    use half::f16;
+
+    // A tiny pool: 8 blocks, 4 tokens/block, 2 KV heads, 8-dim.
+    // Requires CUDA device 0.
+    fn small_pool() -> Arc<GpuBlockPool> {
+        let device = CudaDevice::new(0).expect("CUDA device 0 required for these tests");
+        Arc::new(GpuBlockPool::new(device, 8, 4, 2, 8).unwrap())
+    }
+
+    #[test]
+    fn new_pool_all_blocks_free() {
+        let pool = small_pool();
+        assert_eq!(pool.total_blocks(), 8);
+        assert_eq!(pool.free_count(), 8);
+        assert_eq!(pool.used_count(), 0);
+    }
+
+    #[test]
+    fn alloc_reduces_free_count() {
+        let pool = small_pool();
+        let b = pool.alloc_block().unwrap();
+        assert_eq!(pool.free_count(), 7);
+        assert_eq!(pool.used_count(), 1);
+        pool.free_block(b);
+    }
+
+    #[test]
+    fn free_increments_free_count() {
+        let pool = small_pool();
+        let b = pool.alloc_block().unwrap();
+        assert_eq!(pool.free_count(), 7);
+        pool.free_block(b);
+        assert_eq!(pool.free_count(), 8);
+    }
+
+    #[test]
+    fn alloc_exhausted_returns_error() {
+        let pool = small_pool();
+        let blocks: Vec<u32> = (0..8).map(|_| pool.alloc_block().unwrap()).collect();
+        assert_eq!(pool.free_count(), 0);
+        let err = pool.alloc_block().unwrap_err();
+        assert!(matches!(err, ArenaError::NoFreeBlocks));
+        for b in blocks { pool.free_block(b); }
+    }
+
+    #[test]
+    fn upload_download_roundtrip() {
+        let pool = small_pool();
+        let half_block = pool.num_kv_heads() * pool.block_size() * pool.head_dim(); // 2*4*8 = 64
+        let key: Vec<f16> = (0..half_block).map(|i| f16::from_f32(i as f32)).collect();
+        let val: Vec<f16> = (0..half_block).map(|i| f16::from_f32(i as f32 + 100.0)).collect();
+
+        let b = pool.alloc_block().unwrap();
+        pool.upload_block(b, &key, &val).unwrap();
+
+        let downloaded = pool.download_block(b).unwrap();
+        assert_eq!(&downloaded[..half_block], key.as_slice());
+        assert_eq!(&downloaded[half_block..], val.as_slice());
+        pool.free_block(b);
+    }
+
+    #[test]
+    fn uploaded_zeros_overwritten() {
+        let pool = small_pool();
+        let half_block = pool.num_kv_heads() * pool.block_size() * pool.head_dim();
+        let zeros = vec![f16::ZERO; half_block];
+        let ones  = vec![f16::ONE; half_block];
+
+        let b = pool.alloc_block().unwrap();
+        // First write: all ones
+        pool.upload_block(b, &ones, &ones).unwrap();
+        // Overwrite with zeros
+        pool.upload_block(b, &zeros, &zeros).unwrap();
+        let downloaded = pool.download_block(b).unwrap();
+        assert!(downloaded.iter().all(|&x| x == f16::ZERO));
+        pool.free_block(b);
+    }
+
+    #[test]
+    fn is_compatible_correct_geometry() {
+        let pool = small_pool(); // 2h × 8d
+        assert!(pool.is_compatible(2, 8));
+        assert!(!pool.is_compatible(2, 16));
+        assert!(!pool.is_compatible(4, 8));
+    }
+
+    #[test]
+    fn copy_block_to_pool_preserves_data() {
+        let pool_a = small_pool();
+        let pool_b = small_pool();
+        let half_block = pool_a.num_kv_heads() * pool_a.block_size() * pool_a.head_dim();
+        let key: Vec<f16> = (0..half_block).map(|i| f16::from_f32(i as f32)).collect();
+        let val: Vec<f16> = (0..half_block).map(|i| f16::from_f32(-(i as f32))).collect();
+
+        let src = pool_a.alloc_block().unwrap();
+        let dst = pool_b.alloc_block().unwrap();
+        pool_a.upload_block(src, &key, &val).unwrap();
+        pool_a.copy_block_to_pool(src, &pool_b, dst).unwrap();
+
+        let result = pool_b.download_block(dst).unwrap();
+        assert_eq!(&result[..half_block], key.as_slice());
+        assert_eq!(&result[half_block..], val.as_slice());
+        pool_a.free_block(src);
+        pool_b.free_block(dst);
+    }
+
+    #[test]
+    fn capacity_bytes_matches_geometry() {
+        let pool = small_pool(); // 8 blocks, 4 tokens, 2 heads, 8 dim
+        // elems_per_block = 2 * 2 * 4 * 8 = 128; bytes = 128 * 2 = 256; total = 8 * 256
+        assert_eq!(pool.elems_per_block(), 128);
+        assert_eq!(pool.bytes_per_block(), 256);
+        assert_eq!(pool.capacity_bytes(), 8 * 256);
+    }
+}

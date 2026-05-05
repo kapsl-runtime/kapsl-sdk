@@ -30,6 +30,7 @@ serde = { version = "1.0", features = ["derive"] }
 default = []
 # Opt-in llama.cpp CUDA; the default backend build stays portable.
 gguf-cuda = ["kapsl-llm/gguf-cuda"]
+gguf-cuda-shared-kv = ["kapsl-llm/gguf-cuda-shared-kv", "kapsl-hal/cuda"]
 native = [
     "dep:kapsl-kernels",
     "dep:kapsl-loader",

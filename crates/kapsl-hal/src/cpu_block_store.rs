@@ -96,3 +96,137 @@ impl CpuBlockStore {
         self.free_slots.extend_from_slice(slots);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use half::f16;
+
+    fn make_store(capacity: usize, kv_heads: usize, block_size: usize, head_dim: usize)
+        -> CpuBlockStore
+    {
+        CpuBlockStore::new(capacity, kv_heads, block_size, head_dim)
+    }
+
+    fn block_data(val: f32, elems: usize) -> Vec<f16> {
+        vec![f16::from_f32(val); elems]
+    }
+
+    #[test]
+    fn new_store_has_correct_capacity() {
+        let store = make_store(7, 2, 16, 64);
+        assert_eq!(store.capacity(), 7);
+    }
+
+    #[test]
+    fn new_store_all_slots_free() {
+        let store = make_store(4, 2, 16, 64);
+        assert_eq!(store.free_count(), 4);
+        assert_eq!(store.used_count(), 0);
+    }
+
+    #[test]
+    fn store_and_load_roundtrip() {
+        let mut store = make_store(4, 2, 8, 32);
+        let elems = store.elems_per_block();
+        let data: Vec<f16> = (0..elems).map(|i| f16::from_f32(i as f32)).collect();
+        let slot = store.store_block(&data).unwrap();
+        assert_eq!(store.load_block(slot).unwrap(), data.as_slice());
+    }
+
+    #[test]
+    fn store_decrements_free_count() {
+        let mut store = make_store(3, 1, 4, 8);
+        let elems = store.elems_per_block();
+        let data = block_data(1.0, elems);
+        assert_eq!(store.free_count(), 3);
+        store.store_block(&data).unwrap();
+        assert_eq!(store.free_count(), 2);
+        store.store_block(&data).unwrap();
+        assert_eq!(store.free_count(), 1);
+        store.store_block(&data).unwrap();
+        assert_eq!(store.free_count(), 0);
+        assert_eq!(store.used_count(), 3);
+    }
+
+    #[test]
+    fn full_store_returns_error() {
+        let mut store = make_store(1, 1, 4, 8);
+        let elems = store.elems_per_block();
+        let data = block_data(0.0, elems);
+        store.store_block(&data).unwrap();
+        let err = store.store_block(&data).unwrap_err();
+        assert!(matches!(err, CpuStoreError::Full { capacity: 1 }));
+    }
+
+    #[test]
+    fn size_mismatch_returns_error() {
+        let mut store = make_store(4, 2, 8, 32);
+        let wrong = vec![f16::ZERO; 5]; // not elems_per_block
+        let err = store.store_block(&wrong).unwrap_err();
+        assert!(matches!(err, CpuStoreError::SizeMismatch { .. }));
+    }
+
+    #[test]
+    fn load_out_of_range_returns_error() {
+        let store = make_store(4, 2, 8, 32);
+        let err = store.load_block(99).unwrap_err();
+        assert!(matches!(err, CpuStoreError::OutOfRange(99)));
+    }
+
+    #[test]
+    fn free_slot_increments_free_count() {
+        let mut store = make_store(3, 1, 4, 8);
+        let elems = store.elems_per_block();
+        let data = block_data(1.0, elems);
+        let slot = store.store_block(&data).unwrap();
+        assert_eq!(store.free_count(), 2);
+        store.free_slot(slot);
+        assert_eq!(store.free_count(), 3);
+    }
+
+    #[test]
+    fn free_slots_bulk_restores_multiple() {
+        let mut store = make_store(4, 1, 4, 8);
+        let elems = store.elems_per_block();
+        let data = block_data(0.0, elems);
+        let s0 = store.store_block(&data).unwrap();
+        let s1 = store.store_block(&data).unwrap();
+        let s2 = store.store_block(&data).unwrap();
+        assert_eq!(store.free_count(), 1);
+        store.free_slots_bulk(&[s0, s1, s2]);
+        assert_eq!(store.free_count(), 4);
+    }
+
+    #[test]
+    fn multiple_slots_store_independently() {
+        let mut store = make_store(3, 1, 4, 8);
+        let elems = store.elems_per_block();
+        let data_a: Vec<f16> = (0..elems).map(|i| f16::from_f32(i as f32)).collect();
+        let data_b: Vec<f16> = (0..elems).map(|i| f16::from_f32(i as f32 * 2.0)).collect();
+        let slot_a = store.store_block(&data_a).unwrap();
+        let slot_b = store.store_block(&data_b).unwrap();
+        assert_ne!(slot_a, slot_b);
+        assert_eq!(store.load_block(slot_a).unwrap(), data_a.as_slice());
+        assert_eq!(store.load_block(slot_b).unwrap(), data_b.as_slice());
+    }
+
+    #[test]
+    fn reused_slot_reflects_new_data() {
+        let mut store = make_store(1, 1, 4, 8);
+        let elems = store.elems_per_block();
+        let data_a = block_data(1.0, elems);
+        let data_b = block_data(2.0, elems);
+        let slot = store.store_block(&data_a).unwrap();
+        store.free_slot(slot);
+        let slot2 = store.store_block(&data_b).unwrap();
+        assert_eq!(store.load_block(slot2).unwrap(), data_b.as_slice());
+    }
+
+    #[test]
+    fn elems_per_block_matches_formula() {
+        // 2 * kv_heads * block_size * head_dim
+        let store = CpuBlockStore::new(1, 3, 16, 128);
+        assert_eq!(store.elems_per_block(), 2 * 3 * 16 * 128);
+    }
+}
