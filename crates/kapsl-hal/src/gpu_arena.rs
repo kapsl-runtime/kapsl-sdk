@@ -17,7 +17,7 @@
 //! ```
 
 #[cfg(feature = "cuda")]
-use cudarc::driver::{CudaDevice, CudaSlice, DevicePtr, DeviceSlice};
+use cudarc::driver::{CudaDevice, CudaSlice, DevicePtr};
 #[cfg(feature = "cuda")]
 use std::cell::UnsafeCell;
 #[cfg(feature = "cuda")]
@@ -143,6 +143,19 @@ pub struct GpuBlockPool {
     head_dim: usize,
     /// Stack of free physical block indices (LIFO for cache locality).
     free_stack: Mutex<Vec<u32>>,
+}
+
+#[cfg(feature = "cuda")]
+impl std::fmt::Debug for GpuBlockPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GpuBlockPool")
+            .field("num_blocks", &self.num_blocks)
+            .field("block_size", &self.block_size)
+            .field("num_kv_heads", &self.num_kv_heads)
+            .field("head_dim", &self.head_dim)
+            .field("free", &self.free_stack.lock().unwrap().len())
+            .finish()
+    }
 }
 
 // SAFETY: The free_stack Mutex serialises alloc/free, and the storage
