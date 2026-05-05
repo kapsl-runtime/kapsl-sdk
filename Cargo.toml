@@ -43,6 +43,8 @@ resolver = "2"
 # Patch esaxx-rs to use dynamic CRT (/MD) on Windows MSVC, matching llama-cpp-sys-2.
 # Without this, the linker fails with LNK2038 (RuntimeLibrary mismatch).
 esaxx-rs = { path = "patches/esaxx-rs" }
+llama-cpp-sys-2 = { path = "patches/llama-cpp-sys-2" }
+llama-cpp-2 = { path = "patches/llama-cpp-2" }
 
 [workspace.package]
 version = "0.1.0"

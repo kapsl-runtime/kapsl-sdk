@@ -336,7 +336,10 @@ mod inner {
             };
 
             // 4. Build combined block list and register session.
-            let mut all_blocks: Vec<u32>  = hits.iter().map(|h| h.block_id).collect();
+            // Pure-Rust path: each cached ref has exactly one block_id (single-block layout).
+            let mut all_blocks: Vec<u32>  = hits.iter()
+                .filter_map(|h| h.block_ids.first().copied())
+                .collect();
             let prefix_hash_vec: Vec<u64> = hits.iter().map(|h| h.block_hash).collect();
             let pool      = new_result.pool.clone();
             let device_id = new_result.device_id;
@@ -382,7 +385,8 @@ mod inner {
             let mut promoted = 0usize;
             for (i, &block_id) in blocks_copy.iter().enumerate() {
                 let Some(&hash) = hashes.get(i) else { break };
-                if cache.insert(model_fingerprint, hash, device_id, pool.clone(), block_id, 1) {
+                // Pure-Rust path: one physical block per logical position (vec of length 1).
+                if cache.insert(model_fingerprint, hash, device_id, pool.clone(), vec![block_id], 1) {
                     promoted += 1;
                 } else {
                     break;
@@ -703,6 +707,7 @@ mod inner {
         /// Phase 1 — free zero-refcount prefix cache entries (no CPU transfer).
         /// Phase 2 — evict LRU live sessions to CPU (expensive, done only if
         ///            Phase 1 was insufficient).
+        #[allow(dead_code)]
         fn evict_until_capacity(
             &mut self,
             device_id: usize,
@@ -718,9 +723,9 @@ mod inner {
                     // evict_lru_for_device returns owned Vec, so the mutable borrow ends here.
                     let freed = self.prefix_cache.as_mut().unwrap()
                         .evict_lru_for_device(device_id, to_evict);
-                    for (pool, block_id) in freed {
+                    for (pool, block_ids) in freed {
                         if pool.is_compatible(kv_heads, head_dim) {
-                            pool.free_block(block_id);
+                            for id in block_ids { pool.free_block(id); }
                         }
                     }
                 }
@@ -743,6 +748,196 @@ mod inner {
                 self.evict_session_to_cpu(evict_id)?;
             }
             Ok(())
+        }
+    }
+
+    // ── Tests ─────────────────────────────────────────────────────────────────
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::gpu_arena::GpuBlockPool;
+        use cudarc::driver::CudaDevice;
+
+        // Small pool: 8 blocks, 4 tokens/block, 2 KV heads, 8-dim.
+        // Requires CUDA device 0.
+        fn small_pool() -> Arc<GpuBlockPool> {
+            let device = CudaDevice::new(0).expect("CUDA device 0 required");
+            Arc::new(GpuBlockPool::new(device, 8, 4, 2, 8).unwrap())
+        }
+
+        fn sched() -> CrossDevicePoolScheduler {
+            CrossDevicePoolScheduler::new(0.85, 64)
+        }
+
+        #[test]
+        fn register_pool_creates_cpu_store_for_geometry() {
+            let mut s = sched();
+            let pool = small_pool();
+            s.register_pool(0, pool.clone());
+            // After registration the device is visible.
+            assert!(s.registered_devices().contains(&0));
+            // CPU store was created for this geometry.
+            let free = s.device_free_blocks(0, pool.num_kv_heads(), pool.head_dim());
+            assert_eq!(free, pool.total_blocks());
+        }
+
+        #[test]
+        fn registered_devices_returns_sorted_list() {
+            let mut s = sched();
+            let p0 = small_pool();
+            let p1 = small_pool();
+            s.register_pool(2, p0);
+            s.register_pool(0, p1);
+            assert_eq!(s.registered_devices(), vec![0, 2]);
+        }
+
+        #[test]
+        fn reserve_allocates_blocks_and_records_session() {
+            let mut s = sched();
+            let pool = small_pool();
+            s.register_pool(0, pool.clone());
+            let r = s.reserve_blocks(42, 3, Some(0), pool.num_kv_heads(), pool.head_dim()).unwrap();
+            assert_eq!(r.device_id, 0);
+            assert_eq!(r.blocks.len(), 3);
+            assert_eq!(pool.free_count(), 5);
+            assert_eq!(s.session_count(), 1);
+            assert_eq!(s.sessions_on_device(0), 1);
+        }
+
+        #[test]
+        fn release_session_frees_blocks() {
+            let mut s = sched();
+            let pool = small_pool();
+            s.register_pool(0, pool.clone());
+            s.reserve_blocks(7, 4, Some(0), pool.num_kv_heads(), pool.head_dim()).unwrap();
+            assert_eq!(pool.free_count(), 4);
+            s.release_session(7);
+            assert_eq!(pool.free_count(), 8);
+            assert_eq!(s.session_count(), 0);
+        }
+
+        #[test]
+        fn device_pressure_empty_is_zero() {
+            let mut s = sched();
+            let pool = small_pool();
+            s.register_pool(0, pool);
+            assert_eq!(s.device_pressure(0), 0.0);
+        }
+
+        #[test]
+        fn device_pressure_increases_with_allocations() {
+            let mut s = sched();
+            let pool = small_pool(); // 8 blocks
+            s.register_pool(0, pool.clone());
+            s.reserve_blocks(1, 4, Some(0), pool.num_kv_heads(), pool.head_dim()).unwrap();
+            let pressure = s.device_pressure(0);
+            assert!((pressure - 0.5).abs() < 1e-5, "expected 0.5 got {pressure}");
+        }
+
+        #[test]
+        fn device_free_blocks_filters_by_geometry() {
+            let mut s = sched();
+            let pool = small_pool(); // 2h × 8d, 8 blocks
+            s.register_pool(0, pool.clone());
+            // Correct geometry.
+            assert_eq!(s.device_free_blocks(0, 2, 8), 8);
+            // Wrong geometry — no matching pool.
+            assert_eq!(s.device_free_blocks(0, 4, 8), 0);
+        }
+
+        #[test]
+        fn reserve_falls_back_to_other_device_when_preferred_is_full() {
+            let mut s = sched();
+            let p0 = small_pool(); // 8 blocks
+            let p1 = small_pool(); // 8 blocks
+            let (kv_heads, head_dim) = (p0.num_kv_heads(), p0.head_dim());
+            s.register_pool(0, p0.clone());
+            s.register_pool(1, p1.clone());
+            // Fill device 0 entirely.
+            s.reserve_blocks(10, 8, Some(0), kv_heads, head_dim).unwrap();
+            assert_eq!(p0.free_count(), 0);
+            // A new reservation should land on device 1.
+            let r = s.reserve_blocks(11, 2, Some(0), kv_heads, head_dim).unwrap();
+            assert_eq!(r.device_id, 1);
+            assert_eq!(p1.free_count(), 6);
+        }
+
+        #[test]
+        fn mark_active_updates_lru_timestamp() {
+            let mut s = sched();
+            let pool = small_pool();
+            s.register_pool(0, pool.clone());
+            s.reserve_blocks(5, 1, Some(0), pool.num_kv_heads(), pool.head_dim()).unwrap();
+            // mark_active must not panic and must keep the session alive.
+            s.mark_active(5);
+            assert_eq!(s.session_count(), 1);
+        }
+
+        #[test]
+        fn session_count_and_on_device_metrics() {
+            let mut s = sched();
+            let p0 = small_pool();
+            let p1 = small_pool();
+            let (kv_heads, head_dim) = (p0.num_kv_heads(), p0.head_dim());
+            s.register_pool(0, p0.clone());
+            s.register_pool(1, p1.clone());
+            s.reserve_blocks(1, 1, Some(0), kv_heads, head_dim).unwrap();
+            s.reserve_blocks(2, 1, Some(1), kv_heads, head_dim).unwrap();
+            assert_eq!(s.session_count(), 2);
+            assert_eq!(s.sessions_on_device(0), 1);
+            assert_eq!(s.sessions_on_device(1), 1);
+            assert_eq!(s.sessions_on_cpu(), 0);
+        }
+
+        #[test]
+        fn evict_session_to_cpu_frees_gpu_blocks() {
+            let mut s = sched();
+            let pool = small_pool();
+            let (kv_heads, head_dim) = (pool.num_kv_heads(), pool.head_dim());
+            s.register_pool(0, pool.clone());
+            s.reserve_blocks(99, 3, Some(0), kv_heads, head_dim).unwrap();
+            assert_eq!(pool.free_count(), 5);
+            s.evict_session_to_cpu(99).unwrap();
+            // GPU blocks returned.
+            assert_eq!(pool.free_count(), 8);
+            // Session is now on CPU.
+            assert_eq!(s.sessions_on_cpu(), 1);
+            assert_eq!(s.sessions_on_device(0), 0);
+        }
+
+        #[test]
+        fn evict_and_restore_preserves_kv_data() {
+            let mut s = sched();
+            let pool = small_pool();
+            let (kv_heads, head_dim) = (pool.num_kv_heads(), pool.head_dim());
+            let half_block = kv_heads * pool.block_size() * head_dim;
+            s.register_pool(0, pool.clone());
+            // Reserve one block and upload known KV data.
+            let r = s.reserve_blocks(55, 1, Some(0), kv_heads, head_dim).unwrap();
+            let block_id = r.blocks[0];
+            let key: Vec<half::f16> = (0..half_block).map(|i| half::f16::from_f32(i as f32)).collect();
+            let val: Vec<half::f16> = (0..half_block).map(|i| half::f16::from_f32(100.0 + i as f32)).collect();
+            pool.upload_block(block_id, &key, &val).unwrap();
+
+            // Evict to CPU.
+            s.evict_session_to_cpu(55).unwrap();
+            assert_eq!(pool.free_count(), 8);
+
+            // Restore to GPU.
+            s.restore_session_to_gpu(55, 0).unwrap();
+            assert_eq!(s.sessions_on_device(0), 1);
+            assert_eq!(s.sessions_on_cpu(), 0);
+
+            // Verify KV data survived the round-trip.
+            if let KvTier::Gpu { .. } = s.sessions.get(&55).unwrap().tier {
+                let new_block = s.sessions.get(&55).unwrap().blocks[0];
+                let downloaded = pool.download_block(new_block).unwrap();
+                assert_eq!(&downloaded[..half_block], key.as_slice());
+                assert_eq!(&downloaded[half_block..], val.as_slice());
+            } else {
+                panic!("session should be on GPU after restore");
+            }
         }
     }
 }

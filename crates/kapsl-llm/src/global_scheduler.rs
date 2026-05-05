@@ -352,11 +352,15 @@ impl GlobalKvScheduler {
         *self.reserved_tokens.entry(engine_id).or_insert(0) += tokens;
 
         // Track in-flight count and mark active on first request.
-        let inflight = self.inflight.entry(engine_id).or_insert(0);
-        if *inflight == 0 {
+        let was_idle = {
+            let inflight = self.inflight.entry(engine_id).or_insert(0);
+            let was_idle = *inflight == 0;
+            *inflight += 1;
+            was_idle
+        };
+        if was_idle {
             self.set_active(engine_id, true);
         }
-        *inflight += 1;
 
         true
     }

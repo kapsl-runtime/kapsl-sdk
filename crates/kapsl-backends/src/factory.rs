@@ -6,7 +6,7 @@ use crate::native::NativeBackend;
 use kapsl_core::loader::Manifest;
 use kapsl_core::HardwareRequirements;
 use kapsl_engine_api::Engine;
-#[cfg(any(feature = "gguf-native", feature = "native"))]
+#[cfg(any(feature = "gguf-native", feature = "native", feature = "gguf-cuda-shared-kv"))]
 use kapsl_hal::gpu_arena::GpuPoolHandle;
 use kapsl_hal::device::DeviceInfo;
 use kapsl_llm::llm_backend::LLMBackend;
@@ -153,8 +153,21 @@ impl BackendFactory {
                 .map_err(|e| format!("GgufNativeBackend init failed: {e}"));
         }
 
+        #[cfg(all(feature = "gguf-cuda-shared-kv", not(feature = "gguf-native")))]
+        if manifest.framework == "gguf" {
+            let device_id = manifest.hardware_requirements.device_id.unwrap_or(0);
+            log::info!(
+                "✓ Using GgufBackend (llama.cpp CUDA + Kapsl shared KV), device {}",
+                device_id
+            );
+            return Ok(Box::new(GgufBackend::new_cuda_shared_kv(
+                device_id as usize,
+                None,
+            )));
+        }
+
         // GGUF: fallback to llama.cpp-backed GgufBackend.
-        #[cfg(not(feature = "gguf-native"))]
+        #[cfg(not(any(feature = "gguf-native", feature = "gguf-cuda-shared-kv")))]
         if manifest.framework == "gguf" {
             log::info!("✓ Using GgufBackend (llama.cpp)");
             return Ok(Box::new(GgufBackend::new()));
@@ -277,8 +290,17 @@ impl BackendFactory {
                 .map_err(|e| format!("GgufNativeBackend init failed: {e}"));
         }
 
+        #[cfg(all(feature = "gguf-cuda-shared-kv", not(feature = "gguf-native")))]
+        if manifest.framework == "gguf" {
+            log::info!(
+                "✓ Using GgufBackend (llama.cpp CUDA + Kapsl shared KV) on device {}",
+                device_id
+            );
+            return Ok(Box::new(GgufBackend::new_cuda_shared_kv(device_id, None)));
+        }
+
         // GGUF: fallback to llama.cpp-backed GgufBackend.
-        #[cfg(not(feature = "gguf-native"))]
+        #[cfg(not(any(feature = "gguf-native", feature = "gguf-cuda-shared-kv")))]
         if manifest.framework == "gguf" {
             log::info!("✓ Using GgufBackend (llama.cpp)");
             return Ok(Box::new(GgufBackend::new()));
@@ -471,6 +493,15 @@ impl BackendFactory {
             b = b.with_pool_handle(h);
         }
         Ok(b)
+    }
+
+    /// Create a llama.cpp CUDA backend backed by the Kapsl shared KV pool.
+    #[cfg(feature = "gguf-cuda-shared-kv")]
+    pub fn create_gguf_cuda_shared_kv(
+        device_id: i32,
+        handle: Option<GpuPoolHandle>,
+    ) -> Result<GgufBackend, String> {
+        Ok(GgufBackend::new_cuda_shared_kv(device_id.max(0) as usize, handle))
     }
 
     /// Create a NativeBackend with an optional pre-shared pool handle.
