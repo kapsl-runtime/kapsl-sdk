@@ -1306,8 +1306,10 @@ impl Engine for OnnxBackend {
         Ok(output_packet)
     }
 
-    // TODO: Implement proper streaming for LLM models with token-by-token generation
-    // TODO: This is a placeholder - real streaming should yield tokens as they're generated
+    // Single-shot models (classifiers, vision, embeddings) produce one result,
+    // so a one-item stream is the correct semantics here. Token-by-token LLM
+    // streaming lives in kapsl_llm::LLMBackend, which the factory selects for
+    // manifests with framework == "llm".
     fn infer_stream(
         &self,
         request: &InferenceRequest,
