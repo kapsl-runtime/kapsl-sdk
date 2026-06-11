@@ -36,8 +36,18 @@
 //! let mut global = GlobalKvScheduler::new(8192); // 8192 tokens / round
 //!
 //! // Register engines as they load.
-//! global.register(EngineHandle { engine_id: 0, share_weight: 1 });
-//! global.register(EngineHandle { engine_id: 1, share_weight: 2 }); // 2× the budget
+//! global.register(EngineHandle {
+//!     engine_id: 0,
+//!     share_weight: 1,
+//!     guaranteed_min_tokens: 0,
+//!     max_tokens: None,
+//! });
+//! global.register(EngineHandle {
+//!     engine_id: 1,
+//!     share_weight: 2, // 2× the budget
+//!     guaranteed_min_tokens: 0,
+//!     max_tokens: None,
+//! });
 //!
 //! // Each scheduling round, ask for per-engine budgets.
 //! let budgets = global.allocate_budgets();
