@@ -1037,7 +1037,19 @@ fn main() {
                 common_profile_dir.display()
             );
         }
-        println!("cargo:rustc-link-lib=static=common");
+        // llama.cpp renamed "common" → "llama-common" (+ "llama-common-base")
+        // after the ggml-org:master merge. Support both names so older and
+        // newer fork checkouts both build.
+        let has_llama_common = common_lib_dir.join("libllama-common.a").exists()
+            || common_lib_dir.join("llama-common.lib").exists()
+            || common_lib_dir.join("libllama-common-base.a").exists()
+            || common_lib_dir.join("llama-common-base.lib").exists();
+        if has_llama_common {
+            println!("cargo:rustc-link-lib=static=llama-common-base");
+            println!("cargo:rustc-link-lib=static=llama-common");
+        } else {
+            println!("cargo:rustc-link-lib=static=common");
+        }
     }
 
     if cfg!(feature = "system-ggml") {
