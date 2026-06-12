@@ -15,9 +15,13 @@
 #   KAPSL_DIR=/other/path ./scripts/build-kapsl.sh
 set -euo pipefail
 
-KAPSL_DIR="${KAPSL_DIR:-/fs04/vf38/tngu0610/kapsl-engine/kapsl-runtime}"
+# Default layout: this script lives in <kapsl-sdk>/scripts, with kapsl-engine
+# checked out next to kapsl-sdk (kapsl-runtime's Cargo path deps require the
+# side-by-side layout). Matches both the HPC checkout and a fresh cloud VM.
+SCRIPT_SDK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+KAPSL_SDK_DIR="${KAPSL_SDK_DIR:-$SCRIPT_SDK_DIR}"
+KAPSL_DIR="${KAPSL_DIR:-$(dirname "$KAPSL_SDK_DIR")/kapsl-engine/kapsl-runtime}"
 LLVM_ENV="${LLVM_ENV:-/fs04/vf38/tngu0610/.conda/envs/llvm}"
-KAPSL_SDK_DIR="${KAPSL_SDK_DIR:-/fs04/vf38/tngu0610/kapsl-sdk}"
 KAPSL_LLAMA_CPP_DIR="${KAPSL_LLAMA_CPP_DIR:-$KAPSL_SDK_DIR/third_party/llama.cpp-kapsl}"
 KAPSL_FEATURE="${1:-${KAPSL_FEATURE:-gguf-cuda-shared-kv}}"
 
@@ -61,10 +65,21 @@ rm -f  "$KAPSL_DIR/target/release/deps/libllama_cpp_2-"*.rlib
 echo "==> Setting build environment"
 conda deactivate 2>/dev/null || true
 
-export LIBCLANG_PATH="$LLVM_ENV/lib"
-export BINDGEN_EXTRA_CLANG_ARGS="-I$LLVM_ENV/lib/clang/22/include"
+# HPC: libclang comes from a conda env and CUDA from a module. On cloud VMs
+# (e.g. vast.ai) neither exists — rely on system libclang/nvcc instead.
+if [[ -d "$LLVM_ENV/lib" ]]; then
+  export LIBCLANG_PATH="$LLVM_ENV/lib"
+  export BINDGEN_EXTRA_CLANG_ARGS="-I$LLVM_ENV/lib/clang/22/include"
+fi
 
-module load cuda/12.2.0
+if command -v module >/dev/null 2>&1; then
+  module load cuda/12.2.0
+fi
+
+if ! command -v nvcc >/dev/null 2>&1; then
+  echo "error: nvcc not found; install the CUDA toolkit or load the cuda module" >&2
+  exit 2
+fi
 
 export LLAMA_CUDA=1
 export KAPSL_SDK_DIR
