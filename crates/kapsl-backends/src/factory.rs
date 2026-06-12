@@ -156,13 +156,17 @@ impl BackendFactory {
         #[cfg(all(feature = "gguf-cuda-shared-kv", not(feature = "gguf-native")))]
         if manifest.framework == "gguf" {
             let device_id = manifest.hardware_requirements.device_id.unwrap_or(0);
+            // Reuse the device pool registered with ORT (if any) so GGUF KV
+            // and ONNX sessions draw from the same memory budget.
+            let pool = crate::ort_pool_allocator::registered_pool_handle(device_id as i32);
             log::info!(
-                "✓ Using GgufBackend (llama.cpp CUDA + Kapsl shared KV), device {}",
+                "✓ Using GgufBackend (llama.cpp CUDA + Kapsl shared KV{}), device {}",
+                if pool.is_some() { ", pool shared with ONNX" } else { "" },
                 device_id
             );
             return Ok(Box::new(GgufBackend::new_cuda_shared_kv(
                 device_id as usize,
-                None,
+                pool,
             )));
         }
 

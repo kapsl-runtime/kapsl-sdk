@@ -1,3 +1,4 @@
+pub mod block_range;
 pub mod cpu_block_store;
 pub mod device;
 pub mod device_mesh;

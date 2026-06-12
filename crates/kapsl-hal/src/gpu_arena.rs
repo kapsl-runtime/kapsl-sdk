@@ -29,6 +29,9 @@ use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
 #[cfg(feature = "cuda")]
+use crate::block_range::BlockRangeAllocator;
+
+#[cfg(feature = "cuda")]
 #[derive(Debug, Error)]
 pub enum ArenaError {
     #[error("CUDA driver error: {0}")]
@@ -37,6 +40,8 @@ pub enum ArenaError {
     Oom { requested: usize, available: usize },
     #[error("Block pool exhausted: no free blocks remaining")]
     NoFreeBlocks,
+    #[error("Block pool has no contiguous run of {requested} blocks ({free} free total)")]
+    NoContiguousRun { requested: usize, free: usize },
 }
 
 // ─── GpuArena ────────────────────────────────────────────────────────────────
@@ -126,7 +131,7 @@ impl GpuArena {
 // Dim 4: head dimension element
 //
 // Sharing safety invariant: each physical block is owned by at most one
-// session at any time, enforced by the Mutex-protected free_stack.  Concurrent
+// session at any time, enforced by the Mutex-protected free set.  Concurrent
 // backends writing to *different* physical blocks never alias, so the
 // UnsafeCell on storage is sound.
 
@@ -141,8 +146,8 @@ pub struct GpuBlockPool {
     block_size: usize,
     num_kv_heads: usize,
     head_dim: usize,
-    /// Stack of free physical block indices (LIFO for cache locality).
-    free_stack: Mutex<Vec<u32>>,
+    /// Sorted free set; supports single-block and contiguous-run allocation.
+    free_blocks: Mutex<BlockRangeAllocator>,
 }
 
 #[cfg(feature = "cuda")]
@@ -153,12 +158,12 @@ impl std::fmt::Debug for GpuBlockPool {
             .field("block_size", &self.block_size)
             .field("num_kv_heads", &self.num_kv_heads)
             .field("head_dim", &self.head_dim)
-            .field("free", &self.free_stack.lock().unwrap().len())
+            .field("free", &self.free_blocks.lock().unwrap().free_count())
             .finish()
     }
 }
 
-// SAFETY: The free_stack Mutex serialises alloc/free, and the storage
+// SAFETY: The free_blocks Mutex serialises alloc/free, and the storage
 // UnsafeCell is only written to non-overlapping regions (one per allocated
 // block, owned exclusively by the session that called alloc_block).
 #[cfg(feature = "cuda")]
@@ -179,7 +184,7 @@ impl GpuBlockPool {
         let elems_per_block = 2 * num_kv_heads * block_size * head_dim;
         let total_elems = num_blocks * elems_per_block;
         let storage = device.alloc_zeros::<half::f16>(total_elems)?;
-        let free_stack = (0..num_blocks as u32).rev().collect();
+        let free_blocks = BlockRangeAllocator::new(num_blocks);
 
         let bytes = total_elems * 2;
         log::info!(
@@ -198,28 +203,47 @@ impl GpuBlockPool {
             block_size,
             num_kv_heads,
             head_dim,
-            free_stack: Mutex::new(free_stack),
+            free_blocks: Mutex::new(free_blocks),
         })
     }
 
     /// Allocate a free physical block. Returns the block index.
     pub fn alloc_block(&self) -> Result<u32, ArenaError> {
-        self.free_stack
+        self.free_blocks
             .lock()
             .unwrap()
-            .pop()
+            .alloc()
             .ok_or(ArenaError::NoFreeBlocks)
     }
 
     /// Release a physical block back to the free pool.
     pub fn free_block(&self, block_id: u32) {
         debug_assert!((block_id as usize) < self.num_blocks);
-        self.free_stack.lock().unwrap().push(block_id);
+        self.free_blocks.lock().unwrap().free(block_id);
+    }
+
+    /// Allocate `n` *contiguous* physical blocks, returning the first index.
+    ///
+    /// Used by consumers that need flat device buffers carved out of the pool
+    /// (e.g. the ONNX Runtime allocator) rather than paged single blocks.
+    pub fn alloc_blocks_contiguous(&self, n: usize) -> Result<u32, ArenaError> {
+        let mut free = self.free_blocks.lock().unwrap();
+        free.alloc_run(n).ok_or(ArenaError::NoContiguousRun {
+            requested: n,
+            free: free.free_count(),
+        })
+    }
+
+    /// Release a contiguous run previously returned by
+    /// [`alloc_blocks_contiguous`](Self::alloc_blocks_contiguous).
+    pub fn free_blocks_contiguous(&self, first: u32, n: usize) {
+        debug_assert!(first as usize + n <= self.num_blocks);
+        self.free_blocks.lock().unwrap().free_run(first, n);
     }
 
     /// Number of free blocks remaining.
     pub fn free_count(&self) -> usize {
-        self.free_stack.lock().unwrap().len()
+        self.free_blocks.lock().unwrap().free_count()
     }
 
     /// Total number of blocks in the pool.
@@ -301,6 +325,13 @@ impl GpuBlockPool {
     /// externally-owned KV storage without taking ownership.
     pub fn device_base_ptr(&self) -> *mut std::ffi::c_void {
         *self.storage().device_ptr() as *mut std::ffi::c_void
+    }
+
+    /// Raw CUDA device pointer to the start of a specific physical block.
+    pub fn block_device_ptr(&self, block_id: u32) -> *mut std::ffi::c_void {
+        debug_assert!((block_id as usize) < self.num_blocks);
+        (self.device_base_ptr() as usize + block_id as usize * self.bytes_per_block())
+            as *mut std::ffi::c_void
     }
 
     /// Mutable view of the storage slice (for KV-write kernels).
@@ -501,6 +532,35 @@ mod tests {
         let err = pool.alloc_block().unwrap_err();
         assert!(matches!(err, ArenaError::NoFreeBlocks));
         for b in blocks { pool.free_block(b); }
+    }
+
+    #[test]
+    fn contiguous_alloc_and_free() {
+        let pool = small_pool();
+        let first = pool.alloc_blocks_contiguous(3).unwrap();
+        assert_eq!(pool.free_count(), 5);
+        // The run is contiguous, so block pointers advance by bytes_per_block.
+        let bpb = pool.bytes_per_block();
+        let base = pool.block_device_ptr(first) as usize;
+        assert_eq!(pool.block_device_ptr(first + 1) as usize, base + bpb);
+        assert_eq!(pool.block_device_ptr(first + 2) as usize, base + 2 * bpb);
+        pool.free_blocks_contiguous(first, 3);
+        assert_eq!(pool.free_count(), 8);
+    }
+
+    #[test]
+    fn contiguous_alloc_fragmented_fails() {
+        let pool = small_pool();
+        // Hold every other block so no 2-run exists.
+        let all: Vec<u32> = (0..8).map(|_| pool.alloc_block().unwrap()).collect();
+        for b in all.iter().filter(|b| *b % 2 == 0) {
+            pool.free_block(*b);
+        }
+        let err = pool.alloc_blocks_contiguous(2).unwrap_err();
+        assert!(matches!(err, ArenaError::NoContiguousRun { requested: 2, .. }));
+        for b in all.iter().filter(|b| *b % 2 == 1) {
+            pool.free_block(*b);
+        }
     }
 
     #[test]

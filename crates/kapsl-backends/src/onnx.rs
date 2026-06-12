@@ -470,6 +470,27 @@ impl OnnxBackend {
                 })?;
         }
 
+        // When a shared Kapsl GPU pool is registered with ORT for this
+        // device, opt into env allocators so this session's device memory is
+        // carved out of the same pool as the GGUF KV cache.
+        #[cfg(feature = "onnx-cuda-pool")]
+        if matches!(
+            self.provider,
+            ExecutionProvider::CUDA | ExecutionProvider::TensorRT
+        ) && crate::ort_pool_allocator::is_registered(self.device_id)
+        {
+            builder = builder
+                .with_config_entry(crate::ort_pool_allocator::USE_ENV_ALLOCATORS_KEY, "1")
+                .map_err(|e| EngineError::ModelLoadError {
+                    path: model_path.to_string_lossy().into_owned(),
+                    source: Box::new(std::io::Error::other(e.to_string())),
+                })?;
+            log::info!(
+                "ONNX session (device {}) using shared Kapsl GPU pool allocator",
+                self.device_id
+            );
+        }
+
         // Configure execution providers based on the selected backend
         let builder = match self.provider {
             ExecutionProvider::CUDA => {
