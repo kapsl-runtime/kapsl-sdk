@@ -25,6 +25,8 @@ pub struct KapslMetrics {
     pub kv_cache_evicted_sequences: IntGaugeVec,
     pub kv_cache_packed_layers: IntGaugeVec,
     pub kv_cache_cpu_offloaded_blocks: IntGaugeVec,
+    pub prompt_tokens_total: IntGaugeVec,
+    pub generated_tokens_total: IntGaugeVec,
 }
 
 impl KapslMetrics {
@@ -177,6 +179,22 @@ impl KapslMetrics {
             &["model"],
         )
         .unwrap();
+        let prompt_tokens_total = IntGaugeVec::new(
+            Opts::new(
+                "kapsl_prompt_tokens_total",
+                "Cumulative prompt tokens processed by the engine",
+            ),
+            &["model"],
+        )
+        .unwrap();
+        let generated_tokens_total = IntGaugeVec::new(
+            Opts::new(
+                "kapsl_generated_tokens_total",
+                "Cumulative generated tokens produced by the engine",
+            ),
+            &["model"],
+        )
+        .unwrap();
 
         registry
             .register(Box::new(inference_latency.clone()))
@@ -235,6 +253,12 @@ impl KapslMetrics {
         registry
             .register(Box::new(kv_cache_cpu_offloaded_blocks.clone()))
             .expect("Failed to register kv_cache_cpu_offloaded_blocks");
+        registry
+            .register(Box::new(prompt_tokens_total.clone()))
+            .expect("Failed to register prompt_tokens_total");
+        registry
+            .register(Box::new(generated_tokens_total.clone()))
+            .expect("Failed to register generated_tokens_total");
 
         Self {
             registry: registry.clone(),
@@ -257,6 +281,8 @@ impl KapslMetrics {
             kv_cache_evicted_sequences,
             kv_cache_packed_layers,
             kv_cache_cpu_offloaded_blocks,
+            prompt_tokens_total,
+            generated_tokens_total,
         }
     }
 
@@ -288,6 +314,12 @@ impl KapslMetrics {
         self.kv_cache_cpu_offloaded_blocks
             .with_label_values(&[model])
             .set(metrics.kv_cache_cpu_offloaded_blocks as i64);
+        self.prompt_tokens_total
+            .with_label_values(&[model])
+            .set(metrics.prompt_tokens_total as i64);
+        self.generated_tokens_total
+            .with_label_values(&[model])
+            .set(metrics.generated_tokens_total as i64);
     }
 }
 

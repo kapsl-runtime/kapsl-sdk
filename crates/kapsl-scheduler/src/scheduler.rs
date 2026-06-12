@@ -327,6 +327,8 @@ impl crate::replica_pool::ReplicaScheduler for Scheduler {
         let mut total_kv_evicted_sequences = 0;
         let mut total_kv_packed_layers = 0;
         let mut total_kv_cpu_offloaded_blocks = 0;
+        let mut total_prompt_tokens = 0;
+        let mut total_generated_tokens = 0;
         let count = self.engines.len();
 
         for engine in &self.engines {
@@ -343,6 +345,8 @@ impl crate::replica_pool::ReplicaScheduler for Scheduler {
             total_kv_evicted_sequences += m.kv_cache_evicted_sequences;
             total_kv_packed_layers += m.kv_cache_packed_layers;
             total_kv_cpu_offloaded_blocks += m.kv_cache_cpu_offloaded_blocks;
+            total_prompt_tokens += m.prompt_tokens_total;
+            total_generated_tokens += m.generated_tokens_total;
         }
 
         let (cpu_q, gpu_q) = self.get_queue_depth();
@@ -366,6 +370,8 @@ impl crate::replica_pool::ReplicaScheduler for Scheduler {
             kv_cache_evicted_sequences: total_kv_evicted_sequences,
             kv_cache_packed_layers: total_kv_packed_layers,
             kv_cache_cpu_offloaded_blocks: total_kv_cpu_offloaded_blocks,
+            prompt_tokens_total: total_prompt_tokens,
+            generated_tokens_total: total_generated_tokens,
             ..kapsl_engine_api::EngineMetrics::default()
         }
     }

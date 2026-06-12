@@ -332,6 +332,7 @@ struct ActiveSeq {
     seq_id: i32,
     /// Next KV-cache position to write.
     pos: i32,
+    prompt_tokens: usize,
     n_generated: i32,
     max_tokens: i32,
     min_tokens: i32,
@@ -340,6 +341,23 @@ struct ActiveSeq {
     output: Vec<u8>,
     response: GgufResponse,
     error: Option<EngineError>,
+}
+
+#[cfg(feature = "gguf")]
+fn record_gguf_token_metrics(
+    metrics: &Arc<Mutex<EngineMetrics>>,
+    prompt_tokens: usize,
+    generated_tokens: usize,
+) {
+    if let Ok(mut snapshot) = metrics.lock() {
+        snapshot.prompt_tokens_total = snapshot
+            .prompt_tokens_total
+            .saturating_add(prompt_tokens as u64);
+        snapshot.generated_tokens_total = snapshot
+            .generated_tokens_total
+            .saturating_add(generated_tokens as u64);
+        snapshot.refresh_timestamp();
+    }
 }
 
 /// KV block data downloaded to CPU when the scheduler went idle.
@@ -889,14 +907,38 @@ unsafe extern "C" fn gguf_kapsl_kv_reserve_prefix(
     let n_logical  = (n_tokens as usize).div_ceil(block_size).max(1);
     if n_logical > state.max_blocks_per_seq { return false; }
 
-    // 2. Lookup prefix cache — collect a contiguous run of hits.
+    // 2. Same-session decode usually grows one token at a time. If the current
+    // reservation already covers the requested logical block count, keep its
+    // block table and only refresh complete-block hashes so a just-completed
+    // partial block can be promoted after decode.
+    if state.evicted.lock().unwrap().is_none() {
+        let mut inner = state.inner.lock().unwrap();
+        if inner.n_logical_blocks >= n_logical {
+            inner.all_hashes = all_hashes;
+            inner.model_fingerprint = fp;
+            let table_ptr = match inner.block_table.as_ref() {
+                Some(table) => *table.device_ptr() as *mut u32,
+                None => {
+                    return false;
+                }
+            };
+            unsafe {
+                *block_table_device_out = table_ptr;
+                *n_logical_blocks_out = inner.n_logical_blocks as u32;
+                *n_prefix_hits_out = inner.n_prefix_hits as u32;
+            }
+            return true;
+        }
+    }
+
+    // 3. Lookup prefix cache — collect a contiguous run of hits.
     let hits = {
         let mut c = match cache.lock() { Ok(c) => c, Err(_) => return false };
         c.lookup(fp, &all_hashes)
     };
     let n_hits = hits.len();
 
-    // 3. Check for CPU-evicted state: use restore path if available.
+    // 4. Check for CPU-evicted state: use restore path if available.
     let evicted_opt = state.evicted.lock().unwrap().take();
     if let Some(evicted) = evicted_opt {
         // Build the per-hit block-id lists for the restore helper.
@@ -910,7 +952,7 @@ unsafe extern "C" fn gguf_kapsl_kv_reserve_prefix(
         );
     }
 
-    // 4. Allocate fresh blocks for positions that missed the cache.
+    // 5. Allocate fresh blocks for positions that missed the cache.
     let n_new       = n_logical.saturating_sub(n_hits);
     let needed_phys = n_new.saturating_mul(state.n_layers);
     if needed_phys > state.handle.cap() { return false; }
@@ -924,7 +966,7 @@ unsafe extern "C" fn gguf_kapsl_kv_reserve_prefix(
         return false;
     }
 
-    // 5. Build the block table: cached blocks first, then new blocks.
+    // 6. Build the block table: cached blocks first, then new blocks.
     let mut host_table = vec![0u32; state.n_layers * state.max_blocks_per_seq];
     for layer in 0..state.n_layers {
         for (hit_pos, hit) in hits.iter().enumerate() {
@@ -1158,6 +1200,7 @@ fn sequence_needs_kv_after_first(
 
 #[cfg(feature = "gguf")]
 fn finish_or_activate_prefilled_sequence(
+    metrics: &Arc<Mutex<EngineMetrics>>,
     ctx: &mut llama_cpp_2::context::LlamaContext,
     available_ids: &mut Vec<i32>,
     active: &mut Vec<ActiveSeq>,
@@ -1175,6 +1218,7 @@ fn finish_or_activate_prefilled_sequence(
     if max_tokens <= 0 || (first_tok == eos_token && min_tokens <= 0) {
         let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
         available_ids.push(seq_id);
+        record_gguf_token_metrics(metrics, prompt_len.max(0) as usize, 0);
         response.finish(output);
         return;
     }
@@ -1195,11 +1239,13 @@ fn finish_or_activate_prefilled_sequence(
     if max_tokens <= 1 {
         let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
         available_ids.push(seq_id);
+        record_gguf_token_metrics(metrics, prompt_len.max(0) as usize, 1);
         response.finish(output);
     } else {
         active.push(ActiveSeq {
             seq_id,
             pos: prompt_len,
+            prompt_tokens: prompt_len.max(0) as usize,
             n_generated: 1,
             max_tokens,
             min_tokens,
@@ -1657,6 +1703,7 @@ fn run_scheduler(
             }
 
             finish_or_activate_prefilled_sequence(
+                &metrics,
                 &mut ctx,
                 &mut available_ids,
                 &mut active,
@@ -1672,6 +1719,7 @@ fn run_scheduler(
 
             for copy in ready_copies {
                 finish_or_activate_prefilled_sequence(
+                    &metrics,
                     &mut ctx,
                     &mut available_ids,
                     &mut active,
@@ -1751,6 +1799,11 @@ fn run_scheduler(
             if let Some(error) = done.error {
                 done.response.send_error(error);
             } else {
+                record_gguf_token_metrics(
+                    &metrics,
+                    done.prompt_tokens,
+                    done.n_generated.max(0) as usize,
+                );
                 done.response.finish(done.output);
             }
         }

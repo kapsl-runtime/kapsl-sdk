@@ -146,6 +146,8 @@ pub struct EngineMetrics {
     pub kv_cache_evicted_sequences: u64,
     pub kv_cache_packed_layers: usize,
     pub kv_cache_cpu_offloaded_blocks: u64,
+    pub prompt_tokens_total: u64,
+    pub generated_tokens_total: u64,
 }
 
 impl EngineMetrics {
@@ -168,6 +170,8 @@ impl EngineMetrics {
             kv_cache_evicted_sequences: 0,
             kv_cache_packed_layers: 0,
             kv_cache_cpu_offloaded_blocks: 0,
+            prompt_tokens_total: 0,
+            generated_tokens_total: 0,
         }
     }
 
