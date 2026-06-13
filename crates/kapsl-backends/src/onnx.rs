@@ -7,6 +7,7 @@ use kapsl_engine_api::{
 use ndarray::ArrayD;
 use ort::execution_providers::ExecutionProvider as OrtExecutionProvider;
 use ort::session::builder::GraphOptimizationLevel;
+use ort::session::run_options::{OutputSelector, RunOptions};
 use ort::session::{Session, SessionInputValue};
 use ort::tensor::TensorElementType;
 use ort::value::{TensorRef, Value};
@@ -1198,15 +1199,31 @@ fn run_inference_with_session(
             source: None,
         });
     }
+    let primary_output_name =
+        metadata
+            .output_names
+            .first()
+            .ok_or_else(|| EngineError::InferenceError {
+                reason: "Model has no outputs defined".to_string(),
+                source: None,
+            })?;
+    let run_options = RunOptions::new()
+        .map_err(|e| EngineError::InferenceError {
+            reason: "Failed to create ONNX run options".to_string(),
+            source: Some(Box::new(e)),
+        })?
+        .with_outputs(OutputSelector::no_default().with(primary_output_name.as_str()));
 
     let outputs = if metadata.input_names.len() == 1 && request.additional_inputs.is_empty() {
-        session.run([main_input_tensor]).map_err(|e| {
-            log::error!("ONNX Runtime inference error: {:?}", e);
-            EngineError::InferenceError {
-                reason: format!("Inference failed: {}", e),
-                source: Some(Box::new(e)),
-            }
-        })?
+        session
+            .run_with_options([main_input_tensor], &run_options)
+            .map_err(|e| {
+                log::error!("ONNX Runtime inference error: {:?}", e);
+                EngineError::InferenceError {
+                    reason: format!("Inference failed: {}", e),
+                    source: Some(Box::new(e)),
+                }
+            })?
     } else {
         // Prepare named input map only when required by multi-input models.
         let mut inputs: Vec<(Cow<'_, str>, SessionInputValue)> =
@@ -1348,13 +1365,15 @@ fn run_inference_with_session(
             }
         }
 
-        session.run(inputs).map_err(|e| {
-            log::error!("ONNX Runtime inference error: {:?}", e);
-            EngineError::InferenceError {
-                reason: format!("Inference failed: {}", e),
-                source: Some(Box::new(e)),
-            }
-        })?
+        session
+            .run_with_options(inputs, &run_options)
+            .map_err(|e| {
+                log::error!("ONNX Runtime inference error: {:?}", e);
+                EngineError::InferenceError {
+                    reason: format!("Inference failed: {}", e),
+                    source: Some(Box::new(e)),
+                }
+            })?
     };
 
     // For LLMs, we often get multiple outputs (logits + KV cache).
