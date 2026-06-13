@@ -301,14 +301,21 @@ pub struct BinaryTensorPacket {
 impl serde::Serialize for BinaryTensorPacket {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
+        let human_readable = serializer.is_human_readable();
         // Must match the 4-field layout of BinaryTensorPacketPayload in the Deserialize impl
         // so that bincode round-trips correctly (derived Serialize only emits 3 fields,
         // causing a field-count mismatch on the bincode decode side).
         let mut state = serializer.serialize_struct("BinaryTensorPacket", 4)?;
         state.serialize_field("shape", &self.shape)?;
         state.serialize_field("dtype", &self.dtype)?;
-        state.serialize_field("data", &Some(&self.data))?;
-        state.serialize_field("data_base64", &None::<&str>)?;
+        if human_readable {
+            let data_base64 = base64::engine::general_purpose::STANDARD.encode(&self.data);
+            state.serialize_field("data", &None::<&[u8]>)?;
+            state.serialize_field("data_base64", &Some(data_base64.as_str()))?;
+        } else {
+            state.serialize_field("data", &Some(&self.data))?;
+            state.serialize_field("data_base64", &None::<&str>)?;
+        }
         state.end()
     }
 }
@@ -825,6 +832,39 @@ mod tests {
         assert_eq!(packet.shape, vec![1, 4]);
         assert_eq!(packet.dtype, TensorDtype::Uint8);
         assert_eq!(packet.data, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn binary_tensor_packet_serializes_json_as_data_base64() {
+        let packet = BinaryTensorPacket {
+            shape: vec![1, 4],
+            dtype: TensorDtype::Uint8,
+            data: vec![1, 2, 3, 4],
+        };
+
+        let payload = serde_json::to_value(packet).expect("packet should serialize");
+
+        assert_eq!(payload["shape"], serde_json::json!([1, 4]));
+        assert_eq!(payload["dtype"], serde_json::json!("uint8"));
+        assert!(payload["data"].is_null());
+        assert_eq!(payload["data_base64"], serde_json::json!("AQIDBA=="));
+    }
+
+    #[test]
+    fn binary_tensor_packet_bincode_roundtrips_raw_data_layout() {
+        let packet = BinaryTensorPacket {
+            shape: vec![1, 4],
+            dtype: TensorDtype::Uint8,
+            data: vec![1, 2, 3, 4],
+        };
+
+        let encoded = bincode::serialize(&packet).expect("packet should serialize");
+        let decoded: BinaryTensorPacket =
+            bincode::deserialize(&encoded).expect("packet should deserialize");
+
+        assert_eq!(decoded.shape, packet.shape);
+        assert_eq!(decoded.dtype, packet.dtype);
+        assert_eq!(decoded.data, packet.data);
     }
 
     #[test]
