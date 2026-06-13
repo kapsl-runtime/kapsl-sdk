@@ -27,7 +27,8 @@ use llama_cpp_2::{
     llama_backend::LlamaBackend,
     llama_batch::LlamaBatch,
     model::{params::LlamaModelParams, AddBos, LlamaModel},
-    token::LlamaToken,
+    sampling::LlamaSampler,
+    token::{logit_bias::LlamaLogitBias, LlamaToken},
     TokenToStringError,
 };
 #[cfg(feature = "gguf")]
@@ -340,11 +341,90 @@ struct ActiveSeq {
     n_generated: i32,
     max_tokens: i32,
     min_tokens: i32,
+    suppress_eos_sampler: bool,
     /// Token to feed into the next decode step.
     last_token: LlamaToken,
     output: Vec<u8>,
     response: GgufResponse,
     error: Option<EngineError>,
+}
+
+#[cfg(feature = "gguf")]
+struct GgufBackendSamplers {
+    greedy: Vec<LlamaSampler>,
+    no_eos: Vec<LlamaSampler>,
+    mode_by_seq_id: Vec<Option<bool>>,
+    sample: LlamaSampler,
+}
+
+#[cfg(feature = "gguf")]
+impl GgufBackendSamplers {
+    fn new(model: &LlamaModel, max_concurrent: usize, eos_token: LlamaToken) -> Self {
+        let n_vocab = model.n_vocab();
+        let eos_bias = [LlamaLogitBias::new(eos_token, f32::NEG_INFINITY)];
+        let greedy = (0..max_concurrent)
+            .map(|_| LlamaSampler::chain_simple([LlamaSampler::greedy()]))
+            .collect();
+        let no_eos = (0..max_concurrent)
+            .map(|_| {
+                LlamaSampler::chain_simple([
+                    LlamaSampler::logit_bias(n_vocab, &eos_bias),
+                    LlamaSampler::greedy(),
+                ])
+            })
+            .collect();
+
+        Self {
+            greedy,
+            no_eos,
+            mode_by_seq_id: vec![None; max_concurrent],
+            sample: LlamaSampler::greedy(),
+        }
+    }
+
+    fn set_for_sequence(
+        &mut self,
+        ctx: &mut llama_cpp_2::context::LlamaContext,
+        seq_id: i32,
+        suppress_eos: bool,
+    ) -> bool {
+        let Some(slot) = usize::try_from(seq_id).ok() else {
+            return false;
+        };
+        if self
+            .mode_by_seq_id
+            .get(slot)
+            .copied()
+            .flatten()
+            .is_some_and(|mode| mode == suppress_eos)
+        {
+            return true;
+        }
+        let sampler = if suppress_eos {
+            self.no_eos.get_mut(slot)
+        } else {
+            self.greedy.get_mut(slot)
+        };
+        let Some(sampler) = sampler else {
+            return false;
+        };
+        if unsafe { ctx.set_sampler(seq_id, Some(sampler)) } {
+            if let Some(mode) = self.mode_by_seq_id.get_mut(slot) {
+                *mode = Some(suppress_eos);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    fn sample_token(
+        &mut self,
+        ctx: &llama_cpp_2::context::LlamaContext,
+        batch_pos: i32,
+    ) -> LlamaToken {
+        self.sample.sample(ctx, batch_pos)
+    }
 }
 
 #[cfg(feature = "gguf")]
@@ -1388,34 +1468,6 @@ impl Default for GgufBackend {
 
 // ─── Scheduler loop ───────────────────────────────────────────────────────────
 
-/// Sample the next token greedily from the logits row produced for `batch_pos`.
-/// Skipping EOS here is equivalent to the old logit-bias sampler path but avoids
-/// allocating a llama sampler chain for every generated token.
-#[cfg(feature = "gguf")]
-fn sample_token(
-    ctx: &llama_cpp_2::context::LlamaContext,
-    batch_pos: i32,
-    eos_token: LlamaToken,
-    ban_eos: bool,
-) -> LlamaToken {
-    let logits = ctx.get_logits_ith(batch_pos);
-    let mut best_token = 0_i32;
-    let mut best_logit = f32::NEG_INFINITY;
-
-    for (idx, &logit) in logits.iter().enumerate() {
-        let token = idx as i32;
-        if ban_eos && token == eos_token.0 {
-            continue;
-        }
-        if logit > best_logit {
-            best_logit = logit;
-            best_token = token;
-        }
-    }
-
-    LlamaToken::new(best_token)
-}
-
 #[cfg(feature = "gguf")]
 fn token_piece_bytes(model: &LlamaModel, token: LlamaToken) -> Result<Vec<u8>, EngineError> {
     match model.token_to_piece_bytes(token, 256, true, None) {
@@ -1451,6 +1503,7 @@ fn finish_or_activate_prefilled_sequence(
     eos_token: LlamaToken,
     first_tok: LlamaToken,
     first_piece: Option<&[u8]>,
+    suppress_eos_sampler: bool,
 ) {
     let mut output = Vec::with_capacity((max_tokens.max(0) as usize).saturating_mul(4));
 
@@ -1488,6 +1541,7 @@ fn finish_or_activate_prefilled_sequence(
             n_generated: 1,
             max_tokens,
             min_tokens,
+            suppress_eos_sampler,
             last_token: first_tok,
             output,
             response,
@@ -1638,6 +1692,7 @@ fn run_scheduler(
     );
 
     let eos_token = model.token_eos();
+    let mut samplers = GgufBackendSamplers::new(&model, config.max_concurrent, eos_token);
     let batch_cap = n_batch as usize;
     let mut batch = LlamaBatch::new(batch_cap, 1);
 
@@ -1681,6 +1736,12 @@ fn run_scheduler(
             if req.tokens.is_empty() {
                 req.response
                     .send_error(EngineError::invalid_input("prompt has no tokens"));
+                available_ids.push(seq_id);
+                continue;
+            }
+            if !samplers.set_for_sequence(&mut ctx, seq_id, req.min_tokens > 0) {
+                req.response
+                    .send_error(EngineError::backend("failed to install sampler"));
                 available_ids.push(seq_id);
                 continue;
             }
@@ -1885,7 +1946,7 @@ fn run_scheduler(
         for (mut pref, last_pos) in completed_prefills.drain(..) {
             // EOS is skipped during greedy sampling when min_tokens > 0, so first_tok is
             // guaranteed to be a real content token whenever min_tokens is nonzero.
-            let first_tok = sample_token(&ctx, last_pos, eos_token, pref.min_tokens > 0);
+            let first_tok = samplers.sample_token(&ctx, last_pos);
             let prompt_len = pref.tokens.len() as i32;
 
             let emits_first_piece =
@@ -1943,6 +2004,15 @@ fn run_scheduler(
                 ready_copies.push(copy);
             }
 
+            let suppress_eos_sampler = pref.min_tokens > 1;
+            if !suppress_eos_sampler && !samplers.set_for_sequence(&mut ctx, pref.seq_id, false) {
+                let _ = ctx.clear_kv_cache_seq(Some(pref.seq_id as u32), None, None);
+                available_ids.push(pref.seq_id);
+                pref.response
+                    .send_error(EngineError::backend("failed to install sampler"));
+                continue;
+            }
+
             finish_or_activate_prefilled_sequence(
                 &metrics,
                 &mut ctx,
@@ -1956,9 +2026,21 @@ fn run_scheduler(
                 eos_token,
                 first_tok,
                 first_piece.as_deref(),
+                suppress_eos_sampler,
             );
 
             for copy in ready_copies {
+                let copy_suppress_eos_sampler = copy.min_tokens > 1;
+                if !copy_suppress_eos_sampler
+                    && !samplers.set_for_sequence(&mut ctx, copy.seq_id, false)
+                {
+                    let _ = ctx.clear_kv_cache_seq(Some(copy.seq_id as u32), None, None);
+                    available_ids.push(copy.seq_id);
+                    copy.response
+                        .send_error(EngineError::backend("failed to install sampler"));
+                    continue;
+                }
+
                 finish_or_activate_prefilled_sequence(
                     &metrics,
                     &mut ctx,
@@ -1972,6 +2054,7 @@ fn run_scheduler(
                     eos_token,
                     first_tok,
                     first_piece.as_deref(),
+                    copy_suppress_eos_sampler,
                 );
             }
         }
@@ -1987,10 +2070,8 @@ fn run_scheduler(
                 continue; // this sequence was not in the batch this step
             }
 
-            // Ban EOS when min_tokens not yet reached so the model is forced to emit
-            // real tokens instead of cycling on suppressed EOS indefinitely.
-            let next_tok =
-                sample_token(&ctx, batch_pos, eos_token, seq.n_generated < seq.min_tokens);
+            // The active sampler chain suppresses EOS until min_tokens is reached.
+            let next_tok = samplers.sample_token(&ctx, batch_pos);
             seq.pos += 1;
 
             let eos_and_ready = next_tok == eos_token && seq.n_generated >= seq.min_tokens;
@@ -2029,6 +2110,15 @@ fn run_scheduler(
                 } else {
                     seq.last_token = next_tok;
                     seq.n_generated = next_generated;
+                    if seq.suppress_eos_sampler && next_generated >= seq.min_tokens {
+                        if samplers.set_for_sequence(&mut ctx, seq.seq_id, false) {
+                            seq.suppress_eos_sampler = false;
+                        } else {
+                            seq.error =
+                                Some(EngineError::backend("failed to install sampler"));
+                            to_retire.push(i);
+                        }
+                    }
                 }
             }
         }

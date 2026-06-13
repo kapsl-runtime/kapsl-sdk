@@ -7,6 +7,7 @@ use std::slice;
 
 use crate::llama_batch::LlamaBatch;
 use crate::model::{LlamaLoraAdapter, LlamaModel};
+use crate::sampling::LlamaSampler;
 use crate::timing::LlamaTimings;
 use crate::token::data::LlamaTokenData;
 use crate::token::data_array::LlamaTokenDataArray;
@@ -68,6 +69,24 @@ impl<'model> LlamaContext<'model> {
     #[must_use]
     pub fn n_ctx(&self) -> u32 {
         unsafe { llama_cpp_sys_2::llama_n_ctx(self.context.as_ptr()) }
+    }
+
+    /// Install or clear a backend sampler for a sequence id.
+    ///
+    /// # Safety
+    ///
+    /// The sampler must outlive this context or until the sequence id is
+    /// assigned another sampler. llama.cpp stores the sampler pointer directly.
+    #[must_use]
+    pub unsafe fn set_sampler(
+        &mut self,
+        seq_id: i32,
+        sampler: Option<&mut LlamaSampler>,
+    ) -> bool {
+        let sampler = sampler
+            .map(|sampler| sampler.sampler)
+            .unwrap_or(std::ptr::null_mut());
+        unsafe { llama_cpp_sys_2::llama_set_sampler(self.context.as_ptr(), seq_id, sampler) }
     }
 
     /// Decodes the batch.
