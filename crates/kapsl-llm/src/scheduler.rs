@@ -51,6 +51,11 @@ impl LLMScheduler {
         self.block_manager.set_live_cap(cap);
     }
 
+    /// Set the engine id used to stamp KV block ownership in the block manager.
+    pub fn set_block_engine_id(&mut self, engine_id: u32) {
+        self.block_manager.set_engine_id(engine_id);
+    }
+
     pub fn add_sequence_group(&mut self, seq_group: SequenceGroup) {
         let priority = seq_group.priority;
         let group = Arc::new(Mutex::new(seq_group));

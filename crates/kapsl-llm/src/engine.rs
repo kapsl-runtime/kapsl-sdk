@@ -1274,6 +1274,12 @@ impl LLMEngine {
         self.scheduler.set_block_live_cap(cap);
     }
 
+    /// Set the engine id used to stamp KV block ownership. Call after
+    /// `with_shared_pool` so blocks drawn from the shared pool are traceable.
+    pub fn set_block_engine_id(&mut self, engine_id: u32) {
+        self.scheduler.set_block_engine_id(engine_id);
+    }
+
     /// Override the TurboQuant KV-cache compression bit-width for this engine.
     /// Takes precedence over `metadata.json` and `KAPSL_LLM_KV_COMPRESSION_BITS`.
     /// `bits` must be 2, 3, or 4; other values are silently ignored.

@@ -595,6 +595,9 @@ impl Engine for LLMBackend {
             // watchdog so circuit-breaker / hang transitions reach the global
             // scheduler and a stuck engine cannot starve healthy ones.
             if let Some(sched) = global_scheduler_for_engine {
+                // Stamp block ownership with the real engine id assigned by the
+                // runtime so shared-pool blocks are traceable to this engine.
+                engine.set_block_engine_id(engine_id_for_engine);
                 engine = engine.with_health_reporter(sched, engine_id_for_engine);
                 engine.spawn_watchdog();
             }
