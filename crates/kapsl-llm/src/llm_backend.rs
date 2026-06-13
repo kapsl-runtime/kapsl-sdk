@@ -559,6 +559,7 @@ impl Engine for LLMBackend {
         let global_scheduler_for_engine = self.global_scheduler.clone();
         let engine_id_for_engine = self.engine_id;
         let on_engine_death = self.on_engine_death.clone();
+        let live_kv_cap_for_engine = self.live_kv_cap.clone();
         tokio::spawn(async move {
             let engine = LLMEngine::new(
                 config,
@@ -579,6 +580,12 @@ impl Engine for LLMBackend {
             // Apply per-replica block cap if set.
             if let Some(cap) = kv_blocks_cap {
                 engine.set_kv_blocks_cap(cap);
+            }
+            // Attach the live per-engine KV quota so the (shared-pool) block
+            // manager hard-enforces this engine's fair share. Must come after
+            // with_shared_pool, which rebuilds the scheduler/block manager.
+            if let Some(cap) = live_kv_cap_for_engine {
+                engine.set_live_kv_cap(cap);
             }
             // Apply TurboQuant KV-cache compression bit-width if set.
             if let Some(bits) = kv_compression_bits {

@@ -46,6 +46,11 @@ impl LLMScheduler {
         self.config.max_num_batched_tokens
     }
 
+    /// Attach a hard per-engine KV block quota to the underlying block manager.
+    pub fn set_block_live_cap(&mut self, cap: std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        self.block_manager.set_live_cap(cap);
+    }
+
     pub fn add_sequence_group(&mut self, seq_group: SequenceGroup) {
         let priority = seq_group.priority;
         let group = Arc::new(Mutex::new(seq_group));

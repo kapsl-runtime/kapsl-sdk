@@ -1,5 +1,6 @@
 use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// Represents a physical block of memory in the KV cache
@@ -171,6 +172,15 @@ pub struct BlockManager {
     allocator: BlockManagerAllocator,
     block_tables: HashMap<u64, BlockTable>, // sequence_id -> BlockTable
     block_size: usize,
+    /// Number of blocks this manager currently holds across all sequences.
+    /// Maintained incrementally so the per-engine quota can be checked in O(1).
+    held_blocks: usize,
+    /// Optional hard per-engine block quota. When set (shared-pool mode), this
+    /// manager will not allocate beyond `live_cap` blocks even if the shared
+    /// pool has more free — that headroom belongs to other models' fair shares.
+    /// The runtime updates the atomic on engine join/leave so the cap rebalances
+    /// without a restart.
+    live_cap: Option<Arc<AtomicUsize>>,
 }
 
 impl BlockManager {
@@ -184,6 +194,8 @@ impl BlockManager {
             )),
             block_tables: HashMap::new(),
             block_size,
+            held_blocks: 0,
+            live_cap: None,
         }
     }
 
@@ -197,15 +209,42 @@ impl BlockManager {
             allocator: BlockManagerAllocator::Shared(allocator),
             block_tables: HashMap::new(),
             block_size,
+            held_blocks: 0,
+            live_cap: None,
         }
     }
 
+    /// Attach a hard per-engine block quota (shared with the runtime, updated on
+    /// engine join/leave). Once set, `allocate` / `can_allocate` will not let
+    /// this engine exceed the cap regardless of free blocks in the shared pool.
+    pub fn set_live_cap(&mut self, cap: Arc<AtomicUsize>) {
+        self.live_cap = Some(cap);
+    }
+
+    /// Number of blocks this manager currently holds across all sequences.
+    pub fn held_blocks(&self) -> usize {
+        self.held_blocks
+    }
+
+    /// Current quota ceiling, or `None` if uncapped.
+    fn cap(&self) -> Option<usize> {
+        self.live_cap.as_ref().map(|c| c.load(Ordering::Relaxed))
+    }
+
     pub fn allocate(&mut self, sequence_id: u64) -> Option<PhysicalTokenBlock> {
+        // Hard per-engine quota: refuse once this engine is at its cap, even if
+        // the shared pool still has free blocks reserved for other models.
+        if let Some(cap) = self.cap() {
+            if self.held_blocks >= cap {
+                return None;
+            }
+        }
         if let Some(block) = self.allocator.allocate() {
             self.block_tables
                 .entry(sequence_id)
                 .or_insert_with(|| BlockTable::new(self.block_size))
                 .append(block);
+            self.held_blocks += 1;
             Some(block)
         } else {
             None
@@ -214,9 +253,11 @@ impl BlockManager {
 
     pub fn free(&mut self, sequence_id: u64) {
         if let Some(table) = self.block_tables.remove(&sequence_id) {
+            let count = table.len();
             for block in table.get_physical_blocks() {
                 self.allocator.free(*block);
             }
+            self.held_blocks = self.held_blocks.saturating_sub(count);
         }
     }
 
@@ -228,6 +269,7 @@ impl BlockManager {
             for block in table.get_physical_blocks() {
                 self.allocator.free(*block);
             }
+            self.held_blocks = self.held_blocks.saturating_sub(count);
             count
         } else {
             0
@@ -239,7 +281,14 @@ impl BlockManager {
     }
 
     pub fn can_allocate(&self, num_blocks: usize) -> bool {
-        self.allocator.get_num_free_blocks() >= num_blocks
+        if self.allocator.get_num_free_blocks() < num_blocks {
+            return false;
+        }
+        // Also respect the per-engine quota: remaining headroom under the cap.
+        if let Some(cap) = self.cap() {
+            return cap.saturating_sub(self.held_blocks) >= num_blocks;
+        }
+        true
     }
 
     pub fn block_size(&self) -> usize {

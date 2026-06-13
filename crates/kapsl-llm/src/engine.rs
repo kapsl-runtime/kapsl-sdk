@@ -34,7 +34,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -1265,6 +1265,13 @@ impl LLMEngine {
     /// replica receives a proportional share of the device's block budget.
     pub fn set_kv_blocks_cap(&mut self, cap: usize) {
         self.kv_blocks_cap = Some(cap);
+    }
+
+    /// Attach the runtime's live per-engine KV block quota so the block manager
+    /// hard-enforces this engine's fair share of the shared pool. Call after
+    /// `with_shared_pool` (which rebuilds the scheduler/block manager).
+    pub fn set_live_kv_cap(&mut self, cap: Arc<AtomicUsize>) {
+        self.scheduler.set_block_live_cap(cap);
     }
 
     /// Override the TurboQuant KV-cache compression bit-width for this engine.
