@@ -1354,21 +1354,37 @@ fn run_inference_with_session(
         );
     }
 
+    let logits_top_k = request
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.top_k)
+        .and_then(|top_k| usize::try_from(top_k).ok())
+        .filter(|top_k| *top_k > 0);
+
     // Handle output - try f32 first, otherwise return an error.
     let output_value = &outputs[0];
     let output_packet = if let Ok((shape_ref, data)) = output_value.try_extract_tensor::<f32>() {
+        if let Some(top_k) = logits_top_k {
+            return top_k_last_logits_packet(shape_ref, data.iter().copied(), top_k);
+        }
         BinaryTensorPacket {
             shape: shape_ref.to_vec(),
             dtype: TensorDtype::Float32,
             data: data.iter().flat_map(|&x| x.to_ne_bytes()).collect(),
         }
     } else if let Ok((shape_ref, data)) = output_value.try_extract_tensor::<f64>() {
+        if let Some(top_k) = logits_top_k {
+            return top_k_last_logits_packet(shape_ref, data.iter().map(|&x| x as f32), top_k);
+        }
         BinaryTensorPacket {
             shape: shape_ref.to_vec(),
             dtype: TensorDtype::Float64,
             data: data.iter().flat_map(|&x| x.to_ne_bytes()).collect(),
         }
     } else if let Ok((shape_ref, data)) = output_value.try_extract_tensor::<f16>() {
+        if let Some(top_k) = logits_top_k {
+            return top_k_last_logits_packet(shape_ref, data.iter().map(|x| x.to_f32()), top_k);
+        }
         BinaryTensorPacket {
             shape: shape_ref.to_vec(),
             dtype: TensorDtype::Float16,
@@ -1404,6 +1420,96 @@ fn run_inference_with_session(
     };
 
     Ok(output_packet)
+}
+
+fn top_k_last_logits_packet<I>(
+    shape: &[i64],
+    scores: I,
+    top_k: usize,
+) -> Result<BinaryTensorPacket, EngineError>
+where
+    I: ExactSizeIterator<Item = f32>,
+{
+    let vocab_size = shape
+        .last()
+        .copied()
+        .filter(|dim| *dim > 0)
+        .ok_or_else(|| EngineError::InvalidInput {
+            message: "Cannot apply ONNX top_k output reduction to tensor without a positive last dimension".to_string(),
+            source: None,
+        })? as usize;
+    let total_scores = scores.len();
+    if total_scores < vocab_size {
+        return Err(EngineError::InvalidInput {
+            message: format!(
+                "Cannot apply ONNX top_k output reduction: tensor has {} values but vocab dimension is {}",
+                total_scores, vocab_size
+            ),
+            source: None,
+        });
+    }
+
+    let last_row_offset = total_scores - vocab_size;
+    let requested = top_k.min(vocab_size);
+    let candidates = if requested <= 64 {
+        select_top_k_logits(scores.skip(last_row_offset), requested)
+    } else {
+        let mut candidates: Vec<(usize, f32)> = scores.skip(last_row_offset).enumerate().collect();
+        candidates.sort_unstable_by(compare_logits_desc);
+        candidates.truncate(requested);
+        candidates
+    };
+
+    let mut data = Vec::with_capacity(candidates.len() * 2 * std::mem::size_of::<f32>());
+    for (token_id, score) in candidates {
+        data.extend_from_slice(&(token_id as f32).to_ne_bytes());
+        data.extend_from_slice(&score.to_ne_bytes());
+    }
+
+    BinaryTensorPacket::new(vec![(data.len() / 8) as i64, 2], TensorDtype::Float32, data)
+}
+
+fn compare_logits_desc(
+    (_, left_score): &(usize, f32),
+    (_, right_score): &(usize, f32),
+) -> std::cmp::Ordering {
+    match (left_score.is_nan(), right_score.is_nan()) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        (false, false) => right_score.total_cmp(left_score),
+    }
+}
+
+fn select_top_k_logits<I>(scores: I, top_k: usize) -> Vec<(usize, f32)>
+where
+    I: Iterator<Item = f32>,
+{
+    if top_k == 0 {
+        return Vec::new();
+    }
+
+    let mut candidates: Vec<(usize, f32)> = Vec::with_capacity(top_k);
+    for (token_id, score) in scores.enumerate() {
+        let candidate = (token_id, score);
+        if candidates.len() < top_k {
+            candidates.push(candidate);
+            candidates.sort_unstable_by(compare_logits_desc);
+            continue;
+        }
+
+        let Some(worst) = candidates.last() else {
+            continue;
+        };
+        if compare_logits_desc(&candidate, worst).is_lt() {
+            let insert_at = candidates
+                .binary_search_by(|existing| compare_logits_desc(existing, &candidate))
+                .unwrap_or_else(|index| index);
+            candidates.insert(insert_at, candidate);
+            candidates.pop();
+        }
+    }
+    candidates
 }
 
 #[async_trait]

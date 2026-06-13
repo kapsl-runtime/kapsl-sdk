@@ -126,6 +126,42 @@ mod tests {
     }
 
     #[test]
+    fn test_top_k_last_logits_packet_uses_last_row() {
+        let scores = vec![
+            100.0f32, 90.0, 80.0, 70.0, // earlier row should be ignored
+            0.1, 4.0, -2.0, 3.5,
+        ];
+
+        let packet =
+            top_k_last_logits_packet(&[1, 2, 4], scores.into_iter(), 2).expect("top-k packet");
+
+        assert_eq!(packet.shape, vec![2, 2]);
+        assert_eq!(packet.dtype, TensorDtype::Float32);
+        let values: Vec<f32> = packet
+            .data
+            .chunks_exact(4)
+            .map(|chunk| f32::from_ne_bytes(chunk.try_into().expect("f32 bytes")))
+            .collect();
+        assert_eq!(values, vec![1.0, 4.0, 3.0, 3.5]);
+    }
+
+    #[test]
+    fn test_top_k_last_logits_packet_clamps_to_vocab() {
+        let scores = vec![0.5f32, 2.0, 1.0];
+
+        let packet =
+            top_k_last_logits_packet(&[1, 3], scores.into_iter(), 99).expect("top-k packet");
+
+        assert_eq!(packet.shape, vec![3, 2]);
+        let values: Vec<f32> = packet
+            .data
+            .chunks_exact(4)
+            .map(|chunk| f32::from_ne_bytes(chunk.try_into().expect("f32 bytes")))
+            .collect();
+        assert_eq!(values, vec![1.0, 2.0, 2.0, 1.0, 0.0, 0.5]);
+    }
+
+    #[test]
     fn test_validate_int32_bad_length() {
         let values = vec![1i32];
         let packet = BinaryTensorPacket {
