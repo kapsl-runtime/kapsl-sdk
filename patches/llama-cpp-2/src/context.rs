@@ -71,6 +71,14 @@ impl<'model> LlamaContext<'model> {
         unsafe { llama_cpp_sys_2::llama_n_ctx(self.context.as_ptr()) }
     }
 
+    /// Get the backend-sampled token for the `i`th token in the current batch.
+    #[must_use]
+    pub fn sampled_token_ith(&self, i: i32) -> Option<LlamaToken> {
+        let token =
+            unsafe { llama_cpp_sys_2::llama_get_sampled_token_ith(self.context.as_ptr(), i) };
+        (token != -1).then(|| LlamaToken::new(token))
+    }
+
     /// Install or clear a backend sampler for a sequence id.
     ///
     /// # Safety
@@ -78,11 +86,7 @@ impl<'model> LlamaContext<'model> {
     /// The sampler must outlive this context or until the sequence id is
     /// assigned another sampler. llama.cpp stores the sampler pointer directly.
     #[must_use]
-    pub unsafe fn set_sampler(
-        &mut self,
-        seq_id: i32,
-        sampler: Option<&mut LlamaSampler>,
-    ) -> bool {
+    pub unsafe fn set_sampler(&mut self, seq_id: i32, sampler: Option<&mut LlamaSampler>) -> bool {
         let sampler = sampler
             .map(|sampler| sampler.sampler)
             .unwrap_or(std::ptr::null_mut());

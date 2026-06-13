@@ -8,6 +8,11 @@ use std::collections::VecDeque;
 use std::num::NonZeroU32;
 use std::path::Path;
 use std::sync::mpsc as std_mpsc;
+#[cfg(feature = "gguf")]
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    OnceLock,
+};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -43,9 +48,45 @@ const N_CTX_PER_SEQ_DEFAULT: u32 = 2048;
 const GGUF_TARGET_CONCURRENCY_ENV: &str = "KAPSL_GGUF_TARGET_CONCURRENCY";
 const GGUF_QUEUE_DELAY_US_DEFAULT: u64 = 1_000;
 const GGUF_PREFILL_CHUNK_SIZE_DEFAULT: usize = 512;
+const GGUF_TIMING_ENV: &str = "KAPSL_GGUF_TIMING";
+const GGUF_TIMING_LOG_EVERY_ENV: &str = "KAPSL_GGUF_TIMING_LOG_EVERY";
+const GGUF_TIMING_LOG_EVERY_DEFAULT: u64 = 512;
 // llama.cpp sequence-copy asserts unless the context uses a full/unified KV buffer.
 // Keep this opt-in until we can detect that mode safely at runtime.
 const GGUF_EXACT_PROMPT_KV_REUSE_DEFAULT: bool = false;
+
+#[cfg(feature = "gguf")]
+static GGUF_TIMING_BATCH_BUILD_CALLS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gguf")]
+static GGUF_TIMING_BATCH_BUILD_US: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gguf")]
+static GGUF_TIMING_DECODE_CALLS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gguf")]
+static GGUF_TIMING_DECODE_US: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gguf")]
+static GGUF_TIMING_SAMPLE_CALLS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gguf")]
+static GGUF_TIMING_SAMPLE_US: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gguf")]
+static GGUF_TIMING_PIECE_CALLS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gguf")]
+static GGUF_TIMING_PIECE_US: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gguf")]
+static GGUF_TIMING_EMIT_CALLS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gguf")]
+static GGUF_TIMING_EMIT_US: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gguf")]
+static GGUF_TIMING_KV_RESERVE_CALLS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gguf")]
+static GGUF_TIMING_KV_RESERVE_US: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gguf")]
+static GGUF_TIMING_KV_FAST_PATH_CALLS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gguf")]
+static GGUF_TIMING_KV_EXTEND_CALLS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gguf")]
+static GGUF_TIMING_KV_LOOKUP_CALLS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gguf")]
+static GGUF_TIMING_LAST_LOGGED_SAMPLE_CALLS: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(feature = "gguf")]
 fn max_concurrent() -> usize {
@@ -100,6 +141,134 @@ fn gguf_exact_prompt_kv_reuse() -> bool {
             !matches!(v.as_str(), "0" | "false" | "no" | "off")
         })
         .unwrap_or(GGUF_EXACT_PROMPT_KV_REUSE_DEFAULT)
+}
+
+#[cfg(feature = "gguf")]
+fn gguf_timing_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var(GGUF_TIMING_ENV)
+            .ok()
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                !matches!(v.as_str(), "" | "0" | "false" | "no" | "off")
+            })
+            .unwrap_or(false)
+    })
+}
+
+#[cfg(feature = "gguf")]
+fn gguf_timing_log_every() -> u64 {
+    static LOG_EVERY: OnceLock<u64> = OnceLock::new();
+    *LOG_EVERY.get_or_init(|| {
+        std::env::var(GGUF_TIMING_LOG_EVERY_ENV)
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(GGUF_TIMING_LOG_EVERY_DEFAULT)
+    })
+}
+
+#[cfg(feature = "gguf")]
+fn gguf_timing_elapsed_us(start: Instant) -> u64 {
+    start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+#[cfg(feature = "gguf")]
+fn gguf_timing_record(calls: &AtomicU64, micros: &AtomicU64, start: Instant) {
+    calls.fetch_add(1, Ordering::Relaxed);
+    micros.fetch_add(gguf_timing_elapsed_us(start), Ordering::Relaxed);
+}
+
+#[cfg(feature = "gguf")]
+struct GgufTimingGuard {
+    calls: &'static AtomicU64,
+    micros: &'static AtomicU64,
+    start: Option<Instant>,
+}
+
+#[cfg(feature = "gguf")]
+impl GgufTimingGuard {
+    fn new(calls: &'static AtomicU64, micros: &'static AtomicU64) -> Self {
+        Self {
+            calls,
+            micros,
+            start: gguf_timing_enabled().then(Instant::now),
+        }
+    }
+}
+
+#[cfg(feature = "gguf")]
+impl Drop for GgufTimingGuard {
+    fn drop(&mut self) {
+        if let Some(start) = self.start.take() {
+            gguf_timing_record(self.calls, self.micros, start);
+        }
+    }
+}
+
+#[cfg(feature = "gguf")]
+fn gguf_timing_avg_us(calls: u64, micros: u64) -> f64 {
+    if calls == 0 {
+        0.0
+    } else {
+        micros as f64 / calls as f64
+    }
+}
+
+#[cfg(feature = "gguf")]
+fn gguf_timing_maybe_log(force: bool) {
+    if !gguf_timing_enabled() {
+        return;
+    }
+
+    let sample_calls = GGUF_TIMING_SAMPLE_CALLS.load(Ordering::Relaxed);
+    if sample_calls == 0 {
+        return;
+    }
+
+    let log_every = gguf_timing_log_every();
+    let last = GGUF_TIMING_LAST_LOGGED_SAMPLE_CALLS.load(Ordering::Relaxed);
+    if !force && sample_calls / log_every == last / log_every {
+        return;
+    }
+    GGUF_TIMING_LAST_LOGGED_SAMPLE_CALLS.store(sample_calls, Ordering::Relaxed);
+
+    let batch_calls = GGUF_TIMING_BATCH_BUILD_CALLS.load(Ordering::Relaxed);
+    let batch_us = GGUF_TIMING_BATCH_BUILD_US.load(Ordering::Relaxed);
+    let decode_calls = GGUF_TIMING_DECODE_CALLS.load(Ordering::Relaxed);
+    let decode_us = GGUF_TIMING_DECODE_US.load(Ordering::Relaxed);
+    let sample_us = GGUF_TIMING_SAMPLE_US.load(Ordering::Relaxed);
+    let piece_calls = GGUF_TIMING_PIECE_CALLS.load(Ordering::Relaxed);
+    let piece_us = GGUF_TIMING_PIECE_US.load(Ordering::Relaxed);
+    let emit_calls = GGUF_TIMING_EMIT_CALLS.load(Ordering::Relaxed);
+    let emit_us = GGUF_TIMING_EMIT_US.load(Ordering::Relaxed);
+    let kv_calls = GGUF_TIMING_KV_RESERVE_CALLS.load(Ordering::Relaxed);
+    let kv_us = GGUF_TIMING_KV_RESERVE_US.load(Ordering::Relaxed);
+    let kv_fast = GGUF_TIMING_KV_FAST_PATH_CALLS.load(Ordering::Relaxed);
+    let kv_extend = GGUF_TIMING_KV_EXTEND_CALLS.load(Ordering::Relaxed);
+    let kv_lookup = GGUF_TIMING_KV_LOOKUP_CALLS.load(Ordering::Relaxed);
+
+    eprintln!(
+        "[gguf-timing] calls batch={} decode={} sample={} piece={} emit={} kv={} \
+         avg_us batch={:.1} decode={:.1} sample={:.1} piece={:.1} emit={:.1} kv={:.1} \
+         kv_paths fast={} extend={} lookup={}",
+        batch_calls,
+        decode_calls,
+        sample_calls,
+        piece_calls,
+        emit_calls,
+        kv_calls,
+        gguf_timing_avg_us(batch_calls, batch_us),
+        gguf_timing_avg_us(decode_calls, decode_us),
+        gguf_timing_avg_us(sample_calls, sample_us),
+        gguf_timing_avg_us(piece_calls, piece_us),
+        gguf_timing_avg_us(emit_calls, emit_us),
+        gguf_timing_avg_us(kv_calls, kv_us),
+        kv_fast,
+        kv_extend,
+        kv_lookup,
+    );
 }
 
 #[cfg(feature = "gguf")]
@@ -287,6 +456,7 @@ enum GgufResponse {
 #[cfg(feature = "gguf")]
 impl GgufResponse {
     fn emit_piece(&self, output: &mut Vec<u8>, piece: Vec<u8>) -> bool {
+        let _timing = GgufTimingGuard::new(&GGUF_TIMING_EMIT_CALLS, &GGUF_TIMING_EMIT_US);
         match self {
             Self::Final(_) => {
                 output.extend_from_slice(&piece);
@@ -423,7 +593,9 @@ impl GgufBackendSamplers {
         ctx: &llama_cpp_2::context::LlamaContext,
         batch_pos: i32,
     ) -> LlamaToken {
-        self.sample.sample(ctx, batch_pos)
+        let _timing = GgufTimingGuard::new(&GGUF_TIMING_SAMPLE_CALLS, &GGUF_TIMING_SAMPLE_US);
+        ctx.sampled_token_ith(batch_pos)
+            .unwrap_or_else(|| self.sample.sample(ctx, batch_pos))
     }
 }
 
@@ -1076,6 +1248,7 @@ unsafe extern "C" fn gguf_kapsl_kv_reserve_prefix(
     n_logical_blocks_out: *mut u32,
     n_prefix_hits_out: *mut u32,
 ) -> bool {
+    let _timing = GgufTimingGuard::new(&GGUF_TIMING_KV_RESERVE_CALLS, &GGUF_TIMING_KV_RESERVE_US);
     if user_data.is_null()
         || tokens.is_null()
         || block_table_device_out.is_null()
@@ -1142,6 +1315,7 @@ unsafe extern "C" fn gguf_kapsl_kv_reserve_prefix(
             }
             record_gguf_decode_work_metrics(&state.metrics, 1, delta_tokens as u64);
             record_gguf_partial_reuse_metrics(&state.metrics, 1, saved_tokens as u64);
+            GGUF_TIMING_KV_FAST_PATH_CALLS.fetch_add(1, Ordering::Relaxed);
             return true;
         }
         if had_reservation
@@ -1216,6 +1390,7 @@ unsafe extern "C" fn gguf_kapsl_kv_reserve_prefix(
             }
             record_gguf_decode_work_metrics(&state.metrics, 1, delta_tokens as u64);
             record_gguf_partial_reuse_metrics(&state.metrics, 1, saved_tokens as u64);
+            GGUF_TIMING_KV_EXTEND_CALLS.fetch_add(1, Ordering::Relaxed);
             return true;
         }
     }
@@ -1234,6 +1409,7 @@ unsafe extern "C" fn gguf_kapsl_kv_reserve_prefix(
         };
         c.lookup(fp, &all_hashes)
     };
+    GGUF_TIMING_KV_LOOKUP_CALLS.fetch_add(1, Ordering::Relaxed);
     let n_hits = hits.len();
     let previous_tokens = {
         let inner = state.inner.lock().unwrap();
@@ -1486,6 +1662,7 @@ impl Default for GgufBackend {
 
 #[cfg(feature = "gguf")]
 fn token_piece_bytes(model: &LlamaModel, token: LlamaToken) -> Result<Vec<u8>, EngineError> {
+    let _timing = GgufTimingGuard::new(&GGUF_TIMING_PIECE_CALLS, &GGUF_TIMING_PIECE_US);
     match model.token_to_piece_bytes(token, 256, true, None) {
         Ok(piece) => Ok(piece),
         Err(TokenToStringError::InsufficientBufferSpace(size)) if size < 0 => model
@@ -1826,6 +2003,8 @@ fn run_scheduler(
 
         // ── 4. Build batch: multiple prefills (if any) + all active decode tokens ───
         // Reserve `active.len()` slots for decode tokens so prefills don't crowd them out.
+        let batch_build_timing =
+            GgufTimingGuard::new(&GGUF_TIMING_BATCH_BUILD_CALLS, &GGUF_TIMING_BATCH_BUILD_US);
         batch.clear();
         let prefill_budget = batch_cap.saturating_sub(active.len());
         let mut completed_prefills: Vec<(PendingPrefill, i32)> = Vec::new();
@@ -1915,6 +2094,7 @@ fn run_scheduler(
                 decode_batch_positions.push(-1); // skipped this step
             }
         }
+        drop(batch_build_timing);
 
         if batch.n_tokens() == 0 {
             update_gguf_metrics(&metrics, config, &waiting, &pending, &active, 0);
@@ -1930,7 +2110,10 @@ fn run_scheduler(
         );
 
         // ── 5. Execute one forward pass for all sequences in the batch ────────
-        if let Err(e) = ctx.decode(&mut batch) {
+        let decode_timing = GgufTimingGuard::new(&GGUF_TIMING_DECODE_CALLS, &GGUF_TIMING_DECODE_US);
+        let decode_result = ctx.decode(&mut batch);
+        drop(decode_timing);
+        if let Err(e) = decode_result {
             log::error!("[gguf] decode error: {e}");
             for seq in active.drain(..) {
                 seq.response
@@ -2130,8 +2313,7 @@ fn run_scheduler(
                         if samplers.set_for_sequence(&mut ctx, seq.seq_id, false) {
                             seq.suppress_eos_sampler = false;
                         } else {
-                            seq.error =
-                                Some(EngineError::backend("failed to install sampler"));
+                            seq.error = Some(EngineError::backend("failed to install sampler"));
                             to_retire.push(i);
                         }
                     }
@@ -2155,8 +2337,10 @@ fn run_scheduler(
             }
         }
         update_gguf_metrics(&metrics, config, &waiting, &pending, &active, 0);
+        gguf_timing_maybe_log(false);
     }
 
+    gguf_timing_maybe_log(true);
     log::info!("[gguf] Scheduler thread exiting");
 }
 
