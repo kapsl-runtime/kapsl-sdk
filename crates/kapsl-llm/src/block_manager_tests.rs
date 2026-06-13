@@ -1,6 +1,8 @@
 #[cfg(test)]
 mod tests {
-    use super::super::{BlockAllocator, BlockManager, PhysicalTokenBlock};
+    use super::super::{new_shared_allocator, BlockAllocator, BlockManager, PhysicalTokenBlock};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     #[test]
     fn allocator_allocates_and_frees_blocks() {
@@ -46,5 +48,38 @@ mod tests {
         manager.free(10);
         assert!(manager.get_block_table(10).is_none());
         assert!(manager.can_allocate(2));
+    }
+
+    #[test]
+    fn live_cap_hard_limits_allocation_below_pool_free() {
+        // Shared pool with 8 blocks, but this engine's fair-share cap is 2.
+        let pool = new_shared_allocator(8, 16, 0);
+        let mut manager = BlockManager::new_shared(pool, 16);
+        let cap = Arc::new(AtomicUsize::new(2));
+        manager.set_live_cap(cap.clone());
+
+        // Pool has plenty free, but the quota allows only 2 blocks.
+        assert!(manager.can_allocate(2));
+        assert!(!manager.can_allocate(3), "quota must cap below pool free");
+
+        assert!(manager.allocate(1).is_some());
+        assert!(manager.allocate(1).is_some());
+        assert_eq!(manager.held_blocks(), 2);
+        // At the cap now: further allocation is refused despite free pool blocks.
+        assert!(manager.allocate(1).is_none());
+        assert!(manager.free_blocks() >= 6, "pool still has free blocks");
+
+        // Freeing returns headroom under the cap.
+        manager.free(1);
+        assert_eq!(manager.held_blocks(), 0);
+        assert!(manager.allocate(2).is_some());
+
+        // Runtime raises the cap → more headroom without a restart.
+        cap.store(5, Ordering::Relaxed);
+        for _ in 0..4 {
+            assert!(manager.allocate(2).is_some());
+        }
+        assert_eq!(manager.held_blocks(), 5);
+        assert!(manager.allocate(2).is_none(), "capped at the new ceiling");
     }
 }

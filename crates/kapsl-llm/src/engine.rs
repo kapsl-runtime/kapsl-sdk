@@ -33,9 +33,13 @@ use ort::value::{DynValue, TensorRef, Value};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+use crate::global_scheduler::{EngineHealth, GlobalKvScheduler};
+use futures::FutureExt;
 use tokenizers::Tokenizer;
 use tokio::sync::mpsc;
 
@@ -46,6 +50,59 @@ const DEFAULT_NUM_LAYERS: usize = 32;
 const DEFAULT_NUM_HEADS: usize = 32;
 const DEFAULT_HEAD_DIM: usize = 128;
 const MAX_SEQ_LEN: usize = 4096;
+
+// === Failure isolation ===
+/// Trip the circuit breaker after this many consecutive `execute_step` failures.
+const CIRCUIT_BREAKER_THRESHOLD: u32 = 5;
+/// While the breaker is open, requests fail fast for this long before a single
+/// half-open trial batch is allowed through.
+const CIRCUIT_BREAKER_COOLDOWN: Duration = Duration::from_secs(30);
+/// The watchdog marks the engine `Dead` if its run_loop heartbeat is older than
+/// this — i.e. the loop appears stuck (CUDA hang, deadlock).
+const WATCHDOG_STALL_TIMEOUT: Duration = Duration::from_secs(60);
+/// How often the watchdog samples the heartbeat.
+const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Best-effort extraction of a human-readable message from a caught panic
+/// payload (`catch_unwind`'s `Err` value).
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = panic.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = panic.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
+
+/// Milliseconds since the Unix epoch, or 0 if the clock is before the epoch.
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Reports an engine's [`EngineHealth`] into the shared cross-model scheduler so
+/// the scheduler can stop budgeting work to a failing or hung engine.
+struct EngineHealthReporter {
+    scheduler: Arc<parking_lot::Mutex<GlobalKvScheduler>>,
+    engine_id: u32,
+}
+
+impl EngineHealthReporter {
+    fn report(&self, health: EngineHealth) {
+        self.scheduler.lock().set_health(self.engine_id, health);
+    }
+
+    /// Cheap clone of the handle (shares the underlying scheduler `Arc`).
+    fn clone_handle(&self) -> Self {
+        Self {
+            scheduler: self.scheduler.clone(),
+            engine_id: self.engine_id,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum KvLayout {
@@ -884,6 +941,43 @@ pub struct LLMEngine {
     // Reusable Vec storage for per-batch items (avoids realloc on each batched step).
     prefill_items_pool: Vec<PrefillItem>,
     decode_items_pool: Vec<BatchItem>,
+
+    // === Failure isolation ===
+    // Wall-clock heartbeat (ms since epoch) bumped at the top of every run_loop
+    // iteration; the watchdog reads it to detect a stuck loop.
+    heartbeat: Arc<AtomicU64>,
+    // Set false when the engine is dropped so its watchdog task can exit.
+    watchdog_alive: Arc<AtomicBool>,
+    // Consecutive execute_step failures; reset to 0 on a successful step.
+    consecutive_errors: u32,
+    // Whether the circuit breaker is currently tripped (failing fast).
+    circuit_open: bool,
+    // When the breaker tripped — used to allow a half-open trial after cooldown.
+    circuit_opened_at: Option<Instant>,
+    // Optional handle to report health into the cross-model scheduler.
+    health_reporter: Option<EngineHealthReporter>,
+    // Optional one-shot callback fired when the engine is dropped (its run_loop
+    // task ended), so the runtime can fully deregister it. Distinct from the
+    // watchdog's advisory `Dead` health, which can be transient/recoverable.
+    death_notifier: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl Drop for LLMEngine {
+    fn drop(&mut self) {
+        // Stop the watchdog task and tell the scheduler this engine is gone, so
+        // it stops budgeting work to it immediately. KV blocks are returned to
+        // the shared pool by `BlockManager`'s own Drop.
+        self.watchdog_alive.store(false, Ordering::Relaxed);
+        if let Some(reporter) = self.health_reporter.as_ref() {
+            reporter.report(EngineHealth::Dead);
+        }
+        // Notify the runtime so it can fully deregister this engine (registry,
+        // live caps, cap rebalancing) — unambiguous because it fires exactly
+        // once when the engine object is dropped.
+        if let Some(notify) = self.death_notifier.take() {
+            notify();
+        }
+    }
 }
 
 impl LLMEngine {
@@ -1021,6 +1115,13 @@ impl LLMEngine {
             logits_workspace: Vec::new(),
             prefill_items_pool: Vec::new(),
             decode_items_pool: Vec::new(),
+            heartbeat: Arc::new(AtomicU64::new(0)),
+            watchdog_alive: Arc::new(AtomicBool::new(true)),
+            consecutive_errors: 0,
+            circuit_open: false,
+            circuit_opened_at: None,
+            health_reporter: None,
+            death_notifier: None,
         }
     }
 
@@ -1045,11 +1146,132 @@ impl LLMEngine {
         self
     }
 
+    /// Attach a health reporter so circuit-breaker and watchdog transitions are
+    /// pushed into the cross-model scheduler. Call before `run_loop`.
+    pub fn with_health_reporter(
+        mut self,
+        scheduler: Arc<parking_lot::Mutex<GlobalKvScheduler>>,
+        engine_id: u32,
+    ) -> Self {
+        self.health_reporter = Some(EngineHealthReporter {
+            scheduler,
+            engine_id,
+        });
+        self
+    }
+
+    /// Attach a one-shot callback fired when this engine is dropped (its
+    /// `run_loop` task has ended), so the runtime can fully deregister it.
+    pub fn with_death_notifier(mut self, notifier: Box<dyn FnOnce() + Send>) -> Self {
+        self.death_notifier = Some(notifier);
+        self
+    }
+
+    /// Spawn a background watchdog that marks this engine `Dead` in the global
+    /// scheduler if its run_loop heartbeat goes stale, and `Healthy` again if it
+    /// resumes. The task exits on its own once the engine is dropped. No-op when
+    /// no health reporter is attached.
+    pub fn spawn_watchdog(&self) {
+        let Some(reporter) = self.health_reporter.as_ref() else {
+            return;
+        };
+        let reporter = reporter.clone_handle();
+        let heartbeat = self.heartbeat.clone();
+        let alive = self.watchdog_alive.clone();
+        tokio::spawn(async move {
+            let mut marked_dead = false;
+            loop {
+                tokio::time::sleep(WATCHDOG_POLL_INTERVAL).await;
+                if !alive.load(Ordering::Relaxed) {
+                    break;
+                }
+                let last = heartbeat.load(Ordering::Relaxed);
+                // 0 means run_loop hasn't started ticking yet — nothing to judge.
+                if last == 0 {
+                    continue;
+                }
+                let age = now_millis().saturating_sub(last);
+                let stale = age > WATCHDOG_STALL_TIMEOUT.as_millis() as u64;
+                if stale && !marked_dead {
+                    log::error!(
+                        "[watchdog] engine {} heartbeat stale ({} ms); marking Dead",
+                        reporter.engine_id,
+                        age
+                    );
+                    reporter.report(EngineHealth::Dead);
+                    marked_dead = true;
+                } else if !stale && marked_dead {
+                    log::warn!(
+                        "[watchdog] engine {} heartbeat resumed; marking Healthy",
+                        reporter.engine_id
+                    );
+                    reporter.report(EngineHealth::Healthy);
+                    marked_dead = false;
+                }
+            }
+        });
+    }
+
+    /// Whether the circuit breaker permits an execution attempt this round.
+    /// Open + cooled-down allows a single half-open trial batch.
+    fn circuit_breaker_allows_attempt(&self) -> bool {
+        if !self.circuit_open {
+            return true;
+        }
+        match self.circuit_opened_at {
+            Some(opened) => opened.elapsed() >= CIRCUIT_BREAKER_COOLDOWN,
+            None => true,
+        }
+    }
+
+    /// Record a successful execution step: reset the error counter and, if the
+    /// breaker was open, close it and report the engine healthy again.
+    fn on_execute_success(&mut self) {
+        if self.circuit_open {
+            log::info!("Engine circuit breaker recovered after a successful step; closing.");
+            self.circuit_open = false;
+            self.circuit_opened_at = None;
+            if let Some(r) = self.health_reporter.as_ref() {
+                r.report(EngineHealth::Healthy);
+            }
+        }
+        self.consecutive_errors = 0;
+    }
+
+    /// Record a failed execution step: count it and trip the breaker (reporting
+    /// the engine degraded) once the consecutive-failure threshold is reached.
+    fn on_execute_failure(&mut self) {
+        self.consecutive_errors = self.consecutive_errors.saturating_add(1);
+        if self.consecutive_errors >= CIRCUIT_BREAKER_THRESHOLD {
+            if !self.circuit_open {
+                log::warn!(
+                    "Engine circuit breaker tripped after {} consecutive failures; failing fast for {}s.",
+                    self.consecutive_errors,
+                    CIRCUIT_BREAKER_COOLDOWN.as_secs()
+                );
+            }
+            self.circuit_open = true;
+            // Re-arm the cooldown on every failure so a failed half-open trial
+            // backs off again instead of retrying immediately.
+            self.circuit_opened_at = Some(Instant::now());
+            if let Some(r) = self.health_reporter.as_ref() {
+                r.report(EngineHealth::Degraded);
+            }
+        }
+    }
+
     /// Cap the KV cache `total_blocks` to `cap` during the next `load()` call.
     /// Called by the runtime when creating additional replicas so that each
     /// replica receives a proportional share of the device's block budget.
     pub fn set_kv_blocks_cap(&mut self, cap: usize) {
         self.kv_blocks_cap = Some(cap);
+    }
+
+    /// Attach the runtime's live per-engine KV block quota so the block manager
+    /// hard-enforces this engine's fair share of the shared pool. Call after
+    /// `with_shared_pool` (which rebuilds the scheduler/block manager).
+    pub fn set_live_kv_cap(&mut self, cap: Arc<AtomicUsize>) {
+        self.scheduler.set_block_live_cap(cap);
     }
 
     /// Override the TurboQuant KV-cache compression bit-width for this engine.
@@ -2309,7 +2531,25 @@ impl LLMEngine {
 
     pub async fn run_loop(&mut self) {
         loop {
+            // Heartbeat for the watchdog: record that the loop is alive this tick.
+            self.heartbeat.store(now_millis(), Ordering::Relaxed);
+
+            // Circuit breaker: when open, fail fast until the cooldown elapses,
+            // then let a single half-open trial batch through.
+            let circuit_trial = self.circuit_breaker_allows_attempt();
+            let circuit_blocking = self.circuit_open && !circuit_trial;
+
             while let Ok(mut req) = self.request_rx.try_recv() {
+                // Reject immediately without allocating KV blocks for this model
+                // while the breaker is open and still cooling down.
+                if circuit_blocking {
+                    let _ = req.response_tx.try_send(SequenceGroupOutput {
+                        request_id: req.request_id.clone(),
+                        text: "Model temporarily unavailable: circuit breaker open".to_string(),
+                        finish_reason: Some(FinishReason::Error),
+                    });
+                    continue;
+                }
                 let session_id = req.session_id.clone();
                 let (prompt, req_seq_arc) = {
                     let seq_arc = req.sequences.values().next().unwrap();
@@ -2499,6 +2739,12 @@ impl LLMEngine {
                 self.scheduler.add_sequence_group(req);
             }
 
+            // While the breaker is open and cooling down, do no work this round.
+            if circuit_blocking {
+                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                continue;
+            }
+
             let active_ids = self.scheduler.active_sequence_ids();
             if self.use_kv_cache {
                 self.kv_cache.set_active_sequences(&active_ids);
@@ -2510,14 +2756,36 @@ impl LLMEngine {
                 continue;
             }
 
-            if let Err(e) = self.execute_step(&outputs.scheduled_seq_groups).await {
-                log::error!("Execution error: {}", e);
-                if self.try_recover_from_coreml_failure(&e).await {
-                    log::warn!(
-                        "Current batch failed due to provider error; future requests will run on CPU."
-                    );
+            // Run the step inside a panic boundary so a panic deep in inference
+            // (e.g. an unexpected unwrap in tensor code) fails only this batch
+            // and counts toward the circuit breaker, instead of unwinding and
+            // killing the whole engine task.
+            let step_result =
+                AssertUnwindSafe(self.execute_step(&outputs.scheduled_seq_groups))
+                    .catch_unwind()
+                    .await;
+            match step_result {
+                Ok(Ok(())) => self.on_execute_success(),
+                Ok(Err(e)) => {
+                    log::error!("Execution error: {}", e);
+                    if self.try_recover_from_coreml_failure(&e).await {
+                        log::warn!(
+                            "Current batch failed due to provider error; future requests will run on CPU."
+                        );
+                    }
+                    self.fail_groups_with_error(&outputs.scheduled_seq_groups, &e);
+                    self.on_execute_failure();
                 }
-                self.fail_groups_with_error(&outputs.scheduled_seq_groups, &e);
+                Err(panic) => {
+                    let msg = panic_message(panic.as_ref());
+                    log::error!(
+                        "Execution step panicked: {}; failing batch and counting toward circuit breaker.",
+                        msg
+                    );
+                    let err = EngineError::backend(format!("inference panicked: {}", msg));
+                    self.fail_groups_with_error(&outputs.scheduled_seq_groups, &err);
+                    self.on_execute_failure();
+                }
             }
 
             let finished_ids = self.scheduler.free_finished_sequences();

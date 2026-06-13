@@ -1,6 +1,9 @@
 use crate::block_manager::SharedBlockAllocator;
 use crate::engine::LLMEngine;
 use crate::global_scheduler::GlobalKvScheduler;
+// parking_lot::Mutex does not poison on panic, so a crash in one engine's
+// thread cannot propagate to other engines waiting on the scheduler lock.
+type GlobalSchedulerMutex = parking_lot::Mutex<GlobalKvScheduler>;
 use crate::llm_metrics::LLMMetrics;
 use crate::model_paths::{find_model_asset, find_model_root};
 use crate::scheduler::SchedulerConfig;
@@ -51,7 +54,7 @@ pub struct LLMBackend {
     /// When set, every `infer_stream` call must successfully reserve tokens
     /// before the request is enqueued.  Tokens are released when the stream
     /// completes (naturally, on error, or on drop/cancellation).
-    global_scheduler: Option<Arc<Mutex<GlobalKvScheduler>>>,
+    global_scheduler: Option<Arc<GlobalSchedulerMutex>>,
     /// Stable engine ID assigned by `SharedKvStateInner::attach_engine`.
     /// Used as the key for `GlobalKvScheduler::try_reserve_tokens`.
     engine_id: u32,
@@ -59,6 +62,9 @@ pub struct LLMBackend {
     /// The runtime updates this atomic when engines are added or removed so
     /// that block-level limits rebalance without requiring engine restarts.
     live_kv_cap: Option<Arc<AtomicUsize>>,
+    /// Optional callback invoked with this backend's `engine_id` when its engine
+    /// task ends (drops), so the runtime can fully deregister the dead engine.
+    on_engine_death: Option<Arc<dyn Fn(u32) + Send + Sync>>,
 }
 
 #[derive(Clone)]
@@ -343,16 +349,14 @@ fn load_model_runtime_config(model_path: &Path) -> ModelRuntimeConfig {
 /// the budget is reclaimed whether the stream ends normally, errors, or is
 /// cancelled by the caller dropping the future.
 struct GlobalTokenGuard {
-    scheduler: Arc<Mutex<GlobalKvScheduler>>,
+    scheduler: Arc<GlobalSchedulerMutex>,
     engine_id: u32,
     tokens:    usize,
 }
 
 impl Drop for GlobalTokenGuard {
     fn drop(&mut self) {
-        if let Ok(mut sched) = self.scheduler.lock() {
-            sched.complete_tokens(self.engine_id, self.tokens);
-        }
+        self.scheduler.lock().complete_tokens(self.engine_id, self.tokens);
     }
 }
 
@@ -376,7 +380,15 @@ impl LLMBackend {
             global_scheduler: None,
             engine_id: 0,
             live_kv_cap: None,
+            on_engine_death: None,
         }
+    }
+
+    /// Register a callback invoked with this backend's `engine_id` when its
+    /// engine task ends, so the runtime can deregister the dead engine.
+    pub fn with_on_engine_death(mut self, cb: Arc<dyn Fn(u32) + Send + Sync>) -> Self {
+        self.on_engine_death = Some(cb);
+        self
     }
 
     /// Attach a shared block allocator so this backend draws from a unified
@@ -421,7 +433,7 @@ impl LLMBackend {
     /// potentially OOM-ing the device.
     pub fn with_global_scheduler(
         mut self,
-        scheduler: Arc<Mutex<GlobalKvScheduler>>,
+        scheduler: Arc<GlobalSchedulerMutex>,
         engine_id: u32,
     ) -> Self {
         self.global_scheduler = Some(scheduler);
@@ -544,6 +556,10 @@ impl Engine for LLMBackend {
         let shared_pool = self.shared_pool.clone();
         let kv_blocks_cap = self.kv_blocks_cap;
         let kv_compression_bits = self.kv_compression_bits;
+        let global_scheduler_for_engine = self.global_scheduler.clone();
+        let engine_id_for_engine = self.engine_id;
+        let on_engine_death = self.on_engine_death.clone();
+        let live_kv_cap_for_engine = self.live_kv_cap.clone();
         tokio::spawn(async move {
             let engine = LLMEngine::new(
                 config,
@@ -565,9 +581,29 @@ impl Engine for LLMBackend {
             if let Some(cap) = kv_blocks_cap {
                 engine.set_kv_blocks_cap(cap);
             }
+            // Attach the live per-engine KV quota so the (shared-pool) block
+            // manager hard-enforces this engine's fair share. Must come after
+            // with_shared_pool, which rebuilds the scheduler/block manager.
+            if let Some(cap) = live_kv_cap_for_engine {
+                engine.set_live_kv_cap(cap);
+            }
             // Apply TurboQuant KV-cache compression bit-width if set.
             if let Some(bits) = kv_compression_bits {
                 engine.set_kv_compression_bits(bits);
+            }
+            // Attach the cross-model health reporter and start the stall
+            // watchdog so circuit-breaker / hang transitions reach the global
+            // scheduler and a stuck engine cannot starve healthy ones.
+            if let Some(sched) = global_scheduler_for_engine {
+                engine = engine.with_health_reporter(sched, engine_id_for_engine);
+                engine.spawn_watchdog();
+            }
+            // Fire the runtime's deregistration callback when this engine drops
+            // (load failure or run_loop exit), so dead engines don't leave stale
+            // registry / cap entries behind.
+            if let Some(cb) = on_engine_death {
+                engine = engine
+                    .with_death_notifier(Box::new(move || cb(engine_id_for_engine)));
             }
             let load_result = engine.load(&engine_path).await;
             if let Err(e) = load_tx.send(load_result) {
@@ -767,7 +803,6 @@ impl Engine for LLMBackend {
             if let Some(ref sched) = self.global_scheduler {
                 let admitted = sched
                     .lock()
-                    .unwrap()
                     .try_reserve_tokens(self.engine_id, estimated_tokens);
                 if !admitted {
                     return Box::pin(stream::once(async {
@@ -804,9 +839,21 @@ impl Engine for LLMBackend {
                     }
                 }
 
-                if tx.send(seq_group).await.is_err() {
-                    yield Err(EngineError::backend("Failed to send request to engine"));
-                    return;
+                // Per-model backpressure: reject immediately when this model's
+                // queue is full rather than blocking (which would build latency
+                // and hold the admission reservation indefinitely).
+                match tx.try_send(seq_group) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        yield Err(EngineError::overloaded(
+                            "Model queue full: too many pending requests for this model",
+                        ));
+                        return;
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        yield Err(EngineError::backend("Failed to send request to engine"));
+                        return;
+                    }
                 }
 
                 let mut saw_finish = false;
