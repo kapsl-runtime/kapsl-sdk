@@ -27,6 +27,10 @@ pub struct KapslMetrics {
     pub kv_cache_cpu_offloaded_blocks: IntGaugeVec,
     pub prompt_tokens_total: IntGaugeVec,
     pub generated_tokens_total: IntGaugeVec,
+    pub decode_steps_total: IntGaugeVec,
+    pub decode_tokens_evaluated_total: IntGaugeVec,
+    pub kv_partial_reuse_hits_total: IntGaugeVec,
+    pub kv_partial_reuse_tokens_saved_total: IntGaugeVec,
 }
 
 impl KapslMetrics {
@@ -44,13 +48,9 @@ impl KapslMetrics {
         .unwrap();
 
         let ttft_latency = HistogramVec::new(
-            HistogramOpts::new(
-                "kapsl_ttft_seconds",
-                "Time to first token (seconds)",
-            )
-            .buckets(vec![
-                0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0,
-            ]),
+            HistogramOpts::new("kapsl_ttft_seconds", "Time to first token (seconds)").buckets(
+                vec![0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0],
+            ),
             &["model", "version", "status"],
         )
         .unwrap();
@@ -195,6 +195,38 @@ impl KapslMetrics {
             &["model"],
         )
         .unwrap();
+        let decode_steps_total = IntGaugeVec::new(
+            Opts::new(
+                "kapsl_decode_steps_total",
+                "Cumulative decode reserve steps observed by the engine",
+            ),
+            &["model"],
+        )
+        .unwrap();
+        let decode_tokens_evaluated_total = IntGaugeVec::new(
+            Opts::new(
+                "kapsl_decode_tokens_evaluated_total",
+                "Cumulative logical decode tokens evaluated by the engine",
+            ),
+            &["model"],
+        )
+        .unwrap();
+        let kv_partial_reuse_hits_total = IntGaugeVec::new(
+            Opts::new(
+                "kapsl_kv_partial_reuse_hits_total",
+                "Cumulative same-session partial KV reuse hits",
+            ),
+            &["model"],
+        )
+        .unwrap();
+        let kv_partial_reuse_tokens_saved_total = IntGaugeVec::new(
+            Opts::new(
+                "kapsl_kv_partial_reuse_tokens_saved_total",
+                "Cumulative decode tokens avoided by same-session partial KV reuse",
+            ),
+            &["model"],
+        )
+        .unwrap();
 
         registry
             .register(Box::new(inference_latency.clone()))
@@ -259,6 +291,18 @@ impl KapslMetrics {
         registry
             .register(Box::new(generated_tokens_total.clone()))
             .expect("Failed to register generated_tokens_total");
+        registry
+            .register(Box::new(decode_steps_total.clone()))
+            .expect("Failed to register decode_steps_total");
+        registry
+            .register(Box::new(decode_tokens_evaluated_total.clone()))
+            .expect("Failed to register decode_tokens_evaluated_total");
+        registry
+            .register(Box::new(kv_partial_reuse_hits_total.clone()))
+            .expect("Failed to register kv_partial_reuse_hits_total");
+        registry
+            .register(Box::new(kv_partial_reuse_tokens_saved_total.clone()))
+            .expect("Failed to register kv_partial_reuse_tokens_saved_total");
 
         Self {
             registry: registry.clone(),
@@ -283,6 +327,10 @@ impl KapslMetrics {
             kv_cache_cpu_offloaded_blocks,
             prompt_tokens_total,
             generated_tokens_total,
+            decode_steps_total,
+            decode_tokens_evaluated_total,
+            kv_partial_reuse_hits_total,
+            kv_partial_reuse_tokens_saved_total,
         }
     }
 
@@ -320,6 +368,18 @@ impl KapslMetrics {
         self.generated_tokens_total
             .with_label_values(&[model])
             .set(metrics.generated_tokens_total as i64);
+        self.decode_steps_total
+            .with_label_values(&[model])
+            .set(metrics.decode_steps_total as i64);
+        self.decode_tokens_evaluated_total
+            .with_label_values(&[model])
+            .set(metrics.decode_tokens_evaluated_total as i64);
+        self.kv_partial_reuse_hits_total
+            .with_label_values(&[model])
+            .set(metrics.kv_partial_reuse_hits_total as i64);
+        self.kv_partial_reuse_tokens_saved_total
+            .with_label_values(&[model])
+            .set(metrics.kv_partial_reuse_tokens_saved_total as i64);
     }
 }
 

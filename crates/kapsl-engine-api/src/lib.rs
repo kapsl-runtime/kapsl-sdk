@@ -148,6 +148,10 @@ pub struct EngineMetrics {
     pub kv_cache_cpu_offloaded_blocks: u64,
     pub prompt_tokens_total: u64,
     pub generated_tokens_total: u64,
+    pub decode_steps_total: u64,
+    pub decode_tokens_evaluated_total: u64,
+    pub kv_partial_reuse_hits_total: u64,
+    pub kv_partial_reuse_tokens_saved_total: u64,
 }
 
 impl EngineMetrics {
@@ -172,6 +176,10 @@ impl EngineMetrics {
             kv_cache_cpu_offloaded_blocks: 0,
             prompt_tokens_total: 0,
             generated_tokens_total: 0,
+            decode_steps_total: 0,
+            decode_tokens_evaluated_total: 0,
+            kv_partial_reuse_hits_total: 0,
+            kv_partial_reuse_tokens_saved_total: 0,
         }
     }
 

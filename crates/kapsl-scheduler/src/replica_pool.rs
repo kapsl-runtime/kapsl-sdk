@@ -361,6 +361,10 @@ where
         let mut total_kv_cpu_offloaded_blocks = 0;
         let mut total_prompt_tokens = 0;
         let mut total_generated_tokens = 0;
+        let mut total_decode_steps = 0;
+        let mut total_decode_tokens_evaluated = 0;
+        let mut total_kv_partial_reuse_hits = 0;
+        let mut total_kv_partial_reuse_tokens_saved = 0;
         let mut cpu_q = 0;
         let mut gpu_q = 0;
         let mut count = 0;
@@ -384,6 +388,10 @@ where
                 total_kv_cpu_offloaded_blocks += m.kv_cache_cpu_offloaded_blocks;
                 total_prompt_tokens += m.prompt_tokens_total;
                 total_generated_tokens += m.generated_tokens_total;
+                total_decode_steps += m.decode_steps_total;
+                total_decode_tokens_evaluated += m.decode_tokens_evaluated_total;
+                total_kv_partial_reuse_hits += m.kv_partial_reuse_hits_total;
+                total_kv_partial_reuse_tokens_saved += m.kv_partial_reuse_tokens_saved_total;
                 cpu_q += cq;
                 gpu_q += gq;
             }
@@ -409,6 +417,10 @@ where
             kv_cache_cpu_offloaded_blocks: total_kv_cpu_offloaded_blocks,
             prompt_tokens_total: total_prompt_tokens,
             generated_tokens_total: total_generated_tokens,
+            decode_steps_total: total_decode_steps,
+            decode_tokens_evaluated_total: total_decode_tokens_evaluated,
+            kv_partial_reuse_hits_total: total_kv_partial_reuse_hits,
+            kv_partial_reuse_tokens_saved_total: total_kv_partial_reuse_tokens_saved,
             ..kapsl_engine_api::EngineMetrics::default()
         }
     }
