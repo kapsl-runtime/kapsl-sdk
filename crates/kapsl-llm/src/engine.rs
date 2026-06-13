@@ -956,17 +956,26 @@ pub struct LLMEngine {
     circuit_opened_at: Option<Instant>,
     // Optional handle to report health into the cross-model scheduler.
     health_reporter: Option<EngineHealthReporter>,
+    // Optional one-shot callback fired when the engine is dropped (its run_loop
+    // task ended), so the runtime can fully deregister it. Distinct from the
+    // watchdog's advisory `Dead` health, which can be transient/recoverable.
+    death_notifier: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl Drop for LLMEngine {
     fn drop(&mut self) {
         // Stop the watchdog task and tell the scheduler this engine is gone, so
         // it stops budgeting work to it immediately. KV blocks are returned to
-        // the shared pool by `BlockManager`'s own Drop. Full deregistration /
-        // cap rebalancing is handled by the runtime's detach path.
+        // the shared pool by `BlockManager`'s own Drop.
         self.watchdog_alive.store(false, Ordering::Relaxed);
         if let Some(reporter) = self.health_reporter.as_ref() {
             reporter.report(EngineHealth::Dead);
+        }
+        // Notify the runtime so it can fully deregister this engine (registry,
+        // live caps, cap rebalancing) — unambiguous because it fires exactly
+        // once when the engine object is dropped.
+        if let Some(notify) = self.death_notifier.take() {
+            notify();
         }
     }
 }
@@ -1112,6 +1121,7 @@ impl LLMEngine {
             circuit_open: false,
             circuit_opened_at: None,
             health_reporter: None,
+            death_notifier: None,
         }
     }
 
@@ -1147,6 +1157,13 @@ impl LLMEngine {
             scheduler,
             engine_id,
         });
+        self
+    }
+
+    /// Attach a one-shot callback fired when this engine is dropped (its
+    /// `run_loop` task has ended), so the runtime can fully deregister it.
+    pub fn with_death_notifier(mut self, notifier: Box<dyn FnOnce() + Send>) -> Self {
+        self.death_notifier = Some(notifier);
         self
     }
 

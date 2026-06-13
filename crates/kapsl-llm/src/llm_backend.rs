@@ -62,6 +62,9 @@ pub struct LLMBackend {
     /// The runtime updates this atomic when engines are added or removed so
     /// that block-level limits rebalance without requiring engine restarts.
     live_kv_cap: Option<Arc<AtomicUsize>>,
+    /// Optional callback invoked with this backend's `engine_id` when its engine
+    /// task ends (drops), so the runtime can fully deregister the dead engine.
+    on_engine_death: Option<Arc<dyn Fn(u32) + Send + Sync>>,
 }
 
 #[derive(Clone)]
@@ -377,7 +380,15 @@ impl LLMBackend {
             global_scheduler: None,
             engine_id: 0,
             live_kv_cap: None,
+            on_engine_death: None,
         }
+    }
+
+    /// Register a callback invoked with this backend's `engine_id` when its
+    /// engine task ends, so the runtime can deregister the dead engine.
+    pub fn with_on_engine_death(mut self, cb: Arc<dyn Fn(u32) + Send + Sync>) -> Self {
+        self.on_engine_death = Some(cb);
+        self
     }
 
     /// Attach a shared block allocator so this backend draws from a unified
@@ -547,6 +558,7 @@ impl Engine for LLMBackend {
         let kv_compression_bits = self.kv_compression_bits;
         let global_scheduler_for_engine = self.global_scheduler.clone();
         let engine_id_for_engine = self.engine_id;
+        let on_engine_death = self.on_engine_death.clone();
         tokio::spawn(async move {
             let engine = LLMEngine::new(
                 config,
@@ -578,6 +590,13 @@ impl Engine for LLMBackend {
             if let Some(sched) = global_scheduler_for_engine {
                 engine = engine.with_health_reporter(sched, engine_id_for_engine);
                 engine.spawn_watchdog();
+            }
+            // Fire the runtime's deregistration callback when this engine drops
+            // (load failure or run_loop exit), so dead engines don't leave stale
+            // registry / cap entries behind.
+            if let Some(cb) = on_engine_death {
+                engine = engine
+                    .with_death_notifier(Box::new(move || cb(engine_id_for_engine)));
             }
             let load_result = engine.load(&engine_path).await;
             if let Err(e) = load_tx.send(load_result) {
