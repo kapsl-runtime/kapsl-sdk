@@ -1,6 +1,9 @@
 use crate::block_manager::SharedBlockAllocator;
 use crate::engine::LLMEngine;
 use crate::global_scheduler::GlobalKvScheduler;
+// parking_lot::Mutex does not poison on panic, so a crash in one engine's
+// thread cannot propagate to other engines waiting on the scheduler lock.
+type GlobalSchedulerMutex = parking_lot::Mutex<GlobalKvScheduler>;
 use crate::llm_metrics::LLMMetrics;
 use crate::model_paths::{find_model_asset, find_model_root};
 use crate::scheduler::SchedulerConfig;
@@ -51,7 +54,7 @@ pub struct LLMBackend {
     /// When set, every `infer_stream` call must successfully reserve tokens
     /// before the request is enqueued.  Tokens are released when the stream
     /// completes (naturally, on error, or on drop/cancellation).
-    global_scheduler: Option<Arc<Mutex<GlobalKvScheduler>>>,
+    global_scheduler: Option<Arc<GlobalSchedulerMutex>>,
     /// Stable engine ID assigned by `SharedKvStateInner::attach_engine`.
     /// Used as the key for `GlobalKvScheduler::try_reserve_tokens`.
     engine_id: u32,
@@ -343,16 +346,14 @@ fn load_model_runtime_config(model_path: &Path) -> ModelRuntimeConfig {
 /// the budget is reclaimed whether the stream ends normally, errors, or is
 /// cancelled by the caller dropping the future.
 struct GlobalTokenGuard {
-    scheduler: Arc<Mutex<GlobalKvScheduler>>,
+    scheduler: Arc<GlobalSchedulerMutex>,
     engine_id: u32,
     tokens:    usize,
 }
 
 impl Drop for GlobalTokenGuard {
     fn drop(&mut self) {
-        if let Ok(mut sched) = self.scheduler.lock() {
-            sched.complete_tokens(self.engine_id, self.tokens);
-        }
+        self.scheduler.lock().complete_tokens(self.engine_id, self.tokens);
     }
 }
 
@@ -421,7 +422,7 @@ impl LLMBackend {
     /// potentially OOM-ing the device.
     pub fn with_global_scheduler(
         mut self,
-        scheduler: Arc<Mutex<GlobalKvScheduler>>,
+        scheduler: Arc<GlobalSchedulerMutex>,
         engine_id: u32,
     ) -> Self {
         self.global_scheduler = Some(scheduler);
@@ -544,6 +545,8 @@ impl Engine for LLMBackend {
         let shared_pool = self.shared_pool.clone();
         let kv_blocks_cap = self.kv_blocks_cap;
         let kv_compression_bits = self.kv_compression_bits;
+        let global_scheduler_for_engine = self.global_scheduler.clone();
+        let engine_id_for_engine = self.engine_id;
         tokio::spawn(async move {
             let engine = LLMEngine::new(
                 config,
@@ -568,6 +571,13 @@ impl Engine for LLMBackend {
             // Apply TurboQuant KV-cache compression bit-width if set.
             if let Some(bits) = kv_compression_bits {
                 engine.set_kv_compression_bits(bits);
+            }
+            // Attach the cross-model health reporter and start the stall
+            // watchdog so circuit-breaker / hang transitions reach the global
+            // scheduler and a stuck engine cannot starve healthy ones.
+            if let Some(sched) = global_scheduler_for_engine {
+                engine = engine.with_health_reporter(sched, engine_id_for_engine);
+                engine.spawn_watchdog();
             }
             let load_result = engine.load(&engine_path).await;
             if let Err(e) = load_tx.send(load_result) {
@@ -767,7 +777,6 @@ impl Engine for LLMBackend {
             if let Some(ref sched) = self.global_scheduler {
                 let admitted = sched
                     .lock()
-                    .unwrap()
                     .try_reserve_tokens(self.engine_id, estimated_tokens);
                 if !admitted {
                     return Box::pin(stream::once(async {

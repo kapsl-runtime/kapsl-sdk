@@ -1,5 +1,6 @@
+use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// Represents a physical block of memory in the KV cache
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -80,19 +81,13 @@ pub fn new_shared_allocator(
 /// Return the current free-block count of a shared allocator without holding
 /// the lock beyond this call.
 pub fn shared_allocator_free_blocks(allocator: &SharedBlockAllocator) -> usize {
-    allocator
-        .lock()
-        .expect("SharedBlockAllocator poisoned")
-        .get_num_free_blocks()
+    allocator.lock().get_num_free_blocks()
 }
 
 /// Return total-block count of a shared allocator without holding the lock
 /// beyond this call.
 pub fn shared_allocator_total_blocks(allocator: &SharedBlockAllocator) -> usize {
-    allocator
-        .lock()
-        .expect("SharedBlockAllocator poisoned")
-        .get_num_total_blocks()
+    allocator.lock().get_num_total_blocks()
 }
 
 /// Internal dispatch: each `BlockManager` holds either a private allocator or
@@ -106,34 +101,28 @@ impl BlockManagerAllocator {
     fn allocate(&mut self) -> Option<PhysicalTokenBlock> {
         match self {
             Self::Owned(a) => a.allocate(),
-            Self::Shared(a) => a.lock().expect("SharedBlockAllocator poisoned").allocate(),
+            Self::Shared(a) => a.lock().allocate(),
         }
     }
 
     fn free(&mut self, block: PhysicalTokenBlock) {
         match self {
             Self::Owned(a) => a.free(block),
-            Self::Shared(a) => a.lock().expect("SharedBlockAllocator poisoned").free(block),
+            Self::Shared(a) => a.lock().free(block),
         }
     }
 
     fn get_num_free_blocks(&self) -> usize {
         match self {
             Self::Owned(a) => a.get_num_free_blocks(),
-            Self::Shared(a) => a
-                .lock()
-                .expect("SharedBlockAllocator poisoned")
-                .get_num_free_blocks(),
+            Self::Shared(a) => a.lock().get_num_free_blocks(),
         }
     }
 
     fn get_num_total_blocks(&self) -> usize {
         match self {
             Self::Owned(a) => a.get_num_total_blocks(),
-            Self::Shared(a) => a
-                .lock()
-                .expect("SharedBlockAllocator poisoned")
-                .get_num_total_blocks(),
+            Self::Shared(a) => a.lock().get_num_total_blocks(),
         }
     }
 }
@@ -273,6 +262,15 @@ impl BlockManager {
     /// Total block count in the pool (owned or shared).
     pub fn total_blocks(&self) -> usize {
         self.allocator.get_num_total_blocks()
+    }
+}
+
+impl Drop for BlockManager {
+    fn drop(&mut self) {
+        let seq_ids: Vec<u64> = self.block_tables.keys().copied().collect();
+        for seq_id in seq_ids {
+            self.free(seq_id);
+        }
     }
 }
 
