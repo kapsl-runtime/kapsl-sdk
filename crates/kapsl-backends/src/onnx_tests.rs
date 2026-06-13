@@ -40,6 +40,30 @@ mod tests {
     }
 
     #[test]
+    fn test_copy_primitive_slice_as_ne_bytes_matches_float_encoding() {
+        let values = [0.0f32, 1.0, -2.5, 3.25];
+        assert_eq!(copy_primitive_slice_as_ne_bytes(&values), f32_bytes(&values));
+
+        let values = [f16::from_f32(0.0), f16::from_f32(-2.5)];
+        assert_eq!(copy_primitive_slice_as_ne_bytes(&values), f16_bytes(&values));
+    }
+
+    #[test]
+    fn test_copy_primitive_slice_as_ne_bytes_matches_integer_encoding() {
+        let i32_values = [0i32, -1, 123_456];
+        assert_eq!(
+            copy_primitive_slice_as_ne_bytes(&i32_values),
+            i32_bytes(&i32_values)
+        );
+
+        let i64_values = [0i64, -1, 123_456_789];
+        assert_eq!(
+            copy_primitive_slice_as_ne_bytes(&i64_values),
+            i64_bytes(&i64_values)
+        );
+    }
+
+    #[test]
     fn test_validate_float32_success() {
         let values = vec![0.0f32, 1.0f32, -2.5f32, 3.25f32];
         let packet = BinaryTensorPacket {

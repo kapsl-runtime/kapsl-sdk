@@ -1039,6 +1039,18 @@ fn try_aligned_slice<T: Copy>(bytes: &[u8]) -> Option<&[T]> {
     }
 }
 
+fn copy_primitive_slice_as_ne_bytes<T: Copy>(values: &[T]) -> Vec<u8> {
+    let byte_len = values
+        .len()
+        .checked_mul(std::mem::size_of::<T>())
+        .expect("primitive tensor byte length overflow");
+    // SAFETY: ORT exposes output tensors as contiguous initialized slices. Call
+    // sites use primitive numeric tensor element types, whose in-memory bytes
+    // are the native-endian representation expected by BinaryTensorPacket.
+    let bytes = unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), byte_len) };
+    bytes.to_vec()
+}
+
 /// Validate an incoming BinaryTensorPacket and return the shape and a typed
 /// vector if valid. This performs:
 ///  - dtype support checking
@@ -1370,7 +1382,7 @@ fn run_inference_with_session(
         BinaryTensorPacket {
             shape: shape_ref.to_vec(),
             dtype: TensorDtype::Float32,
-            data: data.iter().flat_map(|&x| x.to_ne_bytes()).collect(),
+            data: copy_primitive_slice_as_ne_bytes(data),
         }
     } else if let Ok((shape_ref, data)) = output_value.try_extract_tensor::<f64>() {
         if let Some(top_k) = logits_top_k {
@@ -1379,7 +1391,7 @@ fn run_inference_with_session(
         BinaryTensorPacket {
             shape: shape_ref.to_vec(),
             dtype: TensorDtype::Float64,
-            data: data.iter().flat_map(|&x| x.to_ne_bytes()).collect(),
+            data: copy_primitive_slice_as_ne_bytes(data),
         }
     } else if let Ok((shape_ref, data)) = output_value.try_extract_tensor::<f16>() {
         if let Some(top_k) = logits_top_k {
@@ -1388,22 +1400,19 @@ fn run_inference_with_session(
         BinaryTensorPacket {
             shape: shape_ref.to_vec(),
             dtype: TensorDtype::Float16,
-            data: data
-                .iter()
-                .flat_map(|x| x.to_bits().to_ne_bytes())
-                .collect(),
+            data: copy_primitive_slice_as_ne_bytes(data),
         }
     } else if let Ok((shape_ref, data)) = output_value.try_extract_tensor::<i32>() {
         BinaryTensorPacket {
             shape: shape_ref.to_vec(),
             dtype: TensorDtype::Int32,
-            data: data.iter().flat_map(|&x| x.to_ne_bytes()).collect(),
+            data: copy_primitive_slice_as_ne_bytes(data),
         }
     } else if let Ok((shape_ref, data)) = output_value.try_extract_tensor::<i64>() {
         BinaryTensorPacket {
             shape: shape_ref.to_vec(),
             dtype: TensorDtype::Int64,
-            data: data.iter().flat_map(|&x| x.to_ne_bytes()).collect(),
+            data: copy_primitive_slice_as_ne_bytes(data),
         }
     } else if let Ok((shape_ref, data)) = output_value.try_extract_tensor::<u8>() {
         BinaryTensorPacket {
