@@ -152,6 +152,10 @@ pub struct EngineMetrics {
     pub decode_tokens_evaluated_total: u64,
     pub kv_partial_reuse_hits_total: u64,
     pub kv_partial_reuse_tokens_saved_total: u64,
+    pub onnx_session_pool_total: usize,
+    pub onnx_session_pool_idle: usize,
+    pub onnx_session_pool_waits_total: u64,
+    pub onnx_session_pool_wait_seconds_total: f64,
 }
 
 impl EngineMetrics {
@@ -180,6 +184,10 @@ impl EngineMetrics {
             decode_tokens_evaluated_total: 0,
             kv_partial_reuse_hits_total: 0,
             kv_partial_reuse_tokens_saved_total: 0,
+            onnx_session_pool_total: 0,
+            onnx_session_pool_idle: 0,
+            onnx_session_pool_waits_total: 0,
+            onnx_session_pool_wait_seconds_total: 0.0,
         }
     }
 

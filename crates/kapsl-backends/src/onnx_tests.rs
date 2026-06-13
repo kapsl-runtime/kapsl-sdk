@@ -61,6 +61,34 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_float32_aligned_input_borrows() {
+        let values = [0.0f32, 1.0f32, -2.5f32, 3.25f32];
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                values.as_ptr().cast::<u8>(),
+                values.len() * std::mem::size_of::<f32>(),
+            )
+        };
+
+        match parse_ne_f32(bytes, values.len()) {
+            std::borrow::Cow::Borrowed(parsed) => assert_eq!(parsed, values.as_slice()),
+            other => panic!("Expected prepared f32 input, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_float32_unaligned_input_falls_back_to_owned() {
+        let values = vec![1.0f32, 2.0f32];
+        let mut data = vec![0u8];
+        data.extend(f32_bytes(&values));
+
+        match parse_ne_f32(&data[1..], values.len()) {
+            std::borrow::Cow::Owned(parsed) => assert_eq!(parsed, values),
+            std::borrow::Cow::Borrowed(_) => panic!("unaligned input should not be borrowed"),
+        }
+    }
+
+    #[test]
     fn test_validate_float32_scalar_empty_shape() {
         let values = vec![42.0f32];
         let packet = BinaryTensorPacket {
@@ -308,6 +336,15 @@ mod tests {
         assert_eq!(backend.device_id, 0);
         // Optimization level 3 maps to 3
         assert_eq!(backend.optimization_level, 3);
+        assert_eq!(backend.session_pool_size(), 1);
+    }
+
+    #[test]
+    fn test_peak_concurrency_hint_controls_session_pool_size() {
+        let backend = OnnxBackend::builder().with_peak_concurrency_hint(8).build();
+
+        assert_eq!(backend.peak_concurrency_hint, Some(8));
+        assert_eq!(backend.session_pool_size(), 8);
     }
 
     #[test]

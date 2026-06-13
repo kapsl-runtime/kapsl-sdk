@@ -365,6 +365,10 @@ where
         let mut total_decode_tokens_evaluated = 0;
         let mut total_kv_partial_reuse_hits = 0;
         let mut total_kv_partial_reuse_tokens_saved = 0;
+        let mut total_onnx_session_pool_total = 0;
+        let mut total_onnx_session_pool_idle = 0;
+        let mut total_onnx_session_pool_waits = 0;
+        let mut total_onnx_session_pool_wait_seconds = 0.0;
         let mut cpu_q = 0;
         let mut gpu_q = 0;
         let mut count = 0;
@@ -392,6 +396,10 @@ where
                 total_decode_tokens_evaluated += m.decode_tokens_evaluated_total;
                 total_kv_partial_reuse_hits += m.kv_partial_reuse_hits_total;
                 total_kv_partial_reuse_tokens_saved += m.kv_partial_reuse_tokens_saved_total;
+                total_onnx_session_pool_total += m.onnx_session_pool_total;
+                total_onnx_session_pool_idle += m.onnx_session_pool_idle;
+                total_onnx_session_pool_waits += m.onnx_session_pool_waits_total;
+                total_onnx_session_pool_wait_seconds += m.onnx_session_pool_wait_seconds_total;
                 cpu_q += cq;
                 gpu_q += gq;
             }
@@ -421,6 +429,10 @@ where
             decode_tokens_evaluated_total: total_decode_tokens_evaluated,
             kv_partial_reuse_hits_total: total_kv_partial_reuse_hits,
             kv_partial_reuse_tokens_saved_total: total_kv_partial_reuse_tokens_saved,
+            onnx_session_pool_total: total_onnx_session_pool_total,
+            onnx_session_pool_idle: total_onnx_session_pool_idle,
+            onnx_session_pool_waits_total: total_onnx_session_pool_waits,
+            onnx_session_pool_wait_seconds_total: total_onnx_session_pool_wait_seconds,
             ..kapsl_engine_api::EngineMetrics::default()
         }
     }

@@ -20,6 +20,10 @@ fn set_kv_cache_metrics_exports_cpu_offload_blocks() {
             kv_cache_evicted_sequences: 1,
             kv_cache_packed_layers: 5,
             kv_cache_cpu_offloaded_blocks: 9,
+            onnx_session_pool_total: 2,
+            onnx_session_pool_idle: 1,
+            onnx_session_pool_waits_total: 4,
+            onnx_session_pool_wait_seconds_total: 1.25,
             ..EngineMetrics::default()
         },
     );
@@ -33,4 +37,8 @@ fn set_kv_cache_metrics_exports_cpu_offload_blocks() {
     assert!(text.contains(r#"kapsl_kv_cache_bytes_used{model="model-7"} 1024"#));
     assert!(text.contains(r#"kapsl_kv_cache_blocks_free{model="model-7"} 48"#));
     assert!(text.contains(r#"kapsl_kv_cache_cpu_offloaded_blocks{model="model-7"} 9"#));
+    assert!(text.contains(r#"kapsl_onnx_session_pool_total{model="model-7"} 2"#));
+    assert!(text.contains(r#"kapsl_onnx_session_pool_idle{model="model-7"} 1"#));
+    assert!(text.contains(r#"kapsl_onnx_session_pool_waits_total{model="model-7"} 4"#));
+    assert!(text.contains(r#"kapsl_onnx_session_pool_wait_seconds_total{model="model-7"} 1.25"#));
 }
