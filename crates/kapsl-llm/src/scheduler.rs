@@ -47,8 +47,17 @@ impl LLMScheduler {
     }
 
     pub fn add_sequence_group(&mut self, seq_group: SequenceGroup) {
-        self.waiting_queue
-            .push_back(Arc::new(Mutex::new(seq_group)));
+        let priority = seq_group.priority;
+        let group = Arc::new(Mutex::new(seq_group));
+        // Keep the waiting queue ordered by descending priority with FIFO order
+        // within a priority tier, so a high-priority request is not stuck behind
+        // already-queued lower-priority ones (head-of-line blocking).
+        let pos = self
+            .waiting_queue
+            .iter()
+            .position(|g| g.lock().map(|g| g.priority < priority).unwrap_or(false))
+            .unwrap_or(self.waiting_queue.len());
+        self.waiting_queue.insert(pos, group);
     }
 
     pub fn active_sequence_ids(&self) -> Vec<u64> {

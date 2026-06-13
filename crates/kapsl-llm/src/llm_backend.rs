@@ -832,9 +832,21 @@ impl Engine for LLMBackend {
                     }
                 }
 
-                if tx.send(seq_group).await.is_err() {
-                    yield Err(EngineError::backend("Failed to send request to engine"));
-                    return;
+                // Per-model backpressure: reject immediately when this model's
+                // queue is full rather than blocking (which would build latency
+                // and hold the admission reservation indefinitely).
+                match tx.try_send(seq_group) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        yield Err(EngineError::overloaded(
+                            "Model queue full: too many pending requests for this model",
+                        ));
+                        return;
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        yield Err(EngineError::backend("Failed to send request to engine"));
+                        return;
+                    }
                 }
 
                 let mut saw_finish = false;
