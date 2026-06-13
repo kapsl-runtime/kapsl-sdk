@@ -1100,18 +1100,18 @@ unsafe extern "C" fn gguf_kapsl_kv_reserve_prefix(
     let block_size = state.handle.pool.block_size().max(1);
     let fp = state.model_fingerprint;
 
-    // 1. Compute chained hashes for all complete prefix blocks.
-    let all_hashes = PrefixBlockCache::compute_prefix_hashes_i32(fp, token_slice, block_size);
     let n_logical = (n_tokens as usize).div_ceil(block_size).max(1);
     if n_logical > state.max_blocks_per_seq {
         return false;
     }
     let n_tokens_usize = n_tokens as usize;
+    let n_complete_blocks = n_tokens_usize / block_size;
+    let mut computed_hashes: Option<Vec<u64>> = None;
 
-    // 2. Same-session decode usually grows one token at a time. If the current
+    // 1. Same-session decode usually grows one token at a time. If the current
     // reservation already covers the requested logical block count, keep its
-    // block table and only refresh complete-block hashes so a just-completed
-    // partial block can be promoted after decode.
+    // block table. Only refresh hashes when another full block has completed;
+    // otherwise avoid re-hashing the entire growing token prefix on every token.
     if state.evicted.lock().unwrap().is_none() {
         let mut inner = state.inner.lock().unwrap();
         let had_reservation = inner.block_table.is_some() && inner.n_logical_blocks > 0;
@@ -1121,7 +1121,12 @@ unsafe extern "C" fn gguf_kapsl_kv_reserve_prefix(
             let complete_prefix_tokens = inner.n_prefix_hits.saturating_mul(block_size);
             let would_evaluate = n_tokens_usize.saturating_sub(complete_prefix_tokens);
             let saved_tokens = would_evaluate.saturating_sub(delta_tokens);
-            inner.all_hashes = all_hashes;
+            if inner.model_fingerprint != fp || inner.all_hashes.len() < n_complete_blocks {
+                let all_hashes = computed_hashes.get_or_insert_with(|| {
+                    PrefixBlockCache::compute_prefix_hashes_i32(fp, token_slice, block_size)
+                });
+                inner.all_hashes = all_hashes.clone();
+            }
             inner.model_fingerprint = fp;
             inner.n_tokens_reserved = inner.n_tokens_reserved.max(n_tokens_usize);
             let table_ptr = match inner.block_table.as_ref() {
@@ -1192,7 +1197,12 @@ unsafe extern "C" fn gguf_kapsl_kv_reserve_prefix(
 
             inner.owned_blocks = owned_blocks;
             inner.n_new_logical = new_n_new;
-            inner.all_hashes = all_hashes;
+            if inner.model_fingerprint != fp || inner.all_hashes.len() < n_complete_blocks {
+                let all_hashes = computed_hashes.get_or_insert_with(|| {
+                    PrefixBlockCache::compute_prefix_hashes_i32(fp, token_slice, block_size)
+                });
+                inner.all_hashes = all_hashes.clone();
+            }
             inner.model_fingerprint = fp;
             inner.block_table = Some(table);
             inner.block_table_host = host_table;
@@ -1209,6 +1219,12 @@ unsafe extern "C" fn gguf_kapsl_kv_reserve_prefix(
             return true;
         }
     }
+
+    // 2. Compute chained hashes for all complete prefix blocks only after the
+    // same-session fast path misses.
+    let all_hashes = computed_hashes.unwrap_or_else(|| {
+        PrefixBlockCache::compute_prefix_hashes_i32(fp, token_slice, block_size)
+    });
 
     // 3. Lookup prefix cache — collect a contiguous run of hits.
     let hits = {
