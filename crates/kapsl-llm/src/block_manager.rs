@@ -3,12 +3,44 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-/// Represents a physical block of memory in the KV cache
+/// Identifies which engine and sequence a physical block belongs to.
+///
+/// Stamped onto a block when it is allocated for a sequence and recorded in the
+/// pool's ownership registry, so any block in a shared pool can be traced back
+/// to its owner — the basis for safe shared-pool reuse and foreign-free
+/// detection. `model_id` is represented by `engine_id`, which the runtime maps
+/// 1:1 to a loaded model/replica.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BlockOwner {
+    pub engine_id: u32,
+    pub sequence_id: u64,
+}
+
+/// Represents a physical block of memory in the KV cache.
+///
+/// Identity is `(block_number, device_id)` — `owner` is metadata that travels
+/// with the handle and is intentionally excluded from equality/hashing so a
+/// block compares equal regardless of which sequence currently holds it.
+#[derive(Debug, Clone, Copy)]
 pub struct PhysicalTokenBlock {
     pub block_number: usize,
     pub block_size: usize,
     pub device_id: usize,
+    /// Owner stamped at allocation time (`None` for ownerless/private allocs).
+    pub owner: Option<BlockOwner>,
+}
+
+impl PartialEq for PhysicalTokenBlock {
+    fn eq(&self, other: &Self) -> bool {
+        self.block_number == other.block_number && self.device_id == other.device_id
+    }
+}
+impl Eq for PhysicalTokenBlock {}
+impl std::hash::Hash for PhysicalTokenBlock {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.block_number.hash(state);
+        self.device_id.hash(state);
+    }
 }
 
 /// Manages the allocation of physical blocks
@@ -18,6 +50,9 @@ pub struct BlockAllocator {
     total_blocks: usize,
     block_size: usize,
     device_id: usize,
+    /// Ownership registry: physical block_number → current owner. The single
+    /// source of truth for who holds each slot in a (possibly shared) pool.
+    owners: HashMap<usize, BlockOwner>,
 }
 
 impl BlockAllocator {
@@ -28,9 +63,11 @@ impl BlockAllocator {
             total_blocks,
             block_size,
             device_id,
+            owners: HashMap::new(),
         }
     }
 
+    /// Allocate an ownerless block (private/owned pools, no registry tracking).
     pub fn allocate(&mut self) -> Option<PhysicalTokenBlock> {
         self.free_blocks
             .pop_front()
@@ -38,13 +75,50 @@ impl BlockAllocator {
                 block_number,
                 block_size: self.block_size,
                 device_id: self.device_id,
+                owner: None,
             })
     }
 
+    /// Allocate a block for `owner`, stamping the handle and recording ownership
+    /// in the registry so the slot can be traced back to its owner.
+    pub fn allocate_for(&mut self, owner: BlockOwner) -> Option<PhysicalTokenBlock> {
+        let block_number = self.free_blocks.pop_front()?;
+        self.owners.insert(block_number, owner);
+        Some(PhysicalTokenBlock {
+            block_number,
+            block_size: self.block_size,
+            device_id: self.device_id,
+            owner: Some(owner),
+        })
+    }
+
     pub fn free(&mut self, block: PhysicalTokenBlock) {
-        if block.device_id == self.device_id {
-            self.free_blocks.push_front(block.block_number);
+        if block.device_id != self.device_id {
+            return;
         }
+        // Reconcile against the registry to catch cross-model corruption: a
+        // block being returned whose recorded owner differs from the handle's,
+        // or a block with no registry entry (double/untracked free).
+        let recorded = self.owners.remove(&block.block_number);
+        match (block.owner, recorded) {
+            (Some(handle), Some(reg)) if handle != reg => {
+                log::warn!(
+                    "[kv-pool] foreign free of block {}: handle owner {:?} != registry owner {:?}",
+                    block.block_number,
+                    handle,
+                    reg
+                );
+            }
+            (Some(handle), None) => {
+                log::warn!(
+                    "[kv-pool] untracked free of block {} (handle owner {:?}); possible double free",
+                    block.block_number,
+                    handle
+                );
+            }
+            _ => {}
+        }
+        self.free_blocks.push_front(block.block_number);
     }
 
     pub fn get_num_free_blocks(&self) -> usize {
@@ -53,6 +127,19 @@ impl BlockAllocator {
 
     pub fn get_num_total_blocks(&self) -> usize {
         self.total_blocks
+    }
+
+    /// Current owner of a physical block, or `None` if free/untracked.
+    pub fn owner_of(&self, block_number: usize) -> Option<BlockOwner> {
+        self.owners.get(&block_number).copied()
+    }
+
+    /// Number of blocks in this pool currently owned by `engine_id` (diagnostics).
+    pub fn count_for_engine(&self, engine_id: u32) -> usize {
+        self.owners
+            .values()
+            .filter(|o| o.engine_id == engine_id)
+            .count()
     }
 }
 
@@ -103,6 +190,20 @@ impl BlockManagerAllocator {
         match self {
             Self::Owned(a) => a.allocate(),
             Self::Shared(a) => a.lock().allocate(),
+        }
+    }
+
+    fn allocate_for(&mut self, owner: BlockOwner) -> Option<PhysicalTokenBlock> {
+        match self {
+            Self::Owned(a) => a.allocate_for(owner),
+            Self::Shared(a) => a.lock().allocate_for(owner),
+        }
+    }
+
+    fn owner_of(&self, block_number: usize) -> Option<BlockOwner> {
+        match self {
+            Self::Owned(a) => a.owner_of(block_number),
+            Self::Shared(a) => a.lock().owner_of(block_number),
         }
     }
 
@@ -181,6 +282,9 @@ pub struct BlockManager {
     /// The runtime updates the atomic on engine join/leave so the cap rebalances
     /// without a restart.
     live_cap: Option<Arc<AtomicUsize>>,
+    /// This manager's engine id. When set, allocations stamp ownership so blocks
+    /// in a shared pool are traceable to their owning engine/sequence.
+    engine_id: Option<u32>,
 }
 
 impl BlockManager {
@@ -196,6 +300,7 @@ impl BlockManager {
             block_size,
             held_blocks: 0,
             live_cap: None,
+            engine_id: None,
         }
     }
 
@@ -211,7 +316,18 @@ impl BlockManager {
             block_size,
             held_blocks: 0,
             live_cap: None,
+            engine_id: None,
         }
+    }
+
+    /// Set this manager's engine id so allocations stamp ownership metadata.
+    pub fn set_engine_id(&mut self, engine_id: u32) {
+        self.engine_id = Some(engine_id);
+    }
+
+    /// Current owner of a physical block in the pool (diagnostics / validation).
+    pub fn block_owner(&self, block_number: usize) -> Option<BlockOwner> {
+        self.allocator.owner_of(block_number)
     }
 
     /// Attach a hard per-engine block quota (shared with the runtime, updated on
@@ -239,7 +355,16 @@ impl BlockManager {
                 return None;
             }
         }
-        if let Some(block) = self.allocator.allocate() {
+        // Stamp ownership when this manager has an engine id, so blocks drawn
+        // from a shared pool are traceable back to their owning engine/sequence.
+        let allocated = match self.engine_id {
+            Some(engine_id) => self.allocator.allocate_for(BlockOwner {
+                engine_id,
+                sequence_id,
+            }),
+            None => self.allocator.allocate(),
+        };
+        if let Some(block) = allocated {
             self.block_tables
                 .entry(sequence_id)
                 .or_insert_with(|| BlockTable::new(self.block_size))
