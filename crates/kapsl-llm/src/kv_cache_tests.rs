@@ -361,6 +361,45 @@ mod tests {
     }
 
     #[test]
+    fn paged_cache_reused_block_not_served_for_old_prefix() {
+        // A single-block pool: after a block is freed and reallocated to a
+        // different sequence with different tokens, a third sequence requesting
+        // the original prefix must NOT reuse the (now-repurposed) block.
+        let config = KvCacheConfig {
+            mode: KvCacheMode::Paged,
+            block_size: 2,
+            total_blocks: 1,
+            eviction_policy: KvEvictionPolicy::None,
+            dense_free_list_cap: 8,
+            initial_seq_len: 256,
+            tq_compression_bits: None,
+        };
+        let mut cache = KvCache::new_with_config(1, 1, 8, 2, config);
+
+        let fill = |cache: &mut KvCache, seq: u64, toks: [u64; 2]| {
+            cache.allocate_sequence(seq, &[]).unwrap();
+            for (i, &t) in toks.iter().enumerate() {
+                let k = vec![f16::from_f32(t as f32); 2];
+                let v = vec![f16::from_f32(t as f32); 2];
+                cache.append_token(seq, 0, i, &k, &v, Some(t)).unwrap();
+            }
+            cache.advance_sequence_by(seq, 2);
+        };
+
+        // Seq 1 registers prefix [10, 11] on the only block.
+        fill(&mut cache, 1, [10, 11]);
+        cache.remove_sequence(1);
+
+        // Seq 2 reallocates that same physical block under a different prefix.
+        fill(&mut cache, 2, [20, 21]);
+
+        // Seq 3 asks for the original prefix: it must not be served the block
+        // that now holds [20, 21].
+        let cached = cache.allocate_sequence(3, &[10, 11]).unwrap();
+        assert_eq!(cached, 0, "must not reuse a block repurposed for new tokens");
+    }
+
+    #[test]
     fn paged_cache_rollback_clears_full_block_prefix() {
         let config = KvCacheConfig {
             mode: KvCacheMode::Paged,
