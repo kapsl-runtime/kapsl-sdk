@@ -67,6 +67,10 @@ pub struct KvCacheStats {
     pub packed_layers: usize,
     /// Blocks currently held in the CPU offload store (paged mode only).
     pub cpu_offloaded_blocks: u64,
+    /// Number of allocate_sequence calls that reused a cached prefix (paged mode).
+    pub prefix_reuse_hits: u64,
+    /// Cumulative prompt tokens skipped via prefix reuse (paged mode).
+    pub prefix_reuse_tokens_saved: u64,
 }
 
 #[derive(Debug)]
@@ -729,6 +733,8 @@ impl DenseKvCache {
             evicted_sequences: 0,
             packed_layers,
             cpu_offloaded_blocks: 0,
+            prefix_reuse_hits: 0,
+            prefix_reuse_tokens_saved: 0,
         }
     }
 }
@@ -939,6 +945,10 @@ pub struct PagedKvCache {
     cpu_store: CpuKvBlockStore,
     /// Running count of blocks currently sitting in `cpu_store`.
     cpu_offloaded_blocks: u64,
+    /// Cumulative prefix-reuse hits (allocate_sequence that reused a prefix).
+    prefix_reuse_hits: u64,
+    /// Cumulative prompt tokens skipped via prefix reuse.
+    prefix_reuse_tokens_saved: u64,
 }
 
 impl PagedKvCache {
@@ -972,6 +982,8 @@ impl PagedKvCache {
             radix_tree: RadixTree::new(),
             cpu_store: CpuKvBlockStore::new(block_stride),
             cpu_offloaded_blocks: 0,
+            prefix_reuse_hits: 0,
+            prefix_reuse_tokens_saved: 0,
         }
     }
 
@@ -1396,6 +1408,10 @@ impl PagedKvCache {
                 reused_blocks.truncate(num_reused_blocks);
             }
             seq.blocks.extend(reused_blocks);
+        }
+        if matched_len > 0 {
+            self.prefix_reuse_hits += 1;
+            self.prefix_reuse_tokens_saved += matched_len as u64;
         }
         // Sync tokens tracking
         seq.tokens = tokens[..matched_len].iter().map(|&t| t as u64).collect();
@@ -1887,6 +1903,8 @@ impl PagedKvCache {
             // Use the store's authoritative count so stats stay consistent
             // even when blocks are put back during failed restore attempts.
             cpu_offloaded_blocks: self.cpu_store.offloaded_block_count() as u64,
+            prefix_reuse_hits: self.prefix_reuse_hits,
+            prefix_reuse_tokens_saved: self.prefix_reuse_tokens_saved,
         }
     }
 }
