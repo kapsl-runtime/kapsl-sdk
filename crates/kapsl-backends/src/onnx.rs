@@ -203,6 +203,17 @@ struct SessionPoolStats {
     wait_seconds_total: f64,
 }
 
+impl PooledSession<'_> {
+    fn discard(&mut self) {
+        let Some(_session) = self.session.take() else {
+            return;
+        };
+
+        self.pool.total_sessions.fetch_sub(1, Ordering::AcqRel);
+        self.pool.condvar.notify_one();
+    }
+}
+
 impl Deref for PooledSession<'_> {
     type Target = Session;
 
@@ -1450,6 +1461,27 @@ fn run_inference_with_session(
     Ok(output_packet)
 }
 
+fn run_inference_with_pooled_session(
+    session: &mut PooledSession<'_>,
+    request: &InferenceRequest,
+    metadata: &ModelMetadata,
+    shape_usize: Vec<usize>,
+    main_input_tensor: SessionInputValue<'_>,
+) -> Result<BinaryTensorPacket, EngineError> {
+    let result = run_inference_with_session(
+        session,
+        request,
+        metadata,
+        shape_usize,
+        main_input_tensor,
+    );
+    if result.is_err() {
+        log::warn!("Discarding ONNX session after inference failure");
+        session.discard();
+    }
+    result
+}
+
 fn top_k_last_logits_packet<I>(
     shape: &[i64],
     scores: I,
@@ -1707,7 +1739,7 @@ impl Engine for OnnxBackend {
                 let (shape_usize, main_input_tensor) = prepared_input
                     .take()
                     .ok_or_else(|| EngineError::backend("input already consumed".to_string()))?;
-                run_inference_with_session(
+                run_inference_with_pooled_session(
                     &mut session,
                     request,
                     &metadata,
@@ -1729,7 +1761,7 @@ impl Engine for OnnxBackend {
                 let (shape_usize, main_input_tensor) = prepared_input
                     .take()
                     .ok_or_else(|| EngineError::backend("input already consumed".to_string()))?;
-                run_inference_with_session(
+                run_inference_with_pooled_session(
                     &mut session,
                     request,
                     &metadata,
@@ -1752,7 +1784,7 @@ impl Engine for OnnxBackend {
             let (shape_usize, main_input_tensor) = prepared_input
                 .take()
                 .ok_or_else(|| EngineError::backend("input already consumed".to_string()))?;
-            run_inference_with_session(
+            run_inference_with_pooled_session(
                 &mut session,
                 request,
                 &metadata,
