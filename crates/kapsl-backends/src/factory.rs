@@ -187,6 +187,15 @@ impl BackendFactory {
                 .map_err(|e| format!("NativeBackend init failed: {e}"));
         }
 
+        #[cfg(feature = "pytorch")]
+        if manifest.framework == "pytorch" {
+            let device_id = manifest.hardware_requirements.device_id.unwrap_or(0);
+            log::info!("✓ Using PyTorchBackend (Python sidecar), device {}", device_id);
+            return crate::pytorch::PyTorchBackend::new(device_id)
+                .map(|b| Box::new(b) as Box<dyn Engine>)
+                .map_err(|e| format!("PyTorchBackend init failed: {e}"));
+        }
+
         // Check for LLM framework
         if manifest.framework == "llm" {
             let requirements = &manifest.hardware_requirements;
@@ -283,6 +292,14 @@ impl BackendFactory {
             return NativeBackend::new(device_id as i32)
                 .map(|b| Box::new(b) as Box<dyn Engine>)
                 .map_err(|e| format!("NativeBackend init failed: {e}"));
+        }
+
+        #[cfg(feature = "pytorch")]
+        if manifest.framework == "pytorch" {
+            log::info!("✓ Using PyTorchBackend (Python sidecar) on device {}", device_id);
+            return crate::pytorch::PyTorchBackend::new(device_id as i32)
+                .map(|b| Box::new(b) as Box<dyn Engine>)
+                .map_err(|e| format!("PyTorchBackend init failed: {e}"));
         }
 
         // GGUF: prefer native CUDA kernels when gguf-native feature is compiled in.

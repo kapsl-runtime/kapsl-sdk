@@ -5,6 +5,8 @@ pub mod gguf_native;
 #[cfg(feature = "native")]
 pub mod native;
 pub mod onnx;
+#[cfg(feature = "pytorch")]
+pub mod pytorch;
 #[cfg(feature = "onnx-cuda-pool")]
 pub mod ort_pool_allocator;
 
@@ -15,3 +17,5 @@ pub use gguf_native::GgufNativeBackend;
 #[cfg(feature = "native")]
 pub use native::NativeBackend;
 pub use onnx::OnnxBackend;
+#[cfg(feature = "pytorch")]
+pub use pytorch::PyTorchBackend;

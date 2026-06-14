@@ -25,9 +25,13 @@ ndarray = "0.17"
 async-trait = "0.1.89"
 async-stream = "0.3"
 serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", optional = true }
 
 [features]
 default = []
+# Run PyTorch-family models via an out-of-process Python sidecar. The Rust side
+# is pure std (process + unix socket) + serde_json; no native libtorch dep.
+pytorch = ["dep:serde_json", "tokio/time"]
 # Opt-in llama.cpp CUDA; the default backend build stays portable.
 gguf-cuda = ["kapsl-llm/gguf-cuda"]
 gguf-cuda-shared-kv = ["kapsl-llm/gguf-cuda-shared-kv", "kapsl-hal/cuda", "onnx-cuda-pool"]
