@@ -45,6 +45,20 @@ def resolve_device(device_id: int) -> str:
     return "cpu"
 
 
+def apply_memory_fraction(device: str, fraction: float) -> None:
+    """Cap this process's share of GPU memory (coarse per-process budgeting)."""
+    if fraction <= 0.0 or not device.startswith("cuda"):
+        return
+    try:
+        import torch
+
+        idx = int(device.split(":", 1)[1]) if ":" in device else 0
+        torch.cuda.set_per_process_memory_fraction(fraction, idx)
+        log(f"set GPU memory fraction {fraction} on {device}")
+    except Exception as exc:  # noqa: BLE001
+        log(f"could not set memory fraction: {exc}")
+
+
 class Generator:
     def __init__(self, model_path: str, device: str) -> None:
         from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -141,9 +155,11 @@ def main() -> None:
     parser.add_argument("--model", required=True)
     parser.add_argument("--socket", required=True)
     parser.add_argument("--device", type=int, default=0)
+    parser.add_argument("--gpu-memory-fraction", type=float, default=0.0)
     args = parser.parse_args()
 
     device = resolve_device(args.device)
+    apply_memory_fraction(device, args.gpu_memory_fraction)
     generator = Generator(args.model, device)
     serve(generator, args.socket)
 

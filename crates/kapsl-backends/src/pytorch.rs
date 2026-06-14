@@ -74,6 +74,15 @@ impl Drop for Sidecar {
 pub struct PyTorchBackend {
     device_id: i32,
     sidecar: Mutex<Option<Sidecar>>,
+    /// Cross-model admission gate, shared with all backends on the runtime.
+    /// When set, each request reserves tokens before forwarding to the worker,
+    /// so PyTorch models participate in global fairness/back-pressure even
+    /// though they don't share the in-process KV block pool.
+    global_scheduler: Option<kapsl_llm::global_scheduler::SharedGlobalScheduler>,
+    /// Stable engine id assigned by the runtime (key into the scheduler).
+    engine_id: u32,
+    /// Optional per-process GPU memory cap (fraction 0..1) passed to the worker.
+    gpu_memory_fraction: Option<f32>,
 }
 
 impl PyTorchBackend {
@@ -81,7 +90,75 @@ impl PyTorchBackend {
         Ok(Self {
             device_id,
             sidecar: Mutex::new(None),
+            global_scheduler: None,
+            engine_id: 0,
+            gpu_memory_fraction: None,
         })
+    }
+
+    /// Attach the cross-model admission gate (mirrors `LLMBackend`). Once set,
+    /// `infer`/`infer_stream` reserve tokens before forwarding and release on
+    /// completion, and worker death is reported as `Dead` health.
+    pub fn with_global_scheduler(
+        mut self,
+        scheduler: kapsl_llm::global_scheduler::SharedGlobalScheduler,
+        engine_id: u32,
+    ) -> Self {
+        self.global_scheduler = Some(scheduler);
+        self.engine_id = engine_id;
+        self
+    }
+
+    /// Cap the worker process's share of GPU memory (fraction in `0.0..=1.0`).
+    /// Passed to the worker so PyTorch's allocator stays within budget — coarse
+    /// per-process budgeting, since the sidecar can't draw from the shared pool.
+    pub fn with_gpu_memory_fraction(mut self, fraction: f32) -> Self {
+        if fraction > 0.0 {
+            self.gpu_memory_fraction = Some(fraction);
+        }
+        self
+    }
+
+    /// Report this engine's health into the cross-model scheduler, if attached.
+    fn report_health(&self, health: kapsl_llm::global_scheduler::EngineHealth) {
+        if let Some(sched) = self.global_scheduler.as_ref() {
+            sched.lock().set_health(self.engine_id, health);
+        }
+    }
+
+    /// Conservative token estimate for admission: prompt bytes/4 + max_new.
+    fn estimate_tokens(req: &InferenceRequest) -> usize {
+        let prompt_tokens = req.input.data.len() / 4 + 1;
+        let max_new = req
+            .metadata
+            .as_ref()
+            .and_then(|m| m.max_new_tokens)
+            .unwrap_or(DEFAULT_MAX_NEW_TOKENS) as usize;
+        prompt_tokens.saturating_add(max_new)
+    }
+
+    /// Reserve admission tokens for a request. Returns a guard that releases
+    /// them on drop, or an error if the global budget is exhausted. `Ok(None)`
+    /// when no scheduler is attached (admission disabled).
+    fn reserve_admission(
+        &self,
+        req: &InferenceRequest,
+    ) -> Result<Option<GlobalTokenGuard>, EngineError> {
+        let Some(sched) = self.global_scheduler.as_ref() else {
+            return Ok(None);
+        };
+        let tokens = Self::estimate_tokens(req);
+        let admitted = sched.lock().try_reserve_tokens(self.engine_id, tokens);
+        if !admitted {
+            return Err(EngineError::overloaded(
+                "Global admission rejected: token budget exhausted across all models",
+            ));
+        }
+        Ok(Some(GlobalTokenGuard {
+            scheduler: sched.clone(),
+            engine_id: self.engine_id,
+            tokens,
+        }))
     }
 
     fn socket_path_for(device_id: i32) -> String {
@@ -138,6 +215,22 @@ impl PyTorchBackend {
         });
         serde_json::to_string(&value)
             .map_err(|e| EngineError::backend(format!("PyTorch request serialize failed: {e}")))
+    }
+}
+
+/// Returns reserved admission tokens to the global scheduler on drop, so the
+/// budget is reclaimed whether a request completes, errors, or is cancelled.
+struct GlobalTokenGuard {
+    scheduler: kapsl_llm::global_scheduler::SharedGlobalScheduler,
+    engine_id: u32,
+    tokens: usize,
+}
+
+impl Drop for GlobalTokenGuard {
+    fn drop(&mut self) {
+        self.scheduler
+            .lock()
+            .complete_tokens(self.engine_id, self.tokens);
     }
 }
 
@@ -278,6 +371,9 @@ impl Engine for PyTorchBackend {
                 .arg(&socket_path)
                 .arg("--device")
                 .arg(self.device_id.to_string());
+            if let Some(fraction) = self.gpu_memory_fraction {
+                command.arg("--gpu-memory-fraction").arg(fraction.to_string());
+            }
             let child = command.spawn().map_err(|e| {
                 EngineError::backend(format!(
                     "failed to spawn PyTorch worker '{}': {e}",
@@ -310,6 +406,7 @@ impl Engine for PyTorchBackend {
             }
 
             *self.sidecar.lock().unwrap() = Some(sidecar);
+            self.report_health(kapsl_llm::global_scheduler::EngineHealth::Healthy);
             log::info!(
                 "PyTorchBackend: worker ready (device {}, socket {})",
                 self.device_id,
@@ -330,6 +427,8 @@ impl Engine for PyTorchBackend {
         #[cfg(unix)]
         {
             let socket_path = self.current_socket()?;
+            // Global admission: reserve before forwarding, release on drop.
+            let _admission = self.reserve_admission(req)?;
             let request_json = Self::build_request_json(req)?;
             let cancel = req.cancellation.clone();
 
@@ -368,6 +467,12 @@ impl Engine for PyTorchBackend {
                 Ok(s) => s,
                 Err(e) => return Box::pin(futures::stream::once(async move { Err(e) })),
             };
+            // Global admission: the guard is held for the stream's lifetime and
+            // releases the reservation when the stream completes or is dropped.
+            let admission = match self.reserve_admission(req) {
+                Ok(guard) => guard,
+                Err(e) => return Box::pin(futures::stream::once(async move { Err(e) })),
+            };
             let request_json = match Self::build_request_json(req) {
                 Ok(s) => s,
                 Err(e) => return Box::pin(futures::stream::once(async move { Err(e) })),
@@ -382,9 +487,12 @@ impl Engine for PyTorchBackend {
                 });
             });
 
-            Box::pin(futures::stream::unfold(rx, |mut rx| async move {
-                rx.recv().await.map(|item| (item, rx))
-            }))
+            Box::pin(futures::stream::unfold(
+                (rx, admission),
+                |(mut rx, admission)| async move {
+                    rx.recv().await.map(|item| (item, (rx, admission)))
+                },
+            ))
         }
     }
 
@@ -416,15 +524,23 @@ impl Engine for PyTorchBackend {
     }
 
     fn health_check(&self) -> Result<(), EngineError> {
-        let mut guard = self.sidecar.lock().unwrap();
-        match guard.as_mut() {
-            Some(sidecar) => match sidecar.child.try_wait().ok().flatten() {
-                Some(status) => Err(EngineError::backend(format!(
+        let exited = {
+            let mut guard = self.sidecar.lock().unwrap();
+            match guard.as_mut() {
+                Some(sidecar) => sidecar.child.try_wait().ok().flatten(),
+                None => return Err(EngineError::ModelNotLoaded),
+            }
+        };
+        match exited {
+            Some(status) => {
+                // Surface worker death to the cross-model scheduler so it stops
+                // budgeting work to this engine.
+                self.report_health(kapsl_llm::global_scheduler::EngineHealth::Dead);
+                Err(EngineError::backend(format!(
                     "PyTorch worker exited: {status}"
-                ))),
-                None => Ok(()),
-            },
-            None => Err(EngineError::ModelNotLoaded),
+                )))
+            }
+            None => Ok(()),
         }
     }
 }
