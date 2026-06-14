@@ -31,6 +31,8 @@ pub struct KapslMetrics {
     pub decode_tokens_evaluated_total: IntGaugeVec,
     pub kv_partial_reuse_hits_total: IntGaugeVec,
     pub kv_partial_reuse_tokens_saved_total: IntGaugeVec,
+    /// Per-model engine health: 0 = healthy, 1 = degraded, 2 = dead.
+    pub engine_health: IntGaugeVec,
 }
 
 impl KapslMetrics {
@@ -227,6 +229,14 @@ impl KapslMetrics {
             &["model"],
         )
         .unwrap();
+        let engine_health = IntGaugeVec::new(
+            Opts::new(
+                "kapsl_engine_health",
+                "Per-model engine health: 0 = healthy, 1 = degraded, 2 = dead",
+            ),
+            &["model"],
+        )
+        .unwrap();
 
         registry
             .register(Box::new(inference_latency.clone()))
@@ -303,6 +313,9 @@ impl KapslMetrics {
         registry
             .register(Box::new(kv_partial_reuse_tokens_saved_total.clone()))
             .expect("Failed to register kv_partial_reuse_tokens_saved_total");
+        registry
+            .register(Box::new(engine_health.clone()))
+            .expect("Failed to register engine_health");
 
         Self {
             registry: registry.clone(),
@@ -331,6 +344,7 @@ impl KapslMetrics {
             decode_tokens_evaluated_total,
             kv_partial_reuse_hits_total,
             kv_partial_reuse_tokens_saved_total,
+            engine_health,
         }
     }
 
@@ -380,6 +394,9 @@ impl KapslMetrics {
         self.kv_partial_reuse_tokens_saved_total
             .with_label_values(&[model])
             .set(metrics.kv_partial_reuse_tokens_saved_total as i64);
+        self.engine_health
+            .with_label_values(&[model])
+            .set(metrics.engine_health as i64);
     }
 }
 

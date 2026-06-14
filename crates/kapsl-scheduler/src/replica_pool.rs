@@ -365,6 +365,9 @@ where
         let mut total_decode_tokens_evaluated = 0;
         let mut total_kv_partial_reuse_hits = 0;
         let mut total_kv_partial_reuse_tokens_saved = 0;
+        // Health aggregates as the worst across replicas (max code: 0 healthy,
+        // 1 degraded, 2 dead) — the pool is as healthy as its sickest replica.
+        let mut worst_health: u8 = 0;
         let mut cpu_q = 0;
         let mut gpu_q = 0;
         let mut count = 0;
@@ -392,6 +395,7 @@ where
                 total_decode_tokens_evaluated += m.decode_tokens_evaluated_total;
                 total_kv_partial_reuse_hits += m.kv_partial_reuse_hits_total;
                 total_kv_partial_reuse_tokens_saved += m.kv_partial_reuse_tokens_saved_total;
+                worst_health = worst_health.max(m.engine_health);
                 cpu_q += cq;
                 gpu_q += gq;
             }
@@ -421,6 +425,7 @@ where
             decode_tokens_evaluated_total: total_decode_tokens_evaluated,
             kv_partial_reuse_hits_total: total_kv_partial_reuse_hits,
             kv_partial_reuse_tokens_saved_total: total_kv_partial_reuse_tokens_saved,
+            engine_health: worst_health,
             ..kapsl_engine_api::EngineMetrics::default()
         }
     }

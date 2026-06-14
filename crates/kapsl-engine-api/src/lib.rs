@@ -152,6 +152,9 @@ pub struct EngineMetrics {
     pub decode_tokens_evaluated_total: u64,
     pub kv_partial_reuse_hits_total: u64,
     pub kv_partial_reuse_tokens_saved_total: u64,
+    /// Operational health of the engine: 0 = healthy, 1 = degraded, 2 = dead.
+    /// Reported from the cross-model scheduler's per-engine health state.
+    pub engine_health: u8,
 }
 
 impl EngineMetrics {
@@ -180,6 +183,7 @@ impl EngineMetrics {
             decode_tokens_evaluated_total: 0,
             kv_partial_reuse_hits_total: 0,
             kv_partial_reuse_tokens_saved_total: 0,
+            engine_health: 0,
         }
     }
 
