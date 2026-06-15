@@ -441,6 +441,22 @@ impl LLMBackend {
         self
     }
 
+    /// This engine's current health as the `EngineMetrics` code: 0 = healthy,
+    /// 1 = degraded, 2 = dead. Reads the cross-model scheduler's per-engine
+    /// health; defaults to healthy when no scheduler is attached.
+    fn engine_health_code(&self) -> u8 {
+        use crate::global_scheduler::EngineHealth;
+        match self
+            .global_scheduler
+            .as_ref()
+            .and_then(|s| s.lock().health_of(self.engine_id))
+        {
+            Some(EngineHealth::Degraded) => 1,
+            Some(EngineHealth::Dead) => 2,
+            _ => 0,
+        }
+    }
+
     pub fn with_device(provider: String, device_id: i32) -> Self {
         let mut backend = Self::new();
         backend.provider_override = Some(provider);
@@ -940,6 +956,7 @@ impl Engine for LLMBackend {
             // GGUF path uses so the existing Prometheus gauges cover both.
             kv_partial_reuse_hits_total: m.kv_cache_prefix_reuse_hits,
             kv_partial_reuse_tokens_saved_total: m.kv_cache_prefix_reuse_tokens_saved,
+            engine_health: self.engine_health_code(),
             ..EngineMetrics::default()
         }
     }
