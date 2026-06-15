@@ -11,4 +11,8 @@ pub struct LLMMetrics {
     pub kv_cache_packed_layers: usize,
     /// Blocks currently sitting in the CPU offload store (paged mode only).
     pub kv_cache_cpu_offloaded_blocks: u64,
+    /// allocate_sequence calls that reused a cached prefix (paged mode only).
+    pub kv_cache_prefix_reuse_hits: u64,
+    /// Cumulative prompt tokens skipped via prefix reuse (paged mode only).
+    pub kv_cache_prefix_reuse_tokens_saved: u64,
 }

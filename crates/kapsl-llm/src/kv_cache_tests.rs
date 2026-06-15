@@ -321,6 +321,42 @@ mod tests {
     }
 
     #[test]
+    fn paged_cache_reports_prefix_reuse_metrics() {
+        let config = KvCacheConfig {
+            mode: KvCacheMode::Paged,
+            block_size: 2,
+            total_blocks: 4,
+            eviction_policy: KvEvictionPolicy::None,
+            dense_free_list_cap: 8,
+            initial_seq_len: 256,
+            tq_compression_bits: None,
+        };
+        let mut cache = KvCache::new_with_config(1, 1, 8, 2, config);
+        let prefix = [100, 101, 102, 103];
+
+        cache.allocate_sequence(1, &[]).unwrap();
+        for (i, &token) in prefix.iter().enumerate() {
+            let key = vec![f16::from_f32(token as f32); 2];
+            let val = vec![f16::from_f32(token as f32); 2];
+            cache
+                .append_token(1, 0, i, &key, &val, Some(token as u64))
+                .unwrap();
+        }
+        cache.advance_sequence_by(1, 4);
+
+        // No reuse yet.
+        assert_eq!(cache.stats().prefix_reuse_hits, 0);
+        assert_eq!(cache.stats().prefix_reuse_tokens_saved, 0);
+
+        // Seq 2 reuses the cached prefix.
+        let reused = cache.allocate_sequence(2, &prefix).unwrap();
+        let stats = cache.stats();
+        assert!(reused > 0);
+        assert_eq!(stats.prefix_reuse_hits, 1);
+        assert_eq!(stats.prefix_reuse_tokens_saved, reused as u64);
+    }
+
+    #[test]
     fn paged_cache_stale_radix_entry_is_ignored_after_remove() {
         let config = KvCacheConfig {
             mode: KvCacheMode::Paged,

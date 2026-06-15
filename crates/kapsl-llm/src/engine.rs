@@ -2412,6 +2412,8 @@ impl LLMEngine {
         metrics.kv_cache_evicted_sequences = stats.evicted_sequences;
         metrics.kv_cache_packed_layers = stats.packed_layers;
         metrics.kv_cache_cpu_offloaded_blocks = stats.cpu_offloaded_blocks;
+        metrics.kv_cache_prefix_reuse_hits = stats.prefix_reuse_hits;
+        metrics.kv_cache_prefix_reuse_tokens_saved = stats.prefix_reuse_tokens_saved;
     }
 
     fn kv_bytes_per_token(&self) -> Option<usize> {

@@ -1915,6 +1915,8 @@ impl PagedKvCache {
             // Use the store's authoritative count so stats stay consistent
             // even when blocks are put back during failed restore attempts.
             cpu_offloaded_blocks: self.cpu_store.offloaded_block_count() as u64,
+            prefix_reuse_hits: self.prefix_reuse_hits,
+            prefix_reuse_tokens_saved: self.prefix_reuse_tokens_saved,
         }
     }
 }

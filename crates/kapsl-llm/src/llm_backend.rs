@@ -936,6 +936,10 @@ impl Engine for LLMBackend {
             kv_cache_evicted_sequences: m.kv_cache_evicted_sequences,
             kv_cache_packed_layers: m.kv_cache_packed_layers,
             kv_cache_cpu_offloaded_blocks: m.kv_cache_cpu_offloaded_blocks,
+            // Paged prefix-cache reuse, reported through the same fields the
+            // GGUF path uses so the existing Prometheus gauges cover both.
+            kv_partial_reuse_hits_total: m.kv_cache_prefix_reuse_hits,
+            kv_partial_reuse_tokens_saved_total: m.kv_cache_prefix_reuse_tokens_saved,
             ..EngineMetrics::default()
         }
     }
