@@ -1,4 +1,5 @@
 use crate::onnx::{ExecutionProvider, OnnxBackend, OnnxBackendBuilder};
+use crate::provider_compat::{resolve_onnx_accelerator_provider, OnnxAcceleratorProvider};
 #[cfg(feature = "gguf-native")]
 use crate::gguf_native::GgufNativeBackend;
 #[cfg(feature = "native")]
@@ -365,7 +366,17 @@ impl BackendFactory {
                     .and_then(|d| d.cuda_version.as_ref())
                     .map(|s| s.as_str())
                     .unwrap_or("unknown");
-                log::info!("   CUDA available: version {:?}", cuda_version);
+                let acceptance = resolve_onnx_accelerator_provider(
+                    OnnxAcceleratorProvider::Cuda,
+                    device_info,
+                    device_id,
+                )?;
+                log::info!(
+                    "   CUDA accepted: version {:?}, bundle={}, device={}",
+                    cuda_version,
+                    acceptance.bundle,
+                    acceptance.device_summary
+                );
                 Self::build_onnx_backend(ExecutionProvider::CUDA, opt_level, device_id, tuning)
             }
 
@@ -381,7 +392,16 @@ impl BackendFactory {
                         "TensorRT execution provider is not available in ONNX Runtime".to_string(),
                     );
                 }
-                log::info!("   TensorRT requested (requires CUDA)");
+                let acceptance = resolve_onnx_accelerator_provider(
+                    OnnxAcceleratorProvider::TensorRt,
+                    device_info,
+                    device_id,
+                )?;
+                log::info!(
+                    "   TensorRT accepted: bundle={}, device={}",
+                    acceptance.bundle,
+                    acceptance.device_summary
+                );
                 Self::build_onnx_backend(ExecutionProvider::TensorRT, opt_level, device_id, tuning)
             }
 

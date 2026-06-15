@@ -7,15 +7,17 @@ use kapsl_engine_api::{
 use ndarray::ArrayD;
 use ort::execution_providers::ExecutionProvider as OrtExecutionProvider;
 use ort::session::builder::GraphOptimizationLevel;
+use ort::session::run_options::{OutputSelector, RunOptions};
 use ort::session::{Session, SessionInputValue};
 use ort::tensor::TensorElementType;
-use ort::value::Value;
+use ort::value::{TensorRef, Value};
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock, RwLock};
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
+use std::time::{Duration, Instant};
 
 // TODO: Consider adding support for OpenVINO and other backends
 #[derive(Debug, Clone, Copy)]
@@ -40,7 +42,7 @@ pub struct ModelMetadata {
 }
 
 pub struct OnnxBackend {
-    session: Arc<RwLock<Option<Session>>>,
+    session: Arc<RwLock<Option<Arc<SessionPool>>>>,
     bucket_sessions: Arc<RwLock<BucketSessionState>>,
     model_path: Arc<RwLock<Option<PathBuf>>>,
     provider: ExecutionProvider,
@@ -60,8 +62,193 @@ pub struct OnnxBackend {
 #[derive(Default)]
 struct BucketSessionState {
     primary_bucket_key: Option<String>,
-    sessions: HashMap<String, Session>,
+    sessions: HashMap<String, Arc<SessionPool>>,
     lru: VecDeque<String>,
+}
+
+struct SessionPool {
+    sessions: Mutex<Vec<Session>>,
+    condvar: Condvar,
+    total_sessions: AtomicUsize,
+    waits_total: AtomicU64,
+    wait_micros_total: AtomicU64,
+    max_sessions: usize,
+}
+
+struct PooledSession<'a> {
+    session: Option<Session>,
+    pool: &'a SessionPool,
+}
+
+impl SessionPool {
+    fn new(initial: Session, max_sessions: usize) -> Self {
+        Self {
+            sessions: Mutex::new(vec![initial]),
+            condvar: Condvar::new(),
+            total_sessions: AtomicUsize::new(1),
+            waits_total: AtomicU64::new(0),
+            wait_micros_total: AtomicU64::new(0),
+            max_sessions: max_sessions.max(1),
+        }
+    }
+
+    fn acquire<F>(&self, mut create_session: F) -> Result<PooledSession<'_>, EngineError>
+    where
+        F: FnMut() -> Result<Session, EngineError>,
+    {
+        loop {
+            {
+                let mut sessions = self.sessions.lock().map_err(|_| EngineError::Backend {
+                    message: "Session pool lock poisoned".to_string(),
+                    source: None,
+                })?;
+                if let Some(session) = sessions.pop() {
+                    return Ok(PooledSession {
+                        session: Some(session),
+                        pool: self,
+                    });
+                }
+            }
+
+            if self.try_reserve_session() {
+                match create_session() {
+                    Ok(session) => {
+                        return Ok(PooledSession {
+                            session: Some(session),
+                            pool: self,
+                        });
+                    }
+                    Err(err) => {
+                        self.release_reserved_session();
+                        return Err(err);
+                    }
+                }
+            }
+
+            let mut sessions = self.sessions.lock().map_err(|_| EngineError::Backend {
+                message: "Session pool lock poisoned".to_string(),
+                source: None,
+            })?;
+            while sessions.is_empty() {
+                self.waits_total.fetch_add(1, Ordering::Relaxed);
+                let wait_start = Instant::now();
+                sessions = self
+                    .condvar
+                    .wait(sessions)
+                    .map_err(|_| EngineError::Backend {
+                        message: "Session pool lock poisoned".to_string(),
+                        source: None,
+                    })?;
+                self.record_wait(wait_start.elapsed());
+            }
+        }
+    }
+
+    fn try_reserve_session(&self) -> bool {
+        loop {
+            let current = self.total_sessions.load(Ordering::Acquire);
+            if current >= self.max_sessions {
+                return false;
+            }
+            if self
+                .total_sessions
+                .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+
+    fn add_reserved_session(&self, session: Session) -> Result<(), EngineError> {
+        let mut sessions = self.sessions.lock().map_err(|_| EngineError::Backend {
+            message: "Session pool lock poisoned".to_string(),
+            source: None,
+        })?;
+        sessions.push(session);
+        self.condvar.notify_one();
+        Ok(())
+    }
+
+    fn release_reserved_session(&self) {
+        self.total_sessions.fetch_sub(1, Ordering::AcqRel);
+        self.condvar.notify_one();
+    }
+
+    fn record_wait(&self, elapsed: Duration) {
+        let micros = elapsed.as_micros().min(u128::from(u64::MAX)) as u64;
+        self.wait_micros_total.fetch_add(micros, Ordering::Relaxed);
+    }
+
+    fn stats(&self) -> SessionPoolStats {
+        let idle_sessions = self
+            .sessions
+            .lock()
+            .map(|sessions| sessions.len())
+            .unwrap_or(0);
+        SessionPoolStats {
+            total_sessions: self.total_sessions.load(Ordering::Acquire),
+            idle_sessions,
+            waits_total: self.waits_total.load(Ordering::Relaxed),
+            wait_seconds_total: self.wait_micros_total.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+        }
+    }
+}
+
+#[derive(Default)]
+struct SessionPoolStats {
+    total_sessions: usize,
+    idle_sessions: usize,
+    waits_total: u64,
+    wait_seconds_total: f64,
+}
+
+impl PooledSession<'_> {
+    fn discard(&mut self) {
+        let Some(_session) = self.session.take() else {
+            return;
+        };
+
+        self.pool.total_sessions.fetch_sub(1, Ordering::AcqRel);
+        self.pool.condvar.notify_one();
+    }
+}
+
+impl Deref for PooledSession<'_> {
+    type Target = Session;
+
+    fn deref(&self) -> &Self::Target {
+        self.session
+            .as_ref()
+            .expect("pooled ONNX session missing before drop")
+    }
+}
+
+impl DerefMut for PooledSession<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.session
+            .as_mut()
+            .expect("pooled ONNX session missing before drop")
+    }
+}
+
+impl Drop for PooledSession<'_> {
+    fn drop(&mut self) {
+        let Some(session) = self.session.take() else {
+            return;
+        };
+
+        match self.pool.sessions.lock() {
+            Ok(mut sessions) => {
+                sessions.push(session);
+                self.pool.condvar.notify_one();
+            }
+            Err(_) => {
+                self.pool.total_sessions.fetch_sub(1, Ordering::AcqRel);
+                self.pool.condvar.notify_one();
+            }
+        }
+    }
 }
 
 const ORT_MEMORY_PATTERN_ENV: &str = "KAPSL_ORT_MEMORY_PATTERN";
@@ -364,6 +551,73 @@ impl OnnxBackend {
             .build())
     }
 
+    fn session_pool_size(&self) -> usize {
+        self.peak_concurrency_hint.unwrap_or(1).max(1) as usize
+    }
+
+    fn create_session_pool(&self, session: Session) -> Arc<SessionPool> {
+        Arc::new(SessionPool::new(session, self.session_pool_size()))
+    }
+
+    fn prewarm_session_pool(
+        &self,
+        pool: &SessionPool,
+        model_path: &Path,
+        opt_level: GraphOptimizationLevel,
+    ) -> Result<(), EngineError> {
+        while pool.try_reserve_session() {
+            match self.create_session(model_path, opt_level) {
+                Ok(session) => pool.add_reserved_session(session)?,
+                Err(err) => {
+                    pool.release_reserved_session();
+                    return Err(err);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn collect_session_pool_stats(&self) -> SessionPoolStats {
+        let mut stats = SessionPoolStats::default();
+        if let Ok(session_guard) = self.session.read() {
+            if let Some(pool) = session_guard.as_ref() {
+                let pool_stats = pool.stats();
+                stats.total_sessions += pool_stats.total_sessions;
+                stats.idle_sessions += pool_stats.idle_sessions;
+                stats.waits_total += pool_stats.waits_total;
+                stats.wait_seconds_total += pool_stats.wait_seconds_total;
+            }
+        }
+        if let Ok(bucket_guard) = self.bucket_sessions.read() {
+            for pool in bucket_guard.sessions.values() {
+                let pool_stats = pool.stats();
+                stats.total_sessions += pool_stats.total_sessions;
+                stats.idle_sessions += pool_stats.idle_sessions;
+                stats.waits_total += pool_stats.waits_total;
+                stats.wait_seconds_total += pool_stats.wait_seconds_total;
+            }
+        }
+        stats
+    }
+
+    fn acquire_session<'a>(
+        &'a self,
+        pool: &'a Arc<SessionPool>,
+    ) -> Result<PooledSession<'a>, EngineError> {
+        pool.acquire(|| {
+            let model_path = self
+                .model_path
+                .read()
+                .map_err(|_| EngineError::Backend {
+                    message: "Lock poisoned".to_string(),
+                    source: None,
+                })?
+                .clone()
+                .ok_or(EngineError::ModelNotLoaded)?;
+            self.create_session(&model_path, self.get_opt_level())
+        })
+    }
+
     fn bucket_key_for_request(&self, request: &InferenceRequest) -> Option<String> {
         if self.max_bucket_sessions <= 1 {
             return None;
@@ -406,11 +660,11 @@ impl OnnxBackend {
         state.lru.push_back(bucket_key.to_string());
     }
 
-    fn get_or_create_bucket_session<'a>(
+    fn get_or_create_bucket_session_pool(
         &self,
-        state: &'a mut BucketSessionState,
+        state: &mut BucketSessionState,
         bucket_key: &str,
-    ) -> Result<&'a mut Session, EngineError> {
+    ) -> Result<Arc<SessionPool>, EngineError> {
         if !state.sessions.contains_key(bucket_key) {
             let secondary_capacity = self.max_bucket_sessions.saturating_sub(1).max(1);
             while state.sessions.len() >= secondary_capacity {
@@ -430,13 +684,16 @@ impl OnnxBackend {
                 .clone()
                 .ok_or(EngineError::ModelNotLoaded)?;
             let session = self.create_session(&model_path, self.get_opt_level())?;
-            state.sessions.insert(bucket_key.to_string(), session);
+            state
+                .sessions
+                .insert(bucket_key.to_string(), self.create_session_pool(session));
         }
 
         Self::touch_bucket_lru(state, bucket_key);
         state
             .sessions
-            .get_mut(bucket_key)
+            .get(bucket_key)
+            .cloned()
             .ok_or(EngineError::ModelNotLoaded)
     }
 
@@ -657,13 +914,13 @@ impl OnnxBackend {
 ///
 /// Note: kept at module scope so tests can access it.
 #[derive(Debug)]
-enum PreparedInput {
-    F32(Vec<f32>),
-    F64(Vec<f64>),
+enum PreparedInput<'a> {
+    F32(Cow<'a, [f32]>),
+    F64(Cow<'a, [f64]>),
     F16(Vec<f16>),
-    I32(Vec<i32>),
-    I64(Vec<i64>),
-    U8(Vec<u8>),
+    I32(Cow<'a, [i32]>),
+    I64(Cow<'a, [i64]>),
+    U8(Cow<'a, [u8]>),
 }
 
 fn validate_byte_len(
@@ -694,20 +951,20 @@ fn validate_byte_len(
     Ok(())
 }
 
-fn parse_ne_f32(bytes: &[u8], num_elements: usize) -> Vec<f32> {
-    if let Some(values) = try_aligned_copy::<f32>(bytes) {
-        return values;
+fn parse_ne_f32(bytes: &[u8], num_elements: usize) -> Cow<'_, [f32]> {
+    if let Some(values) = try_aligned_slice::<f32>(bytes) {
+        return Cow::Borrowed(values);
     }
     let mut values = Vec::with_capacity(num_elements);
     for chunk in bytes.chunks_exact(4) {
         values.push(f32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
     }
-    values
+    Cow::Owned(values)
 }
 
-fn parse_ne_f64(bytes: &[u8], num_elements: usize) -> Vec<f64> {
-    if let Some(values) = try_aligned_copy::<f64>(bytes) {
-        return values;
+fn parse_ne_f64(bytes: &[u8], num_elements: usize) -> Cow<'_, [f64]> {
+    if let Some(values) = try_aligned_slice::<f64>(bytes) {
+        return Cow::Borrowed(values);
     }
     let mut values = Vec::with_capacity(num_elements);
     for chunk in bytes.chunks_exact(8) {
@@ -715,13 +972,13 @@ fn parse_ne_f64(bytes: &[u8], num_elements: usize) -> Vec<f64> {
             chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
         ]));
     }
-    values
+    Cow::Owned(values)
 }
 
 fn parse_ne_f16(bytes: &[u8], num_elements: usize) -> Vec<f16> {
-    if let Some(values) = try_aligned_copy::<u16>(bytes) {
+    if let Some(values) = try_aligned_slice::<u16>(bytes) {
         let mut out = Vec::with_capacity(num_elements);
-        out.extend(values.into_iter().map(f16::from_bits));
+        out.extend(values.iter().copied().map(f16::from_bits));
         return out;
     }
     let mut values = Vec::with_capacity(num_elements);
@@ -731,20 +988,20 @@ fn parse_ne_f16(bytes: &[u8], num_elements: usize) -> Vec<f16> {
     values
 }
 
-fn parse_ne_i32(bytes: &[u8], num_elements: usize) -> Vec<i32> {
-    if let Some(values) = try_aligned_copy::<i32>(bytes) {
-        return values;
+fn parse_ne_i32(bytes: &[u8], num_elements: usize) -> Cow<'_, [i32]> {
+    if let Some(values) = try_aligned_slice::<i32>(bytes) {
+        return Cow::Borrowed(values);
     }
     let mut values = Vec::with_capacity(num_elements);
     for chunk in bytes.chunks_exact(4) {
         values.push(i32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
     }
-    values
+    Cow::Owned(values)
 }
 
-fn parse_ne_i64(bytes: &[u8], num_elements: usize) -> Vec<i64> {
-    if let Some(values) = try_aligned_copy::<i64>(bytes) {
-        return values;
+fn parse_ne_i64(bytes: &[u8], num_elements: usize) -> Cow<'_, [i64]> {
+    if let Some(values) = try_aligned_slice::<i64>(bytes) {
+        return Cow::Borrowed(values);
     }
     let mut values = Vec::with_capacity(num_elements);
     for chunk in bytes.chunks_exact(8) {
@@ -752,7 +1009,7 @@ fn parse_ne_i64(bytes: &[u8], num_elements: usize) -> Vec<i64> {
             chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
         ]));
     }
-    values
+    Cow::Owned(values)
 }
 
 fn find_additional_input_by_name<'a>(
@@ -784,14 +1041,26 @@ fn ensure_unique_additional_input_names(
     Ok(())
 }
 
-fn try_aligned_copy<T: Copy>(bytes: &[u8]) -> Option<Vec<T>> {
+fn try_aligned_slice<T: Copy>(bytes: &[u8]) -> Option<&[T]> {
     // SAFETY: The concrete call sites only use plain numeric POD types.
     let (prefix, aligned, suffix) = unsafe { bytes.align_to::<T>() };
     if prefix.is_empty() && suffix.is_empty() {
-        Some(aligned.to_vec())
+        Some(aligned)
     } else {
         None
     }
+}
+
+fn copy_primitive_slice_as_ne_bytes<T: Copy>(values: &[T]) -> Vec<u8> {
+    let byte_len = values
+        .len()
+        .checked_mul(std::mem::size_of::<T>())
+        .expect("primitive tensor byte length overflow");
+    // SAFETY: ORT exposes output tensors as contiguous initialized slices. Call
+    // sites use primitive numeric tensor element types, whose in-memory bytes
+    // are the native-endian representation expected by BinaryTensorPacket.
+    let bytes = unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), byte_len) };
+    bytes.to_vec()
 }
 
 /// Validate an incoming BinaryTensorPacket and return the shape and a typed
@@ -802,7 +1071,7 @@ fn try_aligned_copy<T: Copy>(bytes: &[u8]) -> Option<Vec<T>> {
 ///  - safe byte->value conversion
 fn validate_and_prepare_input(
     input: &kapsl_engine_api::BinaryTensorPacket,
-) -> Result<(Vec<i64>, PreparedInput), EngineError> {
+) -> Result<(Vec<i64>, PreparedInput<'_>), EngineError> {
     // Compute number of elements from shape; treat empty shape as scalar (1 element)
     let num_elements: usize = if input.shape.is_empty() {
         1
@@ -855,7 +1124,10 @@ fn validate_and_prepare_input(
         }
         TensorDtype::Uint8 => {
             validate_byte_len(input, num_elements, 1, "uint8")?;
-            Ok((input.shape.clone(), PreparedInput::U8(input.data.clone())))
+            Ok((
+                input.shape.clone(),
+                PreparedInput::U8(Cow::Borrowed(&input.data)),
+            ))
         }
         other => Err(EngineError::InvalidInput {
             message: format!(
@@ -874,12 +1146,47 @@ fn tensor_packet_to_session_input(
     let shape_usize = get_shape_usize(&shape_i64);
 
     let value: SessionInputValue = match prepared {
-        PreparedInput::F32(v) => Value::from_array((shape_usize.clone(), v)).map(|v| v.into()),
-        PreparedInput::F64(v) => Value::from_array((shape_usize.clone(), v)).map(|v| v.into()),
+        PreparedInput::F32(v) => match v {
+            Cow::Borrowed(values) => {
+                TensorRef::from_array_view((shape_usize.clone(), values)).map(|v| v.into())
+            }
+            Cow::Owned(values) => {
+                Value::from_array((shape_usize.clone(), values)).map(|v| v.into())
+            }
+        },
+        PreparedInput::F64(v) => match v {
+            Cow::Borrowed(values) => {
+                TensorRef::from_array_view((shape_usize.clone(), values)).map(|v| v.into())
+            }
+            Cow::Owned(values) => {
+                Value::from_array((shape_usize.clone(), values)).map(|v| v.into())
+            }
+        },
         PreparedInput::F16(v) => Value::from_array((shape_usize.clone(), v)).map(|v| v.into()),
-        PreparedInput::I32(v) => Value::from_array((shape_usize.clone(), v)).map(|v| v.into()),
-        PreparedInput::I64(v) => Value::from_array((shape_usize.clone(), v)).map(|v| v.into()),
-        PreparedInput::U8(v) => Value::from_array((shape_usize.clone(), v)).map(|v| v.into()),
+        PreparedInput::I32(v) => match v {
+            Cow::Borrowed(values) => {
+                TensorRef::from_array_view((shape_usize.clone(), values)).map(|v| v.into())
+            }
+            Cow::Owned(values) => {
+                Value::from_array((shape_usize.clone(), values)).map(|v| v.into())
+            }
+        },
+        PreparedInput::I64(v) => match v {
+            Cow::Borrowed(values) => {
+                TensorRef::from_array_view((shape_usize.clone(), values)).map(|v| v.into())
+            }
+            Cow::Owned(values) => {
+                Value::from_array((shape_usize.clone(), values)).map(|v| v.into())
+            }
+        },
+        PreparedInput::U8(v) => match v {
+            Cow::Borrowed(values) => {
+                TensorRef::from_array_view((shape_usize.clone(), values)).map(|v| v.into())
+            }
+            Cow::Owned(values) => {
+                Value::from_array((shape_usize.clone(), values)).map(|v| v.into())
+            }
+        },
     }
     .map_err(|e| EngineError::InferenceError {
         reason: "Failed to create input tensor".to_string(),
@@ -903,15 +1210,31 @@ fn run_inference_with_session(
             source: None,
         });
     }
+    let primary_output_name =
+        metadata
+            .output_names
+            .first()
+            .ok_or_else(|| EngineError::InferenceError {
+                reason: "Model has no outputs defined".to_string(),
+                source: None,
+            })?;
+    let run_options = RunOptions::new()
+        .map_err(|e| EngineError::InferenceError {
+            reason: "Failed to create ONNX run options".to_string(),
+            source: Some(Box::new(e)),
+        })?
+        .with_outputs(OutputSelector::no_default().with(primary_output_name.as_str()));
 
     let outputs = if metadata.input_names.len() == 1 && request.additional_inputs.is_empty() {
-        session.run([main_input_tensor]).map_err(|e| {
-            log::error!("ONNX Runtime inference error: {:?}", e);
-            EngineError::InferenceError {
-                reason: format!("Inference failed: {}", e),
-                source: Some(Box::new(e)),
-            }
-        })?
+        session
+            .run_with_options([main_input_tensor], &run_options)
+            .map_err(|e| {
+                log::error!("ONNX Runtime inference error: {:?}", e);
+                EngineError::InferenceError {
+                    reason: format!("Inference failed: {}", e),
+                    source: Some(Box::new(e)),
+                }
+            })?
     } else {
         // Prepare named input map only when required by multi-input models.
         let mut inputs: Vec<(Cow<'_, str>, SessionInputValue)> =
@@ -1053,13 +1376,15 @@ fn run_inference_with_session(
             }
         }
 
-        session.run(inputs).map_err(|e| {
-            log::error!("ONNX Runtime inference error: {:?}", e);
-            EngineError::InferenceError {
-                reason: format!("Inference failed: {}", e),
-                source: Some(Box::new(e)),
-            }
-        })?
+        session
+            .run_with_options(inputs, &run_options)
+            .map_err(|e| {
+                log::error!("ONNX Runtime inference error: {:?}", e);
+                EngineError::InferenceError {
+                    reason: format!("Inference failed: {}", e),
+                    source: Some(Box::new(e)),
+                }
+            })?
     };
 
     // For LLMs, we often get multiple outputs (logits + KV cache).
@@ -1071,40 +1396,53 @@ fn run_inference_with_session(
         );
     }
 
+    let logits_top_k = request
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.top_k)
+        .and_then(|top_k| usize::try_from(top_k).ok())
+        .filter(|top_k| *top_k > 0);
+
     // Handle output - try f32 first, otherwise return an error.
     let output_value = &outputs[0];
     let output_packet = if let Ok((shape_ref, data)) = output_value.try_extract_tensor::<f32>() {
+        if let Some(top_k) = logits_top_k {
+            return top_k_last_logits_packet(shape_ref, data.iter().copied(), top_k);
+        }
         BinaryTensorPacket {
             shape: shape_ref.to_vec(),
             dtype: TensorDtype::Float32,
-            data: data.iter().flat_map(|&x| x.to_ne_bytes()).collect(),
+            data: copy_primitive_slice_as_ne_bytes(data),
         }
     } else if let Ok((shape_ref, data)) = output_value.try_extract_tensor::<f64>() {
+        if let Some(top_k) = logits_top_k {
+            return top_k_last_logits_packet(shape_ref, data.iter().map(|&x| x as f32), top_k);
+        }
         BinaryTensorPacket {
             shape: shape_ref.to_vec(),
             dtype: TensorDtype::Float64,
-            data: data.iter().flat_map(|&x| x.to_ne_bytes()).collect(),
+            data: copy_primitive_slice_as_ne_bytes(data),
         }
     } else if let Ok((shape_ref, data)) = output_value.try_extract_tensor::<f16>() {
+        if let Some(top_k) = logits_top_k {
+            return top_k_last_logits_packet(shape_ref, data.iter().map(|x| x.to_f32()), top_k);
+        }
         BinaryTensorPacket {
             shape: shape_ref.to_vec(),
             dtype: TensorDtype::Float16,
-            data: data
-                .iter()
-                .flat_map(|x| x.to_bits().to_ne_bytes())
-                .collect(),
+            data: copy_primitive_slice_as_ne_bytes(data),
         }
     } else if let Ok((shape_ref, data)) = output_value.try_extract_tensor::<i32>() {
         BinaryTensorPacket {
             shape: shape_ref.to_vec(),
             dtype: TensorDtype::Int32,
-            data: data.iter().flat_map(|&x| x.to_ne_bytes()).collect(),
+            data: copy_primitive_slice_as_ne_bytes(data),
         }
     } else if let Ok((shape_ref, data)) = output_value.try_extract_tensor::<i64>() {
         BinaryTensorPacket {
             shape: shape_ref.to_vec(),
             dtype: TensorDtype::Int64,
-            data: data.iter().flat_map(|&x| x.to_ne_bytes()).collect(),
+            data: copy_primitive_slice_as_ne_bytes(data),
         }
     } else if let Ok((shape_ref, data)) = output_value.try_extract_tensor::<u8>() {
         BinaryTensorPacket {
@@ -1123,6 +1461,117 @@ fn run_inference_with_session(
     Ok(output_packet)
 }
 
+fn run_inference_with_pooled_session(
+    session: &mut PooledSession<'_>,
+    request: &InferenceRequest,
+    metadata: &ModelMetadata,
+    shape_usize: Vec<usize>,
+    main_input_tensor: SessionInputValue<'_>,
+) -> Result<BinaryTensorPacket, EngineError> {
+    let result = run_inference_with_session(
+        session,
+        request,
+        metadata,
+        shape_usize,
+        main_input_tensor,
+    );
+    if result.is_err() {
+        log::warn!("Discarding ONNX session after inference failure");
+        session.discard();
+    }
+    result
+}
+
+fn top_k_last_logits_packet<I>(
+    shape: &[i64],
+    scores: I,
+    top_k: usize,
+) -> Result<BinaryTensorPacket, EngineError>
+where
+    I: ExactSizeIterator<Item = f32>,
+{
+    let vocab_size = shape
+        .last()
+        .copied()
+        .filter(|dim| *dim > 0)
+        .ok_or_else(|| EngineError::InvalidInput {
+            message: "Cannot apply ONNX top_k output reduction to tensor without a positive last dimension".to_string(),
+            source: None,
+        })? as usize;
+    let total_scores = scores.len();
+    if total_scores < vocab_size {
+        return Err(EngineError::InvalidInput {
+            message: format!(
+                "Cannot apply ONNX top_k output reduction: tensor has {} values but vocab dimension is {}",
+                total_scores, vocab_size
+            ),
+            source: None,
+        });
+    }
+
+    let last_row_offset = total_scores - vocab_size;
+    let requested = top_k.min(vocab_size);
+    let candidates = if requested <= 64 {
+        select_top_k_logits(scores.skip(last_row_offset), requested)
+    } else {
+        let mut candidates: Vec<(usize, f32)> = scores.skip(last_row_offset).enumerate().collect();
+        candidates.sort_unstable_by(compare_logits_desc);
+        candidates.truncate(requested);
+        candidates
+    };
+
+    let mut data = Vec::with_capacity(candidates.len() * 2 * std::mem::size_of::<f32>());
+    for (token_id, score) in candidates {
+        data.extend_from_slice(&(token_id as f32).to_ne_bytes());
+        data.extend_from_slice(&score.to_ne_bytes());
+    }
+
+    BinaryTensorPacket::new(vec![(data.len() / 8) as i64, 2], TensorDtype::Float32, data)
+}
+
+fn compare_logits_desc(
+    (_, left_score): &(usize, f32),
+    (_, right_score): &(usize, f32),
+) -> std::cmp::Ordering {
+    match (left_score.is_nan(), right_score.is_nan()) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        (false, false) => right_score.total_cmp(left_score),
+    }
+}
+
+fn select_top_k_logits<I>(scores: I, top_k: usize) -> Vec<(usize, f32)>
+where
+    I: Iterator<Item = f32>,
+{
+    if top_k == 0 {
+        return Vec::new();
+    }
+
+    let mut candidates: Vec<(usize, f32)> = Vec::with_capacity(top_k);
+    for (token_id, score) in scores.enumerate() {
+        let candidate = (token_id, score);
+        if candidates.len() < top_k {
+            candidates.push(candidate);
+            candidates.sort_unstable_by(compare_logits_desc);
+            continue;
+        }
+
+        let Some(worst) = candidates.last() else {
+            continue;
+        };
+        if compare_logits_desc(&candidate, worst).is_lt() {
+            let insert_at = candidates
+                .binary_search_by(|existing| compare_logits_desc(existing, &candidate))
+                .unwrap_or_else(|index| index);
+            candidates.insert(insert_at, candidate);
+            candidates.pop();
+        }
+    }
+    candidates
+}
+
 #[async_trait]
 impl Engine for OnnxBackend {
     // TODO: Extract session creation to a helper method to reduce duplication
@@ -1138,13 +1587,14 @@ impl Engine for OnnxBackend {
             self.provider
         );
         log::info!(
-            "ORT memory config: memory_pattern={} disable_cpu_mem_arena={} session_buckets={} bucket_dim_granularity={} bucket_max_dims={} peak_concurrency_hint={:?}",
+            "ORT memory config: memory_pattern={} disable_cpu_mem_arena={} session_buckets={} bucket_dim_granularity={} bucket_max_dims={} peak_concurrency_hint={:?} session_pool_size={}",
             self.memory_pattern,
             self.disable_cpu_mem_arena,
             self.max_bucket_sessions,
             self.bucket_dim_granularity,
             self.bucket_max_dims,
-            self.peak_concurrency_hint
+            self.peak_concurrency_hint,
+            self.session_pool_size()
         );
 
         let session = self.create_session(model_path, opt_level)?;
@@ -1206,11 +1656,20 @@ impl Engine for OnnxBackend {
             *meta_guard = Some(metadata);
         }
 
+        let pool = self.create_session_pool(session);
+        if self.session_pool_size() > 1 {
+            log::info!(
+                "Prewarming ONNX primary session pool to {} sessions",
+                self.session_pool_size()
+            );
+            self.prewarm_session_pool(&pool, model_path, opt_level)?;
+        }
+
         let mut session_guard = self.session.write().map_err(|_| EngineError::Backend {
             message: "Lock poisoned".to_string(),
             source: None,
         })?;
-        *session_guard = Some(session);
+        *session_guard = Some(pool);
         drop(session_guard);
 
         if let Ok(mut model_path_guard) = self.model_path.write() {
@@ -1266,35 +1725,44 @@ impl Engine for OnnxBackend {
             };
 
             if use_primary {
-                let mut session_guard = self.session.write().map_err(|_| EngineError::Backend {
-                    message: "Lock poisoned".to_string(),
-                    source: None,
-                })?;
-                let session = session_guard.as_mut().ok_or(EngineError::ModelNotLoaded)?;
+                let pool = {
+                    let session_guard = self.session.read().map_err(|_| EngineError::Backend {
+                        message: "Lock poisoned".to_string(),
+                        source: None,
+                    })?;
+                    session_guard
+                        .as_ref()
+                        .cloned()
+                        .ok_or(EngineError::ModelNotLoaded)?
+                };
+                let mut session = self.acquire_session(&pool)?;
                 let (shape_usize, main_input_tensor) = prepared_input
                     .take()
                     .ok_or_else(|| EngineError::backend("input already consumed".to_string()))?;
-                run_inference_with_session(
-                    session,
+                run_inference_with_pooled_session(
+                    &mut session,
                     request,
                     &metadata,
                     shape_usize,
                     main_input_tensor,
                 )?
             } else {
-                let mut bucket_guard =
-                    self.bucket_sessions
-                        .write()
-                        .map_err(|_| EngineError::Backend {
-                            message: "Lock poisoned".to_string(),
-                            source: None,
-                        })?;
-                let session = self.get_or_create_bucket_session(&mut bucket_guard, &bucket_key)?;
+                let pool = {
+                    let mut bucket_guard =
+                        self.bucket_sessions
+                            .write()
+                            .map_err(|_| EngineError::Backend {
+                                message: "Lock poisoned".to_string(),
+                                source: None,
+                            })?;
+                    self.get_or_create_bucket_session_pool(&mut bucket_guard, &bucket_key)?
+                };
+                let mut session = self.acquire_session(&pool)?;
                 let (shape_usize, main_input_tensor) = prepared_input
                     .take()
                     .ok_or_else(|| EngineError::backend("input already consumed".to_string()))?;
-                run_inference_with_session(
-                    session,
+                run_inference_with_pooled_session(
+                    &mut session,
                     request,
                     &metadata,
                     shape_usize,
@@ -1302,15 +1770,27 @@ impl Engine for OnnxBackend {
                 )?
             }
         } else {
-            let mut session_guard = self.session.write().map_err(|_| EngineError::Backend {
-                message: "Lock poisoned".to_string(),
-                source: None,
-            })?;
-            let session = session_guard.as_mut().ok_or(EngineError::ModelNotLoaded)?;
+            let pool = {
+                let session_guard = self.session.read().map_err(|_| EngineError::Backend {
+                    message: "Lock poisoned".to_string(),
+                    source: None,
+                })?;
+                session_guard
+                    .as_ref()
+                    .cloned()
+                    .ok_or(EngineError::ModelNotLoaded)?
+            };
+            let mut session = self.acquire_session(&pool)?;
             let (shape_usize, main_input_tensor) = prepared_input
                 .take()
                 .ok_or_else(|| EngineError::backend("input already consumed".to_string()))?;
-            run_inference_with_session(session, request, &metadata, shape_usize, main_input_tensor)?
+            run_inference_with_pooled_session(
+                &mut session,
+                request,
+                &metadata,
+                shape_usize,
+                main_input_tensor,
+            )?
         };
 
         // Update metrics
@@ -1364,7 +1844,13 @@ impl Engine for OnnxBackend {
 
     fn metrics(&self) -> kapsl_engine_api::EngineMetrics {
         if let Ok(metrics) = self.metrics.read() {
-            metrics.clone()
+            let mut snapshot = metrics.clone();
+            let pool_stats = self.collect_session_pool_stats();
+            snapshot.onnx_session_pool_total = pool_stats.total_sessions;
+            snapshot.onnx_session_pool_idle = pool_stats.idle_sessions;
+            snapshot.onnx_session_pool_waits_total = pool_stats.waits_total;
+            snapshot.onnx_session_pool_wait_seconds_total = pool_stats.wait_seconds_total;
+            snapshot
         } else {
             kapsl_engine_api::EngineMetrics::default()
         }

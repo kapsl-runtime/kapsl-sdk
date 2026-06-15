@@ -368,6 +368,10 @@ where
         // Health aggregates as the worst across replicas (max code: 0 healthy,
         // 1 degraded, 2 dead) — the pool is as healthy as its sickest replica.
         let mut worst_health: u8 = 0;
+        let mut total_onnx_session_pool_total = 0;
+        let mut total_onnx_session_pool_idle = 0;
+        let mut total_onnx_session_pool_waits = 0;
+        let mut total_onnx_session_pool_wait_seconds = 0.0;
         let mut cpu_q = 0;
         let mut gpu_q = 0;
         let mut count = 0;
@@ -396,6 +400,10 @@ where
                 total_kv_partial_reuse_hits += m.kv_partial_reuse_hits_total;
                 total_kv_partial_reuse_tokens_saved += m.kv_partial_reuse_tokens_saved_total;
                 worst_health = worst_health.max(m.engine_health);
+                total_onnx_session_pool_total += m.onnx_session_pool_total;
+                total_onnx_session_pool_idle += m.onnx_session_pool_idle;
+                total_onnx_session_pool_waits += m.onnx_session_pool_waits_total;
+                total_onnx_session_pool_wait_seconds += m.onnx_session_pool_wait_seconds_total;
                 cpu_q += cq;
                 gpu_q += gq;
             }
@@ -426,6 +434,10 @@ where
             kv_partial_reuse_hits_total: total_kv_partial_reuse_hits,
             kv_partial_reuse_tokens_saved_total: total_kv_partial_reuse_tokens_saved,
             engine_health: worst_health,
+            onnx_session_pool_total: total_onnx_session_pool_total,
+            onnx_session_pool_idle: total_onnx_session_pool_idle,
+            onnx_session_pool_waits_total: total_onnx_session_pool_waits,
+            onnx_session_pool_wait_seconds_total: total_onnx_session_pool_wait_seconds,
             ..kapsl_engine_api::EngineMetrics::default()
         }
     }

@@ -1,4 +1,6 @@
-use prometheus::{HistogramOpts, HistogramVec, IntCounterVec, IntGaugeVec, Opts, Registry};
+use prometheus::{
+    GaugeVec, HistogramOpts, HistogramVec, IntCounterVec, IntGaugeVec, Opts, Registry,
+};
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -33,6 +35,10 @@ pub struct KapslMetrics {
     pub kv_partial_reuse_tokens_saved_total: IntGaugeVec,
     /// Per-model engine health: 0 = healthy, 1 = degraded, 2 = dead.
     pub engine_health: IntGaugeVec,
+    pub onnx_session_pool_total: IntGaugeVec,
+    pub onnx_session_pool_idle: IntGaugeVec,
+    pub onnx_session_pool_waits_total: IntGaugeVec,
+    pub onnx_session_pool_wait_seconds_total: GaugeVec,
 }
 
 impl KapslMetrics {
@@ -237,6 +243,38 @@ impl KapslMetrics {
             &["model"],
         )
         .unwrap();
+        let onnx_session_pool_total = IntGaugeVec::new(
+            Opts::new(
+                "kapsl_onnx_session_pool_total",
+                "Total ONNX Runtime sessions allocated across session pools",
+            ),
+            &["model"],
+        )
+        .unwrap();
+        let onnx_session_pool_idle = IntGaugeVec::new(
+            Opts::new(
+                "kapsl_onnx_session_pool_idle",
+                "Idle ONNX Runtime sessions available across session pools",
+            ),
+            &["model"],
+        )
+        .unwrap();
+        let onnx_session_pool_waits_total = IntGaugeVec::new(
+            Opts::new(
+                "kapsl_onnx_session_pool_waits_total",
+                "Cumulative waits for an ONNX Runtime session",
+            ),
+            &["model"],
+        )
+        .unwrap();
+        let onnx_session_pool_wait_seconds_total = GaugeVec::new(
+            Opts::new(
+                "kapsl_onnx_session_pool_wait_seconds_total",
+                "Cumulative seconds spent waiting for an ONNX Runtime session",
+            ),
+            &["model"],
+        )
+        .unwrap();
 
         registry
             .register(Box::new(inference_latency.clone()))
@@ -316,6 +354,18 @@ impl KapslMetrics {
         registry
             .register(Box::new(engine_health.clone()))
             .expect("Failed to register engine_health");
+        registry
+            .register(Box::new(onnx_session_pool_total.clone()))
+            .expect("Failed to register onnx_session_pool_total");
+        registry
+            .register(Box::new(onnx_session_pool_idle.clone()))
+            .expect("Failed to register onnx_session_pool_idle");
+        registry
+            .register(Box::new(onnx_session_pool_waits_total.clone()))
+            .expect("Failed to register onnx_session_pool_waits_total");
+        registry
+            .register(Box::new(onnx_session_pool_wait_seconds_total.clone()))
+            .expect("Failed to register onnx_session_pool_wait_seconds_total");
 
         Self {
             registry: registry.clone(),
@@ -345,6 +395,10 @@ impl KapslMetrics {
             kv_partial_reuse_hits_total,
             kv_partial_reuse_tokens_saved_total,
             engine_health,
+            onnx_session_pool_total,
+            onnx_session_pool_idle,
+            onnx_session_pool_waits_total,
+            onnx_session_pool_wait_seconds_total,
         }
     }
 
@@ -397,6 +451,18 @@ impl KapslMetrics {
         self.engine_health
             .with_label_values(&[model])
             .set(metrics.engine_health as i64);
+        self.onnx_session_pool_total
+            .with_label_values(&[model])
+            .set(metrics.onnx_session_pool_total as i64);
+        self.onnx_session_pool_idle
+            .with_label_values(&[model])
+            .set(metrics.onnx_session_pool_idle as i64);
+        self.onnx_session_pool_waits_total
+            .with_label_values(&[model])
+            .set(metrics.onnx_session_pool_waits_total as i64);
+        self.onnx_session_pool_wait_seconds_total
+            .with_label_values(&[model])
+            .set(metrics.onnx_session_pool_wait_seconds_total);
     }
 }
 

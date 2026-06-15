@@ -7,6 +7,7 @@ pub mod native;
 pub mod onnx;
 #[cfg(feature = "onnx-cuda-pool")]
 pub mod ort_pool_allocator;
+mod provider_compat;
 
 pub use engine_pool::{EnginePool, EnginePoolConfig};
 pub use factory::{BackendFactory, OnnxRuntimeTuning};

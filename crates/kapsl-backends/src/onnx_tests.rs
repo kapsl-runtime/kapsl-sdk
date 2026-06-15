@@ -40,6 +40,36 @@ mod tests {
     }
 
     #[test]
+    fn test_copy_primitive_slice_as_ne_bytes_matches_float_encoding() {
+        let values = [0.0f32, 1.0, -2.5, 3.25];
+        assert_eq!(
+            copy_primitive_slice_as_ne_bytes(&values),
+            f32_bytes(&values)
+        );
+
+        let values = [f16::from_f32(0.0), f16::from_f32(-2.5)];
+        assert_eq!(
+            copy_primitive_slice_as_ne_bytes(&values),
+            f16_bytes(&values)
+        );
+    }
+
+    #[test]
+    fn test_copy_primitive_slice_as_ne_bytes_matches_integer_encoding() {
+        let i32_values = [0i32, -1, 123_456];
+        assert_eq!(
+            copy_primitive_slice_as_ne_bytes(&i32_values),
+            i32_bytes(&i32_values)
+        );
+
+        let i64_values = [0i64, -1, 123_456_789];
+        assert_eq!(
+            copy_primitive_slice_as_ne_bytes(&i64_values),
+            i64_bytes(&i64_values)
+        );
+    }
+
+    #[test]
     fn test_validate_float32_success() {
         let values = vec![0.0f32, 1.0f32, -2.5f32, 3.25f32];
         let packet = BinaryTensorPacket {
@@ -57,6 +87,34 @@ mod tests {
                 }
             }
             other => panic!("Expected prepared f32 input, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_float32_aligned_input_borrows() {
+        let values = [0.0f32, 1.0f32, -2.5f32, 3.25f32];
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                values.as_ptr().cast::<u8>(),
+                values.len() * std::mem::size_of::<f32>(),
+            )
+        };
+
+        match parse_ne_f32(bytes, values.len()) {
+            std::borrow::Cow::Borrowed(parsed) => assert_eq!(parsed, values.as_slice()),
+            other => panic!("Expected prepared f32 input, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_float32_unaligned_input_falls_back_to_owned() {
+        let values = vec![1.0f32, 2.0f32];
+        let mut data = vec![0u8];
+        data.extend(f32_bytes(&values));
+
+        match parse_ne_f32(&data[1..], values.len()) {
+            std::borrow::Cow::Owned(parsed) => assert_eq!(parsed, values),
+            std::borrow::Cow::Borrowed(_) => panic!("unaligned input should not be borrowed"),
         }
     }
 
@@ -95,6 +153,42 @@ mod tests {
         } else {
             panic!("Expected InvalidInput error for bad length");
         }
+    }
+
+    #[test]
+    fn test_top_k_last_logits_packet_uses_last_row() {
+        let scores = vec![
+            100.0f32, 90.0, 80.0, 70.0, // earlier row should be ignored
+            0.1, 4.0, -2.0, 3.5,
+        ];
+
+        let packet =
+            top_k_last_logits_packet(&[1, 2, 4], scores.into_iter(), 2).expect("top-k packet");
+
+        assert_eq!(packet.shape, vec![2, 2]);
+        assert_eq!(packet.dtype, TensorDtype::Float32);
+        let values: Vec<f32> = packet
+            .data
+            .chunks_exact(4)
+            .map(|chunk| f32::from_ne_bytes(chunk.try_into().expect("f32 bytes")))
+            .collect();
+        assert_eq!(values, vec![1.0, 4.0, 3.0, 3.5]);
+    }
+
+    #[test]
+    fn test_top_k_last_logits_packet_clamps_to_vocab() {
+        let scores = vec![0.5f32, 2.0, 1.0];
+
+        let packet =
+            top_k_last_logits_packet(&[1, 3], scores.into_iter(), 99).expect("top-k packet");
+
+        assert_eq!(packet.shape, vec![3, 2]);
+        let values: Vec<f32> = packet
+            .data
+            .chunks_exact(4)
+            .map(|chunk| f32::from_ne_bytes(chunk.try_into().expect("f32 bytes")))
+            .collect();
+        assert_eq!(values, vec![1.0, 2.0, 2.0, 1.0, 0.0, 0.5]);
     }
 
     #[test]
@@ -308,6 +402,15 @@ mod tests {
         assert_eq!(backend.device_id, 0);
         // Optimization level 3 maps to 3
         assert_eq!(backend.optimization_level, 3);
+        assert_eq!(backend.session_pool_size(), 1);
+    }
+
+    #[test]
+    fn test_peak_concurrency_hint_controls_session_pool_size() {
+        let backend = OnnxBackend::builder().with_peak_concurrency_hint(8).build();
+
+        assert_eq!(backend.peak_concurrency_hint, Some(8));
+        assert_eq!(backend.session_pool_size(), 8);
     }
 
     #[test]
