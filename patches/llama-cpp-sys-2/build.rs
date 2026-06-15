@@ -1039,11 +1039,16 @@ fn main() {
         }
         // llama.cpp renamed "common" → "llama-common" (+ "llama-common-base")
         // after the ggml-org:master merge. Support both names so older and
-        // newer fork checkouts both build.
-        let has_llama_common = common_lib_dir.join("libllama-common.a").exists()
-            || common_lib_dir.join("llama-common.lib").exists()
-            || common_lib_dir.join("libllama-common-base.a").exists()
-            || common_lib_dir.join("llama-common-base.lib").exists();
+        // newer fork checkouts both build. Check both the base dir and the
+        // per-profile subdir, since multi-config generators (MSVC) place the
+        // .lib files under e.g. common/Release rather than common/ directly.
+        let common_lib_exists = |name: &str| {
+            common_lib_dir.join(name).exists() || common_profile_dir.join(name).exists()
+        };
+        let has_llama_common = common_lib_exists("libllama-common.a")
+            || common_lib_exists("llama-common.lib")
+            || common_lib_exists("libllama-common-base.a")
+            || common_lib_exists("llama-common-base.lib");
         if has_llama_common {
             println!("cargo:rustc-link-lib=static=llama-common-base");
             println!("cargo:rustc-link-lib=static=llama-common");
