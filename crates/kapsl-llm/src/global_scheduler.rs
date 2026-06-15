@@ -188,6 +188,10 @@ pub struct GlobalKvScheduler {
     /// How many times each engine has been a preemption donor in the current
     /// round. Reset by [`reset_preemption_round`] at the start of each round.
     preemption_donations_this_round: HashMap<u32, usize>,
+    /// Monotonic counter bumped on every *change* to any engine's health.
+    /// The runtime polls this to know when to recompute KV block caps so a
+    /// degraded/dead engine's quota is reclaimed for healthy engines.
+    health_epoch: u64,
 }
 
 impl GlobalKvScheduler {
@@ -201,6 +205,7 @@ impl GlobalKvScheduler {
             reserved_tokens: HashMap::new(),
             inflight: HashMap::new(),
             preemption_donations_this_round: HashMap::new(),
+            health_epoch: 0,
         }
     }
 
@@ -260,8 +265,20 @@ impl GlobalKvScheduler {
     /// engine's circuit breaker and stall watchdog.
     pub fn set_health(&mut self, engine_id: u32, health: EngineHealth) {
         if let Some(state) = self.engines.get_mut(&engine_id) {
-            state.health = health;
+            if state.health != health {
+                state.health = health;
+                // Only bump on an actual transition so repeated same-value
+                // reports (e.g. a circuit breaker re-reporting Degraded each
+                // failed step) don't trigger needless cap rebalancing.
+                self.health_epoch = self.health_epoch.wrapping_add(1);
+            }
         }
+    }
+
+    /// Monotonic counter incremented on every health transition. The runtime
+    /// polls this to know when to recompute KV block caps.
+    pub fn health_epoch(&self) -> u64 {
+        self.health_epoch
     }
 
     /// Current health of an engine, or `None` if it is not registered.
@@ -750,6 +767,29 @@ mod global_scheduler_tests {
             max_tokens: None,
         });
         assert_eq!(sched.health_of(0), Some(EngineHealth::Healthy));
+    }
+
+    #[test]
+    fn health_epoch_bumps_only_on_transition() {
+        let mut sched = make_scheduler(1000, &[(0, 1, true)]);
+        let e0 = sched.health_epoch();
+
+        // First transition bumps.
+        sched.set_health(0, EngineHealth::Degraded);
+        let e1 = sched.health_epoch();
+        assert_eq!(e1, e0 + 1);
+
+        // Same value again does not bump.
+        sched.set_health(0, EngineHealth::Degraded);
+        assert_eq!(sched.health_epoch(), e1);
+
+        // A different value bumps.
+        sched.set_health(0, EngineHealth::Healthy);
+        assert_eq!(sched.health_epoch(), e1 + 1);
+
+        // Unknown engine never bumps.
+        sched.set_health(999, EngineHealth::Dead);
+        assert_eq!(sched.health_epoch(), e1 + 1);
     }
 
     #[test]
