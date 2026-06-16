@@ -5,6 +5,7 @@ use crate::gguf_native::GgufNativeBackend;
 #[cfg(feature = "native")]
 use crate::native::NativeBackend;
 use kapsl_core::loader::Manifest;
+use kapsl_core::EngineKind;
 use kapsl_core::HardwareRequirements;
 use kapsl_engine_api::Engine;
 #[cfg(any(feature = "gguf-native", feature = "native", feature = "gguf-cuda-shared-kv"))]
@@ -144,9 +145,11 @@ impl BackendFactory {
         device_info: &DeviceInfo,
         tuning: &OnnxRuntimeTuning,
     ) -> Result<Box<dyn Engine>, String> {
+        let engine_kind = EngineKind::resolve(manifest);
+
         // GGUF: prefer native CUDA kernels when gguf-native feature is compiled in.
         #[cfg(feature = "gguf-native")]
-        if manifest.framework == "gguf" {
+        if engine_kind.is_gguf() {
             let device_id = manifest.hardware_requirements.device_id.unwrap_or(0);
             log::info!("✓ Using GgufNativeBackend (GGUF loader + native CUDA), device {}", device_id);
             return crate::gguf_native::GgufNativeBackend::new(device_id as i32)
@@ -155,7 +158,7 @@ impl BackendFactory {
         }
 
         #[cfg(all(feature = "gguf-cuda-shared-kv", not(feature = "gguf-native")))]
-        if manifest.framework == "gguf" {
+        if engine_kind.is_gguf() {
             let device_id = manifest.hardware_requirements.device_id.unwrap_or(0);
             // Reuse the device pool registered with ORT (if any) so GGUF KV
             // and ONNX sessions draw from the same memory budget.
@@ -173,14 +176,14 @@ impl BackendFactory {
 
         // GGUF: fallback to llama.cpp-backed GgufBackend.
         #[cfg(not(any(feature = "gguf-native", feature = "gguf-cuda-shared-kv")))]
-        if manifest.framework == "gguf" {
+        if engine_kind.is_gguf() {
             log::info!("✓ Using GgufBackend (llama.cpp)");
             return Ok(Box::new(GgufBackend::new()));
         }
 
         // Native CUDA: safetensors models use custom kernel backend.
         #[cfg(feature = "native")]
-        if manifest.framework == "native" || manifest.framework == "safetensors" {
+        if engine_kind == EngineKind::Native {
             let device_id = manifest.hardware_requirements.device_id.unwrap_or(0);
             log::info!("✓ Using NativeBackend (custom CUDA kernels), device {}", device_id);
             return crate::native::NativeBackend::new(device_id)
@@ -188,8 +191,8 @@ impl BackendFactory {
                 .map_err(|e| format!("NativeBackend init failed: {e}"));
         }
 
-        // Check for LLM framework
-        if manifest.framework == "llm" {
+        // ONNX generative path (LLMBackend): autoregressive decode over an ONNX graph.
+        if engine_kind.is_onnx_generate() {
             let requirements = &manifest.hardware_requirements;
             if Self::provider_policy() == "manifest" {
                 if let Some(provider) = requirements.preferred_provider.clone() {
@@ -277,9 +280,11 @@ impl BackendFactory {
         device_info: &DeviceInfo,
         tuning: &OnnxRuntimeTuning,
     ) -> Result<Box<dyn Engine>, String> {
+        let engine_kind = EngineKind::resolve(manifest);
+
         // Native safetensors: route to custom CUDA kernel backend
         #[cfg(feature = "native")]
-        if manifest.framework == "native" || manifest.framework == "safetensors" {
+        if engine_kind == EngineKind::Native {
             log::info!("✓ Using NativeBackend (custom CUDA kernels) on device {}", device_id);
             return NativeBackend::new(device_id as i32)
                 .map(|b| Box::new(b) as Box<dyn Engine>)
@@ -288,7 +293,7 @@ impl BackendFactory {
 
         // GGUF: prefer native CUDA kernels when gguf-native feature is compiled in.
         #[cfg(feature = "gguf-native")]
-        if manifest.framework == "gguf" {
+        if engine_kind.is_gguf() {
             log::info!("✓ Using GgufNativeBackend (GGUF loader + native CUDA), device {}", device_id);
             return crate::gguf_native::GgufNativeBackend::new(device_id as i32)
                 .map(|b| Box::new(b) as Box<dyn Engine>)
@@ -296,7 +301,7 @@ impl BackendFactory {
         }
 
         #[cfg(all(feature = "gguf-cuda-shared-kv", not(feature = "gguf-native")))]
-        if manifest.framework == "gguf" {
+        if engine_kind.is_gguf() {
             log::info!(
                 "✓ Using GgufBackend (llama.cpp CUDA + Kapsl shared KV) on device {}",
                 device_id
@@ -306,13 +311,13 @@ impl BackendFactory {
 
         // GGUF: fallback to llama.cpp-backed GgufBackend.
         #[cfg(not(any(feature = "gguf-native", feature = "gguf-cuda-shared-kv")))]
-        if manifest.framework == "gguf" {
+        if engine_kind.is_gguf() {
             log::info!("✓ Using GgufBackend (llama.cpp)");
             return Ok(Box::new(GgufBackend::new()));
         }
 
-        // Check for LLM framework
-        if manifest.framework == "llm" {
+        // ONNX generative path (LLMBackend): autoregressive decode over an ONNX graph.
+        if engine_kind.is_onnx_generate() {
             if Self::provider_policy() == "manifest" {
                 log::info!(
                     "✓ Using LLMBackend with manifest provider override: {}",
