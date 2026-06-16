@@ -48,17 +48,104 @@ fn predicate_helpers() {
     assert!(!EngineKind::Native.uses_onnx_session());
 }
 
-#[test]
-fn resolve_reads_manifest_framework() {
-    let manifest = Manifest {
+/// Build a manifest from the axes under test (model_file controls the
+/// extension cross-check in `validate`).
+fn mk(
+    framework: &str,
+    format: Option<&str>,
+    model_type: Option<&str>,
+    task: Option<&str>,
+    model_file: &str,
+) -> Manifest {
+    Manifest {
         project_name: "m".into(),
-        framework: "gguf".into(),
+        framework: framework.into(),
         version: "1.0.0".into(),
         created_at: "0".into(),
-        model_file: "model.gguf".into(),
+        model_file: model_file.into(),
+        format: format.map(str::to_string),
+        model_type: model_type.map(str::to_string),
+        task: task.map(str::to_string),
         metadata: None,
         hardware_requirements: Default::default(),
         cron_jobs: Vec::new(),
-    };
+    }
+}
+
+#[test]
+fn resolve_reads_manifest_framework() {
+    let manifest = mk("gguf", None, None, None, "model.gguf");
     assert_eq!(EngineKind::resolve(&manifest), EngineKind::GgufGenerate);
+}
+
+#[test]
+fn legacy_only_manifests_resolve_unchanged() {
+    assert_eq!(EngineKind::resolve(&mk("llm", None, None, None, "m.onnx")), EngineKind::OnnxGenerate);
+    assert_eq!(EngineKind::resolve(&mk("onnx", None, None, None, "m.onnx")), EngineKind::OnnxForward);
+    assert_eq!(EngineKind::resolve(&mk("safetensors", None, None, None, "m.safetensors")), EngineKind::Native);
+}
+
+#[test]
+fn new_axes_take_precedence_over_framework() {
+    // framework says onnx (forward), but task=generate -> ONNX generative.
+    let m = mk("onnx", Some("onnx"), Some("causal-lm"), Some("generate"), "m.onnx");
+    assert_eq!(EngineKind::resolve(&m), EngineKind::OnnxGenerate);
+
+    // onnx embedding -> stateless ONNX path for now.
+    let m = mk("onnx", Some("onnx"), Some("embedding"), Some("embed"), "m.onnx");
+    assert_eq!(EngineKind::resolve(&m), EngineKind::OnnxForward);
+}
+
+#[test]
+fn effective_axes_infer_from_framework() {
+    let m = mk("llm", None, None, None, "m.onnx");
+    assert_eq!(super::effective_format(&m), "onnx");
+    assert_eq!(super::effective_model_type(&m), "causal-lm");
+    assert_eq!(super::effective_task(&m), "generate");
+
+    let m = mk("gguf", None, None, None, "m.gguf");
+    assert_eq!(super::effective_format(&m), "gguf");
+    assert_eq!(super::effective_task(&m), "generate");
+}
+
+#[test]
+fn validate_accepts_legacy_manifests() {
+    assert!(EngineKind::validate(&mk("gguf", None, None, None, "model.gguf")).is_ok());
+    assert!(EngineKind::validate(&mk("llm", None, None, None, "model.onnx")).is_ok());
+    assert!(EngineKind::validate(&mk("onnx", None, None, None, "model.onnx")).is_ok());
+    assert!(EngineKind::validate(&mk("safetensors", None, None, None, "model.safetensors")).is_ok());
+}
+
+#[test]
+fn validate_rejects_llm_tag_on_gguf_file() {
+    // The gemma footgun: framework=llm but the file is a .gguf.
+    let err = EngineKind::validate(&mk("llm", None, None, None, "gemma-2b.gguf")).unwrap_err();
+    assert!(err.contains("gguf"), "unexpected: {err}");
+}
+
+#[test]
+fn validate_rejects_non_causal_gguf() {
+    let err = EngineKind::validate(&mk("gguf", Some("gguf"), Some("embedding"), Some("embed"), "m.gguf"))
+        .unwrap_err();
+    assert!(err.contains("causal-lm"), "unexpected: {err}");
+}
+
+#[test]
+fn validate_rejects_incoherent_task_for_model_type() {
+    // causal-lm cannot classify.
+    assert!(EngineKind::validate(&mk("onnx", Some("onnx"), Some("causal-lm"), Some("classify"), "m.onnx")).is_err());
+    // embedding model cannot generate.
+    assert!(EngineKind::validate(&mk("onnx", Some("onnx"), Some("embedding"), Some("generate"), "m.onnx")).is_err());
+}
+
+#[test]
+fn validate_rejects_unknown_vocabulary() {
+    assert!(EngineKind::validate(&mk("onnx", Some("tensorrt"), None, None, "m.onnx")).is_err());
+    assert!(EngineKind::validate(&mk("onnx", None, Some("diffusion"), None, "m.onnx")).is_err());
+    assert!(EngineKind::validate(&mk("onnx", None, None, Some("teleport"), "m.onnx")).is_err());
+}
+
+#[test]
+fn validate_accepts_onnx_embedding() {
+    assert!(EngineKind::validate(&mk("onnx", Some("onnx"), Some("embedding"), Some("embed"), "m.onnx")).is_ok());
 }
