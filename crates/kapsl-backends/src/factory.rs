@@ -34,6 +34,15 @@ pub struct OnnxRuntimeTuning {
     pub peak_concurrency_hint: Option<u32>,
 }
 
+/// Error for a declared-but-unimplemented engine cell (e.g. ONNX embeddings or
+/// classification). The triple is valid; there is just no backend yet.
+fn unimplemented_engine_error(kind: EngineKind) -> String {
+    format!(
+        "model kind `{}` is declared but not yet implemented by a backend",
+        kind.label()
+    )
+}
+
 pub fn parse_optimization_level(level: Option<&String>) -> Result<GraphOptimizationLevel, String> {
     match level.as_ref().map(|s| s.as_str()) {
         Some("disable") | Some("0") => Ok(GraphOptimizationLevel::Disable),
@@ -208,6 +217,10 @@ impl BackendFactory {
             return Ok(Box::new(LLMBackend::new()));
         }
 
+        if !engine_kind.is_implemented() {
+            return Err(unimplemented_engine_error(engine_kind));
+        }
+
         let requirements = &manifest.hardware_requirements;
 
         log::info!("🔍 Selecting backend based on requirements:");
@@ -333,6 +346,10 @@ impl BackendFactory {
                 "✓ Using LLMBackend with device pinning and runtime provider auto-selection"
             );
             return Ok(Box::new(LLMBackend::with_device_id(device_id as i32)));
+        }
+
+        if !engine_kind.is_implemented() {
+            return Err(unimplemented_engine_error(engine_kind));
         }
 
         let requirements = &manifest.hardware_requirements;

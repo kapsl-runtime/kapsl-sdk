@@ -91,9 +91,30 @@ fn new_axes_take_precedence_over_framework() {
     let m = mk("onnx", Some("onnx"), Some("causal-lm"), Some("generate"), "m.onnx");
     assert_eq!(EngineKind::resolve(&m), EngineKind::OnnxGenerate);
 
-    // onnx embedding -> stateless ONNX path for now.
+    // onnx embedding -> dedicated (not-yet-implemented) embed engine.
     let m = mk("onnx", Some("onnx"), Some("embedding"), Some("embed"), "m.onnx");
-    assert_eq!(EngineKind::resolve(&m), EngineKind::OnnxForward);
+    assert_eq!(EngineKind::resolve(&m), EngineKind::OnnxEmbed);
+}
+
+#[test]
+fn resolve_maps_onnx_tasks_to_distinct_engines() {
+    let embed = mk("onnx", Some("onnx"), Some("embedding"), Some("embed"), "m.onnx");
+    assert_eq!(EngineKind::resolve(&embed), EngineKind::OnnxEmbed);
+
+    let classify = mk("onnx", Some("onnx"), Some("seq-classifier"), Some("classify"), "m.onnx");
+    assert_eq!(EngineKind::resolve(&classify), EngineKind::OnnxClassify);
+}
+
+#[test]
+fn unimplemented_cells_report_as_such() {
+    assert!(EngineKind::OnnxEmbed.uses_onnx_session());
+    assert!(!EngineKind::OnnxEmbed.is_implemented());
+    assert!(!EngineKind::OnnxClassify.is_implemented());
+    // The implemented cells stay implemented.
+    assert!(EngineKind::OnnxGenerate.is_implemented());
+    assert!(EngineKind::GgufGenerate.is_implemented());
+    assert!(EngineKind::OnnxForward.is_implemented());
+    assert!(EngineKind::Native.is_implemented());
 }
 
 #[test]
