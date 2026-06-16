@@ -52,8 +52,81 @@ impl EngineKind {
     }
 
     /// Classify the engine family selected by a manifest.
+    ///
+    /// Prefers the orthogonal `format`/`model_type`/`task` axes when present and
+    /// falls back to the legacy `framework`. Infallible and best-effort (it
+    /// always yields *some* family for dispatch); use [`EngineKind::validate`]
+    /// to reject incoherent declarations.
     pub fn resolve(manifest: &Manifest) -> Self {
-        Self::from_framework(&manifest.framework)
+        // Fast path: no new axes set -> exactly the legacy classification.
+        if manifest.format.is_none() && manifest.model_type.is_none() && manifest.task.is_none() {
+            return Self::from_framework(&manifest.framework);
+        }
+        let format = effective_format(manifest);
+        let task = effective_task(manifest);
+        match format.as_str() {
+            "gguf" => Self::GgufGenerate,
+            "safetensors" => Self::Native,
+            // onnx (and anything else) -> generative only when the task says so.
+            _ if task == "generate" => Self::OnnxGenerate,
+            _ => Self::OnnxForward,
+        }
+    }
+
+    /// Validate that a manifest's axes form a coherent, supported combination.
+    ///
+    /// This is where the historically-silent mistakes become clear errors:
+    /// e.g. a `.gguf` model tagged `framework = "llm"`, or a GGUF model declared
+    /// with a non-causal `model_type`. Returns `Ok(())` for legacy manifests
+    /// that resolve to a supported engine, so existing packages keep loading.
+    pub fn validate(manifest: &Manifest) -> Result<(), String> {
+        // Reject explicitly-set values outside the known vocabularies.
+        check_known("format", manifest.format.as_deref(), VALID_FORMATS)?;
+        check_known("model_type", manifest.model_type.as_deref(), VALID_MODEL_TYPES)?;
+        check_known("task", manifest.task.as_deref(), VALID_TASKS)?;
+
+        let format = effective_format(manifest);
+        let model_type = effective_model_type(manifest);
+        let task = effective_task(manifest);
+
+        // The declared format must not contradict the model file's extension.
+        if let Some(ext_format) = format_from_model_file(&manifest.model_file) {
+            if ext_format != format {
+                return Err(format!(
+                    "model_file `{}` is a {} model but the package resolves to format `{}` \
+                     (framework={:?}, format={:?}); set format/framework to `{}`",
+                    manifest.model_file, ext_format, format, manifest.framework, manifest.format,
+                    ext_format
+                ));
+            }
+        }
+
+        // Task must be valid for the model type.
+        let task_ok = match model_type.as_str() {
+            "causal-lm" => matches!(task.as_str(), "generate" | "embed" | "forward"),
+            "embedding" => task == "embed",
+            "seq-classifier" => task == "classify",
+            "seq2seq" => matches!(task.as_str(), "generate" | "forward"),
+            // opaque graphs only support a raw forward pass.
+            _ => task == "forward",
+        };
+        if !task_ok {
+            return Err(format!(
+                "task `{}` is not valid for model_type `{}`",
+                task, model_type
+            ));
+        }
+
+        // GGUF is currently causal-LM/generate only (tokenizer embedded; decode loop).
+        if format == "gguf" && (model_type != "causal-lm" || task != "generate") {
+            return Err(format!(
+                "GGUF models are served as causal-lm/generate only; got model_type=`{}`, task=`{}`. \
+                 (A GGUF embedding/classifier backend does not exist yet.)",
+                model_type, task
+            ));
+        }
+
+        Ok(())
     }
 
     /// Whether this engine performs autoregressive text generation.
@@ -89,5 +162,94 @@ impl EngineKind {
     }
 }
 
+/// Known model file formats / loaders.
+pub const VALID_FORMATS: &[&str] = &["onnx", "gguf", "safetensors"];
+/// Known model capability classes.
+pub const VALID_MODEL_TYPES: &[&str] =
+    &["causal-lm", "embedding", "seq-classifier", "seq2seq", "opaque"];
+/// Known serving operations.
+pub const VALID_TASKS: &[&str] = &["generate", "embed", "classify", "rerank", "forward"];
+
+fn check_known(field: &str, value: Option<&str>, allowed: &[&str]) -> Result<(), String> {
+    if let Some(v) = value {
+        let v = v.trim().to_ascii_lowercase();
+        if !allowed.iter().any(|a| *a == v) {
+            return Err(format!(
+                "unknown {} `{}`; expected one of {:?}",
+                field, v, allowed
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn norm(value: &Option<String>) -> Option<String> {
+    value
+        .as_deref()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| !v.is_empty())
+}
+
+/// Effective model file format: the explicit `format`, else inferred from the
+/// legacy `framework`.
+pub fn effective_format(manifest: &Manifest) -> String {
+    if let Some(f) = norm(&manifest.format) {
+        return f;
+    }
+    match manifest.framework.trim().to_ascii_lowercase().as_str() {
+        "gguf" => "gguf",
+        "native" | "safetensors" => "safetensors",
+        // "llm", "onnx", and anything unknown are ONNX-format (or treated as such).
+        _ => "onnx",
+    }
+    .to_string()
+}
+
+/// Effective model capability class: explicit `model_type`, else inferred from
+/// the legacy `framework`.
+pub fn effective_model_type(manifest: &Manifest) -> String {
+    if let Some(t) = norm(&manifest.model_type) {
+        return t;
+    }
+    match manifest.framework.trim().to_ascii_lowercase().as_str() {
+        "gguf" | "llm" => "causal-lm",
+        // onnx / safetensors / native / unknown: we don't model the architecture.
+        _ => "opaque",
+    }
+    .to_string()
+}
+
+/// Effective serving operation: explicit `task`, else defaulted from the
+/// effective model type.
+pub fn effective_task(manifest: &Manifest) -> String {
+    if let Some(t) = norm(&manifest.task) {
+        return t;
+    }
+    match effective_model_type(manifest).as_str() {
+        "causal-lm" => "generate",
+        "embedding" => "embed",
+        "seq-classifier" => "classify",
+        "seq2seq" => "generate",
+        _ => "forward",
+    }
+    .to_string()
+}
+
+/// Confident format implied by a model file's extension, if recognized.
+fn format_from_model_file(model_file: &str) -> Option<&'static str> {
+    let ext = std::path::Path::new(model_file)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "gguf" => Some("gguf"),
+        "onnx" => Some("onnx"),
+        "safetensors" => Some("safetensors"),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
 #[path = "engine_kind_tests.rs"]
 mod engine_kind_tests;

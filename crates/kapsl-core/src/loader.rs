@@ -69,10 +69,29 @@ pub struct CronJobDef {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
     pub project_name: String,
+    /// Legacy combined backend selector. Kept for backward compatibility and
+    /// still emitted by builds during the deprecation window. New packages also
+    /// populate the orthogonal [`Manifest::format`] / [`Manifest::model_type`] /
+    /// [`Manifest::task`] axes; readers prefer those when present and fall back
+    /// to `framework`. See `EngineKind` for resolution and validation.
     pub framework: String,
     pub version: String,
     pub created_at: String,
     pub model_file: String,
+
+    /// Model file format / loader (`onnx`, `gguf`, `safetensors`). When absent,
+    /// inferred from `framework`.
+    #[serde(default)]
+    pub format: Option<String>,
+    /// Model capability class (`causal-lm`, `embedding`, `seq-classifier`,
+    /// `seq2seq`, `opaque`). When absent, inferred from `framework`.
+    #[serde(default)]
+    pub model_type: Option<String>,
+    /// Serving operation (`generate`, `embed`, `classify`, `rerank`, `forward`).
+    /// When absent, inferred from `model_type`/`framework`.
+    #[serde(default)]
+    pub task: Option<String>,
+
     #[serde(default)]
     pub metadata: Option<serde_yaml::Value>,
 
@@ -211,6 +230,9 @@ impl PackageLoader {
             version: "1.0.0".to_string(),
             created_at: String::new(),
             model_file: model_file_name,
+            format: None,
+            model_type: None,
+            task: None,
             metadata: None,
             hardware_requirements: HardwareRequirements::default(),
             cron_jobs: Vec::new(),
@@ -281,6 +303,9 @@ impl PackageLoader {
                 // model_file is not used for directory-based loading but must
                 // be non-empty for the struct to serialise cleanly.
                 model_file: "model.safetensors".to_string(),
+                format: None,
+                model_type: None,
+                task: None,
                 metadata: None,
                 hardware_requirements: HardwareRequirements::default(),
                 cron_jobs: Vec::new(),
