@@ -34,13 +34,42 @@ pub struct OnnxRuntimeTuning {
     pub peak_concurrency_hint: Option<u32>,
 }
 
-/// Error for a declared-but-unimplemented engine cell (e.g. ONNX embeddings or
-/// classification). The triple is valid; there is just no backend yet.
+/// Error for a declared-but-unimplemented engine cell (e.g. ONNX classification).
+/// The triple is valid; there is just no backend yet.
 fn unimplemented_engine_error(kind: EngineKind) -> String {
     format!(
         "model kind `{}` is declared but not yet implemented by a backend",
         kind.label()
     )
+}
+
+/// Whether embeddings should be L2-normalized. Defaults to true (cosine ==
+/// dot product for vector stores); override with `metadata.embed.normalize`.
+fn embed_normalize(manifest: &Manifest) -> bool {
+    manifest
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("embed"))
+        .and_then(|e| e.get("normalize"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true)
+}
+
+/// Wrap a freshly built ONNX engine in the embedding pooler when the manifest
+/// asks for embeddings; otherwise return it unchanged.
+fn maybe_wrap_embed(
+    engine_kind: EngineKind,
+    manifest: &Manifest,
+    inner: Box<dyn Engine>,
+) -> Box<dyn Engine> {
+    if engine_kind == EngineKind::OnnxEmbed {
+        Box::new(crate::onnx_embed::OnnxEmbedBackend::new(
+            inner,
+            embed_normalize(manifest),
+        ))
+    } else {
+        inner
+    }
 }
 
 pub fn parse_optimization_level(level: Option<&String>) -> Result<GraphOptimizationLevel, String> {
@@ -255,7 +284,7 @@ impl BackendFactory {
             match Self::try_create_provider(provider, device_info, opt_level, device_id, tuning) {
                 Ok(backend) => {
                     log::info!("✓ Using provider: {}", provider);
-                    return Ok(backend);
+                    return Ok(maybe_wrap_embed(engine_kind, manifest, backend));
                 }
                 Err(err) => {
                     log::warn!("⚠ Provider '{}' not available: {}", provider, err);
@@ -267,7 +296,8 @@ impl BackendFactory {
         log::info!("⚠ Using last-resort CPU backend");
         let opt_cpu = parse_optimization_level(requirements.graph_optimization_level.as_ref())
             .unwrap_or(GraphOptimizationLevel::Level3);
-        Self::build_onnx_backend(ExecutionProvider::CPU, opt_cpu, 0, tuning)
+        let inner = Self::build_onnx_backend(ExecutionProvider::CPU, opt_cpu, 0, tuning)?;
+        Ok(maybe_wrap_embed(engine_kind, manifest, inner))
     }
 
     /// Create a backend for a specific device
@@ -355,8 +385,9 @@ impl BackendFactory {
         let requirements = &manifest.hardware_requirements;
         let opt_level = parse_optimization_level(requirements.graph_optimization_level.as_ref())
             .map_err(|e| format!("Invalid graph optimization level in manifest: {}", e))?;
-
-        Self::try_create_provider(provider, device_info, opt_level, device_id as i32, tuning)
+        let inner =
+            Self::try_create_provider(provider, device_info, opt_level, device_id as i32, tuning)?;
+        Ok(maybe_wrap_embed(engine_kind, manifest, inner))
     }
 
     fn try_create_provider(

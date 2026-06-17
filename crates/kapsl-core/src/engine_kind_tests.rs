@@ -108,9 +108,10 @@ fn resolve_maps_onnx_tasks_to_distinct_engines() {
 #[test]
 fn unimplemented_cells_report_as_such() {
     assert!(EngineKind::OnnxEmbed.uses_onnx_session());
-    assert!(!EngineKind::OnnxEmbed.is_implemented());
+    // OnnxEmbed has a backend now; OnnxClassify is still the open cell.
+    assert!(EngineKind::OnnxEmbed.is_implemented());
     assert!(!EngineKind::OnnxClassify.is_implemented());
-    // The implemented cells stay implemented.
+    // The other cells stay implemented.
     assert!(EngineKind::OnnxGenerate.is_implemented());
     assert!(EngineKind::GgufGenerate.is_implemented());
     assert!(EngineKind::OnnxForward.is_implemented());

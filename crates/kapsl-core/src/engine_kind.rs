@@ -35,7 +35,7 @@ pub enum EngineKind {
     /// tensors out). Legacy framework: `"onnx"` (and anything unrecognized).
     OnnxForward,
     /// ONNX encoder run for embeddings (forward pass + pooling). Selected by
-    /// `format=onnx`, `task=embed`. Not yet implemented by a backend.
+    /// `format=onnx`, `task=embed`.
     OnnxEmbed,
     /// ONNX classifier (forward pass + classification head). Selected by
     /// `format=onnx`, `task=classify`. Not yet implemented by a backend.
@@ -165,11 +165,11 @@ impl EngineKind {
     }
 
     /// Whether a backend exists for this engine kind. Declared-but-unimplemented
-    /// cells (`OnnxEmbed`, `OnnxClassify`) resolve so the runtime can reject them
-    /// with a clear "not implemented yet" error instead of silently running the
-    /// wrong path (e.g. raw forward in place of pooled embeddings).
+    /// cells resolve so the runtime can reject them with a clear "not implemented
+    /// yet" error instead of silently running the wrong path (e.g. a raw forward
+    /// pass in place of a classification head).
     pub fn is_implemented(&self) -> bool {
-        !matches!(self, Self::OnnxEmbed | Self::OnnxClassify)
+        !matches!(self, Self::OnnxClassify)
     }
 
     /// Stable label for logs/diagnostics.

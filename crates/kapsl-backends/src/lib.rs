@@ -5,6 +5,7 @@ pub mod gguf_native;
 #[cfg(feature = "native")]
 pub mod native;
 pub mod onnx;
+pub mod onnx_embed;
 #[cfg(feature = "onnx-cuda-pool")]
 pub mod ort_pool_allocator;
 mod provider_compat;
@@ -16,3 +17,4 @@ pub use gguf_native::GgufNativeBackend;
 #[cfg(feature = "native")]
 pub use native::NativeBackend;
 pub use onnx::OnnxBackend;
+pub use onnx_embed::OnnxEmbedBackend;
