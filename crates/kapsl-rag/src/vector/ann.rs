@@ -12,7 +12,7 @@
 use hnsw_rs::prelude::*;
 use std::collections::{HashMap, HashSet};
 
-const HNSW_MAX_NB_CONNECTION: usize = 16;
+const HNSW_MAX_NB_CONNECTION: usize = 32;
 const HNSW_NB_LAYER: usize = 16;
 const HNSW_EF_CONSTRUCTION: usize = 200;
 const TOMBSTONE_REBUILD_FRACTION: f32 = 0.2;
@@ -92,7 +92,12 @@ impl ScopeIndex {
         }
         // Over-fetch so tombstones don't eat into the requested k.
         let fetch = k + self.tombstones.len().min(k);
-        let ef_search = (fetch * 2).max(HNSW_EF_CONSTRUCTION / 4);
+        // Search beam width. A small ef can miss an obvious nearest neighbor when
+        // it sits among unrelated vectors (the greedy traversal never routes to
+        // its node), and nondeterministic graph construction makes that flaky
+        // across runs/platforms. Keep ef generous and floored at the construction
+        // beam so recall of a clear top hit is reliable.
+        let ef_search = (fetch * 4).max(HNSW_EF_CONSTRUCTION);
         self.hnsw
             .search(query, fetch, ef_search)
             .into_iter()
