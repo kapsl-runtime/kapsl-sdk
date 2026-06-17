@@ -37,8 +37,8 @@ pub enum EngineKind {
     /// ONNX encoder run for embeddings (forward pass + pooling). Selected by
     /// `format=onnx`, `task=embed`.
     OnnxEmbed,
-    /// ONNX classifier (forward pass + classification head). Selected by
-    /// `format=onnx`, `task=classify`. Not yet implemented by a backend.
+    /// ONNX classifier (forward pass + softmax over logits). Selected by
+    /// `format=onnx`, `task=classify`.
     OnnxClassify,
 }
 
@@ -164,12 +164,21 @@ impl EngineKind {
         )
     }
 
-    /// Whether a backend exists for this engine kind. Declared-but-unimplemented
-    /// cells resolve so the runtime can reject them with a clear "not implemented
-    /// yet" error instead of silently running the wrong path (e.g. a raw forward
-    /// pass in place of a classification head).
+    /// Whether a backend exists for this engine kind. All current cells are
+    /// implemented; this stays as the extension point — a new variant added
+    /// without a backend gets a `=> false` arm here, and the runtime rejects it
+    /// with a clear "not implemented yet" error rather than silently running the
+    /// wrong path. The match is exhaustive so a new variant won't compile until
+    /// its status is declared.
     pub fn is_implemented(&self) -> bool {
-        !matches!(self, Self::OnnxClassify)
+        match self {
+            Self::GgufGenerate
+            | Self::OnnxGenerate
+            | Self::Native
+            | Self::OnnxForward
+            | Self::OnnxEmbed
+            | Self::OnnxClassify => true,
+        }
     }
 
     /// Stable label for logs/diagnostics.
