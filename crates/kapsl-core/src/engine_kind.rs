@@ -34,6 +34,12 @@ pub enum EngineKind {
     /// A plain ONNX graph run as a single stateless forward pass (tensors in,
     /// tensors out). Legacy framework: `"onnx"` (and anything unrecognized).
     OnnxForward,
+    /// ONNX encoder run for embeddings (forward pass + pooling). Selected by
+    /// `format=onnx`, `task=embed`.
+    OnnxEmbed,
+    /// ONNX classifier (forward pass + classification head). Selected by
+    /// `format=onnx`, `task=classify`. Not yet implemented by a backend.
+    OnnxClassify,
 }
 
 impl EngineKind {
@@ -67,9 +73,13 @@ impl EngineKind {
         match format.as_str() {
             "gguf" => Self::GgufGenerate,
             "safetensors" => Self::Native,
-            // onnx (and anything else) -> generative only when the task says so.
-            _ if task == "generate" => Self::OnnxGenerate,
-            _ => Self::OnnxForward,
+            // onnx (and anything else) dispatches on the requested task.
+            _ => match task.as_str() {
+                "generate" => Self::OnnxGenerate,
+                "embed" => Self::OnnxEmbed,
+                "classify" => Self::OnnxClassify,
+                _ => Self::OnnxForward,
+            },
         }
     }
 
@@ -146,9 +156,20 @@ impl EngineKind {
         matches!(self, Self::OnnxGenerate)
     }
 
-    /// Whether this engine runs an ONNX Runtime session (generative or forward).
+    /// Whether this engine runs an ONNX Runtime session.
     pub fn uses_onnx_session(&self) -> bool {
-        matches!(self, Self::OnnxGenerate | Self::OnnxForward)
+        matches!(
+            self,
+            Self::OnnxGenerate | Self::OnnxForward | Self::OnnxEmbed | Self::OnnxClassify
+        )
+    }
+
+    /// Whether a backend exists for this engine kind. Declared-but-unimplemented
+    /// cells resolve so the runtime can reject them with a clear "not implemented
+    /// yet" error instead of silently running the wrong path (e.g. a raw forward
+    /// pass in place of a classification head).
+    pub fn is_implemented(&self) -> bool {
+        !matches!(self, Self::OnnxClassify)
     }
 
     /// Stable label for logs/diagnostics.
@@ -158,6 +179,8 @@ impl EngineKind {
             Self::OnnxGenerate => "onnx-generate",
             Self::Native => "native",
             Self::OnnxForward => "onnx-forward",
+            Self::OnnxEmbed => "onnx-embed",
+            Self::OnnxClassify => "onnx-classify",
         }
     }
 }
