@@ -106,16 +106,18 @@ fn resolve_maps_onnx_tasks_to_distinct_engines() {
 }
 
 #[test]
-fn unimplemented_cells_report_as_such() {
-    assert!(EngineKind::OnnxEmbed.uses_onnx_session());
-    // OnnxEmbed has a backend now; OnnxClassify is still the open cell.
-    assert!(EngineKind::OnnxEmbed.is_implemented());
-    assert!(!EngineKind::OnnxClassify.is_implemented());
-    // The other cells stay implemented.
-    assert!(EngineKind::OnnxGenerate.is_implemented());
-    assert!(EngineKind::GgufGenerate.is_implemented());
-    assert!(EngineKind::OnnxForward.is_implemented());
-    assert!(EngineKind::Native.is_implemented());
+fn all_current_cells_are_implemented() {
+    for kind in [
+        EngineKind::GgufGenerate,
+        EngineKind::OnnxGenerate,
+        EngineKind::Native,
+        EngineKind::OnnxForward,
+        EngineKind::OnnxEmbed,
+        EngineKind::OnnxClassify,
+    ] {
+        assert!(kind.is_implemented(), "{kind:?} should have a backend");
+    }
+    assert!(EngineKind::OnnxClassify.uses_onnx_session());
 }
 
 #[test]

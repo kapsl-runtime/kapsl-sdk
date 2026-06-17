@@ -43,32 +43,40 @@ fn unimplemented_engine_error(kind: EngineKind) -> String {
     )
 }
 
-/// Whether embeddings should be L2-normalized. Defaults to true (cosine ==
-/// dot product for vector stores); override with `metadata.embed.normalize`.
-fn embed_normalize(manifest: &Manifest) -> bool {
+/// Read a boolean knob from `metadata.<section>.<key>`, defaulting to `default`.
+fn manifest_metadata_bool(manifest: &Manifest, section: &str, key: &str, default: bool) -> bool {
     manifest
         .metadata
         .as_ref()
-        .and_then(|m| m.get("embed"))
-        .and_then(|e| e.get("normalize"))
+        .and_then(|m| m.get(section))
+        .and_then(|s| s.get(key))
         .and_then(|v| v.as_bool())
-        .unwrap_or(true)
+        .unwrap_or(default)
 }
 
-/// Wrap a freshly built ONNX engine in the embedding pooler when the manifest
-/// asks for embeddings; otherwise return it unchanged.
-fn maybe_wrap_embed(
+/// Wrap a freshly built ONNX engine in the task post-processor the manifest asks
+/// for (embedding pooling or classification softmax); otherwise return it
+/// unchanged.
+fn maybe_wrap_onnx_postprocess(
     engine_kind: EngineKind,
     manifest: &Manifest,
     inner: Box<dyn Engine>,
 ) -> Box<dyn Engine> {
-    if engine_kind == EngineKind::OnnxEmbed {
-        Box::new(crate::onnx_embed::OnnxEmbedBackend::new(
-            inner,
-            embed_normalize(manifest),
-        ))
-    } else {
-        inner
+    match engine_kind {
+        EngineKind::OnnxEmbed => {
+            // Default true: cosine == dot product for vector stores.
+            let normalize = manifest_metadata_bool(manifest, "embed", "normalize", true);
+            Box::new(crate::onnx_embed::OnnxEmbedBackend::new(inner, normalize))
+        }
+        EngineKind::OnnxClassify => {
+            // Default true: most classifier exports emit raw logits.
+            let apply_softmax = manifest_metadata_bool(manifest, "classify", "apply_softmax", true);
+            Box::new(crate::onnx_classify::OnnxClassifyBackend::new(
+                inner,
+                apply_softmax,
+            ))
+        }
+        _ => inner,
     }
 }
 
@@ -284,7 +292,7 @@ impl BackendFactory {
             match Self::try_create_provider(provider, device_info, opt_level, device_id, tuning) {
                 Ok(backend) => {
                     log::info!("✓ Using provider: {}", provider);
-                    return Ok(maybe_wrap_embed(engine_kind, manifest, backend));
+                    return Ok(maybe_wrap_onnx_postprocess(engine_kind, manifest, backend));
                 }
                 Err(err) => {
                     log::warn!("⚠ Provider '{}' not available: {}", provider, err);
@@ -297,7 +305,7 @@ impl BackendFactory {
         let opt_cpu = parse_optimization_level(requirements.graph_optimization_level.as_ref())
             .unwrap_or(GraphOptimizationLevel::Level3);
         let inner = Self::build_onnx_backend(ExecutionProvider::CPU, opt_cpu, 0, tuning)?;
-        Ok(maybe_wrap_embed(engine_kind, manifest, inner))
+        Ok(maybe_wrap_onnx_postprocess(engine_kind, manifest, inner))
     }
 
     /// Create a backend for a specific device
@@ -387,7 +395,7 @@ impl BackendFactory {
             .map_err(|e| format!("Invalid graph optimization level in manifest: {}", e))?;
         let inner =
             Self::try_create_provider(provider, device_info, opt_level, device_id as i32, tuning)?;
-        Ok(maybe_wrap_embed(engine_kind, manifest, inner))
+        Ok(maybe_wrap_onnx_postprocess(engine_kind, manifest, inner))
     }
 
     fn try_create_provider(
