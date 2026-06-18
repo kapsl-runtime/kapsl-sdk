@@ -1,1 +1,4 @@
 /target/
+/.venv/
+/.DS_Store
+/rag-data/

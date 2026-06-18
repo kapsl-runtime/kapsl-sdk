@@ -22,7 +22,7 @@ If you need to build from the monorepo:
 cd kapsl-sdk
 cargo build --release
 
-# Python extension module (requires Rust 1.75+ and maturin)
+# Python extension module (requires Rust 1.92.0 and maturin)
 pip install maturin
 cd kapsl-sdk/crates/kapsl-pyo3
 maturin develop --release

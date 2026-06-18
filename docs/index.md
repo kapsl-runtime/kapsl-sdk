@@ -1,8 +1,10 @@
 # kapsl-sdk
 
-`kapsl-sdk` is the official Python client library for [kapsl-runtime](https://kapsl.ai) — a high-performance Rust-based inference runtime for local and embedded AI model execution.
+`kapsl-sdk` contains the shared Rust crates used by `kapsl-runtime` and the
+official Python client library for connecting to a running runtime process.
 
-Use `kapsl-sdk` to connect a Python application to a running `kapsl-runtime` instance and run inference over any packaged model.
+Use the Python package when an application needs to connect to
+`kapsl-runtime` and run inference over any packaged model.
 
 ## What it provides
 
@@ -11,6 +13,8 @@ Use `kapsl-sdk` to connect a Python application to a running `kapsl-runtime` ins
 - **`KapslHybridClient`** — combines IPC signaling with shared-memory payloads
 - Bundled voice embeddings for TTS models (`load_voice`, `list_voices`)
 - CPython 3.9 – 3.13 support via PyO3 / Maturin
+- Rust crates for engine API types, backends, transport, scheduling, RAG,
+  shared memory, hardware abstraction, LLM execution, and quantization
 
 ## When to use it
 
@@ -22,6 +26,9 @@ Use `kapsl-sdk` when your Python service or tool needs to:
 - Call the runtime from a backend service with low latency requirements
 
 `kapsl-sdk` is a **client library**, not the runtime server itself. You need a running `kapsl-runtime` process to use it.
+
+For runtime CLI, HTTP server, dashboard, and installer work, use the separate
+`kapsl-engine` repository.
 
 ## Navigation
 

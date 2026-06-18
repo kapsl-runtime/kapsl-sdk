@@ -1,8 +1,23 @@
 # kapsl-sdk
 
-Python client SDK for [kapsl-runtime](https://kapsl.ai) — the Rust-native AI model inference engine.
+Shared Rust crates and the Python client package for `kapsl-runtime`.
 
-Supports socket, TCP, shared-memory, and hybrid transports with a simple Python API.
+The workspace contains reusable engine libraries used by `kapsl-engine`,
+plus the `kapsl-sdk` Python package. The Python API supports socket, TCP,
+shared-memory, and hybrid transports.
+
+## Workspace Layout
+
+- `crates/kapsl-engine-api`: shared engine traits and request/response types
+- `crates/kapsl-core`: manifests, package loading, model registry, and scaling policy types
+- `crates/kapsl-backends`: backend factory and ONNX/GGUF/native backend implementations
+- `crates/kapsl-llm`: LLM backend, GGUF integration, scheduling, KV cache, and RAG prompt helpers
+- `crates/kapsl-hal`, `crates/kapsl-kernels`, `crates/kapsl-loader`, `crates/kapsl-quantization`: lower-level model execution support
+- `crates/kapsl-scheduler`, `crates/kapsl-transport`, `crates/kapsl-ipc`, `crates/kapsl-shm`: serving and transport primitives
+- `crates/kapsl-rag`, `crates/kapsl-rag-sdk`: RAG implementation and connector protocol
+- `crates/kapsl-pyo3`: Python extension module exported as `kapsl_sdk`
+- `patches/`: temporary third-party crate patches used by this workspace
+- `third_party/`: vendored upstream source used by patched bindings
 
 ## Install
 
@@ -75,3 +90,18 @@ client = KapslClient(api_token="your-token")
 
 - Python 3.9+
 - A running `kapsl-runtime` instance ([install guide](https://downloads.kapsl.net/install.sh))
+
+## Rust Development
+
+Build the Rust workspace:
+
+```bash
+cargo build --workspace
+```
+
+Build the Python extension from source:
+
+```bash
+pip install maturin
+maturin develop --manifest-path crates/kapsl-pyo3/Cargo.toml --release
+```

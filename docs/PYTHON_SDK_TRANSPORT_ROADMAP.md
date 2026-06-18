@@ -1,6 +1,6 @@
 # Python SDK Transport Roadmap
 
-This document describes a forward-compatible path for remote transports in `kapsl_runtime`.
+This document describes a forward-compatible path for remote transports in `kapsl_sdk`.
 
 ## Current State
 
