@@ -1210,31 +1210,46 @@ fn run_inference_with_session(
             source: None,
         });
     }
-    let primary_output_name =
-        metadata
-            .output_names
-            .first()
-            .ok_or_else(|| EngineError::InferenceError {
-                reason: "Model has no outputs defined".to_string(),
-                source: None,
-            })?;
-    let run_options = RunOptions::new()
-        .map_err(|e| EngineError::InferenceError {
-            reason: "Failed to create ONNX run options".to_string(),
-            source: Some(Box::new(e)),
-        })?
-        .with_outputs(OutputSelector::no_default().with(primary_output_name.as_str()));
+    if metadata.output_names.is_empty() {
+        return Err(EngineError::InferenceError {
+            reason: "Model has no outputs defined".to_string(),
+            source: None,
+        });
+    }
+    let run_options = if metadata.output_names.len() > 1 {
+        let primary_output_name = &metadata.output_names[0];
+        Some(
+            RunOptions::new()
+                .map_err(|e| EngineError::InferenceError {
+                    reason: "Failed to create ONNX run options".to_string(),
+                    source: Some(Box::new(e)),
+                })?
+                .with_outputs(OutputSelector::no_default().with(primary_output_name.as_str())),
+        )
+    } else {
+        None
+    };
 
     let outputs = if metadata.input_names.len() == 1 && request.additional_inputs.is_empty() {
-        session
-            .run_with_options([main_input_tensor], &run_options)
-            .map_err(|e| {
+        if let Some(run_options) = run_options.as_ref() {
+            session
+                .run_with_options([main_input_tensor], run_options)
+                .map_err(|e| {
+                    log::error!("ONNX Runtime inference error: {:?}", e);
+                    EngineError::InferenceError {
+                        reason: format!("Inference failed: {}", e),
+                        source: Some(Box::new(e)),
+                    }
+                })?
+        } else {
+            session.run([main_input_tensor]).map_err(|e| {
                 log::error!("ONNX Runtime inference error: {:?}", e);
                 EngineError::InferenceError {
                     reason: format!("Inference failed: {}", e),
                     source: Some(Box::new(e)),
                 }
             })?
+        }
     } else {
         // Prepare named input map only when required by multi-input models.
         let mut inputs: Vec<(Cow<'_, str>, SessionInputValue)> =
@@ -1376,15 +1391,23 @@ fn run_inference_with_session(
             }
         }
 
-        session
-            .run_with_options(inputs, &run_options)
-            .map_err(|e| {
+        if let Some(run_options) = run_options.as_ref() {
+            session.run_with_options(inputs, run_options).map_err(|e| {
                 log::error!("ONNX Runtime inference error: {:?}", e);
                 EngineError::InferenceError {
                     reason: format!("Inference failed: {}", e),
                     source: Some(Box::new(e)),
                 }
             })?
+        } else {
+            session.run(inputs).map_err(|e| {
+                log::error!("ONNX Runtime inference error: {:?}", e);
+                EngineError::InferenceError {
+                    reason: format!("Inference failed: {}", e),
+                    source: Some(Box::new(e)),
+                }
+            })?
+        }
     };
 
     // For LLMs, we often get multiple outputs (logits + KV cache).
@@ -1468,13 +1491,8 @@ fn run_inference_with_pooled_session(
     shape_usize: Vec<usize>,
     main_input_tensor: SessionInputValue<'_>,
 ) -> Result<BinaryTensorPacket, EngineError> {
-    let result = run_inference_with_session(
-        session,
-        request,
-        metadata,
-        shape_usize,
-        main_input_tensor,
-    );
+    let result =
+        run_inference_with_session(session, request, metadata, shape_usize, main_input_tensor);
     if result.is_err() {
         log::warn!("Discarding ONNX session after inference failure");
         session.discard();

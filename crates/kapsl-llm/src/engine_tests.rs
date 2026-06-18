@@ -2,7 +2,8 @@
 mod tests {
     use super::super::{
         build_kv_array_f16, build_kv_array_f32_from_f16, empty_kv_shape, infer_kv_layout,
-        parse_safe_load_setting, KvLayout, SafeLoadSetting,
+        normalize_metadata_safe_load_setting, parse_safe_load_env_setting, parse_safe_load_setting,
+        KvLayout, SafeLoadSetting,
     };
     use half::f16;
     use serde_json::json;
@@ -31,6 +32,39 @@ mod tests {
             Some(SafeLoadSetting::ForceOff)
         );
         assert_eq!(parse_safe_load_setting(&json!("maybe")), None);
+    }
+
+    #[test]
+    fn parse_safe_load_env_setting_handles_auto_and_bool_literals() {
+        assert_eq!(
+            parse_safe_load_env_setting("1"),
+            Some(SafeLoadSetting::ForceOn)
+        );
+        assert_eq!(
+            parse_safe_load_env_setting("false"),
+            Some(SafeLoadSetting::ForceOff)
+        );
+        assert_eq!(
+            parse_safe_load_env_setting("auto"),
+            Some(SafeLoadSetting::Auto)
+        );
+        assert_eq!(parse_safe_load_env_setting("maybe"), None);
+    }
+
+    #[test]
+    fn metadata_safe_load_true_is_advisory_auto() {
+        assert_eq!(
+            normalize_metadata_safe_load_setting(SafeLoadSetting::ForceOn),
+            SafeLoadSetting::Auto
+        );
+        assert_eq!(
+            normalize_metadata_safe_load_setting(SafeLoadSetting::ForceOff),
+            SafeLoadSetting::ForceOff
+        );
+        assert_eq!(
+            normalize_metadata_safe_load_setting(SafeLoadSetting::Auto),
+            SafeLoadSetting::Auto
+        );
     }
 
     #[test]

@@ -32,8 +32,8 @@ use ort::tensor::TensorElementType;
 use ort::value::{DynValue, TensorRef, Value};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
 use std::panic::AssertUnwindSafe;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -145,6 +145,22 @@ fn parse_safe_load_setting(value: &serde_json::Value) -> Option<SafeLoadSetting>
         "0" | "false" | "off" | "no" => Some(SafeLoadSetting::ForceOff),
         "auto" => Some(SafeLoadSetting::Auto),
         _ => None,
+    }
+}
+
+fn parse_safe_load_env_setting(value: &str) -> Option<SafeLoadSetting> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" => Some(SafeLoadSetting::ForceOn),
+        "0" | "false" | "off" | "no" => Some(SafeLoadSetting::ForceOff),
+        "auto" => Some(SafeLoadSetting::Auto),
+        _ => None,
+    }
+}
+
+fn normalize_metadata_safe_load_setting(setting: SafeLoadSetting) -> SafeLoadSetting {
+    match setting {
+        SafeLoadSetting::ForceOn => SafeLoadSetting::Auto,
+        other => other,
     }
 }
 
@@ -1884,13 +1900,15 @@ impl LLMEngine {
 
         let safe_load_env = env_var_alias("KAPSL_LLM_SAFE_LOAD", "KAPSL_LLM_SAFE_LOAD");
         let safe_load_setting = if let Some(value) = safe_load_env.as_deref() {
-            if value == "0" {
-                SafeLoadSetting::ForceOff
-            } else {
-                SafeLoadSetting::ForceOn
-            }
+            parse_safe_load_env_setting(value).unwrap_or(SafeLoadSetting::ForceOn)
         } else if let Some(metadata_setting) = metadata_safe_load {
-            metadata_setting
+            let normalized = normalize_metadata_safe_load_setting(metadata_setting);
+            if metadata_setting == SafeLoadSetting::ForceOn && normalized == SafeLoadSetting::Auto {
+                log::info!(
+                    "metadata.llm.safe_load=true is treated as auto; using fast load first and retrying with safe-load settings only if needed. Set KAPSL_LLM_SAFE_LOAD=1 to force safe-load."
+                );
+            }
+            normalized
         } else {
             SafeLoadSetting::Auto
         };
@@ -2768,10 +2786,9 @@ impl LLMEngine {
             // (e.g. an unexpected unwrap in tensor code) fails only this batch
             // and counts toward the circuit breaker, instead of unwinding and
             // killing the whole engine task.
-            let step_result =
-                AssertUnwindSafe(self.execute_step(&outputs.scheduled_seq_groups))
-                    .catch_unwind()
-                    .await;
+            let step_result = AssertUnwindSafe(self.execute_step(&outputs.scheduled_seq_groups))
+                .catch_unwind()
+                .await;
             match step_result {
                 Ok(Ok(())) => self.on_execute_success(),
                 Ok(Err(e)) => {
