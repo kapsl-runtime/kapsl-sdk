@@ -46,6 +46,7 @@ use llama_cpp_sys_2::{llama_kapsl_kv_pool_desc, LLAMA_KAPSL_KV_DTYPE_F16};
 
 const MAX_CONCURRENT_DEFAULT: usize = 32;
 const N_CTX_PER_SEQ_DEFAULT: u32 = 2048;
+const GGUF_N_GPU_LAYERS_ENV: &str = "KAPSL_GGUF_N_GPU_LAYERS";
 const GGUF_TARGET_CONCURRENCY_ENV: &str = "KAPSL_GGUF_TARGET_CONCURRENCY";
 const GGUF_QUEUE_DELAY_US_DEFAULT: u64 = 1_000;
 const GGUF_PREFILL_CHUNK_SIZE_DEFAULT: usize = 512;
@@ -113,6 +114,18 @@ fn n_ctx_per_seq() -> u32 {
         .and_then(|v| v.parse::<u32>().ok())
         .filter(|&v| v > 0)
         .unwrap_or(N_CTX_PER_SEQ_DEFAULT)
+}
+
+#[cfg(feature = "gguf")]
+fn gguf_model_params() -> LlamaModelParams {
+    let params = LlamaModelParams::default();
+    match std::env::var(GGUF_N_GPU_LAYERS_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+    {
+        Some(n_gpu_layers) => params.with_n_gpu_layers(n_gpu_layers),
+        None => params,
+    }
 }
 
 #[cfg(feature = "gguf")]
@@ -317,12 +330,12 @@ impl GgufServingConfig {
     fn from_model(model: &LlamaModel, n_ctx_train: u32) -> Self {
         let max_concurrent = max_concurrent();
         let ctx_per_seq = n_ctx_per_seq().min(n_ctx_train);
-        let n_batch = ctx_per_seq + max_concurrent as u32;
+        let prefill_chunk_size = gguf_prefill_chunk_size().min(ctx_per_seq as usize).max(1);
         Self {
             max_concurrent,
             ctx_per_seq,
             queue_delay: gguf_queue_delay(),
-            prefill_chunk_size: gguf_prefill_chunk_size().min(n_batch as usize).max(1),
+            prefill_chunk_size,
             exact_prompt_kv_reuse: gguf_exact_prompt_kv_reuse(),
             kv_bytes_per_cell: estimate_kv_bytes_per_cell(model),
         }
@@ -333,7 +346,8 @@ impl GgufServingConfig {
     }
 
     fn n_batch(self) -> u32 {
-        self.ctx_per_seq + self.max_concurrent as u32
+        self.prefill_chunk_size
+            .saturating_add(self.max_concurrent.max(1)) as u32
     }
 }
 
@@ -2399,7 +2413,7 @@ impl Engine for GgufBackend {
             let backend_for_load = global_gguf_backend()?;
             let backend_for_closure = Arc::clone(&backend_for_load);
             let (model, n_ctx_train) = tokio::task::spawn_blocking(move || {
-                let params = LlamaModelParams::default().with_n_gpu_layers(99);
+                let params = gguf_model_params();
                 let model =
                     LlamaModel::load_from_file(&backend_for_closure, &model_path_load, &params)
                         .map_err(|e| EngineError::backend(format!("GGUF load failed: {e}")))?;
@@ -2577,7 +2591,11 @@ impl Engine for GgufBackend {
 
         let data = match resp_rx.recv() {
             Ok(result) => result?,
-            Err(_) => Vec::new(),
+            Err(_) => {
+                return Err(EngineError::backend(
+                    "gguf scheduler disconnected before producing a response",
+                ));
+            }
         };
         let len = data.len() as i64;
         BinaryTensorPacket::new(vec![1, len], TensorDtype::Uint8, data)
@@ -2719,5 +2737,38 @@ impl Engine for GgufBackend {
         Err(EngineError::backend(
             "GGUF support not compiled in (enable the 'gguf' feature)",
         ))
+    }
+}
+
+#[cfg(all(test, feature = "gguf"))]
+mod tests {
+    use super::GgufServingConfig;
+    use std::time::Duration;
+
+    fn test_config(ctx_per_seq: u32, max_concurrent: usize, prefill_chunk_size: usize) -> GgufServingConfig {
+        GgufServingConfig {
+            max_concurrent,
+            ctx_per_seq,
+            queue_delay: Duration::ZERO,
+            prefill_chunk_size,
+            exact_prompt_kv_reuse: false,
+            kv_bytes_per_cell: 0,
+        }
+    }
+
+    #[test]
+    fn gguf_batch_capacity_tracks_prefill_chunk_instead_of_full_ctx() {
+        let config = test_config(2048, 1, 512);
+
+        assert_eq!(config.total_ctx(), 2048);
+        assert_eq!(config.n_batch(), 513);
+    }
+
+    #[test]
+    fn gguf_batch_capacity_reserves_decode_slots_for_all_sequences() {
+        let config = test_config(4096, 8, 128);
+
+        assert_eq!(config.total_ctx(), 32_768);
+        assert_eq!(config.n_batch(), 136);
     }
 }
