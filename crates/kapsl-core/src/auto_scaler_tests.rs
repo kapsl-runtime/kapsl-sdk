@@ -97,6 +97,28 @@ mod tests {
     }
 
     #[test]
+    fn test_scale_up_to_meet_min_replicas_when_idle() {
+        let mut scaler = AutoScaler::new();
+        let policy = ScalingPolicy {
+            min_replicas: 3,
+            max_replicas: 4,
+            target_queue_depth: 5,
+            scale_down_threshold: 2,
+            cooldown_seconds: 300,
+        };
+        scaler.register_policy(0, policy);
+
+        // Raising min_replicas on an idle model (empty queue) must scale up to the
+        // floor immediately, without waiting for load-based hysteresis.
+        let result = scaler.should_scale_up(0, 1, 1, 0, Duration::from_secs(10), true);
+        assert_eq!(result, Some(3));
+
+        // Once at the floor, an idle model stays put.
+        let result = scaler.should_scale_up(0, 3, 3, 0, Duration::from_secs(10), true);
+        assert!(result.is_none());
+    }
+
+    #[test]
     fn test_get_next_replica_id() {
         let scaler = AutoScaler::new();
 
