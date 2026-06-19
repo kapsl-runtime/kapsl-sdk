@@ -6,6 +6,9 @@ use crate::global_scheduler::GlobalKvScheduler;
 type GlobalSchedulerMutex = parking_lot::Mutex<GlobalKvScheduler>;
 use crate::llm_metrics::LLMMetrics;
 use crate::model_paths::{find_model_asset, find_model_root};
+use crate::prompt_adapter::{
+    chat_template_from_explicit_name, chat_template_from_model_identifiers, ChatPromptTemplate,
+};
 use crate::scheduler::SchedulerConfig;
 use crate::sequence::{SamplingParams, SequenceGroup};
 use async_stream::stream;
@@ -69,9 +72,7 @@ pub struct LLMBackend {
 
 #[derive(Clone)]
 struct ModelRuntimeConfig {
-    use_chat_template: bool,
-    prompt_prefix: String,
-    prompt_suffix: String,
+    prompt_template: Option<ChatPromptTemplate>,
     sampling: SamplingParams,
 }
 
@@ -150,13 +151,12 @@ fn extract_tag(template: &str, label: &str) -> Option<String> {
 
 fn load_model_runtime_config(model_path: &Path) -> ModelRuntimeConfig {
     let mut config = ModelRuntimeConfig {
-        use_chat_template: false,
-        prompt_prefix: String::new(),
-        prompt_suffix: String::new(),
+        prompt_template: None,
         sampling: default_sampling_params(),
     };
 
     let mut cfg_json: Option<Value> = None;
+    let manifest_llm_json = read_manifest_llm_metadata(model_path);
     if let Some(gen_path) = find_model_asset(model_path, "generation_config.json") {
         if let Some(gen) = read_json(&gen_path) {
             if let Some(temp) = gen.get("temperature").and_then(|v| v.as_f64()) {
@@ -266,16 +266,12 @@ fn load_model_runtime_config(model_path: &Path) -> ModelRuntimeConfig {
         }
     }
 
-    let use_template = template_text.is_some();
-
-    if use_template {
+    if template_text.is_some() {
         let think_suffix = template_text
             .as_deref()
             .filter(|t| t.contains("<think>"))
             .map(|_| "<think>\n".to_string())
             .unwrap_or_default();
-
-        config.use_chat_template = true;
 
         let template_uses_role_header_format = template_text
             .as_deref()
@@ -303,12 +299,13 @@ fn load_model_runtime_config(model_path: &Path) -> ModelRuntimeConfig {
                 })
                 .unwrap_or_default();
 
-            config.prompt_prefix =
-                format!("{}<|start_header_id|>user<|end_header_id|>\n\n", bos_token);
-            config.prompt_suffix = format!(
-                "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n{}",
-                think_suffix
-            );
+            config.prompt_template = Some(ChatPromptTemplate::Boundary {
+                prefix: format!("{}<|start_header_id|>user<|end_header_id|>\n\n", bos_token),
+                suffix: format!(
+                    "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n{}",
+                    think_suffix
+                ),
+            });
         } else {
             let bos_token_id = cfg_json
                 .as_ref()
@@ -336,12 +333,58 @@ fn load_model_runtime_config(model_path: &Path) -> ModelRuntimeConfig {
                 .and_then(|t| extract_tag(t, "Assistant"))
                 .unwrap_or_else(|| "<|assistant|>".to_string());
 
-            config.prompt_prefix = format!("{}{}", bos_token, user_tag);
-            config.prompt_suffix = format!("{}{}", assistant_tag, think_suffix);
+            config.prompt_template = Some(ChatPromptTemplate::Boundary {
+                prefix: format!("{}{}", bos_token, user_tag),
+                suffix: format!("{}{}", assistant_tag, think_suffix),
+            });
         }
+    } else {
+        config.prompt_template =
+            prompt_template_from_manifest_or_config(manifest_llm_json.as_ref(), cfg_json.as_ref());
     }
 
     config
+}
+
+fn read_manifest_llm_metadata(model_path: &Path) -> Option<Value> {
+    let meta_path = find_model_root(model_path).join("metadata.json");
+    read_json(&meta_path).and_then(|meta| meta.get("metadata").and_then(|m| m.get("llm")).cloned())
+}
+
+fn json_string_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+    value.get(key).and_then(|v| v.as_str()).map(str::trim)
+}
+
+fn prompt_template_from_manifest_or_config(
+    llm_meta: Option<&Value>,
+    cfg_json: Option<&Value>,
+) -> Option<ChatPromptTemplate> {
+    if let Some(llm) = llm_meta {
+        for key in ["chat_template", "prompt_template", "model_family"] {
+            if let Some(template) =
+                json_string_field(llm, key).and_then(chat_template_from_explicit_name)
+            {
+                return Some(template);
+            }
+        }
+    }
+
+    let mut identifiers = Vec::new();
+    if let Some(cfg) = cfg_json {
+        if let Some(model_type) = json_string_field(cfg, "model_type") {
+            identifiers.push(model_type.to_string());
+        }
+        if let Some(architectures) = cfg.get("architectures").and_then(|v| v.as_array()) {
+            identifiers.extend(
+                architectures
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .map(str::to_string),
+            );
+        }
+    }
+
+    chat_template_from_model_identifiers(identifiers.iter().map(String::as_str))
 }
 
 /// RAII guard that returns a token reservation to `GlobalKvScheduler` when
@@ -366,9 +409,7 @@ impl LLMBackend {
             request_tx: RwLock::new(None),
             metrics: Arc::new(Mutex::new(LLMMetrics::default())),
             model_config: Arc::new(Mutex::new(ModelRuntimeConfig {
-                use_chat_template: false,
-                prompt_prefix: String::new(),
-                prompt_suffix: String::new(),
+                prompt_template: None,
                 sampling: default_sampling_params(),
             })),
             provider_override: None,
@@ -733,14 +774,11 @@ impl Engine for LLMBackend {
         };
 
         let runtime_cfg = self.model_config.lock().unwrap().clone();
-        let prompt = if runtime_cfg.use_chat_template {
-            format!(
-                "{}{}{}",
-                runtime_cfg.prompt_prefix, prompt, runtime_cfg.prompt_suffix
-            )
-        } else {
-            prompt
-        };
+        let prompt = runtime_cfg
+            .prompt_template
+            .as_ref()
+            .map(|template| template.render(&prompt))
+            .unwrap_or(prompt);
 
         let mut sampling_params = runtime_cfg.sampling;
         if let Some(meta) = request.metadata.as_ref() {
