@@ -92,4 +92,42 @@ mod tests {
         assert_eq!(finished.len(), 1);
         assert!(scheduler.block_manager.can_allocate(1));
     }
+
+    #[test]
+    fn waiting_queue_orders_by_priority_then_fifo() {
+        let config = SchedulerConfig {
+            max_num_batched_tokens: 64,
+            max_num_seqs: 4,
+            max_paddings: 0,
+        };
+        let block_manager = BlockManager::new(4, 16, 0);
+        let mut scheduler = LLMScheduler::new(config, block_manager);
+
+        let mut g_low = make_group(1);
+        g_low.priority = 0;
+        g_low.request_id = "low".to_string();
+        let mut g_mid_a = make_group(1);
+        g_mid_a.priority = 5;
+        g_mid_a.request_id = "mid_a".to_string();
+        let mut g_high = make_group(1);
+        g_high.priority = 9;
+        g_high.request_id = "high".to_string();
+        let mut g_mid_b = make_group(1);
+        g_mid_b.priority = 5;
+        g_mid_b.request_id = "mid_b".to_string();
+
+        // Arrival order: low, mid_a, high, mid_b.
+        scheduler.add_sequence_group(g_low);
+        scheduler.add_sequence_group(g_mid_a);
+        scheduler.add_sequence_group(g_high);
+        scheduler.add_sequence_group(g_mid_b);
+
+        let order: Vec<String> = scheduler
+            .waiting_queue
+            .iter()
+            .map(|g| g.lock().unwrap().request_id.clone())
+            .collect();
+        // Descending priority, FIFO within a tier: mid_a before mid_b.
+        assert_eq!(order, vec!["high", "mid_a", "mid_b", "low"]);
+    }
 }

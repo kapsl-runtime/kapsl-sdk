@@ -6,6 +6,7 @@ pub mod kv_cache;
 pub mod llm_backend;
 pub mod llm_metrics;
 pub mod model_paths;
+pub mod prompt_adapter;
 pub mod radix_tree;
 pub mod rag;
 pub mod scheduler;

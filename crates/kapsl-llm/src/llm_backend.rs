@@ -1,8 +1,14 @@
 use crate::block_manager::SharedBlockAllocator;
 use crate::engine::LLMEngine;
 use crate::global_scheduler::GlobalKvScheduler;
+// parking_lot::Mutex does not poison on panic, so a crash in one engine's
+// thread cannot propagate to other engines waiting on the scheduler lock.
+type GlobalSchedulerMutex = parking_lot::Mutex<GlobalKvScheduler>;
 use crate::llm_metrics::LLMMetrics;
 use crate::model_paths::{find_model_asset, find_model_root};
+use crate::prompt_adapter::{
+    chat_template_from_explicit_name, chat_template_from_model_identifiers, ChatPromptTemplate,
+};
 use crate::scheduler::SchedulerConfig;
 use crate::sequence::{SamplingParams, SequenceGroup};
 use async_stream::stream;
@@ -51,7 +57,7 @@ pub struct LLMBackend {
     /// When set, every `infer_stream` call must successfully reserve tokens
     /// before the request is enqueued.  Tokens are released when the stream
     /// completes (naturally, on error, or on drop/cancellation).
-    global_scheduler: Option<Arc<Mutex<GlobalKvScheduler>>>,
+    global_scheduler: Option<Arc<GlobalSchedulerMutex>>,
     /// Stable engine ID assigned by `SharedKvStateInner::attach_engine`.
     /// Used as the key for `GlobalKvScheduler::try_reserve_tokens`.
     engine_id: u32,
@@ -59,13 +65,14 @@ pub struct LLMBackend {
     /// The runtime updates this atomic when engines are added or removed so
     /// that block-level limits rebalance without requiring engine restarts.
     live_kv_cap: Option<Arc<AtomicUsize>>,
+    /// Optional callback invoked with this backend's `engine_id` when its engine
+    /// task ends (drops), so the runtime can fully deregister the dead engine.
+    on_engine_death: Option<Arc<dyn Fn(u32) + Send + Sync>>,
 }
 
 #[derive(Clone)]
 struct ModelRuntimeConfig {
-    use_chat_template: bool,
-    prompt_prefix: String,
-    prompt_suffix: String,
+    prompt_template: Option<ChatPromptTemplate>,
     sampling: SamplingParams,
 }
 
@@ -144,13 +151,12 @@ fn extract_tag(template: &str, label: &str) -> Option<String> {
 
 fn load_model_runtime_config(model_path: &Path) -> ModelRuntimeConfig {
     let mut config = ModelRuntimeConfig {
-        use_chat_template: false,
-        prompt_prefix: String::new(),
-        prompt_suffix: String::new(),
+        prompt_template: None,
         sampling: default_sampling_params(),
     };
 
     let mut cfg_json: Option<Value> = None;
+    let manifest_llm_json = read_manifest_llm_metadata(model_path);
     if let Some(gen_path) = find_model_asset(model_path, "generation_config.json") {
         if let Some(gen) = read_json(&gen_path) {
             if let Some(temp) = gen.get("temperature").and_then(|v| v.as_f64()) {
@@ -260,16 +266,12 @@ fn load_model_runtime_config(model_path: &Path) -> ModelRuntimeConfig {
         }
     }
 
-    let use_template = template_text.is_some();
-
-    if use_template {
+    if template_text.is_some() {
         let think_suffix = template_text
             .as_deref()
             .filter(|t| t.contains("<think>"))
             .map(|_| "<think>\n".to_string())
             .unwrap_or_default();
-
-        config.use_chat_template = true;
 
         let template_uses_role_header_format = template_text
             .as_deref()
@@ -297,12 +299,13 @@ fn load_model_runtime_config(model_path: &Path) -> ModelRuntimeConfig {
                 })
                 .unwrap_or_default();
 
-            config.prompt_prefix =
-                format!("{}<|start_header_id|>user<|end_header_id|>\n\n", bos_token);
-            config.prompt_suffix = format!(
-                "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n{}",
-                think_suffix
-            );
+            config.prompt_template = Some(ChatPromptTemplate::Boundary {
+                prefix: format!("{}<|start_header_id|>user<|end_header_id|>\n\n", bos_token),
+                suffix: format!(
+                    "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n{}",
+                    think_suffix
+                ),
+            });
         } else {
             let bos_token_id = cfg_json
                 .as_ref()
@@ -330,12 +333,58 @@ fn load_model_runtime_config(model_path: &Path) -> ModelRuntimeConfig {
                 .and_then(|t| extract_tag(t, "Assistant"))
                 .unwrap_or_else(|| "<|assistant|>".to_string());
 
-            config.prompt_prefix = format!("{}{}", bos_token, user_tag);
-            config.prompt_suffix = format!("{}{}", assistant_tag, think_suffix);
+            config.prompt_template = Some(ChatPromptTemplate::Boundary {
+                prefix: format!("{}{}", bos_token, user_tag),
+                suffix: format!("{}{}", assistant_tag, think_suffix),
+            });
         }
+    } else {
+        config.prompt_template =
+            prompt_template_from_manifest_or_config(manifest_llm_json.as_ref(), cfg_json.as_ref());
     }
 
     config
+}
+
+fn read_manifest_llm_metadata(model_path: &Path) -> Option<Value> {
+    let meta_path = find_model_root(model_path).join("metadata.json");
+    read_json(&meta_path).and_then(|meta| meta.get("metadata").and_then(|m| m.get("llm")).cloned())
+}
+
+fn json_string_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+    value.get(key).and_then(|v| v.as_str()).map(str::trim)
+}
+
+fn prompt_template_from_manifest_or_config(
+    llm_meta: Option<&Value>,
+    cfg_json: Option<&Value>,
+) -> Option<ChatPromptTemplate> {
+    if let Some(llm) = llm_meta {
+        for key in ["chat_template", "prompt_template", "model_family"] {
+            if let Some(template) =
+                json_string_field(llm, key).and_then(chat_template_from_explicit_name)
+            {
+                return Some(template);
+            }
+        }
+    }
+
+    let mut identifiers = Vec::new();
+    if let Some(cfg) = cfg_json {
+        if let Some(model_type) = json_string_field(cfg, "model_type") {
+            identifiers.push(model_type.to_string());
+        }
+        if let Some(architectures) = cfg.get("architectures").and_then(|v| v.as_array()) {
+            identifiers.extend(
+                architectures
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .map(str::to_string),
+            );
+        }
+    }
+
+    chat_template_from_model_identifiers(identifiers.iter().map(String::as_str))
 }
 
 /// RAII guard that returns a token reservation to `GlobalKvScheduler` when
@@ -343,16 +392,14 @@ fn load_model_runtime_config(model_path: &Path) -> ModelRuntimeConfig {
 /// the budget is reclaimed whether the stream ends normally, errors, or is
 /// cancelled by the caller dropping the future.
 struct GlobalTokenGuard {
-    scheduler: Arc<Mutex<GlobalKvScheduler>>,
+    scheduler: Arc<GlobalSchedulerMutex>,
     engine_id: u32,
     tokens:    usize,
 }
 
 impl Drop for GlobalTokenGuard {
     fn drop(&mut self) {
-        if let Ok(mut sched) = self.scheduler.lock() {
-            sched.complete_tokens(self.engine_id, self.tokens);
-        }
+        self.scheduler.lock().complete_tokens(self.engine_id, self.tokens);
     }
 }
 
@@ -362,9 +409,7 @@ impl LLMBackend {
             request_tx: RwLock::new(None),
             metrics: Arc::new(Mutex::new(LLMMetrics::default())),
             model_config: Arc::new(Mutex::new(ModelRuntimeConfig {
-                use_chat_template: false,
-                prompt_prefix: String::new(),
-                prompt_suffix: String::new(),
+                prompt_template: None,
                 sampling: default_sampling_params(),
             })),
             provider_override: None,
@@ -376,7 +421,15 @@ impl LLMBackend {
             global_scheduler: None,
             engine_id: 0,
             live_kv_cap: None,
+            on_engine_death: None,
         }
+    }
+
+    /// Register a callback invoked with this backend's `engine_id` when its
+    /// engine task ends, so the runtime can deregister the dead engine.
+    pub fn with_on_engine_death(mut self, cb: Arc<dyn Fn(u32) + Send + Sync>) -> Self {
+        self.on_engine_death = Some(cb);
+        self
     }
 
     /// Attach a shared block allocator so this backend draws from a unified
@@ -421,12 +474,28 @@ impl LLMBackend {
     /// potentially OOM-ing the device.
     pub fn with_global_scheduler(
         mut self,
-        scheduler: Arc<Mutex<GlobalKvScheduler>>,
+        scheduler: Arc<GlobalSchedulerMutex>,
         engine_id: u32,
     ) -> Self {
         self.global_scheduler = Some(scheduler);
         self.engine_id = engine_id;
         self
+    }
+
+    /// This engine's current health as the `EngineMetrics` code: 0 = healthy,
+    /// 1 = degraded, 2 = dead. Reads the cross-model scheduler's per-engine
+    /// health; defaults to healthy when no scheduler is attached.
+    fn engine_health_code(&self) -> u8 {
+        use crate::global_scheduler::EngineHealth;
+        match self
+            .global_scheduler
+            .as_ref()
+            .and_then(|s| s.lock().health_of(self.engine_id))
+        {
+            Some(EngineHealth::Degraded) => 1,
+            Some(EngineHealth::Dead) => 2,
+            _ => 0,
+        }
     }
 
     pub fn with_device(provider: String, device_id: i32) -> Self {
@@ -544,6 +613,10 @@ impl Engine for LLMBackend {
         let shared_pool = self.shared_pool.clone();
         let kv_blocks_cap = self.kv_blocks_cap;
         let kv_compression_bits = self.kv_compression_bits;
+        let global_scheduler_for_engine = self.global_scheduler.clone();
+        let engine_id_for_engine = self.engine_id;
+        let on_engine_death = self.on_engine_death.clone();
+        let live_kv_cap_for_engine = self.live_kv_cap.clone();
         tokio::spawn(async move {
             let engine = LLMEngine::new(
                 config,
@@ -565,9 +638,32 @@ impl Engine for LLMBackend {
             if let Some(cap) = kv_blocks_cap {
                 engine.set_kv_blocks_cap(cap);
             }
+            // Attach the live per-engine KV quota so the (shared-pool) block
+            // manager hard-enforces this engine's fair share. Must come after
+            // with_shared_pool, which rebuilds the scheduler/block manager.
+            if let Some(cap) = live_kv_cap_for_engine {
+                engine.set_live_kv_cap(cap);
+            }
             // Apply TurboQuant KV-cache compression bit-width if set.
             if let Some(bits) = kv_compression_bits {
                 engine.set_kv_compression_bits(bits);
+            }
+            // Attach the cross-model health reporter and start the stall
+            // watchdog so circuit-breaker / hang transitions reach the global
+            // scheduler and a stuck engine cannot starve healthy ones.
+            if let Some(sched) = global_scheduler_for_engine {
+                // Stamp block ownership with the real engine id assigned by the
+                // runtime so shared-pool blocks are traceable to this engine.
+                engine.set_block_engine_id(engine_id_for_engine);
+                engine = engine.with_health_reporter(sched, engine_id_for_engine);
+                engine.spawn_watchdog();
+            }
+            // Fire the runtime's deregistration callback when this engine drops
+            // (load failure or run_loop exit), so dead engines don't leave stale
+            // registry / cap entries behind.
+            if let Some(cb) = on_engine_death {
+                engine = engine
+                    .with_death_notifier(Box::new(move || cb(engine_id_for_engine)));
             }
             let load_result = engine.load(&engine_path).await;
             if let Err(e) = load_tx.send(load_result) {
@@ -678,14 +774,11 @@ impl Engine for LLMBackend {
         };
 
         let runtime_cfg = self.model_config.lock().unwrap().clone();
-        let prompt = if runtime_cfg.use_chat_template {
-            format!(
-                "{}{}{}",
-                runtime_cfg.prompt_prefix, prompt, runtime_cfg.prompt_suffix
-            )
-        } else {
-            prompt
-        };
+        let prompt = runtime_cfg
+            .prompt_template
+            .as_ref()
+            .map(|template| template.render(&prompt))
+            .unwrap_or(prompt);
 
         let mut sampling_params = runtime_cfg.sampling;
         if let Some(meta) = request.metadata.as_ref() {
@@ -767,7 +860,6 @@ impl Engine for LLMBackend {
             if let Some(ref sched) = self.global_scheduler {
                 let admitted = sched
                     .lock()
-                    .unwrap()
                     .try_reserve_tokens(self.engine_id, estimated_tokens);
                 if !admitted {
                     return Box::pin(stream::once(async {
@@ -804,9 +896,21 @@ impl Engine for LLMBackend {
                     }
                 }
 
-                if tx.send(seq_group).await.is_err() {
-                    yield Err(EngineError::backend("Failed to send request to engine"));
-                    return;
+                // Per-model backpressure: reject immediately when this model's
+                // queue is full rather than blocking (which would build latency
+                // and hold the admission reservation indefinitely).
+                match tx.try_send(seq_group) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        yield Err(EngineError::overloaded(
+                            "Model queue full: too many pending requests for this model",
+                        ));
+                        return;
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        yield Err(EngineError::backend("Failed to send request to engine"));
+                        return;
+                    }
                 }
 
                 let mut saw_finish = false;
@@ -886,6 +990,11 @@ impl Engine for LLMBackend {
             kv_cache_evicted_sequences: m.kv_cache_evicted_sequences,
             kv_cache_packed_layers: m.kv_cache_packed_layers,
             kv_cache_cpu_offloaded_blocks: m.kv_cache_cpu_offloaded_blocks,
+            // Paged prefix-cache reuse, reported through the same fields the
+            // GGUF path uses so the existing Prometheus gauges cover both.
+            kv_partial_reuse_hits_total: m.kv_cache_prefix_reuse_hits,
+            kv_partial_reuse_tokens_saved_total: m.kv_cache_prefix_reuse_tokens_saved,
+            engine_health: self.engine_health_code(),
             ..EngineMetrics::default()
         }
     }

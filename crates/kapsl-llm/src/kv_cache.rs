@@ -67,6 +67,10 @@ pub struct KvCacheStats {
     pub packed_layers: usize,
     /// Blocks currently held in the CPU offload store (paged mode only).
     pub cpu_offloaded_blocks: u64,
+    /// Number of allocate_sequence calls that reused a cached prefix (paged mode).
+    pub prefix_reuse_hits: u64,
+    /// Cumulative prompt tokens skipped via prefix reuse (paged mode).
+    pub prefix_reuse_tokens_saved: u64,
 }
 
 #[derive(Debug)]
@@ -729,6 +733,8 @@ impl DenseKvCache {
             evicted_sequences: 0,
             packed_layers,
             cpu_offloaded_blocks: 0,
+            prefix_reuse_hits: 0,
+            prefix_reuse_tokens_saved: 0,
         }
     }
 }
@@ -934,11 +940,21 @@ pub struct PagedKvCache {
     scratch_key: Vec<f16>,
     scratch_value: Vec<f16>,
     radix_tree: RadixTree,
+    /// The exact prefix tokens each physical block is registered under in the
+    /// radix tree. Used to (a) remove the correct radix entry when a block is
+    /// truly freed (ref→0) and (b) validate on reuse that a block still holds
+    /// the matched tokens, so a freed+reallocated block can never be reused for
+    /// a stale prefix.
+    block_tokens: HashMap<usize, Vec<u64>>,
     /// CPU offload store: blocks moved here instead of being permanently freed
     /// when the GPU pool is exhausted after LRU eviction.
     cpu_store: CpuKvBlockStore,
     /// Running count of blocks currently sitting in `cpu_store`.
     cpu_offloaded_blocks: u64,
+    /// Cumulative prefix-reuse hits (allocate_sequence that reused a prefix).
+    prefix_reuse_hits: u64,
+    /// Cumulative prompt tokens skipped via prefix reuse.
+    prefix_reuse_tokens_saved: u64,
 }
 
 impl PagedKvCache {
@@ -970,8 +986,24 @@ impl PagedKvCache {
             scratch_key: vec![f16::ZERO; expected],
             scratch_value: vec![f16::ZERO; expected],
             radix_tree: RadixTree::new(),
+            block_tokens: HashMap::new(),
             cpu_store: CpuKvBlockStore::new(block_stride),
             cpu_offloaded_blocks: 0,
+            prefix_reuse_hits: 0,
+            prefix_reuse_tokens_saved: 0,
+        }
+    }
+
+    /// Free a block and, when its last reference is released, drop its
+    /// prefix-cache registration (radix entry + token signature). Centralising
+    /// this means a freed block can never be reused for a stale prefix after it
+    /// is reallocated, regardless of which path freed it.
+    fn free_block(&mut self, block_id: usize) {
+        self.allocator.free(block_id);
+        if self.allocator.get_ref_count(block_id) == 0 {
+            if let Some(tokens) = self.block_tokens.remove(&block_id) {
+                self.radix_tree.remove(&tokens);
+            }
         }
     }
 
@@ -1096,7 +1128,7 @@ impl PagedKvCache {
             &self.value_storage,
         );
         for &block_id in &block_ids {
-            self.allocator.free(block_id);
+            self.free_block(block_id);
         }
         self.cpu_offloaded_blocks += block_ids.len() as u64;
 
@@ -1138,7 +1170,7 @@ impl PagedKvCache {
                 None => {
                     // Not enough free blocks — free what we got and put data back.
                     for &b in &new_block_ids {
-                        self.allocator.free(b);
+                        self.free_block(b);
                     }
                     self.cpu_store.return_sequence(sequence_id, entry);
                     return None;
@@ -1191,7 +1223,7 @@ impl PagedKvCache {
                 Err(e) => {
                     // Cleanup allocated blocks
                     for block in blocks {
-                        self.allocator.free(block);
+                        self.free_block(block);
                     }
                     return Err(e);
                 }
@@ -1260,7 +1292,10 @@ impl PagedKvCache {
             return;
         }
 
-        // Remove stale prefix entries that become invalid after rollback.
+        // A retained full block whose trailing tokens become invalid after
+        // rollback (they get overwritten as generation resumes) must lose its
+        // prefix registration. Guard on ref<=1 so a block still shared with
+        // another sequence is left intact.
         let old_full_blocks = seq.tokens.len() / self.block_size;
         let new_full_blocks = length / self.block_size;
         if old_full_blocks > new_full_blocks {
@@ -1269,9 +1304,8 @@ impl PagedKvCache {
                     break;
                 };
                 if self.allocator.get_ref_count(block_id) <= 1 {
-                    let prefix_len = (block_idx + 1) * self.block_size;
-                    if prefix_len <= seq.tokens.len() {
-                        self.radix_tree.remove(&seq.tokens[..prefix_len]);
+                    if let Some(tokens) = self.block_tokens.remove(&block_id) {
+                        self.radix_tree.remove(&tokens);
                     }
                 }
             }
@@ -1282,11 +1316,13 @@ impl PagedKvCache {
             seq.tokens.truncate(length);
         }
 
-        // Free blocks that are completely outside the new length.
+        // Free blocks that are completely outside the new length. `free_block`
+        // drops each block's radix registration when its last ref is released,
+        // so stale prefix entries for freed blocks are cleared automatically.
         let needed_blocks = length.div_ceil(self.block_size);
         while seq.blocks.len() > needed_blocks {
             if let Some(block) = seq.blocks.pop_back() {
-                self.allocator.free(block);
+                self.free_block(block);
             }
         }
 
@@ -1300,22 +1336,11 @@ impl PagedKvCache {
 
     fn evict_sequence(&mut self, sequence_id: u64) {
         if let Some(seq) = self.sequences.remove(&sequence_id) {
-            let full_blocks = seq.tokens.len() / self.block_size;
-            for block_idx in 0..full_blocks {
-                let Some(&block_id) = seq.blocks.get(block_idx) else {
-                    break;
-                };
-                if self.allocator.get_ref_count(block_id) <= 1 {
-                    let prefix_len = (block_idx + 1) * self.block_size;
-                    if prefix_len <= seq.tokens.len() {
-                        self.radix_tree.remove(&seq.tokens[..prefix_len]);
-                    }
-                }
-            }
-
             let freed_blocks = seq.blocks.len() as u64;
+            // free_block clears each block's radix registration when its last
+            // reference is released.
             for block in seq.blocks {
-                self.allocator.free(block);
+                self.free_block(block);
             }
             self.evicted_blocks += freed_blocks;
             self.evicted_sequences_count += 1;
@@ -1370,10 +1395,20 @@ impl PagedKvCache {
 
         let mut seq = PagedSequence::new(self.num_layers);
 
-        // Verify prefix blocks are still valid before reusing them.
+        // Verify prefix blocks are still valid before reusing them. A block is
+        // only safe to reuse if it is still allocated *and* still registered
+        // under exactly the matched prefix tokens — guarding against a stale
+        // radix entry whose block was freed and reallocated with new content.
         let mut reused_blocks = Vec::new();
-        for &block_id in &matched_blocks {
-            if self.allocator.get_ref_count(block_id) > 0 {
+        for (k, &block_id) in matched_blocks.iter().enumerate() {
+            let expected_end = (k + 1) * self.block_size;
+            let tokens_match = expected_end <= tokens_u64.len()
+                && self
+                    .block_tokens
+                    .get(&block_id)
+                    .map(|t| t.as_slice() == &tokens_u64[..expected_end])
+                    .unwrap_or(false);
+            if self.allocator.get_ref_count(block_id) > 0 && tokens_match {
                 self.allocator.add_ref(block_id);
                 reused_blocks.push(block_id);
             } else {
@@ -1391,11 +1426,15 @@ impl PagedKvCache {
             let num_reused_blocks = matched_len.div_ceil(self.block_size);
             if reused_blocks.len() > num_reused_blocks {
                 for &block_id in &reused_blocks[num_reused_blocks..] {
-                    self.allocator.free(block_id);
+                    self.free_block(block_id);
                 }
                 reused_blocks.truncate(num_reused_blocks);
             }
             seq.blocks.extend(reused_blocks);
+        }
+        if matched_len > 0 {
+            self.prefix_reuse_hits += 1;
+            self.prefix_reuse_tokens_saved += matched_len as u64;
         }
         // Sync tokens tracking
         seq.tokens = tokens[..matched_len].iter().map(|&t| t as u64).collect();
@@ -1477,16 +1516,15 @@ impl PagedKvCache {
                     // If block is full, add to RadixTree
                     if (pos + 1).is_multiple_of(self.block_size) {
                         let block_idx = *seq.blocks.back().expect("block missing");
-                        // Get tokens for this block
+                        // Get tokens for this block (full prefix up to its end).
                         let start = 0;
                         let block_tokens = &seq.tokens[start..=pos];
                         self.radix_tree.insert(block_tokens, block_idx);
-                        // Increment ref count for storage in tree?
-                        // The allocator counts refs. When we put it in the tree, we should probably add a ref.
-                        // But wait, the tree doesn't "own" the block in the sense of allocation.
-                        // If we evict the block, we should remove from tree.
-                        // For now, let's just use the tree as an index.
-                        // We should increment ref count if we *share* it.
+                        // Record the exact prefix this block is registered under so
+                        // free_block can remove the right entry and reuse can
+                        // validate token identity. Overwrites any stale mapping if
+                        // this physical block was previously registered.
+                        self.block_tokens.insert(block_idx, block_tokens.to_vec());
                     }
                 } else if pos < seq.tokens.len() {
                     // Overwriting? Verify token matches?
@@ -1741,7 +1779,7 @@ impl PagedKvCache {
             old
         };
         for block in old_blocks {
-            self.allocator.free(block);
+            self.free_block(block);
         }
 
         let block_size = self.block_size;
@@ -1792,21 +1830,11 @@ impl PagedKvCache {
 
     pub fn remove_sequence(&mut self, sequence_id: u64) {
         if let Some(seq) = self.sequences.remove(&sequence_id) {
-            let full_blocks = seq.tokens.len() / self.block_size;
-            for block_idx in 0..full_blocks {
-                let Some(&block_id) = seq.blocks.get(block_idx) else {
-                    break;
-                };
-                if self.allocator.get_ref_count(block_id) <= 1 {
-                    let prefix_len = (block_idx + 1) * self.block_size;
-                    if prefix_len <= seq.tokens.len() {
-                        self.radix_tree.remove(&seq.tokens[..prefix_len]);
-                    }
-                }
-            }
-
+            // free_block clears each block's radix registration when its last
+            // reference is released, so shared blocks stay registered until the
+            // final owner is gone.
             for block in seq.blocks {
-                self.allocator.free(block);
+                self.free_block(block);
             }
         }
     }
@@ -1887,6 +1915,8 @@ impl PagedKvCache {
             // Use the store's authoritative count so stats stay consistent
             // even when blocks are put back during failed restore attempts.
             cpu_offloaded_blocks: self.cpu_store.offloaded_block_count() as u64,
+            prefix_reuse_hits: self.prefix_reuse_hits,
+            prefix_reuse_tokens_saved: self.prefix_reuse_tokens_saved,
         }
     }
 }

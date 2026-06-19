@@ -1,9 +1,11 @@
 use crate::onnx::{ExecutionProvider, OnnxBackend, OnnxBackendBuilder};
+use crate::provider_compat::{resolve_onnx_accelerator_provider, OnnxAcceleratorProvider};
 #[cfg(feature = "gguf-native")]
 use crate::gguf_native::GgufNativeBackend;
 #[cfg(feature = "native")]
 use crate::native::NativeBackend;
 use kapsl_core::loader::Manifest;
+use kapsl_core::EngineKind;
 use kapsl_core::HardwareRequirements;
 use kapsl_engine_api::Engine;
 #[cfg(any(feature = "gguf-native", feature = "native", feature = "gguf-cuda-shared-kv"))]
@@ -30,6 +32,52 @@ pub struct OnnxRuntimeTuning {
     pub bucket_dim_granularity: Option<usize>,
     pub bucket_max_dims: Option<usize>,
     pub peak_concurrency_hint: Option<u32>,
+}
+
+/// Error for a declared-but-unimplemented engine cell (e.g. ONNX classification).
+/// The triple is valid; there is just no backend yet.
+fn unimplemented_engine_error(kind: EngineKind) -> String {
+    format!(
+        "model kind `{}` is declared but not yet implemented by a backend",
+        kind.label()
+    )
+}
+
+/// Read a boolean knob from `metadata.<section>.<key>`, defaulting to `default`.
+fn manifest_metadata_bool(manifest: &Manifest, section: &str, key: &str, default: bool) -> bool {
+    manifest
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get(section))
+        .and_then(|s| s.get(key))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(default)
+}
+
+/// Wrap a freshly built ONNX engine in the task post-processor the manifest asks
+/// for (embedding pooling or classification softmax); otherwise return it
+/// unchanged.
+fn maybe_wrap_onnx_postprocess(
+    engine_kind: EngineKind,
+    manifest: &Manifest,
+    inner: Box<dyn Engine>,
+) -> Box<dyn Engine> {
+    match engine_kind {
+        EngineKind::OnnxEmbed => {
+            // Default true: cosine == dot product for vector stores.
+            let normalize = manifest_metadata_bool(manifest, "embed", "normalize", true);
+            Box::new(crate::onnx_embed::OnnxEmbedBackend::new(inner, normalize))
+        }
+        EngineKind::OnnxClassify => {
+            // Default true: most classifier exports emit raw logits.
+            let apply_softmax = manifest_metadata_bool(manifest, "classify", "apply_softmax", true);
+            Box::new(crate::onnx_classify::OnnxClassifyBackend::new(
+                inner,
+                apply_softmax,
+            ))
+        }
+        _ => inner,
+    }
 }
 
 pub fn parse_optimization_level(level: Option<&String>) -> Result<GraphOptimizationLevel, String> {
@@ -143,9 +191,11 @@ impl BackendFactory {
         device_info: &DeviceInfo,
         tuning: &OnnxRuntimeTuning,
     ) -> Result<Box<dyn Engine>, String> {
+        let engine_kind = EngineKind::resolve(manifest);
+
         // GGUF: prefer native CUDA kernels when gguf-native feature is compiled in.
         #[cfg(feature = "gguf-native")]
-        if manifest.framework == "gguf" {
+        if engine_kind.is_gguf() {
             let device_id = manifest.hardware_requirements.device_id.unwrap_or(0);
             log::info!("✓ Using GgufNativeBackend (GGUF loader + native CUDA), device {}", device_id);
             return crate::gguf_native::GgufNativeBackend::new(device_id as i32)
@@ -154,28 +204,32 @@ impl BackendFactory {
         }
 
         #[cfg(all(feature = "gguf-cuda-shared-kv", not(feature = "gguf-native")))]
-        if manifest.framework == "gguf" {
+        if engine_kind.is_gguf() {
             let device_id = manifest.hardware_requirements.device_id.unwrap_or(0);
+            // Reuse the device pool registered with ORT (if any) so GGUF KV
+            // and ONNX sessions draw from the same memory budget.
+            let pool = crate::ort_pool_allocator::registered_pool_handle(device_id as i32);
             log::info!(
-                "✓ Using GgufBackend (llama.cpp CUDA + Kapsl shared KV), device {}",
+                "✓ Using GgufBackend (llama.cpp CUDA + Kapsl shared KV{}), device {}",
+                if pool.is_some() { ", pool shared with ONNX" } else { "" },
                 device_id
             );
             return Ok(Box::new(GgufBackend::new_cuda_shared_kv(
                 device_id as usize,
-                None,
+                pool,
             )));
         }
 
         // GGUF: fallback to llama.cpp-backed GgufBackend.
         #[cfg(not(any(feature = "gguf-native", feature = "gguf-cuda-shared-kv")))]
-        if manifest.framework == "gguf" {
+        if engine_kind.is_gguf() {
             log::info!("✓ Using GgufBackend (llama.cpp)");
             return Ok(Box::new(GgufBackend::new()));
         }
 
         // Native CUDA: safetensors models use custom kernel backend.
         #[cfg(feature = "native")]
-        if manifest.framework == "native" || manifest.framework == "safetensors" {
+        if engine_kind == EngineKind::Native {
             let device_id = manifest.hardware_requirements.device_id.unwrap_or(0);
             log::info!("✓ Using NativeBackend (custom CUDA kernels), device {}", device_id);
             return crate::native::NativeBackend::new(device_id)
@@ -183,8 +237,8 @@ impl BackendFactory {
                 .map_err(|e| format!("NativeBackend init failed: {e}"));
         }
 
-        // Check for LLM framework
-        if manifest.framework == "llm" {
+        // ONNX generative path (LLMBackend): autoregressive decode over an ONNX graph.
+        if engine_kind.is_onnx_generate() {
             let requirements = &manifest.hardware_requirements;
             if Self::provider_policy() == "manifest" {
                 if let Some(provider) = requirements.preferred_provider.clone() {
@@ -198,6 +252,10 @@ impl BackendFactory {
             }
             log::info!("✓ Using LLMBackend with runtime fastest-provider selection");
             return Ok(Box::new(LLMBackend::new()));
+        }
+
+        if !engine_kind.is_implemented() {
+            return Err(unimplemented_engine_error(engine_kind));
         }
 
         let requirements = &manifest.hardware_requirements;
@@ -234,7 +292,7 @@ impl BackendFactory {
             match Self::try_create_provider(provider, device_info, opt_level, device_id, tuning) {
                 Ok(backend) => {
                     log::info!("✓ Using provider: {}", provider);
-                    return Ok(backend);
+                    return Ok(maybe_wrap_onnx_postprocess(engine_kind, manifest, backend));
                 }
                 Err(err) => {
                     log::warn!("⚠ Provider '{}' not available: {}", provider, err);
@@ -246,7 +304,8 @@ impl BackendFactory {
         log::info!("⚠ Using last-resort CPU backend");
         let opt_cpu = parse_optimization_level(requirements.graph_optimization_level.as_ref())
             .unwrap_or(GraphOptimizationLevel::Level3);
-        Self::build_onnx_backend(ExecutionProvider::CPU, opt_cpu, 0, tuning)
+        let inner = Self::build_onnx_backend(ExecutionProvider::CPU, opt_cpu, 0, tuning)?;
+        Ok(maybe_wrap_onnx_postprocess(engine_kind, manifest, inner))
     }
 
     /// Create a backend for a specific device
@@ -272,9 +331,11 @@ impl BackendFactory {
         device_info: &DeviceInfo,
         tuning: &OnnxRuntimeTuning,
     ) -> Result<Box<dyn Engine>, String> {
+        let engine_kind = EngineKind::resolve(manifest);
+
         // Native safetensors: route to custom CUDA kernel backend
         #[cfg(feature = "native")]
-        if manifest.framework == "native" || manifest.framework == "safetensors" {
+        if engine_kind == EngineKind::Native {
             log::info!("✓ Using NativeBackend (custom CUDA kernels) on device {}", device_id);
             return NativeBackend::new(device_id as i32)
                 .map(|b| Box::new(b) as Box<dyn Engine>)
@@ -283,7 +344,7 @@ impl BackendFactory {
 
         // GGUF: prefer native CUDA kernels when gguf-native feature is compiled in.
         #[cfg(feature = "gguf-native")]
-        if manifest.framework == "gguf" {
+        if engine_kind.is_gguf() {
             log::info!("✓ Using GgufNativeBackend (GGUF loader + native CUDA), device {}", device_id);
             return crate::gguf_native::GgufNativeBackend::new(device_id as i32)
                 .map(|b| Box::new(b) as Box<dyn Engine>)
@@ -291,7 +352,7 @@ impl BackendFactory {
         }
 
         #[cfg(all(feature = "gguf-cuda-shared-kv", not(feature = "gguf-native")))]
-        if manifest.framework == "gguf" {
+        if engine_kind.is_gguf() {
             log::info!(
                 "✓ Using GgufBackend (llama.cpp CUDA + Kapsl shared KV) on device {}",
                 device_id
@@ -301,13 +362,13 @@ impl BackendFactory {
 
         // GGUF: fallback to llama.cpp-backed GgufBackend.
         #[cfg(not(any(feature = "gguf-native", feature = "gguf-cuda-shared-kv")))]
-        if manifest.framework == "gguf" {
+        if engine_kind.is_gguf() {
             log::info!("✓ Using GgufBackend (llama.cpp)");
             return Ok(Box::new(GgufBackend::new()));
         }
 
-        // Check for LLM framework
-        if manifest.framework == "llm" {
+        // ONNX generative path (LLMBackend): autoregressive decode over an ONNX graph.
+        if engine_kind.is_onnx_generate() {
             if Self::provider_policy() == "manifest" {
                 log::info!(
                     "✓ Using LLMBackend with manifest provider override: {}",
@@ -325,11 +386,16 @@ impl BackendFactory {
             return Ok(Box::new(LLMBackend::with_device_id(device_id as i32)));
         }
 
+        if !engine_kind.is_implemented() {
+            return Err(unimplemented_engine_error(engine_kind));
+        }
+
         let requirements = &manifest.hardware_requirements;
         let opt_level = parse_optimization_level(requirements.graph_optimization_level.as_ref())
             .map_err(|e| format!("Invalid graph optimization level in manifest: {}", e))?;
-
-        Self::try_create_provider(provider, device_info, opt_level, device_id as i32, tuning)
+        let inner =
+            Self::try_create_provider(provider, device_info, opt_level, device_id as i32, tuning)?;
+        Ok(maybe_wrap_onnx_postprocess(engine_kind, manifest, inner))
     }
 
     fn try_create_provider(
@@ -361,7 +427,17 @@ impl BackendFactory {
                     .and_then(|d| d.cuda_version.as_ref())
                     .map(|s| s.as_str())
                     .unwrap_or("unknown");
-                log::info!("   CUDA available: version {:?}", cuda_version);
+                let acceptance = resolve_onnx_accelerator_provider(
+                    OnnxAcceleratorProvider::Cuda,
+                    device_info,
+                    device_id,
+                )?;
+                log::info!(
+                    "   CUDA accepted: version {:?}, bundle={}, device={}",
+                    cuda_version,
+                    acceptance.bundle,
+                    acceptance.device_summary
+                );
                 Self::build_onnx_backend(ExecutionProvider::CUDA, opt_level, device_id, tuning)
             }
 
@@ -377,7 +453,16 @@ impl BackendFactory {
                         "TensorRT execution provider is not available in ONNX Runtime".to_string(),
                     );
                 }
-                log::info!("   TensorRT requested (requires CUDA)");
+                let acceptance = resolve_onnx_accelerator_provider(
+                    OnnxAcceleratorProvider::TensorRt,
+                    device_info,
+                    device_id,
+                )?;
+                log::info!(
+                    "   TensorRT accepted: bundle={}, device={}",
+                    acceptance.bundle,
+                    acceptance.device_summary
+                );
                 Self::build_onnx_backend(ExecutionProvider::TensorRT, opt_level, device_id, tuning)
             }
 

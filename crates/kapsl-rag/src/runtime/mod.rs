@@ -6,11 +6,9 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use bytes::Bytes;
 use kapsl_rag_sdk::protocol::{ConnectorRequest, ConnectorRequestKind, ConnectorResponse};
 use wasmtime::{Engine, Linker, Module, Store};
-use wasmtime_wasi::preview2::pipe::{MemoryInputPipe, MemoryOutputPipe};
-use wasmtime_wasi::preview2::preview1::{
-    add_to_linker_sync, WasiPreview1Adapter, WasiPreview1View,
-};
-use wasmtime_wasi::preview2::{DirPerms, FilePerms, Table, WasiCtx, WasiCtxBuilder, WasiView};
+use wasmtime_wasi::p1::{add_to_linker_sync, WasiP1Ctx};
+use wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe};
+use wasmtime_wasi::{DirPerms, FilePerms, WasiCtxBuilder};
 
 #[derive(thiserror::Error, Debug)]
 pub enum RuntimeError {
@@ -39,50 +37,6 @@ impl From<serde_json::Error> for RuntimeError {
 pub trait ConnectorRuntime {
     fn send(&mut self, request: ConnectorRequest) -> Result<ConnectorResponse, RuntimeError>;
     fn close(&mut self) -> Result<(), RuntimeError>;
-}
-
-struct WasiState {
-    table: Table,
-    ctx: WasiCtx,
-    adapter: WasiPreview1Adapter,
-}
-
-impl WasiState {
-    fn new(ctx: WasiCtx) -> Self {
-        Self {
-            table: Table::new(),
-            ctx,
-            adapter: WasiPreview1Adapter::new(),
-        }
-    }
-}
-
-impl WasiView for WasiState {
-    fn table(&self) -> &Table {
-        &self.table
-    }
-
-    fn table_mut(&mut self) -> &mut Table {
-        &mut self.table
-    }
-
-    fn ctx(&self) -> &WasiCtx {
-        &self.ctx
-    }
-
-    fn ctx_mut(&mut self) -> &mut WasiCtx {
-        &mut self.ctx
-    }
-}
-
-impl WasiPreview1View for WasiState {
-    fn adapter(&self) -> &WasiPreview1Adapter {
-        &self.adapter
-    }
-
-    fn adapter_mut(&mut self) -> &mut WasiPreview1Adapter {
-        &mut self.adapter
-    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -223,8 +177,9 @@ impl WasmConnectorRuntime {
     fn run_once(&self, input: &str) -> Result<String, RuntimeError> {
         // Run the WASM connector to completion for this request. This keeps the
         // implementation simple and sandboxed, at the cost of per-request startup.
-        let mut linker = Linker::new(&self.engine);
-        add_to_linker_sync(&mut linker).map_err(|e| RuntimeError::Wasm(e.to_string()))?;
+        let mut linker = Linker::<WasiP1Ctx>::new(&self.engine);
+        add_to_linker_sync(&mut linker, |ctx| ctx)
+            .map_err(|e| RuntimeError::Wasm(e.to_string()))?;
 
         let stdin = MemoryInputPipe::new(Bytes::from(input.as_bytes().to_vec()));
         let stdout = MemoryOutputPipe::new(4 * 1024 * 1024);
@@ -242,15 +197,14 @@ impl WasmConnectorRuntime {
 
         for dir in &self.permissions.preopen_dirs {
             validate_guest_path(&dir.guest_path)?;
-            let cap_dir =
-                cap_std::fs::Dir::open_ambient_dir(&dir.host_path, cap_std::ambient_authority())
-                    .map_err(|e| RuntimeError::Wasm(e.to_string()))?;
             let (dir_perms, file_perms) = perms_for(dir.read_only);
-            let _ = builder.preopened_dir(cap_dir, dir_perms, file_perms, &dir.guest_path);
+            builder
+                .preopened_dir(&dir.host_path, &dir.guest_path, dir_perms, file_perms)
+                .map_err(|e| RuntimeError::Wasm(e.to_string()))?;
         }
 
-        let wasi = builder.build();
-        let mut store = Store::new(&self.engine, WasiState::new(wasi));
+        let wasi = builder.build_p1();
+        let mut store = Store::new(&self.engine, wasi);
         let instance = linker
             .instantiate(&mut store, &self.module)
             .map_err(|e| RuntimeError::Wasm(e.to_string()))?;

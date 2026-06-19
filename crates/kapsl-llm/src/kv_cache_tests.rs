@@ -321,6 +321,42 @@ mod tests {
     }
 
     #[test]
+    fn paged_cache_reports_prefix_reuse_metrics() {
+        let config = KvCacheConfig {
+            mode: KvCacheMode::Paged,
+            block_size: 2,
+            total_blocks: 4,
+            eviction_policy: KvEvictionPolicy::None,
+            dense_free_list_cap: 8,
+            initial_seq_len: 256,
+            tq_compression_bits: None,
+        };
+        let mut cache = KvCache::new_with_config(1, 1, 8, 2, config);
+        let prefix = [100, 101, 102, 103];
+
+        cache.allocate_sequence(1, &[]).unwrap();
+        for (i, &token) in prefix.iter().enumerate() {
+            let key = vec![f16::from_f32(token as f32); 2];
+            let val = vec![f16::from_f32(token as f32); 2];
+            cache
+                .append_token(1, 0, i, &key, &val, Some(token as u64))
+                .unwrap();
+        }
+        cache.advance_sequence_by(1, 4);
+
+        // No reuse yet.
+        assert_eq!(cache.stats().prefix_reuse_hits, 0);
+        assert_eq!(cache.stats().prefix_reuse_tokens_saved, 0);
+
+        // Seq 2 reuses the cached prefix.
+        let reused = cache.allocate_sequence(2, &prefix).unwrap();
+        let stats = cache.stats();
+        assert!(reused > 0);
+        assert_eq!(stats.prefix_reuse_hits, 1);
+        assert_eq!(stats.prefix_reuse_tokens_saved, reused as u64);
+    }
+
+    #[test]
     fn paged_cache_stale_radix_entry_is_ignored_after_remove() {
         let config = KvCacheConfig {
             mode: KvCacheMode::Paged,
@@ -358,6 +394,45 @@ mod tests {
                 Some(1),
             )
             .unwrap();
+    }
+
+    #[test]
+    fn paged_cache_reused_block_not_served_for_old_prefix() {
+        // A single-block pool: after a block is freed and reallocated to a
+        // different sequence with different tokens, a third sequence requesting
+        // the original prefix must NOT reuse the (now-repurposed) block.
+        let config = KvCacheConfig {
+            mode: KvCacheMode::Paged,
+            block_size: 2,
+            total_blocks: 1,
+            eviction_policy: KvEvictionPolicy::None,
+            dense_free_list_cap: 8,
+            initial_seq_len: 256,
+            tq_compression_bits: None,
+        };
+        let mut cache = KvCache::new_with_config(1, 1, 8, 2, config);
+
+        let fill = |cache: &mut KvCache, seq: u64, toks: [u64; 2]| {
+            cache.allocate_sequence(seq, &[]).unwrap();
+            for (i, &t) in toks.iter().enumerate() {
+                let k = vec![f16::from_f32(t as f32); 2];
+                let v = vec![f16::from_f32(t as f32); 2];
+                cache.append_token(seq, 0, i, &k, &v, Some(t)).unwrap();
+            }
+            cache.advance_sequence_by(seq, 2);
+        };
+
+        // Seq 1 registers prefix [10, 11] on the only block.
+        fill(&mut cache, 1, [10, 11]);
+        cache.remove_sequence(1);
+
+        // Seq 2 reallocates that same physical block under a different prefix.
+        fill(&mut cache, 2, [20, 21]);
+
+        // Seq 3 asks for the original prefix: it must not be served the block
+        // that now holds [20, 21].
+        let cached = cache.allocate_sequence(3, &[10, 11]).unwrap();
+        assert_eq!(cached, 0, "must not reuse a block repurposed for new tokens");
     }
 
     #[test]

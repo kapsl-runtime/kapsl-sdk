@@ -1,3 +1,4 @@
+use crate::prompt_adapter::{chat_template_from_model_identifiers, prompt_is_explicitly_formatted};
 use async_stream::stream;
 use async_trait::async_trait;
 use kapsl_engine_api::{
@@ -8,6 +9,11 @@ use std::collections::VecDeque;
 use std::num::NonZeroU32;
 use std::path::Path;
 use std::sync::mpsc as std_mpsc;
+#[cfg(feature = "gguf")]
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    OnceLock,
+};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -26,27 +32,63 @@ use llama_cpp_2::{
     context::params::LlamaContextParams,
     llama_backend::LlamaBackend,
     llama_batch::LlamaBatch,
-    model::{params::LlamaModelParams, AddBos, LlamaModel},
-    token::LlamaToken,
+    model::{params::LlamaModelParams, AddBos, LlamaChatMessage, LlamaModel},
+    sampling::LlamaSampler,
+    token::{logit_bias::LlamaLogitBias, LlamaToken},
     TokenToStringError,
 };
 #[cfg(feature = "gguf")]
 use llama_cpp_sys_2::LLAMA_FLASH_ATTN_TYPE_AUTO;
 #[cfg(feature = "gguf-cuda-shared-kv")]
-use llama_cpp_sys_2::{
-    llama_kapsl_kv_pool_desc, LLAMA_KAPSL_KV_DTYPE_F16,
-};
+use llama_cpp_sys_2::{llama_kapsl_kv_pool_desc, LLAMA_KAPSL_KV_DTYPE_F16};
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 
 const MAX_CONCURRENT_DEFAULT: usize = 32;
 const N_CTX_PER_SEQ_DEFAULT: u32 = 2048;
+const GGUF_N_GPU_LAYERS_ENV: &str = "KAPSL_GGUF_N_GPU_LAYERS";
 const GGUF_TARGET_CONCURRENCY_ENV: &str = "KAPSL_GGUF_TARGET_CONCURRENCY";
 const GGUF_QUEUE_DELAY_US_DEFAULT: u64 = 1_000;
 const GGUF_PREFILL_CHUNK_SIZE_DEFAULT: usize = 512;
+const GGUF_TIMING_ENV: &str = "KAPSL_GGUF_TIMING";
+const GGUF_TIMING_LOG_EVERY_ENV: &str = "KAPSL_GGUF_TIMING_LOG_EVERY";
+const GGUF_TIMING_LOG_EVERY_DEFAULT: u64 = 512;
 // llama.cpp sequence-copy asserts unless the context uses a full/unified KV buffer.
 // Keep this opt-in until we can detect that mode safely at runtime.
 const GGUF_EXACT_PROMPT_KV_REUSE_DEFAULT: bool = false;
+
+#[cfg(feature = "gguf")]
+static GGUF_TIMING_BATCH_BUILD_CALLS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gguf")]
+static GGUF_TIMING_BATCH_BUILD_US: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gguf")]
+static GGUF_TIMING_DECODE_CALLS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gguf")]
+static GGUF_TIMING_DECODE_US: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gguf")]
+static GGUF_TIMING_SAMPLE_CALLS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gguf")]
+static GGUF_TIMING_SAMPLE_US: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gguf")]
+static GGUF_TIMING_PIECE_CALLS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gguf")]
+static GGUF_TIMING_PIECE_US: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gguf")]
+static GGUF_TIMING_EMIT_CALLS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gguf")]
+static GGUF_TIMING_EMIT_US: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gguf")]
+static GGUF_TIMING_KV_RESERVE_CALLS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gguf")]
+static GGUF_TIMING_KV_RESERVE_US: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gguf")]
+static GGUF_TIMING_KV_FAST_PATH_CALLS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gguf")]
+static GGUF_TIMING_KV_EXTEND_CALLS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gguf")]
+static GGUF_TIMING_KV_LOOKUP_CALLS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gguf")]
+static GGUF_TIMING_LAST_LOGGED_SAMPLE_CALLS: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(feature = "gguf")]
 fn max_concurrent() -> usize {
@@ -72,6 +114,18 @@ fn n_ctx_per_seq() -> u32 {
         .and_then(|v| v.parse::<u32>().ok())
         .filter(|&v| v > 0)
         .unwrap_or(N_CTX_PER_SEQ_DEFAULT)
+}
+
+#[cfg(feature = "gguf")]
+fn gguf_model_params() -> LlamaModelParams {
+    let params = LlamaModelParams::default();
+    match std::env::var(GGUF_N_GPU_LAYERS_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+    {
+        Some(n_gpu_layers) => params.with_n_gpu_layers(n_gpu_layers),
+        None => params,
+    }
 }
 
 #[cfg(feature = "gguf")]
@@ -104,6 +158,163 @@ fn gguf_exact_prompt_kv_reuse() -> bool {
 }
 
 #[cfg(feature = "gguf")]
+fn gguf_timing_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var(GGUF_TIMING_ENV)
+            .ok()
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                !matches!(v.as_str(), "" | "0" | "false" | "no" | "off")
+            })
+            .unwrap_or(false)
+    })
+}
+
+#[cfg(feature = "gguf")]
+fn gguf_timing_log_every() -> u64 {
+    static LOG_EVERY: OnceLock<u64> = OnceLock::new();
+    *LOG_EVERY.get_or_init(|| {
+        std::env::var(GGUF_TIMING_LOG_EVERY_ENV)
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(GGUF_TIMING_LOG_EVERY_DEFAULT)
+    })
+}
+
+#[cfg(feature = "gguf")]
+fn gguf_timing_elapsed_us(start: Instant) -> u64 {
+    start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+#[cfg(feature = "gguf")]
+fn gguf_timing_record(calls: &AtomicU64, micros: &AtomicU64, start: Instant) {
+    calls.fetch_add(1, Ordering::Relaxed);
+    micros.fetch_add(gguf_timing_elapsed_us(start), Ordering::Relaxed);
+}
+
+#[cfg(feature = "gguf")]
+fn gguf_prepare_prompt(model: &LlamaModel, prompt: String) -> Result<String, EngineError> {
+    if prompt.trim().is_empty() || prompt_is_explicitly_formatted(&prompt) {
+        return Ok(prompt);
+    }
+
+    let template = match model.chat_template(None) {
+        Ok(template) => template,
+        Err(_) => {
+            let identifiers: Vec<String> = ["general.name", "general.architecture"]
+                .iter()
+                .filter_map(|key| model.meta_val_str(key).ok())
+                .collect();
+            if let Some(template) =
+                chat_template_from_model_identifiers(identifiers.iter().map(String::as_str))
+            {
+                return Ok(template.render(&prompt));
+            }
+            return Ok(prompt);
+        }
+    };
+    let message = LlamaChatMessage::new("user".to_string(), prompt.clone())
+        .map_err(|e| EngineError::backend(format!("chat message build failed: {e}")))?;
+
+    model
+        .apply_chat_template(&template, &[message], true)
+        .map_err(|e| EngineError::backend(format!("chat template apply failed: {e}")))
+}
+
+#[cfg(feature = "gguf")]
+struct GgufTimingGuard {
+    calls: &'static AtomicU64,
+    micros: &'static AtomicU64,
+    start: Option<Instant>,
+}
+
+#[cfg(feature = "gguf")]
+impl GgufTimingGuard {
+    fn new(calls: &'static AtomicU64, micros: &'static AtomicU64) -> Self {
+        Self {
+            calls,
+            micros,
+            start: gguf_timing_enabled().then(Instant::now),
+        }
+    }
+}
+
+#[cfg(feature = "gguf")]
+impl Drop for GgufTimingGuard {
+    fn drop(&mut self) {
+        if let Some(start) = self.start.take() {
+            gguf_timing_record(self.calls, self.micros, start);
+        }
+    }
+}
+
+#[cfg(feature = "gguf")]
+fn gguf_timing_avg_us(calls: u64, micros: u64) -> f64 {
+    if calls == 0 {
+        0.0
+    } else {
+        micros as f64 / calls as f64
+    }
+}
+
+#[cfg(feature = "gguf")]
+fn gguf_timing_maybe_log(force: bool) {
+    if !gguf_timing_enabled() {
+        return;
+    }
+
+    let sample_calls = GGUF_TIMING_SAMPLE_CALLS.load(Ordering::Relaxed);
+    if sample_calls == 0 {
+        return;
+    }
+
+    let log_every = gguf_timing_log_every();
+    let last = GGUF_TIMING_LAST_LOGGED_SAMPLE_CALLS.load(Ordering::Relaxed);
+    if !force && sample_calls / log_every == last / log_every {
+        return;
+    }
+    GGUF_TIMING_LAST_LOGGED_SAMPLE_CALLS.store(sample_calls, Ordering::Relaxed);
+
+    let batch_calls = GGUF_TIMING_BATCH_BUILD_CALLS.load(Ordering::Relaxed);
+    let batch_us = GGUF_TIMING_BATCH_BUILD_US.load(Ordering::Relaxed);
+    let decode_calls = GGUF_TIMING_DECODE_CALLS.load(Ordering::Relaxed);
+    let decode_us = GGUF_TIMING_DECODE_US.load(Ordering::Relaxed);
+    let sample_us = GGUF_TIMING_SAMPLE_US.load(Ordering::Relaxed);
+    let piece_calls = GGUF_TIMING_PIECE_CALLS.load(Ordering::Relaxed);
+    let piece_us = GGUF_TIMING_PIECE_US.load(Ordering::Relaxed);
+    let emit_calls = GGUF_TIMING_EMIT_CALLS.load(Ordering::Relaxed);
+    let emit_us = GGUF_TIMING_EMIT_US.load(Ordering::Relaxed);
+    let kv_calls = GGUF_TIMING_KV_RESERVE_CALLS.load(Ordering::Relaxed);
+    let kv_us = GGUF_TIMING_KV_RESERVE_US.load(Ordering::Relaxed);
+    let kv_fast = GGUF_TIMING_KV_FAST_PATH_CALLS.load(Ordering::Relaxed);
+    let kv_extend = GGUF_TIMING_KV_EXTEND_CALLS.load(Ordering::Relaxed);
+    let kv_lookup = GGUF_TIMING_KV_LOOKUP_CALLS.load(Ordering::Relaxed);
+
+    eprintln!(
+        "[gguf-timing] calls batch={} decode={} sample={} piece={} emit={} kv={} \
+         avg_us batch={:.1} decode={:.1} sample={:.1} piece={:.1} emit={:.1} kv={:.1} \
+         kv_paths fast={} extend={} lookup={}",
+        batch_calls,
+        decode_calls,
+        sample_calls,
+        piece_calls,
+        emit_calls,
+        kv_calls,
+        gguf_timing_avg_us(batch_calls, batch_us),
+        gguf_timing_avg_us(decode_calls, decode_us),
+        gguf_timing_avg_us(sample_calls, sample_us),
+        gguf_timing_avg_us(piece_calls, piece_us),
+        gguf_timing_avg_us(emit_calls, emit_us),
+        gguf_timing_avg_us(kv_calls, kv_us),
+        kv_fast,
+        kv_extend,
+        kv_lookup,
+    );
+}
+
+#[cfg(feature = "gguf")]
 #[derive(Clone, Copy, Debug)]
 struct GgufServingConfig {
     max_concurrent: usize,
@@ -119,12 +330,12 @@ impl GgufServingConfig {
     fn from_model(model: &LlamaModel, n_ctx_train: u32) -> Self {
         let max_concurrent = max_concurrent();
         let ctx_per_seq = n_ctx_per_seq().min(n_ctx_train);
-        let n_batch = ctx_per_seq + max_concurrent as u32;
+        let prefill_chunk_size = gguf_prefill_chunk_size().min(ctx_per_seq as usize).max(1);
         Self {
             max_concurrent,
             ctx_per_seq,
             queue_delay: gguf_queue_delay(),
-            prefill_chunk_size: gguf_prefill_chunk_size().min(n_batch as usize).max(1),
+            prefill_chunk_size,
             exact_prompt_kv_reuse: gguf_exact_prompt_kv_reuse(),
             kv_bytes_per_cell: estimate_kv_bytes_per_cell(model),
         }
@@ -135,7 +346,8 @@ impl GgufServingConfig {
     }
 
     fn n_batch(self) -> u32 {
-        self.ctx_per_seq + self.max_concurrent as u32
+        self.prefill_chunk_size
+            .saturating_add(self.max_concurrent.max(1)) as u32
     }
 }
 
@@ -165,7 +377,9 @@ fn gguf_shared_kv_block_count(
     {
         return blocks.max(n_layers);
     }
-    let blocks_per_seq = (config.ctx_per_seq as usize).div_ceil(block_size.max(1)).max(1);
+    let blocks_per_seq = (config.ctx_per_seq as usize)
+        .div_ceil(block_size.max(1))
+        .max(1);
     n_layers
         .saturating_mul(config.max_concurrent.max(1))
         .saturating_mul(blocks_per_seq)
@@ -203,9 +417,8 @@ static GGUF_BACKEND_INIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 // ─── Cross-device KV scheduler singleton ──────────────────────────────────────
 
 #[cfg(feature = "gguf-cuda-shared-kv")]
-static GGUF_KV_SCHEDULER: std::sync::OnceLock<
-    std::sync::Mutex<CrossDevicePoolScheduler>
-> = std::sync::OnceLock::new();
+static GGUF_KV_SCHEDULER: std::sync::OnceLock<std::sync::Mutex<CrossDevicePoolScheduler>> =
+    std::sync::OnceLock::new();
 
 #[cfg(feature = "gguf-cuda-shared-kv")]
 fn gguf_global_kv_scheduler() -> &'static std::sync::Mutex<CrossDevicePoolScheduler> {
@@ -230,7 +443,12 @@ fn gguf_global_kv_scheduler() -> &'static std::sync::Mutex<CrossDevicePoolSchedu
 #[cfg(feature = "gguf-cuda-shared-kv")]
 fn gguf_select_device(fallback_device_id: usize, kv_heads: usize, head_dim: usize) -> usize {
     if !std::env::var("KAPSL_GGUF_AUTO_DEVICE")
-        .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"))
+        .map(|v| {
+            !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
         .unwrap_or(false)
     {
         return fallback_device_id;
@@ -281,13 +499,17 @@ enum GgufResponse {
 
 #[cfg(feature = "gguf")]
 impl GgufResponse {
-    fn emit_piece(&self, output: &mut Vec<u8>, piece: Vec<u8>) -> bool {
+    fn emit_bytes(&self, output: &mut Vec<u8>, bytes: Vec<u8>) -> bool {
+        if bytes.is_empty() {
+            return true;
+        }
+        let _timing = GgufTimingGuard::new(&GGUF_TIMING_EMIT_CALLS, &GGUF_TIMING_EMIT_US);
         match self {
             Self::Final(_) => {
-                output.extend_from_slice(&piece);
+                output.extend_from_slice(&bytes);
                 true
             }
-            Self::Stream(tx) => tx.send(Ok(piece)).is_ok(),
+            Self::Stream(tx) => tx.send(Ok(bytes)).is_ok(),
         }
     }
 
@@ -303,6 +525,99 @@ impl GgufResponse {
                 let _ = tx.send(Err(error));
             }
         }
+    }
+}
+
+#[cfg(feature = "gguf")]
+const GGUF_CHAT_STOP_SEQUENCES: &[&[u8]] = &[
+    b"<end_of_turn>",
+    b"<start_of_turn>user",
+    b"<|im_end|>",
+    b"<|im_start|>user",
+    b"<|eot_id|>",
+];
+
+#[cfg(feature = "gguf")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GgufEmitResult {
+    Continue,
+    Disconnected,
+    Stopped,
+}
+
+#[cfg(feature = "gguf")]
+struct GgufStopFilter {
+    pending: Vec<u8>,
+    stopped: bool,
+}
+
+#[cfg(feature = "gguf")]
+impl GgufStopFilter {
+    fn new() -> Self {
+        Self {
+            pending: Vec::new(),
+            stopped: false,
+        }
+    }
+
+    fn max_stop_len() -> usize {
+        GGUF_CHAT_STOP_SEQUENCES
+            .iter()
+            .map(|seq| seq.len())
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn find_stop(bytes: &[u8]) -> Option<usize> {
+        GGUF_CHAT_STOP_SEQUENCES
+            .iter()
+            .filter_map(|stop| bytes.windows(stop.len()).position(|window| window == *stop))
+            .min()
+    }
+
+    fn push_piece(
+        &mut self,
+        response: &GgufResponse,
+        output: &mut Vec<u8>,
+        piece: Vec<u8>,
+    ) -> GgufEmitResult {
+        if self.stopped {
+            return GgufEmitResult::Stopped;
+        }
+
+        self.pending.extend_from_slice(&piece);
+        if let Some(stop_at) = Self::find_stop(&self.pending) {
+            let emit = self.pending[..stop_at].to_vec();
+            self.pending.clear();
+            self.stopped = true;
+            return if response.emit_bytes(output, emit) {
+                GgufEmitResult::Stopped
+            } else {
+                GgufEmitResult::Disconnected
+            };
+        }
+
+        let keep = Self::max_stop_len().saturating_sub(1);
+        if self.pending.len() <= keep {
+            return GgufEmitResult::Continue;
+        }
+
+        let emit_len = self.pending.len() - keep;
+        let emit = self.pending.drain(..emit_len).collect::<Vec<_>>();
+        if response.emit_bytes(output, emit) {
+            GgufEmitResult::Continue
+        } else {
+            GgufEmitResult::Disconnected
+        }
+    }
+
+    fn flush(&mut self, response: &GgufResponse, output: &mut Vec<u8>) -> bool {
+        if self.stopped || self.pending.is_empty() {
+            self.pending.clear();
+            return true;
+        }
+        let emit = std::mem::take(&mut self.pending);
+        response.emit_bytes(output, emit)
     }
 }
 
@@ -332,14 +647,151 @@ struct ActiveSeq {
     seq_id: i32,
     /// Next KV-cache position to write.
     pos: i32,
+    prompt_tokens: usize,
     n_generated: i32,
     max_tokens: i32,
     min_tokens: i32,
+    suppress_eos_sampler: bool,
     /// Token to feed into the next decode step.
     last_token: LlamaToken,
     output: Vec<u8>,
+    stop_filter: GgufStopFilter,
     response: GgufResponse,
     error: Option<EngineError>,
+}
+
+#[cfg(feature = "gguf")]
+struct GgufBackendSamplers {
+    greedy: Vec<LlamaSampler>,
+    no_eos: Vec<LlamaSampler>,
+    mode_by_seq_id: Vec<Option<bool>>,
+    sample: LlamaSampler,
+}
+
+#[cfg(feature = "gguf")]
+impl GgufBackendSamplers {
+    fn new(model: &LlamaModel, max_concurrent: usize, eos_token: LlamaToken) -> Self {
+        let n_vocab = model.n_vocab();
+        let eos_bias = [LlamaLogitBias::new(eos_token, f32::NEG_INFINITY)];
+        let greedy = (0..max_concurrent)
+            .map(|_| LlamaSampler::chain_simple([LlamaSampler::greedy()]))
+            .collect();
+        let no_eos = (0..max_concurrent)
+            .map(|_| {
+                LlamaSampler::chain_simple([
+                    LlamaSampler::logit_bias(n_vocab, &eos_bias),
+                    LlamaSampler::greedy(),
+                ])
+            })
+            .collect();
+
+        Self {
+            greedy,
+            no_eos,
+            mode_by_seq_id: vec![None; max_concurrent],
+            sample: LlamaSampler::greedy(),
+        }
+    }
+
+    fn set_for_sequence(
+        &mut self,
+        ctx: &mut llama_cpp_2::context::LlamaContext,
+        seq_id: i32,
+        suppress_eos: bool,
+    ) -> bool {
+        let Some(slot) = usize::try_from(seq_id).ok() else {
+            return false;
+        };
+        if self
+            .mode_by_seq_id
+            .get(slot)
+            .copied()
+            .flatten()
+            .is_some_and(|mode| mode == suppress_eos)
+        {
+            return true;
+        }
+        let sampler = if suppress_eos {
+            self.no_eos.get_mut(slot)
+        } else {
+            self.greedy.get_mut(slot)
+        };
+        let Some(sampler) = sampler else {
+            return false;
+        };
+        if unsafe { ctx.set_sampler(seq_id, Some(sampler)) } {
+            if let Some(mode) = self.mode_by_seq_id.get_mut(slot) {
+                *mode = Some(suppress_eos);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    fn sample_token(
+        &mut self,
+        ctx: &llama_cpp_2::context::LlamaContext,
+        batch_pos: i32,
+    ) -> LlamaToken {
+        let _timing = GgufTimingGuard::new(&GGUF_TIMING_SAMPLE_CALLS, &GGUF_TIMING_SAMPLE_US);
+        ctx.sampled_token_ith(batch_pos)
+            .unwrap_or_else(|| self.sample.sample(ctx, batch_pos))
+    }
+}
+
+#[cfg(feature = "gguf")]
+fn record_gguf_token_metrics(
+    metrics: &Arc<Mutex<EngineMetrics>>,
+    prompt_tokens: usize,
+    generated_tokens: usize,
+) {
+    if let Ok(mut snapshot) = metrics.lock() {
+        snapshot.prompt_tokens_total = snapshot
+            .prompt_tokens_total
+            .saturating_add(prompt_tokens as u64);
+        snapshot.generated_tokens_total = snapshot
+            .generated_tokens_total
+            .saturating_add(generated_tokens as u64);
+        snapshot.refresh_timestamp();
+    }
+}
+
+#[cfg(feature = "gguf-cuda-shared-kv")]
+fn record_gguf_decode_work_metrics(
+    metrics: &Arc<Mutex<EngineMetrics>>,
+    steps: u64,
+    tokens_evaluated: u64,
+) {
+    if steps == 0 && tokens_evaluated == 0 {
+        return;
+    }
+    if let Ok(mut snapshot) = metrics.lock() {
+        snapshot.decode_steps_total = snapshot.decode_steps_total.saturating_add(steps);
+        snapshot.decode_tokens_evaluated_total = snapshot
+            .decode_tokens_evaluated_total
+            .saturating_add(tokens_evaluated);
+        snapshot.refresh_timestamp();
+    }
+}
+
+#[cfg(feature = "gguf-cuda-shared-kv")]
+fn record_gguf_partial_reuse_metrics(
+    metrics: &Arc<Mutex<EngineMetrics>>,
+    hits: u64,
+    tokens_saved: u64,
+) {
+    if hits == 0 && tokens_saved == 0 {
+        return;
+    }
+    if let Ok(mut snapshot) = metrics.lock() {
+        snapshot.kv_partial_reuse_hits_total =
+            snapshot.kv_partial_reuse_hits_total.saturating_add(hits);
+        snapshot.kv_partial_reuse_tokens_saved_total = snapshot
+            .kv_partial_reuse_tokens_saved_total
+            .saturating_add(tokens_saved);
+        snapshot.refresh_timestamp();
+    }
 }
 
 /// KV block data downloaded to CPU when the scheduler went idle.
@@ -348,13 +800,13 @@ struct ActiveSeq {
 /// restores the data back to freshly allocated GPU blocks.
 #[cfg(feature = "gguf-cuda-shared-kv")]
 struct CpuEvictedState {
-    store:     CpuBlockStore,
+    store: CpuBlockStore,
     /// Slot indices: `slots[layer * n_logical + pos]`
     /// where `pos` is 0-indexed within the evicted (non-promoted) positions.
-    slots:        Vec<u32>,
+    slots: Vec<u32>,
     /// Number of owned logical positions that were saved.
-    n_logical:    usize,
-    n_layers:     usize,
+    n_logical: usize,
+    n_layers: usize,
     /// Original `n_logical_blocks` at eviction time, used by `needs_restore`
     /// to tell C++ which token count to force-re-reserve.
     n_logical_at_eviction: usize,
@@ -369,6 +821,7 @@ struct GgufSharedKvPool {
 #[cfg(feature = "gguf-cuda-shared-kv")]
 struct GgufSharedKvPoolState {
     handle: GpuPoolHandle,
+    metrics: Arc<Mutex<EngineMetrics>>,
     device_id: usize,
     n_layers: usize,
     max_blocks_per_seq: usize,
@@ -415,7 +868,9 @@ struct GgufSharedKvReservation {
     n_promoted_logical: usize,
     model_fingerprint: u64,
     block_table: Option<CudaSlice<u32>>,
+    block_table_host: Vec<u32>,
     n_logical_blocks: usize,
+    n_tokens_reserved: usize,
 }
 
 #[cfg(feature = "gguf-cuda-shared-kv")]
@@ -426,54 +881,65 @@ unsafe impl Sync for GgufSharedKvPool {}
 #[cfg(feature = "gguf-cuda-shared-kv")]
 impl GgufSharedKvPool {
     fn new(
-        handle:            GpuPoolHandle,
-        device_id:         usize,
-        n_layers:          usize,
-        max_ctx:           usize,
-        prefix_cache:      Option<Arc<Mutex<PrefixBlockCache>>>,
+        handle: GpuPoolHandle,
+        metrics: Arc<Mutex<EngineMetrics>>,
+        device_id: usize,
+        n_layers: usize,
+        max_ctx: usize,
+        prefix_cache: Option<Arc<Mutex<PrefixBlockCache>>>,
         model_fingerprint: u64,
     ) -> Self {
-        let pool_arc           = handle.pool.clone();
-        let block_size         = handle.pool.block_size().max(1);
+        let pool_arc = handle.pool.clone();
+        let block_size = handle.pool.block_size().max(1);
         let max_blocks_per_seq = max_ctx.div_ceil(block_size).max(1);
         let has_prefix = prefix_cache.is_some();
         let evict_when_idle = std::env::var("KAPSL_GGUF_EVICT_ON_IDLE")
-            .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"))
+            .map(|v| {
+                !matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "0" | "false" | "no" | "off"
+                )
+            })
             .unwrap_or(false);
 
         let mut state = Box::new(GgufSharedKvPoolState {
             handle,
+            metrics,
             device_id,
             n_layers,
             max_blocks_per_seq,
             prefix_cache,
             model_fingerprint,
-            inner:           Mutex::new(GgufSharedKvReservation::default()),
-            evicted:         Mutex::new(None),
+            inner: Mutex::new(GgufSharedKvReservation::default()),
+            evicted: Mutex::new(None),
             evict_when_idle,
         });
         let state_ptr = (&mut *state) as *mut GgufSharedKvPoolState;
         let pool = &state.handle.pool;
         let desc = Box::new(llama_kapsl_kv_pool_desc {
-            user_data:                state_ptr.cast(),
-            device_id:                device_id as u32,
-            block_size:               pool.block_size() as u32,
-            num_blocks:               pool.total_blocks() as u32,
-            num_kv_heads:             pool.num_kv_heads() as u32,
-            head_dim:                 pool.head_dim() as u32,
-            dtype:                    LLAMA_KAPSL_KV_DTYPE_F16,
-            device_base:              pool.device_base_ptr(),
-            block_table_device:       std::ptr::null_mut(),
+            user_data: state_ptr.cast(),
+            device_id: device_id as u32,
+            block_size: pool.block_size() as u32,
+            num_blocks: pool.total_blocks() as u32,
+            num_kv_heads: pool.num_kv_heads() as u32,
+            head_dim: pool.head_dim() as u32,
+            dtype: LLAMA_KAPSL_KV_DTYPE_F16,
+            device_base: pool.device_base_ptr(),
+            block_table_device: std::ptr::null_mut(),
             block_table_layer_stride: max_blocks_per_seq as u32,
-            n_layers:                 n_layers as u32,
-            max_blocks_per_seq:       max_blocks_per_seq as u32,
+            n_layers: n_layers as u32,
+            max_blocks_per_seq: max_blocks_per_seq as u32,
             model_fingerprint,
-            reserve:                  Some(gguf_kapsl_kv_reserve),
-            release:                  Some(gguf_kapsl_kv_release),
-            touch:                    Some(gguf_kapsl_kv_touch),
-            reserve_prefix:  if has_prefix { Some(gguf_kapsl_kv_reserve_prefix) } else { None },
-            promote_prefix:           None, // handled via promote_if_pending() from Rust
-            needs_restore:            Some(gguf_kapsl_kv_needs_restore),
+            reserve: Some(gguf_kapsl_kv_reserve),
+            release: Some(gguf_kapsl_kv_release),
+            touch: Some(gguf_kapsl_kv_touch),
+            reserve_prefix: if has_prefix {
+                Some(gguf_kapsl_kv_reserve_prefix)
+            } else {
+                None
+            },
+            promote_prefix: None, // handled via promote_if_pending() from Rust
+            needs_restore: Some(gguf_kapsl_kv_needs_restore),
         });
         let kv_pool = Self { state, desc };
         gguf_global_kv_scheduler()
@@ -491,22 +957,31 @@ impl GgufSharedKvPool {
     /// to promote.
     fn promote_if_pending(&mut self) {
         let state = &mut *self.state;
-        let Some(cache) = &state.prefix_cache else { return };
+        let Some(cache) = &state.prefix_cache else {
+            return;
+        };
         let mut inner = state.inner.lock().unwrap();
         let n_new = inner.n_new_logical;
-        if n_new == 0 || inner.n_promoted_logical >= n_new { return; }
+        if n_new == 0 || inner.n_promoted_logical >= n_new {
+            return;
+        }
 
-        let start     = inner.n_promoted_logical;
-        let fp        = inner.model_fingerprint;
-        let pool      = state.handle.pool.clone();
-        let n_layers  = state.n_layers;
+        let start = inner.n_promoted_logical;
+        let fp = inner.model_fingerprint;
+        let pool = state.handle.pool.clone();
+        let n_layers = state.n_layers;
         let device_id = self.desc.device_id as usize;
-        let mut c = match cache.lock() { Ok(c) => c, Err(_) => return };
+        let mut c = match cache.lock() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
 
         let mut promoted = start;
         for pos in start..n_new {
             let hash_idx = inner.n_prefix_hits + pos;
-            let Some(&hash) = inner.all_hashes.get(hash_idx) else { break };
+            let Some(&hash) = inner.all_hashes.get(hash_idx) else {
+                break;
+            };
 
             // Build the block_ids Vec for this logical position (one block per layer).
             let block_ids: Vec<u32> = (0..n_layers)
@@ -536,35 +1011,43 @@ impl GgufSharedKvPool {
         let state = &*self.state;
 
         // Skip if already evicted.
-        if state.evicted.lock().unwrap().is_some() { return false; }
+        if state.evicted.lock().unwrap().is_some() {
+            return false;
+        }
 
-        let mut inner      = state.inner.lock().unwrap();
-        let n_new          = inner.n_new_logical;
-        let n_promoted     = inner.n_promoted_logical;
-        let n_owned        = n_new.saturating_sub(n_promoted);
+        let mut inner = state.inner.lock().unwrap();
+        let n_new = inner.n_new_logical;
+        let n_promoted = inner.n_promoted_logical;
+        let n_owned = n_new.saturating_sub(n_promoted);
         let n_logical_orig = inner.n_logical_blocks;
 
-        if n_owned == 0 { return false; }
+        if n_owned == 0 {
+            return false;
+        }
 
-        let n_layers   = state.n_layers;
-        let pool       = &state.handle.pool;
+        let n_layers = state.n_layers;
+        let pool = &state.handle.pool;
 
         // Download each un-promoted owned block to CPU.
-        let n_slots    = n_owned * n_layers;
-        let mut store  = CpuBlockStore::new(
-            n_slots, pool.num_kv_heads(), pool.block_size(), pool.head_dim());
+        let n_slots = n_owned * n_layers;
+        let mut store = CpuBlockStore::new(
+            n_slots,
+            pool.num_kv_heads(),
+            pool.block_size(),
+            pool.head_dim(),
+        );
         let mut slots: Vec<u32> = Vec::with_capacity(n_slots);
 
         for layer in 0..n_layers {
             for pos in n_promoted..n_new {
                 let block_id = match inner.owned_blocks.get(layer * n_new + pos) {
                     Some(&id) => id,
-                    None      => return false,
+                    None => return false,
                 };
                 match pool.download_block(block_id) {
                     Ok(data) => match store.store_block(&data) {
                         Ok(slot) => slots.push(slot),
-                        Err(_)   => return false,
+                        Err(_) => return false,
                     },
                     Err(_) => return false,
                 }
@@ -572,8 +1055,7 @@ impl GgufSharedKvPool {
         }
 
         // Release prefix borrows + free all un-promoted GPU blocks.
-        gguf_release_reservation_inner(
-            &mut inner, &state.prefix_cache, pool, n_layers);
+        gguf_release_reservation_inner(&mut inner, &state.prefix_cache, pool, n_layers);
         drop(inner);
 
         *state.evicted.lock().unwrap() = Some(CpuEvictedState {
@@ -586,7 +1068,8 @@ impl GgufSharedKvPool {
 
         log::info!(
             "[gguf] evicted {} owned positions ({} GPU blocks freed) to CPU",
-            n_owned, n_owned * n_layers
+            n_owned,
+            n_owned * n_layers
         );
         true
     }
@@ -611,7 +1094,7 @@ impl Drop for GgufSharedKvPoolState {
             }
         }
         // Free un-promoted owned blocks.  Promoted blocks are now cache-owned.
-        let n_new    = inner.n_new_logical;
+        let n_new = inner.n_new_logical;
         let n_layers = self.n_layers;
         for layer in 0..n_layers {
             for pos in inner.n_promoted_logical..n_new {
@@ -629,7 +1112,9 @@ unsafe extern "C" fn gguf_kapsl_kv_needs_restore(
     user_data: *mut std::ffi::c_void,
     _session_id: u64,
 ) -> u32 {
-    if user_data.is_null() { return 0; }
+    if user_data.is_null() {
+        return 0;
+    }
     let state = &*(user_data as *mut GgufSharedKvPoolState);
     match &*state.evicted.lock().unwrap() {
         Some(e) => {
@@ -649,34 +1134,42 @@ unsafe extern "C" fn gguf_kapsl_kv_needs_restore(
 /// cannot be obtained even after eviction.
 #[cfg(feature = "gguf-cuda-shared-kv")]
 fn alloc_blocks_with_cache_eviction(
-    state:    &GgufSharedKvPoolState,
+    state: &GgufSharedKvPoolState,
     n_needed: usize,
-    out:      &mut Vec<u32>,
+    out: &mut Vec<u32>,
 ) -> bool {
     // First pass: allocate as many blocks as are immediately available.
     while out.len() < n_needed {
         match state.handle.pool.alloc_block() {
-            Ok(b)  => out.push(b),
+            Ok(b) => out.push(b),
             Err(_) => break,
         }
     }
-    if out.len() == n_needed { return true; }
+    if out.len() == n_needed {
+        return true;
+    }
 
     // Evict LRU zero-refcount prefix-cache entries to reclaim GPU blocks.
     let still_needed = n_needed - out.len();
     if let Some(cache) = &state.prefix_cache {
         if let Ok(mut c) = cache.lock() {
             let freed = c.evict_lru_for_device(state.device_id, still_needed);
-            for (p, ids) in freed { for id in ids { p.free_block(id); } }
+            for (p, ids) in freed {
+                for id in ids {
+                    p.free_block(id);
+                }
+            }
         }
     }
 
     // Second pass after eviction.
     while out.len() < n_needed {
         match state.handle.pool.alloc_block() {
-            Ok(b)  => out.push(b),
+            Ok(b) => out.push(b),
             Err(_) => {
-                for b in out.drain(..) { state.handle.pool.free_block(b); }
+                for b in out.drain(..) {
+                    state.handle.pool.free_block(b);
+                }
                 return false;
             }
         }
@@ -696,21 +1189,21 @@ fn alloc_blocks_with_cache_eviction(
 /// On allocation failure, restores the evicted state so a future call can retry.
 #[cfg(feature = "gguf-cuda-shared-kv")]
 fn gguf_restore_from_cpu(
-    state:                   &GgufSharedKvPoolState,
-    evicted:                 CpuEvictedState,
-    logical_blocks:          usize,
-    n_prefix_hits:           usize,
-    prefix_hit_block_ids:    &[Vec<u32>], // per-hit, per-layer block ids; len == n_prefix_hits
-    block_table_device_out:  *mut *mut u32,
-    n_logical_out:           *mut u32,
-    n_prefix_hits_out:       *mut u32,    // may be null for non-prefix path
+    state: &GgufSharedKvPoolState,
+    evicted: CpuEvictedState,
+    logical_blocks: usize,
+    n_prefix_hits: usize,
+    prefix_hit_block_ids: &[Vec<u32>], // per-hit, per-layer block ids; len == n_prefix_hits
+    block_table_device_out: *mut *mut u32,
+    n_logical_out: *mut u32,
+    n_prefix_hits_out: *mut u32, // may be null for non-prefix path
 ) -> bool {
-    let n_layers    = state.n_layers;
-    let pool        = &state.handle.pool;
-    let n_new       = logical_blocks.saturating_sub(n_prefix_hits);
-    let n_restore   = n_new.min(evicted.n_logical);
-    let n_fresh     = n_new.saturating_sub(n_restore);
-    let total_phys  = n_new * n_layers;
+    let n_layers = state.n_layers;
+    let pool = &state.handle.pool;
+    let n_new = logical_blocks.saturating_sub(n_prefix_hits);
+    let n_restore = n_new.min(evicted.n_logical);
+    let n_fresh = n_new.saturating_sub(n_restore);
+    let total_phys = n_new * n_layers;
 
     let mut new_blocks: Vec<u32> = Vec::with_capacity(total_phys);
     if !alloc_blocks_with_cache_eviction(state, total_phys, &mut new_blocks) {
@@ -725,8 +1218,13 @@ fn gguf_restore_from_cpu(
             let cpu_slot = evicted.slots[layer * evicted.n_logical + pos];
             if let Ok(data) = evicted.store.load_block(cpu_slot) {
                 let half = data.len() / 2;
-                if pool.upload_block(block_id, &data[..half], &data[half..]).is_err() {
-                    for b in new_blocks { pool.free_block(b); }
+                if pool
+                    .upload_block(block_id, &data[..half], &data[half..])
+                    .is_err()
+                {
+                    for b in new_blocks {
+                        pool.free_block(b);
+                    }
                     *state.evicted.lock().unwrap() = Some(evicted);
                     return false;
                 }
@@ -740,7 +1238,9 @@ fn gguf_restore_from_cpu(
     let mut host_table = vec![0u32; n_layers * state.max_blocks_per_seq];
     for layer in 0..n_layers {
         for (hit_pos, block_ids) in prefix_hit_block_ids.iter().enumerate() {
-            let blk = block_ids.get(layer).copied()
+            let blk = block_ids
+                .get(layer)
+                .copied()
                 .unwrap_or_else(|| block_ids.first().copied().unwrap_or(0));
             host_table[layer * state.max_blocks_per_seq + hit_pos] = blk;
         }
@@ -753,7 +1253,9 @@ fn gguf_restore_from_cpu(
     let table = match pool.device().htod_sync_copy(&host_table) {
         Ok(t) => t,
         Err(_) => {
-            for b in new_blocks { pool.free_block(b); }
+            for b in new_blocks {
+                pool.free_block(b);
+            }
             *state.evicted.lock().unwrap() = Some(evicted);
             return false;
         }
@@ -762,25 +1264,28 @@ fn gguf_restore_from_cpu(
 
     let mut inner = state.inner.lock().unwrap();
     gguf_release_reservation_inner(&mut inner, &state.prefix_cache, pool, n_layers);
-    inner.owned_blocks       = new_blocks;
-    inner.n_new_logical      = n_new;
+    inner.owned_blocks = new_blocks;
+    inner.n_new_logical = n_new;
     inner.n_promoted_logical = 0;
-    inner.all_hashes         = Vec::new();
-    inner.n_prefix_hits      = n_prefix_hits;
-    inner.model_fingerprint  = state.model_fingerprint;
-    inner.block_table        = Some(table);
-    inner.n_logical_blocks   = logical_blocks;
+    inner.all_hashes = Vec::new();
+    inner.n_prefix_hits = n_prefix_hits;
+    inner.model_fingerprint = state.model_fingerprint;
+    inner.block_table = Some(table);
+    inner.block_table_host = host_table;
+    inner.n_logical_blocks = logical_blocks;
+    inner.n_tokens_reserved = logical_blocks.saturating_mul(state.handle.pool.block_size().max(1));
 
     unsafe {
         *block_table_device_out = table_ptr;
-        *n_logical_out          = logical_blocks as u32;
+        *n_logical_out = logical_blocks as u32;
         if !n_prefix_hits_out.is_null() {
-            *n_prefix_hits_out  = n_prefix_hits as u32;
+            *n_prefix_hits_out = n_prefix_hits as u32;
         }
     }
     log::info!(
         "[gguf] restored {} positions from CPU ({} fresh) to GPU after eviction",
-        n_restore, n_fresh
+        n_restore,
+        n_fresh
     );
     true
 }
@@ -799,23 +1304,32 @@ unsafe extern "C" fn gguf_kapsl_kv_reserve(
         return false;
     }
     let state = &*(user_data as *mut GgufSharedKvPoolState);
-    let block_size     = state.handle.pool.block_size().max(1);
+    let block_size = state.handle.pool.block_size().max(1);
     let logical_blocks = (tokens_needed as usize).div_ceil(block_size).max(1);
-    if logical_blocks > state.max_blocks_per_seq { return false; }
+    if logical_blocks > state.max_blocks_per_seq {
+        return false;
+    }
 
     // ── Restore path: re-upload CPU-evicted blocks ────────────────────────
     let evicted_opt = state.evicted.lock().unwrap().take();
     if let Some(evicted) = evicted_opt {
         return gguf_restore_from_cpu(
-            state, evicted, logical_blocks,
-            0, &[],
-            block_table_device_out, n_blocks_out, std::ptr::null_mut(),
+            state,
+            evicted,
+            logical_blocks,
+            0,
+            &[],
+            block_table_device_out,
+            n_blocks_out,
+            std::ptr::null_mut(),
         );
     }
 
     // ── Fresh allocation ──────────────────────────────────────────────────
     let needed_physical = logical_blocks.saturating_mul(state.n_layers);
-    if needed_physical > state.handle.cap() { return false; }
+    if needed_physical > state.handle.cap() {
+        return false;
+    }
 
     let mut new_blocks = Vec::with_capacity(needed_physical);
     if !alloc_blocks_with_cache_eviction(state, needed_physical, &mut new_blocks) {
@@ -831,23 +1345,35 @@ unsafe extern "C" fn gguf_kapsl_kv_reserve(
     }
     let table = match state.handle.pool.device().htod_sync_copy(&host_table) {
         Ok(t) => t,
-        Err(_) => { for b in new_blocks { state.handle.pool.free_block(b); } return false; }
+        Err(_) => {
+            for b in new_blocks {
+                state.handle.pool.free_block(b);
+            }
+            return false;
+        }
     };
     let table_ptr = *table.device_ptr() as *mut u32;
 
     let mut inner = state.inner.lock().unwrap();
-    gguf_release_reservation_inner(&mut inner, &state.prefix_cache, &state.handle.pool, state.n_layers);
-    inner.owned_blocks       = new_blocks;
-    inner.n_new_logical      = logical_blocks;
+    gguf_release_reservation_inner(
+        &mut inner,
+        &state.prefix_cache,
+        &state.handle.pool,
+        state.n_layers,
+    );
+    inner.owned_blocks = new_blocks;
+    inner.n_new_logical = logical_blocks;
     inner.n_promoted_logical = 0;
-    inner.all_hashes         = Vec::new();
-    inner.n_prefix_hits      = 0;
-    inner.model_fingerprint  = state.model_fingerprint;
-    inner.block_table        = Some(table);
-    inner.n_logical_blocks   = logical_blocks;
+    inner.all_hashes = Vec::new();
+    inner.n_prefix_hits = 0;
+    inner.model_fingerprint = state.model_fingerprint;
+    inner.block_table = Some(table);
+    inner.block_table_host = host_table;
+    inner.n_logical_blocks = logical_blocks;
+    inner.n_tokens_reserved = tokens_needed as usize;
 
     *block_table_device_out = table_ptr;
-    *n_blocks_out           = logical_blocks as u32;
+    *n_blocks_out = logical_blocks as u32;
     true
 }
 
@@ -863,6 +1389,7 @@ unsafe extern "C" fn gguf_kapsl_kv_reserve_prefix(
     n_logical_blocks_out: *mut u32,
     n_prefix_hits_out: *mut u32,
 ) -> bool {
+    let _timing = GgufTimingGuard::new(&GGUF_TIMING_KV_RESERVE_CALLS, &GGUF_TIMING_KV_RESERVE_US);
     if user_data.is_null()
         || tokens.is_null()
         || block_table_device_out.is_null()
@@ -875,60 +1402,209 @@ unsafe extern "C" fn gguf_kapsl_kv_reserve_prefix(
     let Some(cache) = &state.prefix_cache else {
         // Prefix cache disabled — fall back to plain reserve.
         return gguf_kapsl_kv_reserve(
-            user_data, _session_id, n_tokens,
-            block_table_device_out, n_logical_blocks_out,
+            user_data,
+            _session_id,
+            n_tokens,
+            block_table_device_out,
+            n_logical_blocks_out,
         );
     };
 
     let token_slice = std::slice::from_raw_parts(tokens, n_tokens as usize);
-    let block_size  = state.handle.pool.block_size().max(1);
-    let fp          = state.model_fingerprint;
+    let block_size = state.handle.pool.block_size().max(1);
+    let fp = state.model_fingerprint;
 
-    // 1. Compute chained hashes for all complete prefix blocks.
-    let all_hashes = PrefixBlockCache::compute_prefix_hashes_i32(fp, token_slice, block_size);
-    let n_logical  = (n_tokens as usize).div_ceil(block_size).max(1);
-    if n_logical > state.max_blocks_per_seq { return false; }
+    let n_logical = (n_tokens as usize).div_ceil(block_size).max(1);
+    if n_logical > state.max_blocks_per_seq {
+        return false;
+    }
+    let n_tokens_usize = n_tokens as usize;
+    let n_complete_blocks = n_tokens_usize / block_size;
+    let mut computed_hashes: Option<Vec<u64>> = None;
 
-    // 2. Lookup prefix cache — collect a contiguous run of hits.
+    // 1. Same-session decode usually grows one token at a time. If the current
+    // reservation already covers the requested logical block count, keep its
+    // block table. Only refresh hashes when another full block has completed;
+    // otherwise avoid re-hashing the entire growing token prefix on every token.
+    if state.evicted.lock().unwrap().is_none() {
+        let mut inner = state.inner.lock().unwrap();
+        let had_reservation = inner.block_table.is_some() && inner.n_logical_blocks > 0;
+        if inner.n_logical_blocks >= n_logical {
+            let previous_tokens = inner.n_tokens_reserved;
+            let delta_tokens = n_tokens_usize.saturating_sub(previous_tokens).max(1);
+            let complete_prefix_tokens = inner.n_prefix_hits.saturating_mul(block_size);
+            let would_evaluate = n_tokens_usize.saturating_sub(complete_prefix_tokens);
+            let saved_tokens = would_evaluate.saturating_sub(delta_tokens);
+            if inner.model_fingerprint != fp || inner.all_hashes.len() < n_complete_blocks {
+                let all_hashes = computed_hashes.get_or_insert_with(|| {
+                    PrefixBlockCache::compute_prefix_hashes_i32(fp, token_slice, block_size)
+                });
+                inner.all_hashes = all_hashes.clone();
+            }
+            inner.model_fingerprint = fp;
+            inner.n_tokens_reserved = inner.n_tokens_reserved.max(n_tokens_usize);
+            let table_ptr = match inner.block_table.as_ref() {
+                Some(table) => *table.device_ptr() as *mut u32,
+                None => {
+                    return false;
+                }
+            };
+            unsafe {
+                *block_table_device_out = table_ptr;
+                *n_logical_blocks_out = inner.n_logical_blocks as u32;
+                *n_prefix_hits_out = inner.n_prefix_hits as u32;
+            }
+            record_gguf_decode_work_metrics(&state.metrics, 1, delta_tokens as u64);
+            record_gguf_partial_reuse_metrics(&state.metrics, 1, saved_tokens as u64);
+            GGUF_TIMING_KV_FAST_PATH_CALLS.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+        if had_reservation
+            && n_logical > inner.n_logical_blocks
+            && inner.block_table_host.len() == state.n_layers * state.max_blocks_per_seq
+        {
+            let previous_tokens = inner.n_tokens_reserved;
+            let delta_tokens = n_tokens_usize.saturating_sub(previous_tokens).max(1);
+            let complete_prefix_tokens = inner.n_prefix_hits.saturating_mul(block_size);
+            let would_evaluate = n_tokens_usize.saturating_sub(complete_prefix_tokens);
+            let saved_tokens = would_evaluate.saturating_sub(delta_tokens);
+            let old_logical = inner.n_logical_blocks;
+            let old_n_new = inner.n_new_logical;
+            let additional_logical = n_logical.saturating_sub(old_logical);
+            let needed_phys = additional_logical.saturating_mul(state.n_layers);
+
+            let mut added_blocks = Vec::with_capacity(needed_phys);
+            if !alloc_blocks_with_cache_eviction(state, needed_phys, &mut added_blocks) {
+                return false;
+            }
+
+            let new_n_new = old_n_new.saturating_add(additional_logical);
+            let mut owned_blocks = vec![0u32; new_n_new.saturating_mul(state.n_layers)];
+            for layer in 0..state.n_layers {
+                for pos in 0..old_n_new {
+                    owned_blocks[layer * new_n_new + pos] =
+                        inner.owned_blocks[layer * old_n_new + pos];
+                }
+                for pos in 0..additional_logical {
+                    owned_blocks[layer * new_n_new + old_n_new + pos] =
+                        added_blocks[layer * additional_logical + pos];
+                }
+            }
+
+            let mut host_table = inner.block_table_host.clone();
+            for layer in 0..state.n_layers {
+                for pos in 0..additional_logical {
+                    host_table[layer * state.max_blocks_per_seq + old_logical + pos] =
+                        added_blocks[layer * additional_logical + pos];
+                }
+            }
+
+            let table = match state.handle.pool.device().htod_sync_copy(&host_table) {
+                Ok(table) => table,
+                Err(_) => {
+                    for block in added_blocks {
+                        state.handle.pool.free_block(block);
+                    }
+                    return false;
+                }
+            };
+            let table_ptr = *table.device_ptr() as *mut u32;
+
+            inner.owned_blocks = owned_blocks;
+            inner.n_new_logical = new_n_new;
+            if inner.model_fingerprint != fp || inner.all_hashes.len() < n_complete_blocks {
+                let all_hashes = computed_hashes.get_or_insert_with(|| {
+                    PrefixBlockCache::compute_prefix_hashes_i32(fp, token_slice, block_size)
+                });
+                inner.all_hashes = all_hashes.clone();
+            }
+            inner.model_fingerprint = fp;
+            inner.block_table = Some(table);
+            inner.block_table_host = host_table;
+            inner.n_logical_blocks = n_logical;
+            inner.n_tokens_reserved = n_tokens_usize;
+
+            unsafe {
+                *block_table_device_out = table_ptr;
+                *n_logical_blocks_out = inner.n_logical_blocks as u32;
+                *n_prefix_hits_out = inner.n_prefix_hits as u32;
+            }
+            record_gguf_decode_work_metrics(&state.metrics, 1, delta_tokens as u64);
+            record_gguf_partial_reuse_metrics(&state.metrics, 1, saved_tokens as u64);
+            GGUF_TIMING_KV_EXTEND_CALLS.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+    }
+
+    // 2. Compute chained hashes for all complete prefix blocks only after the
+    // same-session fast path misses.
+    let all_hashes = computed_hashes.unwrap_or_else(|| {
+        PrefixBlockCache::compute_prefix_hashes_i32(fp, token_slice, block_size)
+    });
+
+    // 3. Lookup prefix cache — collect a contiguous run of hits.
     let hits = {
-        let mut c = match cache.lock() { Ok(c) => c, Err(_) => return false };
+        let mut c = match cache.lock() {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
         c.lookup(fp, &all_hashes)
     };
+    GGUF_TIMING_KV_LOOKUP_CALLS.fetch_add(1, Ordering::Relaxed);
     let n_hits = hits.len();
+    let previous_tokens = {
+        let inner = state.inner.lock().unwrap();
+        inner.n_tokens_reserved
+    };
+    if previous_tokens > 0 && n_tokens_usize > previous_tokens {
+        let complete_prefix_tokens = n_hits.saturating_mul(block_size);
+        let evaluated_tokens = n_tokens_usize.saturating_sub(complete_prefix_tokens).max(1);
+        record_gguf_decode_work_metrics(&state.metrics, 1, evaluated_tokens as u64);
+    }
 
-    // 3. Check for CPU-evicted state: use restore path if available.
+    // 4. Check for CPU-evicted state: use restore path if available.
     let evicted_opt = state.evicted.lock().unwrap().take();
     if let Some(evicted) = evicted_opt {
         // Build the per-hit block-id lists for the restore helper.
-        let hit_block_ids: Vec<Vec<u32>> = hits.iter()
-            .map(|h| h.block_ids.clone())
-            .collect();
+        let hit_block_ids: Vec<Vec<u32>> = hits.iter().map(|h| h.block_ids.clone()).collect();
         return gguf_restore_from_cpu(
-            state, evicted, n_logical,
-            n_hits, &hit_block_ids,
-            block_table_device_out, n_logical_blocks_out, n_prefix_hits_out,
+            state,
+            evicted,
+            n_logical,
+            n_hits,
+            &hit_block_ids,
+            block_table_device_out,
+            n_logical_blocks_out,
+            n_prefix_hits_out,
         );
     }
 
-    // 4. Allocate fresh blocks for positions that missed the cache.
-    let n_new       = n_logical.saturating_sub(n_hits);
+    // 5. Allocate fresh blocks for positions that missed the cache.
+    let n_new = n_logical.saturating_sub(n_hits);
     let needed_phys = n_new.saturating_mul(state.n_layers);
-    if needed_phys > state.handle.cap() { return false; }
+    if needed_phys > state.handle.cap() {
+        return false;
+    }
 
     let mut new_blocks: Vec<u32> = Vec::with_capacity(needed_phys);
     if !alloc_blocks_with_cache_eviction(state, needed_phys, &mut new_blocks) {
         // Release prefix borrows before failing.
         if let Ok(mut c) = cache.lock() {
-            for h in &hits { c.release(fp, h.block_hash); }
+            for h in &hits {
+                c.release(fp, h.block_hash);
+            }
         }
         return false;
     }
 
-    // 5. Build the block table: cached blocks first, then new blocks.
+    // 6. Build the block table: cached blocks first, then new blocks.
     let mut host_table = vec![0u32; state.n_layers * state.max_blocks_per_seq];
     for layer in 0..state.n_layers {
         for (hit_pos, hit) in hits.iter().enumerate() {
-            let blk = hit.block_ids.get(layer).copied()
+            let blk = hit
+                .block_ids
+                .get(layer)
+                .copied()
                 .unwrap_or_else(|| hit.block_ids.first().copied().unwrap_or(0));
             host_table[layer * state.max_blocks_per_seq + hit_pos] = blk;
         }
@@ -941,9 +1617,13 @@ unsafe extern "C" fn gguf_kapsl_kv_reserve_prefix(
     let table = match state.handle.pool.device().htod_sync_copy(&host_table) {
         Ok(t) => t,
         Err(_) => {
-            for b in new_blocks { state.handle.pool.free_block(b); }
+            for b in new_blocks {
+                state.handle.pool.free_block(b);
+            }
             if let Ok(mut c) = cache.lock() {
-                for h in &hits { c.release(fp, h.block_hash); }
+                for h in &hits {
+                    c.release(fp, h.block_hash);
+                }
             }
             return false;
         }
@@ -951,19 +1631,26 @@ unsafe extern "C" fn gguf_kapsl_kv_reserve_prefix(
     let table_ptr = *table.device_ptr() as *mut u32;
 
     let mut inner = state.inner.lock().unwrap();
-    gguf_release_reservation_inner(&mut inner, &state.prefix_cache, &state.handle.pool, state.n_layers);
-    inner.owned_blocks       = new_blocks;
-    inner.n_new_logical      = n_new;
+    gguf_release_reservation_inner(
+        &mut inner,
+        &state.prefix_cache,
+        &state.handle.pool,
+        state.n_layers,
+    );
+    inner.owned_blocks = new_blocks;
+    inner.n_new_logical = n_new;
     inner.n_promoted_logical = 0;
-    inner.all_hashes         = all_hashes;
-    inner.n_prefix_hits      = n_hits;
-    inner.model_fingerprint  = fp;
-    inner.block_table        = Some(table);
-    inner.n_logical_blocks   = n_logical;
+    inner.all_hashes = all_hashes;
+    inner.n_prefix_hits = n_hits;
+    inner.model_fingerprint = fp;
+    inner.block_table = Some(table);
+    inner.block_table_host = host_table;
+    inner.n_logical_blocks = n_logical;
+    inner.n_tokens_reserved = n_tokens_usize;
 
     *block_table_device_out = table_ptr;
-    *n_logical_blocks_out   = n_logical as u32;
-    *n_prefix_hits_out      = n_hits as u32;
+    *n_logical_blocks_out = n_logical as u32;
+    *n_prefix_hits_out = n_hits as u32;
     true
 }
 
@@ -972,10 +1659,10 @@ unsafe extern "C" fn gguf_kapsl_kv_reserve_prefix(
 /// Inline release logic, callable with explicit pool access.
 #[cfg(feature = "gguf-cuda-shared-kv")]
 fn gguf_release_reservation_inner(
-    inner:        &mut GgufSharedKvReservation,
+    inner: &mut GgufSharedKvReservation,
     prefix_cache: &Option<Arc<Mutex<PrefixBlockCache>>>,
-    pool:         &Arc<GpuBlockPool>,
-    n_layers:     usize,
+    pool: &Arc<GpuBlockPool>,
+    n_layers: usize,
 ) {
     // Release prefix cache borrows.
     if let Some(cache) = prefix_cache {
@@ -1002,10 +1689,17 @@ fn gguf_release_reservation_inner(
 
 #[cfg(feature = "gguf-cuda-shared-kv")]
 unsafe extern "C" fn gguf_kapsl_kv_release(user_data: *mut std::ffi::c_void, _session_id: u64) {
-    if user_data.is_null() { return; }
+    if user_data.is_null() {
+        return;
+    }
     let state = &*(user_data as *mut GgufSharedKvPoolState);
     let mut inner = state.inner.lock().unwrap();
-    gguf_release_reservation_inner(&mut inner, &state.prefix_cache, &state.handle.pool, state.n_layers);
+    gguf_release_reservation_inner(
+        &mut inner,
+        &state.prefix_cache,
+        &state.handle.pool,
+        state.n_layers,
+    );
 }
 
 #[cfg(feature = "gguf-cuda-shared-kv")]
@@ -1107,36 +1801,9 @@ impl Default for GgufBackend {
 
 // ─── Scheduler loop ───────────────────────────────────────────────────────────
 
-/// Sample the next token greedily from the logits row produced for `batch_pos`.
-/// Skipping EOS here is equivalent to the old logit-bias sampler path but avoids
-/// allocating a llama sampler chain for every generated token.
-#[cfg(feature = "gguf")]
-fn sample_token(
-    ctx: &llama_cpp_2::context::LlamaContext,
-    batch_pos: i32,
-    eos_token: LlamaToken,
-    ban_eos: bool,
-) -> LlamaToken {
-    let logits = ctx.get_logits_ith(batch_pos);
-    let mut best_token = 0_i32;
-    let mut best_logit = f32::NEG_INFINITY;
-
-    for (idx, &logit) in logits.iter().enumerate() {
-        let token = idx as i32;
-        if ban_eos && token == eos_token.0 {
-            continue;
-        }
-        if logit > best_logit {
-            best_logit = logit;
-            best_token = token;
-        }
-    }
-
-    LlamaToken::new(best_token)
-}
-
 #[cfg(feature = "gguf")]
 fn token_piece_bytes(model: &LlamaModel, token: LlamaToken) -> Result<Vec<u8>, EngineError> {
+    let _timing = GgufTimingGuard::new(&GGUF_TIMING_PIECE_CALLS, &GGUF_TIMING_PIECE_US);
     match model.token_to_piece_bytes(token, 256, true, None) {
         Ok(piece) => Ok(piece),
         Err(TokenToStringError::InsufficientBufferSpace(size)) if size < 0 => model
@@ -1158,6 +1825,7 @@ fn sequence_needs_kv_after_first(
 
 #[cfg(feature = "gguf")]
 fn finish_or_activate_prefilled_sequence(
+    metrics: &Arc<Mutex<EngineMetrics>>,
     ctx: &mut llama_cpp_2::context::LlamaContext,
     available_ids: &mut Vec<i32>,
     active: &mut Vec<ActiveSeq>,
@@ -1169,12 +1837,15 @@ fn finish_or_activate_prefilled_sequence(
     eos_token: LlamaToken,
     first_tok: LlamaToken,
     first_piece: Option<&[u8]>,
+    suppress_eos_sampler: bool,
 ) {
     let mut output = Vec::with_capacity((max_tokens.max(0) as usize).saturating_mul(4));
+    let mut stop_filter = GgufStopFilter::new();
 
     if max_tokens <= 0 || (first_tok == eos_token && min_tokens <= 0) {
         let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
         available_ids.push(seq_id);
+        record_gguf_token_metrics(metrics, prompt_len.max(0) as usize, 0);
         response.finish(output);
         return;
     }
@@ -1186,25 +1857,44 @@ fn finish_or_activate_prefilled_sequence(
         return;
     };
 
-    if !response.emit_piece(&mut output, piece.to_vec()) {
-        let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
-        available_ids.push(seq_id);
-        return;
+    match stop_filter.push_piece(&response, &mut output, piece.to_vec()) {
+        GgufEmitResult::Continue => {}
+        GgufEmitResult::Stopped => {
+            let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
+            available_ids.push(seq_id);
+            record_gguf_token_metrics(metrics, prompt_len.max(0) as usize, 1);
+            response.finish(output);
+            return;
+        }
+        GgufEmitResult::Disconnected => {
+            let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
+            available_ids.push(seq_id);
+            return;
+        }
     }
 
     if max_tokens <= 1 {
+        if !stop_filter.flush(&response, &mut output) {
+            let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
+            available_ids.push(seq_id);
+            return;
+        }
         let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
         available_ids.push(seq_id);
+        record_gguf_token_metrics(metrics, prompt_len.max(0) as usize, 1);
         response.finish(output);
     } else {
         active.push(ActiveSeq {
             seq_id,
             pos: prompt_len,
+            prompt_tokens: prompt_len.max(0) as usize,
             n_generated: 1,
             max_tokens,
             min_tokens,
+            suppress_eos_sampler,
             last_token: first_tok,
             output,
+            stop_filter,
             response,
             error: None,
         });
@@ -1353,6 +2043,7 @@ fn run_scheduler(
     );
 
     let eos_token = model.token_eos();
+    let mut samplers = GgufBackendSamplers::new(&model, config.max_concurrent, eos_token);
     let batch_cap = n_batch as usize;
     let mut batch = LlamaBatch::new(batch_cap, 1);
 
@@ -1399,6 +2090,12 @@ fn run_scheduler(
                 available_ids.push(seq_id);
                 continue;
             }
+            if !samplers.set_for_sequence(&mut ctx, seq_id, req.min_tokens > 0) {
+                req.response
+                    .send_error(EngineError::backend("failed to install sampler"));
+                available_ids.push(seq_id);
+                continue;
+            }
 
             pending.push_back(PendingPrefill {
                 seq_id,
@@ -1420,8 +2117,8 @@ fn run_scheduler(
                     pool.evict_to_cpu();
                 }
                 // Log cross-device pressure snapshot at debug level.
-                let kv_heads  = pool.state.handle.pool.num_kv_heads();
-                let head_dim  = pool.state.handle.pool.head_dim();
+                let kv_heads = pool.state.handle.pool.num_kv_heads();
+                let head_dim = pool.state.handle.pool.head_dim();
                 let device_id = pool.desc.device_id as usize;
                 let sched = gguf_global_kv_scheduler().lock().unwrap();
                 log::debug!(
@@ -1432,7 +2129,9 @@ fn run_scheduler(
                     sched.device_free_blocks(device_id, kv_heads, head_dim),
                     kv_heads,
                     head_dim,
-                    sched.registered_devices().iter()
+                    sched
+                        .registered_devices()
+                        .iter()
                         .map(|d| d.to_string())
                         .collect::<Vec<_>>()
                         .join(", "),
@@ -1462,6 +2161,8 @@ fn run_scheduler(
 
         // ── 4. Build batch: multiple prefills (if any) + all active decode tokens ───
         // Reserve `active.len()` slots for decode tokens so prefills don't crowd them out.
+        let batch_build_timing =
+            GgufTimingGuard::new(&GGUF_TIMING_BATCH_BUILD_CALLS, &GGUF_TIMING_BATCH_BUILD_US);
         batch.clear();
         let prefill_budget = batch_cap.saturating_sub(active.len());
         let mut completed_prefills: Vec<(PendingPrefill, i32)> = Vec::new();
@@ -1551,6 +2252,7 @@ fn run_scheduler(
                 decode_batch_positions.push(-1); // skipped this step
             }
         }
+        drop(batch_build_timing);
 
         if batch.n_tokens() == 0 {
             update_gguf_metrics(&metrics, config, &waiting, &pending, &active, 0);
@@ -1566,7 +2268,10 @@ fn run_scheduler(
         );
 
         // ── 5. Execute one forward pass for all sequences in the batch ────────
-        if let Err(e) = ctx.decode(&mut batch) {
+        let decode_timing = GgufTimingGuard::new(&GGUF_TIMING_DECODE_CALLS, &GGUF_TIMING_DECODE_US);
+        let decode_result = ctx.decode(&mut batch);
+        drop(decode_timing);
+        if let Err(e) = decode_result {
             log::error!("[gguf] decode error: {e}");
             for seq in active.drain(..) {
                 seq.response
@@ -1598,7 +2303,7 @@ fn run_scheduler(
         for (mut pref, last_pos) in completed_prefills.drain(..) {
             // EOS is skipped during greedy sampling when min_tokens > 0, so first_tok is
             // guaranteed to be a real content token whenever min_tokens is nonzero.
-            let first_tok = sample_token(&ctx, last_pos, eos_token, pref.min_tokens > 0);
+            let first_tok = samplers.sample_token(&ctx, last_pos);
             let prompt_len = pref.tokens.len() as i32;
 
             let emits_first_piece =
@@ -1656,7 +2361,17 @@ fn run_scheduler(
                 ready_copies.push(copy);
             }
 
+            let suppress_eos_sampler = pref.min_tokens > 1;
+            if !suppress_eos_sampler && !samplers.set_for_sequence(&mut ctx, pref.seq_id, false) {
+                let _ = ctx.clear_kv_cache_seq(Some(pref.seq_id as u32), None, None);
+                available_ids.push(pref.seq_id);
+                pref.response
+                    .send_error(EngineError::backend("failed to install sampler"));
+                continue;
+            }
+
             finish_or_activate_prefilled_sequence(
+                &metrics,
                 &mut ctx,
                 &mut available_ids,
                 &mut active,
@@ -1668,10 +2383,23 @@ fn run_scheduler(
                 eos_token,
                 first_tok,
                 first_piece.as_deref(),
+                suppress_eos_sampler,
             );
 
             for copy in ready_copies {
+                let copy_suppress_eos_sampler = copy.min_tokens > 1;
+                if !copy_suppress_eos_sampler
+                    && !samplers.set_for_sequence(&mut ctx, copy.seq_id, false)
+                {
+                    let _ = ctx.clear_kv_cache_seq(Some(copy.seq_id as u32), None, None);
+                    available_ids.push(copy.seq_id);
+                    copy.response
+                        .send_error(EngineError::backend("failed to install sampler"));
+                    continue;
+                }
+
                 finish_or_activate_prefilled_sequence(
+                    &metrics,
                     &mut ctx,
                     &mut available_ids,
                     &mut active,
@@ -1683,6 +2411,7 @@ fn run_scheduler(
                     eos_token,
                     first_tok,
                     first_piece.as_deref(),
+                    copy_suppress_eos_sampler,
                 );
             }
         }
@@ -1698,10 +2427,8 @@ fn run_scheduler(
                 continue; // this sequence was not in the batch this step
             }
 
-            // Ban EOS when min_tokens not yet reached so the model is forced to emit
-            // real tokens instead of cycling on suppressed EOS indefinitely.
-            let next_tok =
-                sample_token(&ctx, batch_pos, eos_token, seq.n_generated < seq.min_tokens);
+            // The active sampler chain suppresses EOS until min_tokens is reached.
+            let next_tok = samplers.sample_token(&ctx, batch_pos);
             seq.pos += 1;
 
             let eos_and_ready = next_tok == eos_token && seq.n_generated >= seq.min_tokens;
@@ -1720,9 +2447,15 @@ fn run_scheduler(
                             continue;
                         }
                     };
-                    if seq.response.emit_piece(&mut seq.output, piece) {
-                        seq.last_token = next_tok;
-                        seq.n_generated = next_generated;
+                    match seq
+                        .stop_filter
+                        .push_piece(&seq.response, &mut seq.output, piece)
+                    {
+                        GgufEmitResult::Continue | GgufEmitResult::Stopped => {
+                            seq.last_token = next_tok;
+                            seq.n_generated = next_generated;
+                        }
+                        GgufEmitResult::Disconnected => {}
                     }
                     to_retire.push(i);
                 }
@@ -1735,11 +2468,30 @@ fn run_scheduler(
                         continue;
                     }
                 };
-                if !seq.response.emit_piece(&mut seq.output, piece) {
-                    to_retire.push(i);
-                } else {
-                    seq.last_token = next_tok;
-                    seq.n_generated = next_generated;
+                match seq
+                    .stop_filter
+                    .push_piece(&seq.response, &mut seq.output, piece)
+                {
+                    GgufEmitResult::Disconnected => {
+                        to_retire.push(i);
+                    }
+                    GgufEmitResult::Stopped => {
+                        seq.last_token = next_tok;
+                        seq.n_generated = next_generated;
+                        to_retire.push(i);
+                    }
+                    GgufEmitResult::Continue => {
+                        seq.last_token = next_tok;
+                        seq.n_generated = next_generated;
+                        if seq.suppress_eos_sampler && next_generated >= seq.min_tokens {
+                            if samplers.set_for_sequence(&mut ctx, seq.seq_id, false) {
+                                seq.suppress_eos_sampler = false;
+                            } else {
+                                seq.error = Some(EngineError::backend("failed to install sampler"));
+                                to_retire.push(i);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1751,12 +2503,23 @@ fn run_scheduler(
             if let Some(error) = done.error {
                 done.response.send_error(error);
             } else {
+                let mut done = done;
+                if !done.stop_filter.flush(&done.response, &mut done.output) {
+                    continue;
+                }
+                record_gguf_token_metrics(
+                    &metrics,
+                    done.prompt_tokens,
+                    done.n_generated.max(0) as usize,
+                );
                 done.response.finish(done.output);
             }
         }
         update_gguf_metrics(&metrics, config, &waiting, &pending, &active, 0);
+        gguf_timing_maybe_log(false);
     }
 
+    gguf_timing_maybe_log(true);
     log::info!("[gguf] Scheduler thread exiting");
 }
 
@@ -1785,7 +2548,7 @@ impl Engine for GgufBackend {
             let backend_for_load = global_gguf_backend()?;
             let backend_for_closure = Arc::clone(&backend_for_load);
             let (model, n_ctx_train) = tokio::task::spawn_blocking(move || {
-                let params = LlamaModelParams::default().with_n_gpu_layers(99);
+                let params = gguf_model_params();
                 let model =
                     LlamaModel::load_from_file(&backend_for_closure, &model_path_load, &params)
                         .map_err(|e| EngineError::backend(format!("GGUF load failed: {e}")))?;
@@ -1842,7 +2605,9 @@ impl Engine for GgufBackend {
                         let num_blocks = gguf_shared_kv_block_count(n_layers, config, block_size);
                         let pool = Arc::new(
                             GpuBlockPool::new(device, num_blocks, block_size, n_head_kv, head_dim)
-                                .map_err(|e| EngineError::backend(format!("shared KV pool: {e}")))?,
+                                .map_err(|e| {
+                                    EngineError::backend(format!("shared KV pool: {e}"))
+                                })?,
                         );
                         let handle = GpuPoolHandle::private(pool);
                         *slot = Some(handle.clone());
@@ -1864,8 +2629,8 @@ impl Engine for GgufBackend {
             {
                 // Compute a stable model fingerprint from architecture parameters.
                 let model_fingerprint = {
-                    use std::hash::{Hash, Hasher};
                     use std::collections::hash_map::DefaultHasher;
+                    use std::hash::{Hash, Hasher};
                     let mut h = DefaultHasher::new();
                     n_layers.hash(&mut h);
                     n_head_kv.hash(&mut h);
@@ -1882,15 +2647,16 @@ impl Engine for GgufBackend {
                         .filter(|&v| v > 0);
                     env_cap.unwrap_or_else(|| (pool_blocks / n_layers / 4).max(1))
                 };
-                let prefix_cache = Some(Arc::new(Mutex::new(
-                    PrefixBlockCache::new(prefix_cache_cap),
-                )));
+                let prefix_cache = Some(Arc::new(Mutex::new(PrefixBlockCache::new(
+                    prefix_cache_cap,
+                ))));
                 log::info!(
                     "[gguf] Prefix KV cache enabled: capacity={} logical positions",
                     prefix_cache_cap
                 );
                 Some(GgufSharedKvPool::new(
                     handle,
+                    self.metrics.clone(),
                     effective_device_id,
                     n_layers,
                     config.total_ctx(),
@@ -1940,7 +2706,7 @@ impl Engine for GgufBackend {
 
     fn infer(&self, request: &InferenceRequest) -> Result<BinaryTensorPacket, EngineError> {
         let inner = self.inner.as_ref().ok_or(EngineError::ModelNotLoaded)?;
-        let prompt = Self::extract_prompt(request)?;
+        let prompt = gguf_prepare_prompt(&inner.weights.model, Self::extract_prompt(request)?)?;
         let tokens = inner
             .weights
             .model
@@ -1960,7 +2726,11 @@ impl Engine for GgufBackend {
 
         let data = match resp_rx.recv() {
             Ok(result) => result?,
-            Err(_) => Vec::new(),
+            Err(_) => {
+                return Err(EngineError::backend(
+                    "gguf scheduler disconnected before producing a response",
+                ));
+            }
         };
         let len = data.len() as i64;
         BinaryTensorPacket::new(vec![1, len], TensorDtype::Uint8, data)
@@ -1977,8 +2747,10 @@ impl Engine for GgufBackend {
             }
         };
 
-        let prompt = match Self::extract_prompt(request) {
-            Ok(p) => p,
+        let prompt = match Self::extract_prompt(request)
+            .and_then(|prompt| gguf_prepare_prompt(&inner.weights.model, prompt))
+        {
+            Ok(prompt) => prompt,
             Err(e) => {
                 return Box::pin(stream! { yield Err(e); });
             }
@@ -2065,6 +2837,61 @@ impl Engine for GgufBackend {
     }
 }
 
+#[cfg(all(test, feature = "gguf"))]
+mod gguf_stop_filter_tests {
+    use super::{GgufEmitResult, GgufResponse, GgufStopFilter};
+    use std::sync::mpsc;
+
+    #[test]
+    fn stop_filter_hides_split_gemma_user_turn_marker() {
+        let (tx, rx) = mpsc::channel();
+        let response = GgufResponse::Stream(tx);
+        let mut output = Vec::new();
+        let mut filter = GgufStopFilter::new();
+
+        assert_eq!(
+            filter.push_piece(&response, &mut output, b"answer ".to_vec()),
+            GgufEmitResult::Continue
+        );
+        assert_eq!(
+            filter.push_piece(&response, &mut output, b"<start_of".to_vec()),
+            GgufEmitResult::Continue
+        );
+        assert_eq!(
+            filter.push_piece(&response, &mut output, b"_turn>user\nignored".to_vec()),
+            GgufEmitResult::Stopped
+        );
+
+        let chunks = rx
+            .try_iter()
+            .map(|chunk| String::from_utf8(chunk.expect("chunk")).expect("utf8"))
+            .collect::<Vec<_>>()
+            .join("");
+        assert_eq!(chunks, "answer ");
+    }
+
+    #[test]
+    fn stop_filter_flushes_text_without_stop_marker() {
+        let (tx, rx) = mpsc::channel();
+        let response = GgufResponse::Stream(tx);
+        let mut output = Vec::new();
+        let mut filter = GgufStopFilter::new();
+
+        assert_eq!(
+            filter.push_piece(&response, &mut output, b"hello".to_vec()),
+            GgufEmitResult::Continue
+        );
+        assert!(filter.flush(&response, &mut output));
+
+        let chunks = rx
+            .try_iter()
+            .map(|chunk| String::from_utf8(chunk.expect("chunk")).expect("utf8"))
+            .collect::<Vec<_>>()
+            .join("");
+        assert_eq!(chunks, "hello");
+    }
+}
+
 // ─── Stub impl when gguf feature is disabled ──────────────────────────────────
 
 #[cfg(not(feature = "gguf"))]
@@ -2100,5 +2927,38 @@ impl Engine for GgufBackend {
         Err(EngineError::backend(
             "GGUF support not compiled in (enable the 'gguf' feature)",
         ))
+    }
+}
+
+#[cfg(all(test, feature = "gguf"))]
+mod tests {
+    use super::GgufServingConfig;
+    use std::time::Duration;
+
+    fn test_config(ctx_per_seq: u32, max_concurrent: usize, prefill_chunk_size: usize) -> GgufServingConfig {
+        GgufServingConfig {
+            max_concurrent,
+            ctx_per_seq,
+            queue_delay: Duration::ZERO,
+            prefill_chunk_size,
+            exact_prompt_kv_reuse: false,
+            kv_bytes_per_cell: 0,
+        }
+    }
+
+    #[test]
+    fn gguf_batch_capacity_tracks_prefill_chunk_instead_of_full_ctx() {
+        let config = test_config(2048, 1, 512);
+
+        assert_eq!(config.total_ctx(), 2048);
+        assert_eq!(config.n_batch(), 513);
+    }
+
+    #[test]
+    fn gguf_batch_capacity_reserves_decode_slots_for_all_sequences() {
+        let config = test_config(4096, 8, 128);
+
+        assert_eq!(config.total_ctx(), 32_768);
+        assert_eq!(config.n_batch(), 136);
     }
 }

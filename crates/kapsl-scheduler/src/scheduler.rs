@@ -327,6 +327,16 @@ impl crate::replica_pool::ReplicaScheduler for Scheduler {
         let mut total_kv_evicted_sequences = 0;
         let mut total_kv_packed_layers = 0;
         let mut total_kv_cpu_offloaded_blocks = 0;
+        let mut total_prompt_tokens = 0;
+        let mut total_generated_tokens = 0;
+        let mut total_decode_steps = 0;
+        let mut total_decode_tokens_evaluated = 0;
+        let mut total_kv_partial_reuse_hits = 0;
+        let mut total_kv_partial_reuse_tokens_saved = 0;
+        let mut total_onnx_session_pool_total = 0;
+        let mut total_onnx_session_pool_idle = 0;
+        let mut total_onnx_session_pool_waits = 0;
+        let mut total_onnx_session_pool_wait_seconds = 0.0;
         let count = self.engines.len();
 
         for engine in &self.engines {
@@ -343,6 +353,16 @@ impl crate::replica_pool::ReplicaScheduler for Scheduler {
             total_kv_evicted_sequences += m.kv_cache_evicted_sequences;
             total_kv_packed_layers += m.kv_cache_packed_layers;
             total_kv_cpu_offloaded_blocks += m.kv_cache_cpu_offloaded_blocks;
+            total_prompt_tokens += m.prompt_tokens_total;
+            total_generated_tokens += m.generated_tokens_total;
+            total_decode_steps += m.decode_steps_total;
+            total_decode_tokens_evaluated += m.decode_tokens_evaluated_total;
+            total_kv_partial_reuse_hits += m.kv_partial_reuse_hits_total;
+            total_kv_partial_reuse_tokens_saved += m.kv_partial_reuse_tokens_saved_total;
+            total_onnx_session_pool_total += m.onnx_session_pool_total;
+            total_onnx_session_pool_idle += m.onnx_session_pool_idle;
+            total_onnx_session_pool_waits += m.onnx_session_pool_waits_total;
+            total_onnx_session_pool_wait_seconds += m.onnx_session_pool_wait_seconds_total;
         }
 
         let (cpu_q, gpu_q) = self.get_queue_depth();
@@ -366,6 +386,16 @@ impl crate::replica_pool::ReplicaScheduler for Scheduler {
             kv_cache_evicted_sequences: total_kv_evicted_sequences,
             kv_cache_packed_layers: total_kv_packed_layers,
             kv_cache_cpu_offloaded_blocks: total_kv_cpu_offloaded_blocks,
+            prompt_tokens_total: total_prompt_tokens,
+            generated_tokens_total: total_generated_tokens,
+            decode_steps_total: total_decode_steps,
+            decode_tokens_evaluated_total: total_decode_tokens_evaluated,
+            kv_partial_reuse_hits_total: total_kv_partial_reuse_hits,
+            kv_partial_reuse_tokens_saved_total: total_kv_partial_reuse_tokens_saved,
+            onnx_session_pool_total: total_onnx_session_pool_total,
+            onnx_session_pool_idle: total_onnx_session_pool_idle,
+            onnx_session_pool_waits_total: total_onnx_session_pool_waits,
+            onnx_session_pool_wait_seconds_total: total_onnx_session_pool_wait_seconds,
             ..kapsl_engine_api::EngineMetrics::default()
         }
     }

@@ -1,4 +1,6 @@
-use prometheus::{HistogramOpts, HistogramVec, IntCounterVec, IntGaugeVec, Opts, Registry};
+use prometheus::{
+    GaugeVec, HistogramOpts, HistogramVec, IntCounterVec, IntGaugeVec, Opts, Registry,
+};
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -25,6 +27,18 @@ pub struct KapslMetrics {
     pub kv_cache_evicted_sequences: IntGaugeVec,
     pub kv_cache_packed_layers: IntGaugeVec,
     pub kv_cache_cpu_offloaded_blocks: IntGaugeVec,
+    pub prompt_tokens_total: IntGaugeVec,
+    pub generated_tokens_total: IntGaugeVec,
+    pub decode_steps_total: IntGaugeVec,
+    pub decode_tokens_evaluated_total: IntGaugeVec,
+    pub kv_partial_reuse_hits_total: IntGaugeVec,
+    pub kv_partial_reuse_tokens_saved_total: IntGaugeVec,
+    /// Per-model engine health: 0 = healthy, 1 = degraded, 2 = dead.
+    pub engine_health: IntGaugeVec,
+    pub onnx_session_pool_total: IntGaugeVec,
+    pub onnx_session_pool_idle: IntGaugeVec,
+    pub onnx_session_pool_waits_total: IntGaugeVec,
+    pub onnx_session_pool_wait_seconds_total: GaugeVec,
 }
 
 impl KapslMetrics {
@@ -42,13 +56,9 @@ impl KapslMetrics {
         .unwrap();
 
         let ttft_latency = HistogramVec::new(
-            HistogramOpts::new(
-                "kapsl_ttft_seconds",
-                "Time to first token (seconds)",
-            )
-            .buckets(vec![
-                0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0,
-            ]),
+            HistogramOpts::new("kapsl_ttft_seconds", "Time to first token (seconds)").buckets(
+                vec![0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0],
+            ),
             &["model", "version", "status"],
         )
         .unwrap();
@@ -177,6 +187,94 @@ impl KapslMetrics {
             &["model"],
         )
         .unwrap();
+        let prompt_tokens_total = IntGaugeVec::new(
+            Opts::new(
+                "kapsl_prompt_tokens_total",
+                "Cumulative prompt tokens processed by the engine",
+            ),
+            &["model"],
+        )
+        .unwrap();
+        let generated_tokens_total = IntGaugeVec::new(
+            Opts::new(
+                "kapsl_generated_tokens_total",
+                "Cumulative generated tokens produced by the engine",
+            ),
+            &["model"],
+        )
+        .unwrap();
+        let decode_steps_total = IntGaugeVec::new(
+            Opts::new(
+                "kapsl_decode_steps_total",
+                "Cumulative decode reserve steps observed by the engine",
+            ),
+            &["model"],
+        )
+        .unwrap();
+        let decode_tokens_evaluated_total = IntGaugeVec::new(
+            Opts::new(
+                "kapsl_decode_tokens_evaluated_total",
+                "Cumulative logical decode tokens evaluated by the engine",
+            ),
+            &["model"],
+        )
+        .unwrap();
+        let kv_partial_reuse_hits_total = IntGaugeVec::new(
+            Opts::new(
+                "kapsl_kv_partial_reuse_hits_total",
+                "Cumulative same-session partial KV reuse hits",
+            ),
+            &["model"],
+        )
+        .unwrap();
+        let kv_partial_reuse_tokens_saved_total = IntGaugeVec::new(
+            Opts::new(
+                "kapsl_kv_partial_reuse_tokens_saved_total",
+                "Cumulative decode tokens avoided by same-session partial KV reuse",
+            ),
+            &["model"],
+        )
+        .unwrap();
+        let engine_health = IntGaugeVec::new(
+            Opts::new(
+                "kapsl_engine_health",
+                "Per-model engine health: 0 = healthy, 1 = degraded, 2 = dead",
+            ),
+            &["model"],
+        )
+        .unwrap();
+        let onnx_session_pool_total = IntGaugeVec::new(
+            Opts::new(
+                "kapsl_onnx_session_pool_total",
+                "Total ONNX Runtime sessions allocated across session pools",
+            ),
+            &["model"],
+        )
+        .unwrap();
+        let onnx_session_pool_idle = IntGaugeVec::new(
+            Opts::new(
+                "kapsl_onnx_session_pool_idle",
+                "Idle ONNX Runtime sessions available across session pools",
+            ),
+            &["model"],
+        )
+        .unwrap();
+        let onnx_session_pool_waits_total = IntGaugeVec::new(
+            Opts::new(
+                "kapsl_onnx_session_pool_waits_total",
+                "Cumulative waits for an ONNX Runtime session",
+            ),
+            &["model"],
+        )
+        .unwrap();
+        let onnx_session_pool_wait_seconds_total = GaugeVec::new(
+            Opts::new(
+                "kapsl_onnx_session_pool_wait_seconds_total",
+                "Cumulative seconds spent waiting for an ONNX Runtime session",
+            ),
+            &["model"],
+        )
+        .unwrap();
 
         registry
             .register(Box::new(inference_latency.clone()))
@@ -235,6 +333,39 @@ impl KapslMetrics {
         registry
             .register(Box::new(kv_cache_cpu_offloaded_blocks.clone()))
             .expect("Failed to register kv_cache_cpu_offloaded_blocks");
+        registry
+            .register(Box::new(prompt_tokens_total.clone()))
+            .expect("Failed to register prompt_tokens_total");
+        registry
+            .register(Box::new(generated_tokens_total.clone()))
+            .expect("Failed to register generated_tokens_total");
+        registry
+            .register(Box::new(decode_steps_total.clone()))
+            .expect("Failed to register decode_steps_total");
+        registry
+            .register(Box::new(decode_tokens_evaluated_total.clone()))
+            .expect("Failed to register decode_tokens_evaluated_total");
+        registry
+            .register(Box::new(kv_partial_reuse_hits_total.clone()))
+            .expect("Failed to register kv_partial_reuse_hits_total");
+        registry
+            .register(Box::new(kv_partial_reuse_tokens_saved_total.clone()))
+            .expect("Failed to register kv_partial_reuse_tokens_saved_total");
+        registry
+            .register(Box::new(engine_health.clone()))
+            .expect("Failed to register engine_health");
+        registry
+            .register(Box::new(onnx_session_pool_total.clone()))
+            .expect("Failed to register onnx_session_pool_total");
+        registry
+            .register(Box::new(onnx_session_pool_idle.clone()))
+            .expect("Failed to register onnx_session_pool_idle");
+        registry
+            .register(Box::new(onnx_session_pool_waits_total.clone()))
+            .expect("Failed to register onnx_session_pool_waits_total");
+        registry
+            .register(Box::new(onnx_session_pool_wait_seconds_total.clone()))
+            .expect("Failed to register onnx_session_pool_wait_seconds_total");
 
         Self {
             registry: registry.clone(),
@@ -257,6 +388,17 @@ impl KapslMetrics {
             kv_cache_evicted_sequences,
             kv_cache_packed_layers,
             kv_cache_cpu_offloaded_blocks,
+            prompt_tokens_total,
+            generated_tokens_total,
+            decode_steps_total,
+            decode_tokens_evaluated_total,
+            kv_partial_reuse_hits_total,
+            kv_partial_reuse_tokens_saved_total,
+            engine_health,
+            onnx_session_pool_total,
+            onnx_session_pool_idle,
+            onnx_session_pool_waits_total,
+            onnx_session_pool_wait_seconds_total,
         }
     }
 
@@ -288,6 +430,39 @@ impl KapslMetrics {
         self.kv_cache_cpu_offloaded_blocks
             .with_label_values(&[model])
             .set(metrics.kv_cache_cpu_offloaded_blocks as i64);
+        self.prompt_tokens_total
+            .with_label_values(&[model])
+            .set(metrics.prompt_tokens_total as i64);
+        self.generated_tokens_total
+            .with_label_values(&[model])
+            .set(metrics.generated_tokens_total as i64);
+        self.decode_steps_total
+            .with_label_values(&[model])
+            .set(metrics.decode_steps_total as i64);
+        self.decode_tokens_evaluated_total
+            .with_label_values(&[model])
+            .set(metrics.decode_tokens_evaluated_total as i64);
+        self.kv_partial_reuse_hits_total
+            .with_label_values(&[model])
+            .set(metrics.kv_partial_reuse_hits_total as i64);
+        self.kv_partial_reuse_tokens_saved_total
+            .with_label_values(&[model])
+            .set(metrics.kv_partial_reuse_tokens_saved_total as i64);
+        self.engine_health
+            .with_label_values(&[model])
+            .set(metrics.engine_health as i64);
+        self.onnx_session_pool_total
+            .with_label_values(&[model])
+            .set(metrics.onnx_session_pool_total as i64);
+        self.onnx_session_pool_idle
+            .with_label_values(&[model])
+            .set(metrics.onnx_session_pool_idle as i64);
+        self.onnx_session_pool_waits_total
+            .with_label_values(&[model])
+            .set(metrics.onnx_session_pool_waits_total as i64);
+        self.onnx_session_pool_wait_seconds_total
+            .with_label_values(&[model])
+            .set(metrics.onnx_session_pool_wait_seconds_total);
     }
 }
 

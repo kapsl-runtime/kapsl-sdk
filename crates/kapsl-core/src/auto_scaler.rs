@@ -142,6 +142,16 @@ impl AutoScaler {
         let policy = self.get_policy(base_model_id);
         let state = self.states.entry(base_model_id).or_default();
 
+        // Enforce the configured floor: bring a running model up to min_replicas
+        // regardless of queue load. Without this, raising min_replicas on an idle
+        // model never takes effect, since the load-based logic below only triggers
+        // when the queue exceeds target_queue_depth.
+        if current_replicas >= 1 && current_replicas < policy.min_replicas {
+            state.high_load_duration = Duration::from_secs(0);
+            state.last_scale_up = Some(Instant::now());
+            return Some(policy.min_replicas);
+        }
+
         if policy.target_queue_depth == 0 {
             return None;
         }

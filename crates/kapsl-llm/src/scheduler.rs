@@ -46,9 +46,28 @@ impl LLMScheduler {
         self.config.max_num_batched_tokens
     }
 
+    /// Attach a hard per-engine KV block quota to the underlying block manager.
+    pub fn set_block_live_cap(&mut self, cap: std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        self.block_manager.set_live_cap(cap);
+    }
+
+    /// Set the engine id used to stamp KV block ownership in the block manager.
+    pub fn set_block_engine_id(&mut self, engine_id: u32) {
+        self.block_manager.set_engine_id(engine_id);
+    }
+
     pub fn add_sequence_group(&mut self, seq_group: SequenceGroup) {
-        self.waiting_queue
-            .push_back(Arc::new(Mutex::new(seq_group)));
+        let priority = seq_group.priority;
+        let group = Arc::new(Mutex::new(seq_group));
+        // Keep the waiting queue ordered by descending priority with FIFO order
+        // within a priority tier, so a high-priority request is not stuck behind
+        // already-queued lower-priority ones (head-of-line blocking).
+        let pos = self
+            .waiting_queue
+            .iter()
+            .position(|g| g.lock().map(|g| g.priority < priority).unwrap_or(false))
+            .unwrap_or(self.waiting_queue.len());
+        self.waiting_queue.insert(pos, group);
     }
 
     pub fn active_sequence_ids(&self) -> Vec<u64> {
