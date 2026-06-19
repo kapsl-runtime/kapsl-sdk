@@ -1,6 +1,10 @@
 #[cfg(test)]
 mod tests {
-    use super::super::{extract_bos_token, extract_tag, load_model_runtime_config, LLMBackend};
+    use super::super::{
+        default_sampling_params, extract_bos_token, extract_tag, load_model_runtime_config,
+        LLMBackend, ModelRuntimeConfig,
+    };
+    use crate::prompt_adapter::ChatPromptTemplate;
     use crate::sequence::{FinishReason, SequenceGroupOutput};
     use futures::StreamExt;
     use kapsl_engine_api::{BinaryTensorPacket, Engine, InferenceRequest, TensorDtype};
@@ -80,9 +84,13 @@ mod tests {
         fs::write(root.join("chat_template.jinja"), template).expect("chat template");
 
         let runtime = load_model_runtime_config(&model_path);
-        assert!(runtime.use_chat_template);
-        assert_eq!(runtime.prompt_prefix, "<bos><|user|>");
-        assert_eq!(runtime.prompt_suffix, "<|assistant|>");
+        assert_eq!(
+            runtime
+                .prompt_template
+                .as_ref()
+                .map(|template| template.render("Hi")),
+            Some("<bos><|user|>Hi<|assistant|>".to_string())
+        );
 
         let sampling = runtime.sampling;
         assert_eq!(sampling.max_tokens, 128);
@@ -110,11 +118,40 @@ mod tests {
         assert_eq!(runtime.sampling.stop_token_ids, vec![1, 106, 2]);
     }
 
+    #[test]
+    fn load_model_runtime_config_reads_manifest_chat_template_for_onnx() {
+        let root = make_temp_dir("manifest_template");
+        let model_path = root.join("model.onnx");
+        fs::write(&model_path, "").expect("model file");
+
+        let manifest = json!({
+            "metadata": {
+                "llm": {
+                    "chat_template": "gemma"
+                }
+            }
+        });
+        fs::write(root.join("metadata.json"), manifest.to_string()).expect("metadata");
+
+        let runtime = load_model_runtime_config(&model_path);
+        assert_eq!(
+            runtime
+                .prompt_template
+                .as_ref()
+                .map(|template| template.render("Hello")),
+            Some("<start_of_turn>user\nHello<end_of_turn>\n<start_of_turn>model\n".to_string())
+        );
+    }
+
     #[tokio::test]
     async fn infer_stream_handles_cumulative_and_incremental_outputs() {
         let backend = LLMBackend::new();
         let (tx, mut rx) = mpsc::channel(1);
         *backend.request_tx.write().unwrap() = Some(tx);
+        *backend.model_config.lock().unwrap() = ModelRuntimeConfig {
+            prompt_template: Some(ChatPromptTemplate::Gemma),
+            sampling: default_sampling_params(),
+        };
 
         let request = InferenceRequest {
             input: BinaryTensorPacket {
@@ -150,6 +187,18 @@ mod tests {
         });
 
         let seq_group = rx.recv().await.expect("seq_group");
+        let queued_prompt = seq_group
+            .sequences
+            .get(&0)
+            .expect("sequence")
+            .lock()
+            .unwrap()
+            .prompt
+            .clone();
+        assert_eq!(
+            queued_prompt,
+            "<start_of_turn>user\nHi<end_of_turn>\n<start_of_turn>model\n"
+        );
 
         seq_group
             .response_tx

@@ -1,3 +1,4 @@
+use crate::prompt_adapter::{chat_template_from_model_identifiers, prompt_is_explicitly_formatted};
 use async_stream::stream;
 use async_trait::async_trait;
 use kapsl_engine_api::{
@@ -31,7 +32,7 @@ use llama_cpp_2::{
     context::params::LlamaContextParams,
     llama_backend::LlamaBackend,
     llama_batch::LlamaBatch,
-    model::{params::LlamaModelParams, AddBos, LlamaModel},
+    model::{params::LlamaModelParams, AddBos, LlamaChatMessage, LlamaModel},
     sampling::LlamaSampler,
     token::{logit_bias::LlamaLogitBias, LlamaToken},
     TokenToStringError,
@@ -191,6 +192,35 @@ fn gguf_timing_elapsed_us(start: Instant) -> u64 {
 fn gguf_timing_record(calls: &AtomicU64, micros: &AtomicU64, start: Instant) {
     calls.fetch_add(1, Ordering::Relaxed);
     micros.fetch_add(gguf_timing_elapsed_us(start), Ordering::Relaxed);
+}
+
+#[cfg(feature = "gguf")]
+fn gguf_prepare_prompt(model: &LlamaModel, prompt: String) -> Result<String, EngineError> {
+    if prompt.trim().is_empty() || prompt_is_explicitly_formatted(&prompt) {
+        return Ok(prompt);
+    }
+
+    let template = match model.chat_template(None) {
+        Ok(template) => template,
+        Err(_) => {
+            let identifiers: Vec<String> = ["general.name", "general.architecture"]
+                .iter()
+                .filter_map(|key| model.meta_val_str(key).ok())
+                .collect();
+            if let Some(template) =
+                chat_template_from_model_identifiers(identifiers.iter().map(String::as_str))
+            {
+                return Ok(template.render(&prompt));
+            }
+            return Ok(prompt);
+        }
+    };
+    let message = LlamaChatMessage::new("user".to_string(), prompt.clone())
+        .map_err(|e| EngineError::backend(format!("chat message build failed: {e}")))?;
+
+    model
+        .apply_chat_template(&template, &[message], true)
+        .map_err(|e| EngineError::backend(format!("chat template apply failed: {e}")))
 }
 
 #[cfg(feature = "gguf")]
@@ -2541,7 +2571,7 @@ impl Engine for GgufBackend {
 
     fn infer(&self, request: &InferenceRequest) -> Result<BinaryTensorPacket, EngineError> {
         let inner = self.inner.as_ref().ok_or(EngineError::ModelNotLoaded)?;
-        let prompt = Self::extract_prompt(request)?;
+        let prompt = gguf_prepare_prompt(&inner.weights.model, Self::extract_prompt(request)?)?;
         let tokens = inner
             .weights
             .model
@@ -2582,8 +2612,10 @@ impl Engine for GgufBackend {
             }
         };
 
-        let prompt = match Self::extract_prompt(request) {
-            Ok(p) => p,
+        let prompt = match Self::extract_prompt(request)
+            .and_then(|prompt| gguf_prepare_prompt(&inner.weights.model, prompt))
+        {
+            Ok(prompt) => prompt,
             Err(e) => {
                 return Box::pin(stream! { yield Err(e); });
             }
