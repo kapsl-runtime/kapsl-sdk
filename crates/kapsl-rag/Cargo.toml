@@ -17,9 +17,8 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 hnsw_rs = "0.3"
 log = "0.4"
 toml = "0.8"
-wasmtime = "16"
-wasmtime-wasi = "16"
-cap-std = "2"
+wasmtime = "44"
+wasmtime-wasi = "44"
 bytes = "1"
 
 [dev-dependencies]
