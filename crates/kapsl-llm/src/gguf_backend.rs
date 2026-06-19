@@ -499,14 +499,17 @@ enum GgufResponse {
 
 #[cfg(feature = "gguf")]
 impl GgufResponse {
-    fn emit_piece(&self, output: &mut Vec<u8>, piece: Vec<u8>) -> bool {
+    fn emit_bytes(&self, output: &mut Vec<u8>, bytes: Vec<u8>) -> bool {
+        if bytes.is_empty() {
+            return true;
+        }
         let _timing = GgufTimingGuard::new(&GGUF_TIMING_EMIT_CALLS, &GGUF_TIMING_EMIT_US);
         match self {
             Self::Final(_) => {
-                output.extend_from_slice(&piece);
+                output.extend_from_slice(&bytes);
                 true
             }
-            Self::Stream(tx) => tx.send(Ok(piece)).is_ok(),
+            Self::Stream(tx) => tx.send(Ok(bytes)).is_ok(),
         }
     }
 
@@ -522,6 +525,99 @@ impl GgufResponse {
                 let _ = tx.send(Err(error));
             }
         }
+    }
+}
+
+#[cfg(feature = "gguf")]
+const GGUF_CHAT_STOP_SEQUENCES: &[&[u8]] = &[
+    b"<end_of_turn>",
+    b"<start_of_turn>user",
+    b"<|im_end|>",
+    b"<|im_start|>user",
+    b"<|eot_id|>",
+];
+
+#[cfg(feature = "gguf")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GgufEmitResult {
+    Continue,
+    Disconnected,
+    Stopped,
+}
+
+#[cfg(feature = "gguf")]
+struct GgufStopFilter {
+    pending: Vec<u8>,
+    stopped: bool,
+}
+
+#[cfg(feature = "gguf")]
+impl GgufStopFilter {
+    fn new() -> Self {
+        Self {
+            pending: Vec::new(),
+            stopped: false,
+        }
+    }
+
+    fn max_stop_len() -> usize {
+        GGUF_CHAT_STOP_SEQUENCES
+            .iter()
+            .map(|seq| seq.len())
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn find_stop(bytes: &[u8]) -> Option<usize> {
+        GGUF_CHAT_STOP_SEQUENCES
+            .iter()
+            .filter_map(|stop| bytes.windows(stop.len()).position(|window| window == *stop))
+            .min()
+    }
+
+    fn push_piece(
+        &mut self,
+        response: &GgufResponse,
+        output: &mut Vec<u8>,
+        piece: Vec<u8>,
+    ) -> GgufEmitResult {
+        if self.stopped {
+            return GgufEmitResult::Stopped;
+        }
+
+        self.pending.extend_from_slice(&piece);
+        if let Some(stop_at) = Self::find_stop(&self.pending) {
+            let emit = self.pending[..stop_at].to_vec();
+            self.pending.clear();
+            self.stopped = true;
+            return if response.emit_bytes(output, emit) {
+                GgufEmitResult::Stopped
+            } else {
+                GgufEmitResult::Disconnected
+            };
+        }
+
+        let keep = Self::max_stop_len().saturating_sub(1);
+        if self.pending.len() <= keep {
+            return GgufEmitResult::Continue;
+        }
+
+        let emit_len = self.pending.len() - keep;
+        let emit = self.pending.drain(..emit_len).collect::<Vec<_>>();
+        if response.emit_bytes(output, emit) {
+            GgufEmitResult::Continue
+        } else {
+            GgufEmitResult::Disconnected
+        }
+    }
+
+    fn flush(&mut self, response: &GgufResponse, output: &mut Vec<u8>) -> bool {
+        if self.stopped || self.pending.is_empty() {
+            self.pending.clear();
+            return true;
+        }
+        let emit = std::mem::take(&mut self.pending);
+        response.emit_bytes(output, emit)
     }
 }
 
@@ -559,6 +655,7 @@ struct ActiveSeq {
     /// Token to feed into the next decode step.
     last_token: LlamaToken,
     output: Vec<u8>,
+    stop_filter: GgufStopFilter,
     response: GgufResponse,
     error: Option<EngineError>,
 }
@@ -1743,6 +1840,7 @@ fn finish_or_activate_prefilled_sequence(
     suppress_eos_sampler: bool,
 ) {
     let mut output = Vec::with_capacity((max_tokens.max(0) as usize).saturating_mul(4));
+    let mut stop_filter = GgufStopFilter::new();
 
     if max_tokens <= 0 || (first_tok == eos_token && min_tokens <= 0) {
         let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
@@ -1759,13 +1857,28 @@ fn finish_or_activate_prefilled_sequence(
         return;
     };
 
-    if !response.emit_piece(&mut output, piece.to_vec()) {
-        let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
-        available_ids.push(seq_id);
-        return;
+    match stop_filter.push_piece(&response, &mut output, piece.to_vec()) {
+        GgufEmitResult::Continue => {}
+        GgufEmitResult::Stopped => {
+            let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
+            available_ids.push(seq_id);
+            record_gguf_token_metrics(metrics, prompt_len.max(0) as usize, 1);
+            response.finish(output);
+            return;
+        }
+        GgufEmitResult::Disconnected => {
+            let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
+            available_ids.push(seq_id);
+            return;
+        }
     }
 
     if max_tokens <= 1 {
+        if !stop_filter.flush(&response, &mut output) {
+            let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
+            available_ids.push(seq_id);
+            return;
+        }
         let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
         available_ids.push(seq_id);
         record_gguf_token_metrics(metrics, prompt_len.max(0) as usize, 1);
@@ -1781,6 +1894,7 @@ fn finish_or_activate_prefilled_sequence(
             suppress_eos_sampler,
             last_token: first_tok,
             output,
+            stop_filter,
             response,
             error: None,
         });
@@ -2333,9 +2447,15 @@ fn run_scheduler(
                             continue;
                         }
                     };
-                    if seq.response.emit_piece(&mut seq.output, piece) {
-                        seq.last_token = next_tok;
-                        seq.n_generated = next_generated;
+                    match seq
+                        .stop_filter
+                        .push_piece(&seq.response, &mut seq.output, piece)
+                    {
+                        GgufEmitResult::Continue | GgufEmitResult::Stopped => {
+                            seq.last_token = next_tok;
+                            seq.n_generated = next_generated;
+                        }
+                        GgufEmitResult::Disconnected => {}
                     }
                     to_retire.push(i);
                 }
@@ -2348,17 +2468,28 @@ fn run_scheduler(
                         continue;
                     }
                 };
-                if !seq.response.emit_piece(&mut seq.output, piece) {
-                    to_retire.push(i);
-                } else {
-                    seq.last_token = next_tok;
-                    seq.n_generated = next_generated;
-                    if seq.suppress_eos_sampler && next_generated >= seq.min_tokens {
-                        if samplers.set_for_sequence(&mut ctx, seq.seq_id, false) {
-                            seq.suppress_eos_sampler = false;
-                        } else {
-                            seq.error = Some(EngineError::backend("failed to install sampler"));
-                            to_retire.push(i);
+                match seq
+                    .stop_filter
+                    .push_piece(&seq.response, &mut seq.output, piece)
+                {
+                    GgufEmitResult::Disconnected => {
+                        to_retire.push(i);
+                    }
+                    GgufEmitResult::Stopped => {
+                        seq.last_token = next_tok;
+                        seq.n_generated = next_generated;
+                        to_retire.push(i);
+                    }
+                    GgufEmitResult::Continue => {
+                        seq.last_token = next_tok;
+                        seq.n_generated = next_generated;
+                        if seq.suppress_eos_sampler && next_generated >= seq.min_tokens {
+                            if samplers.set_for_sequence(&mut ctx, seq.seq_id, false) {
+                                seq.suppress_eos_sampler = false;
+                            } else {
+                                seq.error = Some(EngineError::backend("failed to install sampler"));
+                                to_retire.push(i);
+                            }
                         }
                     }
                 }
@@ -2372,6 +2503,10 @@ fn run_scheduler(
             if let Some(error) = done.error {
                 done.response.send_error(error);
             } else {
+                let mut done = done;
+                if !done.stop_filter.flush(&done.response, &mut done.output) {
+                    continue;
+                }
                 record_gguf_token_metrics(
                     &metrics,
                     done.prompt_tokens,
@@ -2699,6 +2834,61 @@ impl Engine for GgufBackend {
             model_version: None,
             peak_concurrency: Some(inner.max_concurrent as u32),
         })
+    }
+}
+
+#[cfg(all(test, feature = "gguf"))]
+mod gguf_stop_filter_tests {
+    use super::{GgufEmitResult, GgufResponse, GgufStopFilter};
+    use std::sync::mpsc;
+
+    #[test]
+    fn stop_filter_hides_split_gemma_user_turn_marker() {
+        let (tx, rx) = mpsc::channel();
+        let response = GgufResponse::Stream(tx);
+        let mut output = Vec::new();
+        let mut filter = GgufStopFilter::new();
+
+        assert_eq!(
+            filter.push_piece(&response, &mut output, b"answer ".to_vec()),
+            GgufEmitResult::Continue
+        );
+        assert_eq!(
+            filter.push_piece(&response, &mut output, b"<start_of".to_vec()),
+            GgufEmitResult::Continue
+        );
+        assert_eq!(
+            filter.push_piece(&response, &mut output, b"_turn>user\nignored".to_vec()),
+            GgufEmitResult::Stopped
+        );
+
+        let chunks = rx
+            .try_iter()
+            .map(|chunk| String::from_utf8(chunk.expect("chunk")).expect("utf8"))
+            .collect::<Vec<_>>()
+            .join("");
+        assert_eq!(chunks, "answer ");
+    }
+
+    #[test]
+    fn stop_filter_flushes_text_without_stop_marker() {
+        let (tx, rx) = mpsc::channel();
+        let response = GgufResponse::Stream(tx);
+        let mut output = Vec::new();
+        let mut filter = GgufStopFilter::new();
+
+        assert_eq!(
+            filter.push_piece(&response, &mut output, b"hello".to_vec()),
+            GgufEmitResult::Continue
+        );
+        assert!(filter.flush(&response, &mut output));
+
+        let chunks = rx
+            .try_iter()
+            .map(|chunk| String::from_utf8(chunk.expect("chunk")).expect("utf8"))
+            .collect::<Vec<_>>()
+            .join("");
+        assert_eq!(chunks, "hello");
     }
 }
 
