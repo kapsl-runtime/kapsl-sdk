@@ -174,6 +174,10 @@ impl Stream for MetricStream {
                             "ok",
                         ])
                         .observe(ttft);
+                    this.metrics
+                        .model_ttft_ms
+                        .with_label_values(&[this.model_id.as_str()])
+                        .set(ttft * 1000.0);
                 }
                 Poll::Ready(Some(Ok(item)))
             }
@@ -189,6 +193,10 @@ impl Stream for MetricStream {
                             "err",
                         ])
                         .observe(ttft);
+                    this.metrics
+                        .model_ttft_ms
+                        .with_label_values(&[this.model_id.as_str()])
+                        .set(ttft * 1000.0);
                 }
                 this.saw_error = true;
                 Poll::Ready(Some(Err(err)))
