@@ -39,6 +39,9 @@ pub struct KapslMetrics {
     pub onnx_session_pool_idle: IntGaugeVec,
     pub onnx_session_pool_waits_total: IntGaugeVec,
     pub onnx_session_pool_wait_seconds_total: GaugeVec,
+    /// Most recent time-to-first-token (milliseconds) per model. Surfaced on the
+    /// runtime `/api/models` so control-plane autoscalers can scale on TTFT SLOs.
+    pub model_ttft_ms: GaugeVec,
 }
 
 impl KapslMetrics {
@@ -275,6 +278,14 @@ impl KapslMetrics {
             &["model"],
         )
         .unwrap();
+        let model_ttft_ms = GaugeVec::new(
+            Opts::new(
+                "kapsl_model_ttft_ms",
+                "Most recent time-to-first-token in milliseconds per model",
+            ),
+            &["model"],
+        )
+        .unwrap();
 
         registry
             .register(Box::new(inference_latency.clone()))
@@ -282,6 +293,9 @@ impl KapslMetrics {
         registry
             .register(Box::new(ttft_latency.clone()))
             .expect("Failed to register ttft_latency");
+        registry
+            .register(Box::new(model_ttft_ms.clone()))
+            .expect("Failed to register model_ttft_ms");
         registry
             .register(Box::new(inference_count.clone()))
             .expect("Failed to register inference_count");
@@ -399,6 +413,7 @@ impl KapslMetrics {
             onnx_session_pool_idle,
             onnx_session_pool_waits_total,
             onnx_session_pool_wait_seconds_total,
+            model_ttft_ms,
         }
     }
 
