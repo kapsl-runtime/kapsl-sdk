@@ -568,33 +568,64 @@ impl GgufStopFilter {
             .unwrap_or(0)
     }
 
-    fn find_stop(bytes: &[u8]) -> Option<usize> {
+    /// Locate the earliest chat stop-marker in `bytes`, returning its start
+    /// offset and length.
+    fn find_stop(bytes: &[u8]) -> Option<(usize, usize)> {
         GGUF_CHAT_STOP_SEQUENCES
             .iter()
-            .filter_map(|stop| bytes.windows(stop.len()).position(|window| window == *stop))
-            .min()
+            .filter_map(|stop| {
+                bytes
+                    .windows(stop.len())
+                    .position(|window| window == *stop)
+                    .map(|start| (start, stop.len()))
+            })
+            .min_by_key(|&(start, _)| start)
     }
 
+    /// Feed a freshly decoded token `piece` into the filter.
+    ///
+    /// When `may_stop` is true a chat stop-marker latches the filter and
+    /// retires the sequence (emitting only the text before the marker). When
+    /// `may_stop` is false — i.e. the sequence is still below its `min_tokens`
+    /// floor — stop-markers are *not* honored: the text before each marker is
+    /// emitted, the marker bytes themselves are dropped (so they never leak
+    /// into the output), and generation continues. This mirrors the EOS gate
+    /// so `min_tokens` is enforced even when the model emits a turn-marker
+    /// (e.g. Qwen's `<|im_end|>`) before the floor is reached.
     fn push_piece(
         &mut self,
         response: &GgufResponse,
         output: &mut Vec<u8>,
         piece: Vec<u8>,
+        may_stop: bool,
     ) -> GgufEmitResult {
         if self.stopped {
             return GgufEmitResult::Stopped;
         }
 
         self.pending.extend_from_slice(&piece);
-        if let Some(stop_at) = Self::find_stop(&self.pending) {
-            let emit = self.pending[..stop_at].to_vec();
-            self.pending.clear();
-            self.stopped = true;
-            return if response.emit_bytes(output, emit) {
-                GgufEmitResult::Stopped
-            } else {
-                GgufEmitResult::Disconnected
-            };
+
+        if may_stop {
+            if let Some((stop_at, _stop_len)) = Self::find_stop(&self.pending) {
+                let emit = self.pending[..stop_at].to_vec();
+                self.pending.clear();
+                self.stopped = true;
+                return if response.emit_bytes(output, emit) {
+                    GgufEmitResult::Stopped
+                } else {
+                    GgufEmitResult::Disconnected
+                };
+            }
+        } else {
+            // Below the min_tokens floor: emit the text preceding each marker,
+            // discard the marker bytes, and keep decoding.
+            while let Some((stop_at, stop_len)) = Self::find_stop(&self.pending) {
+                let emit = self.pending[..stop_at].to_vec();
+                self.pending.drain(..stop_at + stop_len);
+                if !response.emit_bytes(output, emit) {
+                    return GgufEmitResult::Disconnected;
+                }
+            }
         }
 
         let keep = Self::max_stop_len().saturating_sub(1);
@@ -1857,7 +1888,10 @@ fn finish_or_activate_prefilled_sequence(
         return;
     };
 
-    match stop_filter.push_piece(&response, &mut output, piece.to_vec()) {
+    // The first generated token sits at generated-count 0, so it may only stop
+    // on a marker once the min_tokens floor is already satisfied.
+    let first_may_stop = min_tokens <= 0;
+    match stop_filter.push_piece(&response, &mut output, piece.to_vec(), first_may_stop) {
         GgufEmitResult::Continue => {}
         GgufEmitResult::Stopped => {
             let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
@@ -2434,6 +2468,9 @@ fn run_scheduler(
             let eos_and_ready = next_tok == eos_token && seq.n_generated >= seq.min_tokens;
             let next_generated = seq.n_generated + 1;
             let max_reached = next_generated >= seq.max_tokens;
+            // A chat stop-marker may only retire the sequence once the
+            // min_tokens floor is met — mirrors the EOS gate above.
+            let may_stop = seq.n_generated >= seq.min_tokens;
 
             if eos_and_ready || max_reached {
                 if eos_and_ready {
@@ -2449,7 +2486,7 @@ fn run_scheduler(
                     };
                     match seq
                         .stop_filter
-                        .push_piece(&seq.response, &mut seq.output, piece)
+                        .push_piece(&seq.response, &mut seq.output, piece, may_stop)
                     {
                         GgufEmitResult::Continue | GgufEmitResult::Stopped => {
                             seq.last_token = next_tok;
@@ -2470,7 +2507,7 @@ fn run_scheduler(
                 };
                 match seq
                     .stop_filter
-                    .push_piece(&seq.response, &mut seq.output, piece)
+                    .push_piece(&seq.response, &mut seq.output, piece, may_stop)
                 {
                     GgufEmitResult::Disconnected => {
                         to_retire.push(i);
@@ -2842,6 +2879,13 @@ mod gguf_stop_filter_tests {
     use super::{GgufEmitResult, GgufResponse, GgufStopFilter};
     use std::sync::mpsc;
 
+    fn drain_chunks(rx: &mpsc::Receiver<Result<Vec<u8>, super::EngineError>>) -> String {
+        rx.try_iter()
+            .map(|chunk| String::from_utf8(chunk.expect("chunk")).expect("utf8"))
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
     #[test]
     fn stop_filter_hides_split_gemma_user_turn_marker() {
         let (tx, rx) = mpsc::channel();
@@ -2850,24 +2894,19 @@ mod gguf_stop_filter_tests {
         let mut filter = GgufStopFilter::new();
 
         assert_eq!(
-            filter.push_piece(&response, &mut output, b"answer ".to_vec()),
+            filter.push_piece(&response, &mut output, b"answer ".to_vec(), true),
             GgufEmitResult::Continue
         );
         assert_eq!(
-            filter.push_piece(&response, &mut output, b"<start_of".to_vec()),
+            filter.push_piece(&response, &mut output, b"<start_of".to_vec(), true),
             GgufEmitResult::Continue
         );
         assert_eq!(
-            filter.push_piece(&response, &mut output, b"_turn>user\nignored".to_vec()),
+            filter.push_piece(&response, &mut output, b"_turn>user\nignored".to_vec(), true),
             GgufEmitResult::Stopped
         );
 
-        let chunks = rx
-            .try_iter()
-            .map(|chunk| String::from_utf8(chunk.expect("chunk")).expect("utf8"))
-            .collect::<Vec<_>>()
-            .join("");
-        assert_eq!(chunks, "answer ");
+        assert_eq!(drain_chunks(&rx), "answer ");
     }
 
     #[test]
@@ -2878,17 +2917,62 @@ mod gguf_stop_filter_tests {
         let mut filter = GgufStopFilter::new();
 
         assert_eq!(
-            filter.push_piece(&response, &mut output, b"hello".to_vec()),
+            filter.push_piece(&response, &mut output, b"hello".to_vec(), true),
             GgufEmitResult::Continue
         );
         assert!(filter.flush(&response, &mut output));
 
-        let chunks = rx
-            .try_iter()
-            .map(|chunk| String::from_utf8(chunk.expect("chunk")).expect("utf8"))
-            .collect::<Vec<_>>()
-            .join("");
-        assert_eq!(chunks, "hello");
+        assert_eq!(drain_chunks(&rx), "hello");
+    }
+
+    #[test]
+    fn stop_filter_keeps_going_past_marker_below_floor() {
+        // Below the min_tokens floor (may_stop = false), a turn-marker must not
+        // retire the sequence: surrounding text is emitted, the marker bytes are
+        // dropped, and generation continues.
+        let (tx, rx) = mpsc::channel();
+        let response = GgufResponse::Stream(tx);
+        let mut output = Vec::new();
+        let mut filter = GgufStopFilter::new();
+
+        assert_eq!(
+            filter.push_piece(&response, &mut output, b"answer<|im_end|>".to_vec(), false),
+            GgufEmitResult::Continue
+        );
+        assert_eq!(
+            filter.push_piece(&response, &mut output, b"more".to_vec(), false),
+            GgufEmitResult::Continue
+        );
+        assert!(filter.flush(&response, &mut output));
+
+        // The marker text never leaks; the text around it is preserved.
+        assert_eq!(drain_chunks(&rx), "answermore");
+    }
+
+    #[test]
+    fn stop_filter_drops_marker_below_floor_then_stops_at_floor() {
+        // First marker (below floor) is dropped; once at the floor the next
+        // marker latches the filter as usual.
+        let (tx, rx) = mpsc::channel();
+        let response = GgufResponse::Stream(tx);
+        let mut output = Vec::new();
+        let mut filter = GgufStopFilter::new();
+
+        assert_eq!(
+            filter.push_piece(&response, &mut output, b"a<|im_end|>b".to_vec(), false),
+            GgufEmitResult::Continue
+        );
+        assert_eq!(
+            filter.push_piece(&response, &mut output, b"c<|im_end|>d".to_vec(), true),
+            GgufEmitResult::Stopped
+        );
+        // Subsequent pushes stay stopped.
+        assert_eq!(
+            filter.push_piece(&response, &mut output, b"e".to_vec(), true),
+            GgufEmitResult::Stopped
+        );
+
+        assert_eq!(drain_chunks(&rx), "abc");
     }
 }
 
