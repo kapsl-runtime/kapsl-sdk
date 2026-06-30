@@ -960,8 +960,11 @@ impl GgufSharedKvPool {
             block_table_layer_stride: max_blocks_per_seq as u32,
             n_layers: n_layers as u32,
             max_blocks_per_seq: max_blocks_per_seq as u32,
+            block_table_seq_stride: 0,
+            n_seq_slots: 0,
             model_fingerprint,
             reserve: Some(gguf_kapsl_kv_reserve),
+            reserve_seq: None,
             release: Some(gguf_kapsl_kv_release),
             touch: Some(gguf_kapsl_kv_touch),
             reserve_prefix: if has_prefix {
