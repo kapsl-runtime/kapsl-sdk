@@ -464,6 +464,94 @@ fn gguf_select_device(fallback_device_id: usize, kv_heads: usize, head_dim: usiz
         .unwrap_or(fallback_device_id)
 }
 
+/// Parse an environment variable using the same truthiness rules as the other
+/// `KAPSL_GGUF_*` boolean toggles: unset, empty, `0`, `false`, `no`, `off`
+/// (case-insensitive) are false; anything else is true.
+#[cfg(feature = "gguf-cuda-shared-kv")]
+fn gguf_env_is_truthy(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| {
+            !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "" | "0" | "false" | "no" | "off"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Decide whether the Kapsl shared-KV (paged external KV) path can serve a
+/// loaded GGUF model. Returns `Some(reason)` when it cannot and the engine must
+/// fall back to llama.cpp's native KV cache instead.
+///
+/// The shared-KV ABI (`llama_kapsl_kv_pool_desc`) describes a *single uniform*
+/// KV geometry: one `num_kv_heads`/`head_dim`, a separate-K/V `[2, …]` block
+/// layout, and full causal attention only. Architectures that violate those
+/// assumptions either hard-abort inside llama.cpp — `create_memory()` runs
+/// `GGML_ASSERT(hparams.swa_type == LLAMA_SWA_TYPE_NONE)` when a kapsl pool is
+/// attached — or silently bypass the external pool (recurrent / hybrid memory),
+/// wasting the allocation. We detect those here, before the pool is built, via
+/// architecture-scoped GGUF metadata so the model runs correctly on the native
+/// path rather than crashing or producing a mislabeled benchmark.
+#[cfg(feature = "gguf-cuda-shared-kv")]
+fn gguf_shared_kv_disable_reason(model: &LlamaModel) -> Option<String> {
+    // Operator override — this is the real wiring for the flag the benchmark
+    // scripts already pass (previously a no-op read by nothing).
+    if gguf_env_is_truthy("KAPSL_GGUF_DISABLE_SHARED_KV") {
+        return Some("disabled by KAPSL_GGUF_DISABLE_SHARED_KV".to_string());
+    }
+
+    // Escape hatch for deliberately exercising the shared-KV path on an
+    // architecture this guard would otherwise reject (e.g. measuring the
+    // sliding-window abort, or a model whose metadata trips the conservative
+    // detection below). Opt-in only; may abort or produce wrong output.
+    if gguf_env_is_truthy("KAPSL_GGUF_FORCE_SHARED_KV") {
+        log::warn!(
+            "[gguf] KAPSL_GGUF_FORCE_SHARED_KV set: bypassing shared-KV architecture guard; \
+             this may abort or yield incorrect output on unsupported models"
+        );
+        return None;
+    }
+
+    let arch = model.meta_val_str("general.architecture").unwrap_or_default();
+    if arch.is_empty() {
+        // Without a known architecture we cannot vet the KV geometry; stay on
+        // the safe native path rather than risk a mismatch or abort.
+        return Some("unknown architecture (no general.architecture metadata)".to_string());
+    }
+
+    let has_key = |suffix: &str| model.meta_val_str(&format!("{arch}.{suffix}")).is_ok();
+    let pos_int = |suffix: &str| {
+        model
+            .meta_val_str(&format!("{arch}.{suffix}"))
+            .ok()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .is_some_and(|n| n > 0)
+    };
+
+    // 1. Sliding-window / ISWA attention (Gemma 2/3, Phi-3-SWA, Cohere2, …):
+    //    llama.cpp asserts swa_type == NONE for the kapsl cache, so attaching
+    //    the pool would abort the process.
+    if pos_int("attention.sliding_window") {
+        return Some(format!("sliding-window attention (arch={arch})"));
+    }
+
+    // 2. Multi-head latent attention (DeepSeek-V2/V3-style): the compressed
+    //    latent KV does not fit the [2, num_kv_heads, head_dim] pool layout.
+    if has_key("attention.kv_lora_rank") {
+        return Some(format!("multi-head latent attention (arch={arch})"));
+    }
+
+    // 3. Recurrent / hybrid state-space memory (Mamba, RWKV, Jamba, Falcon-H1,
+    //    Nemotron-H, …): these route through llama.cpp's recurrent / hybrid
+    //    memory and ignore the external pool entirely. Detected by the presence
+    //    of SSM / WKV metadata rather than an exact architecture allowlist.
+    if has_key("ssm.state_size") || has_key("ssm.conv_kernel") || has_key("wkv.head_size") {
+        return Some(format!("recurrent/hybrid state-space memory (arch={arch})"));
+    }
+
+    None
+}
+
 #[cfg(feature = "gguf")]
 fn global_gguf_backend() -> Result<Arc<LlamaBackend>, EngineError> {
     if let Some(b) = GGUF_BACKEND.get() {
@@ -862,6 +950,13 @@ struct GgufSharedKvPoolState {
     /// Stable model identity hash (set at pool construction time).
     model_fingerprint: u64,
     inner: Mutex<GgufSharedKvReservation>,
+    /// Number of concurrent sequence slots the combined block table holds
+    /// (= scheduler max_concurrent). 0 disables multi-sequence batching.
+    n_seq_slots: usize,
+    /// Multi-sequence reservation state: per-seq persistent block ownership plus
+    /// the combined block table shared by all slots. Only used by the
+    /// `reserve_seq` path; the single-sequence `inner` path is untouched.
+    multi: Mutex<GgufMultiSeqState>,
     /// CPU-side KV block backup, populated by `evict_to_cpu()`.
     /// Cleared by the next `reserve` call which uploads data back to GPU.
     evicted: Mutex<Option<CpuEvictedState>>,
@@ -904,6 +999,24 @@ struct GgufSharedKvReservation {
     n_tokens_reserved: usize,
 }
 
+/// Multi-sequence reservation state for concurrent paged decode.
+///
+/// Each active sequence (keyed by its scheduler seq_id, which doubles as its
+/// block-table slot) persistently owns physical blocks — grow-only, never freed
+/// mid-decode — so its KV data survives across steps. The combined block table
+/// is `[n_seq_slots, n_layers, max_blocks_per_seq]` flattened; the kernels select
+/// a token's slice via `seq_slot * (n_layers * max_blocks_per_seq)`.
+#[cfg(feature = "gguf-cuda-shared-kv")]
+#[derive(Default)]
+struct GgufMultiSeqState {
+    /// seq_id -> owned[layer] = logical-ordered physical block ids.
+    sessions: std::collections::HashMap<u64, Vec<Vec<u32>>>,
+    /// Host mirror of the combined block table, len `n_seq_slots * seq_stride`.
+    combined_host: Vec<u32>,
+    /// Device copy of `combined_host`; its pointer is handed to llama.cpp.
+    combined_device: Option<CudaSlice<u32>>,
+}
+
 #[cfg(feature = "gguf-cuda-shared-kv")]
 unsafe impl Send for GgufSharedKvPool {}
 #[cfg(feature = "gguf-cuda-shared-kv")]
@@ -917,6 +1030,7 @@ impl GgufSharedKvPool {
         device_id: usize,
         n_layers: usize,
         max_ctx: usize,
+        max_concurrent: usize,
         prefix_cache: Option<Arc<Mutex<PrefixBlockCache>>>,
         model_fingerprint: u64,
     ) -> Self {
@@ -924,6 +1038,10 @@ impl GgufSharedKvPool {
         let block_size = handle.pool.block_size().max(1);
         let max_blocks_per_seq = max_ctx.div_ceil(block_size).max(1);
         let has_prefix = prefix_cache.is_some();
+        // Combined block table geometry for multi-sequence batching.
+        let n_seq_slots = max_concurrent.max(1);
+        let block_table_seq_stride = n_layers * max_blocks_per_seq;
+        let combined_host = vec![0u32; n_seq_slots * block_table_seq_stride];
         let evict_when_idle = std::env::var("KAPSL_GGUF_EVICT_ON_IDLE")
             .map(|v| {
                 !matches!(
@@ -942,6 +1060,11 @@ impl GgufSharedKvPool {
             prefix_cache,
             model_fingerprint,
             inner: Mutex::new(GgufSharedKvReservation::default()),
+            n_seq_slots,
+            multi: Mutex::new(GgufMultiSeqState {
+                combined_host,
+                ..Default::default()
+            }),
             evicted: Mutex::new(None),
             evict_when_idle,
         });
@@ -960,11 +1083,12 @@ impl GgufSharedKvPool {
             block_table_layer_stride: max_blocks_per_seq as u32,
             n_layers: n_layers as u32,
             max_blocks_per_seq: max_blocks_per_seq as u32,
-            block_table_seq_stride: 0,
-            n_seq_slots: 0,
+            // Multi-sequence combined block table geometry.
+            block_table_seq_stride: block_table_seq_stride as u32,
+            n_seq_slots: n_seq_slots as u32,
             model_fingerprint,
             reserve: Some(gguf_kapsl_kv_reserve),
-            reserve_seq: None,
+            reserve_seq: Some(gguf_kapsl_kv_reserve_seq),
             release: Some(gguf_kapsl_kv_release),
             touch: Some(gguf_kapsl_kv_touch),
             reserve_prefix: if has_prefix {
@@ -1411,6 +1535,93 @@ unsafe extern "C" fn gguf_kapsl_kv_reserve(
     true
 }
 
+// ── Multi-sequence reserve callback ──────────────────────────────────────────
+//
+// Reserves blocks for ONE sequence slot (keyed by seq_id) in the combined block
+// table, growing the slot's per-layer block ownership as the sequence's context
+// grows. Block ownership is persistent across decode steps (never freed until
+// the sequence is released) so KV data survives. Returns the combined table's
+// device pointer, which is shared across all slots.
+#[cfg(feature = "gguf-cuda-shared-kv")]
+unsafe extern "C" fn gguf_kapsl_kv_reserve_seq(
+    user_data: *mut std::ffi::c_void,
+    seq_id: u64,
+    tokens_needed: u32,
+    block_table_device_out: *mut *mut u32,
+    n_blocks_out: *mut u32,
+) -> bool {
+    if user_data.is_null() || block_table_device_out.is_null() || n_blocks_out.is_null() {
+        return false;
+    }
+    let state = &*(user_data as *mut GgufSharedKvPoolState);
+    let block_size = state.handle.pool.block_size().max(1);
+    let logical = (tokens_needed as usize).div_ceil(block_size).max(1);
+    if logical > state.max_blocks_per_seq {
+        return false;
+    }
+    let slot = seq_id as usize;
+    if slot >= state.n_seq_slots {
+        return false;
+    }
+    let n_layers = state.n_layers;
+    let seq_stride = n_layers * state.max_blocks_per_seq;
+
+    let mut m = state.multi.lock().unwrap();
+
+    // Grow this sequence's per-layer block ownership to `logical` blocks. All
+    // layers stay the same length, so the fresh blocks are committed
+    // all-or-nothing to keep the slot consistent on allocation failure.
+    let have = m
+        .sessions
+        .get(&seq_id)
+        .map(|owned| owned.iter().map(|v| v.len()).min().unwrap_or(0))
+        .unwrap_or(0);
+    if logical > have {
+        let per_layer = logical - have;
+        let mut fresh: Vec<u32> = Vec::with_capacity(per_layer * n_layers);
+        if !alloc_blocks_with_cache_eviction(state, per_layer * n_layers, &mut fresh) {
+            return false;
+        }
+        let owned = m
+            .sessions
+            .entry(seq_id)
+            .or_insert_with(|| vec![Vec::new(); n_layers]);
+        for layer in 0..n_layers {
+            let start = layer * per_layer;
+            owned[layer].extend_from_slice(&fresh[start..start + per_layer]);
+        }
+    }
+
+    // Write this sequence's blocks into its slot of the combined block table.
+    {
+        let GgufMultiSeqState {
+            sessions,
+            combined_host,
+            ..
+        } = &mut *m;
+        let owned = &sessions[&seq_id];
+        let base = slot * seq_stride;
+        for layer in 0..n_layers {
+            let layer_base = base + layer * state.max_blocks_per_seq;
+            for l in 0..logical {
+                combined_host[layer_base + l] = owned[layer][l];
+            }
+        }
+    }
+
+    // Upload the combined table and hand its device pointer to llama.cpp.
+    let table = match state.handle.pool.device().htod_sync_copy(&m.combined_host) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    let table_ptr = *table.device_ptr() as *mut u32;
+    m.combined_device = Some(table);
+
+    *block_table_device_out = table_ptr;
+    *n_blocks_out = logical as u32;
+    true
+}
+
 // ── Reserve callback (with prefix cache) ─────────────────────────────────────
 
 #[cfg(feature = "gguf-cuda-shared-kv")]
@@ -1722,11 +1933,34 @@ fn gguf_release_reservation_inner(
 }
 
 #[cfg(feature = "gguf-cuda-shared-kv")]
-unsafe extern "C" fn gguf_kapsl_kv_release(user_data: *mut std::ffi::c_void, _session_id: u64) {
+unsafe extern "C" fn gguf_kapsl_kv_release(user_data: *mut std::ffi::c_void, session_id: u64) {
     if user_data.is_null() {
         return;
     }
     let state = &*(user_data as *mut GgufSharedKvPoolState);
+
+    // Multi-sequence path: free this sequence slot's persistent blocks and clear
+    // its block-table region so a future request reusing the seq_id starts fresh.
+    // No-op in single-sequence mode (sessions is empty).
+    {
+        let mut m = state.multi.lock().unwrap();
+        if let Some(owned) = m.sessions.remove(&session_id) {
+            for layer in owned {
+                for b in layer {
+                    state.handle.pool.free_block(b);
+                }
+            }
+            let slot = session_id as usize;
+            if slot < state.n_seq_slots {
+                let seq_stride = state.n_layers * state.max_blocks_per_seq;
+                let base = slot * seq_stride;
+                for x in &mut m.combined_host[base..base + seq_stride] {
+                    *x = 0;
+                }
+            }
+        }
+    }
+
     let mut inner = state.inner.lock().unwrap();
     gguf_release_reservation_inner(
         &mut inner,
@@ -1746,6 +1980,49 @@ unsafe extern "C" fn gguf_kapsl_kv_touch(
 
 // ─── Backend ──────────────────────────────────────────────────────────────────
 
+/// Which KV-cache implementation a loaded GGUF engine actually ended up using.
+/// Recorded at load time so diagnostics and benchmarks can report the real path
+/// instead of inferring it from build features or env vars (which can be wrong:
+/// shared-KV silently falls back to native for unsupported architectures).
+#[cfg(feature = "gguf-cuda-shared-kv")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GgufKvPath {
+    /// Not yet loaded.
+    Unloaded,
+    /// Kapsl paged external KV pool (shared-KV).
+    SharedKv,
+    /// llama.cpp's native in-process KV cache (unified / ISWA / recurrent).
+    Native,
+}
+
+#[cfg(feature = "gguf-cuda-shared-kv")]
+impl GgufKvPath {
+    /// Stable lowercase label for logs, info endpoints, and benchmark output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GgufKvPath::Unloaded => "unloaded",
+            GgufKvPath::SharedKv => "shared-kv",
+            GgufKvPath::Native => "native",
+        }
+    }
+
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => GgufKvPath::SharedKv,
+            2 => GgufKvPath::Native,
+            _ => GgufKvPath::Unloaded,
+        }
+    }
+
+    fn as_u8(self) -> u8 {
+        match self {
+            GgufKvPath::Unloaded => 0,
+            GgufKvPath::SharedKv => 1,
+            GgufKvPath::Native => 2,
+        }
+    }
+}
+
 pub struct GgufBackend {
     #[cfg(feature = "gguf")]
     inner: Option<GgufInner>,
@@ -1754,6 +2031,9 @@ pub struct GgufBackend {
     device_id: usize,
     #[cfg(feature = "gguf-cuda-shared-kv")]
     pool_slot: Arc<Mutex<Option<GpuPoolHandle>>>,
+    /// Active KV path, set during `load()`. Read lock-free via `active_kv_path`.
+    #[cfg(feature = "gguf-cuda-shared-kv")]
+    kv_path: Arc<std::sync::atomic::AtomicU8>,
 }
 
 #[cfg(feature = "gguf")]
@@ -1773,6 +2053,8 @@ impl GgufBackend {
             device_id: 0,
             #[cfg(feature = "gguf-cuda-shared-kv")]
             pool_slot: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "gguf-cuda-shared-kv")]
+            kv_path: Arc::new(std::sync::atomic::AtomicU8::new(GgufKvPath::Unloaded.as_u8())),
         }
     }
 
@@ -1784,7 +2066,15 @@ impl GgufBackend {
             metrics: Arc::new(Mutex::new(EngineMetrics::new())),
             device_id,
             pool_slot: Arc::new(Mutex::new(handle)),
+            kv_path: Arc::new(std::sync::atomic::AtomicU8::new(GgufKvPath::Unloaded.as_u8())),
         }
+    }
+
+    /// The KV-cache path this engine is using after `load()`. Returns
+    /// [`GgufKvPath::Unloaded`] before a model is loaded.
+    #[cfg(feature = "gguf-cuda-shared-kv")]
+    pub fn active_kv_path(&self) -> GgufKvPath {
+        GgufKvPath::from_u8(self.kv_path.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     #[cfg(feature = "gguf-cuda-shared-kv")]
@@ -2612,7 +2902,20 @@ impl Engine for GgufBackend {
 
         let config = GgufServingConfig::from_model(&weights.model, weights.n_ctx_train);
         #[cfg(feature = "gguf-cuda-shared-kv")]
-        let shared_kv_pool = {
+        let shared_kv_pool = if let Some(reason) = gguf_shared_kv_disable_reason(&weights.model) {
+            // Architecture/geometry the uniform shared-KV pool cannot represent
+            // (or an explicit operator override): skip the pool and let
+            // llama.cpp build its native KV cache for this model.
+            log::info!(
+                "[gguf] kv_path=native shared-KV disabled for {} ({reason}); using llama.cpp native KV path",
+                model_path.display()
+            );
+            self.kv_path.store(
+                GgufKvPath::Native.as_u8(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            None
+        } else {
             let n_layers = weights.model.n_layer().max(1) as usize;
             let n_embd = weights.model.n_embd().max(1) as usize;
             let n_head = weights.model.n_head().max(1) as usize;
@@ -2694,12 +2997,20 @@ impl Engine for GgufBackend {
                     "[gguf] Prefix KV cache enabled: capacity={} logical positions",
                     prefix_cache_cap
                 );
+                self.kv_path.store(
+                    GgufKvPath::SharedKv.as_u8(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                log::info!(
+                    "[gguf] kv_path=shared-kv Kapsl paged external KV pool active on device {effective_device_id}"
+                );
                 Some(GgufSharedKvPool::new(
                     handle,
                     self.metrics.clone(),
                     effective_device_id,
                     n_layers,
                     config.total_ctx(),
+                    config.max_concurrent,
                     prefix_cache,
                     model_fingerprint,
                 ))
