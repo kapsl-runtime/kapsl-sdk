@@ -37,10 +37,15 @@ mod tests {
 
     #[test]
     fn test_expired_lease_is_reused() {
-        let allocator = SimpleShmAllocator::new_with_ttl(256, 32, 1, Duration::from_millis(20));
+        // TTL margins are intentionally generous: the slot must still be leased
+        // when we re-check on the next line, and reusable after the sleep. A
+        // tight TTL (e.g. 20ms) flakes on loaded CI runners where >TTL can
+        // elapse between the allocate and the immediate `is_none()` check.
+        let ttl = Duration::from_millis(500);
+        let allocator = SimpleShmAllocator::new_with_ttl(256, 32, 1, ttl);
         let first = allocator.try_allocate(8).expect("slot");
         assert!(allocator.try_allocate(8).is_none());
-        thread::sleep(Duration::from_millis(30));
+        thread::sleep(ttl + Duration::from_millis(100));
         let second = allocator
             .try_allocate(8)
             .expect("expired lease should be reusable");
