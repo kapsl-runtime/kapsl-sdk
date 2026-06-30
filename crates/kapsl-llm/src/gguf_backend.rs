@@ -464,6 +464,94 @@ fn gguf_select_device(fallback_device_id: usize, kv_heads: usize, head_dim: usiz
         .unwrap_or(fallback_device_id)
 }
 
+/// Parse an environment variable using the same truthiness rules as the other
+/// `KAPSL_GGUF_*` boolean toggles: unset, empty, `0`, `false`, `no`, `off`
+/// (case-insensitive) are false; anything else is true.
+#[cfg(feature = "gguf-cuda-shared-kv")]
+fn gguf_env_is_truthy(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| {
+            !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "" | "0" | "false" | "no" | "off"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Decide whether the Kapsl shared-KV (paged external KV) path can serve a
+/// loaded GGUF model. Returns `Some(reason)` when it cannot and the engine must
+/// fall back to llama.cpp's native KV cache instead.
+///
+/// The shared-KV ABI (`llama_kapsl_kv_pool_desc`) describes a *single uniform*
+/// KV geometry: one `num_kv_heads`/`head_dim`, a separate-K/V `[2, …]` block
+/// layout, and full causal attention only. Architectures that violate those
+/// assumptions either hard-abort inside llama.cpp — `create_memory()` runs
+/// `GGML_ASSERT(hparams.swa_type == LLAMA_SWA_TYPE_NONE)` when a kapsl pool is
+/// attached — or silently bypass the external pool (recurrent / hybrid memory),
+/// wasting the allocation. We detect those here, before the pool is built, via
+/// architecture-scoped GGUF metadata so the model runs correctly on the native
+/// path rather than crashing or producing a mislabeled benchmark.
+#[cfg(feature = "gguf-cuda-shared-kv")]
+fn gguf_shared_kv_disable_reason(model: &LlamaModel) -> Option<String> {
+    // Operator override — this is the real wiring for the flag the benchmark
+    // scripts already pass (previously a no-op read by nothing).
+    if gguf_env_is_truthy("KAPSL_GGUF_DISABLE_SHARED_KV") {
+        return Some("disabled by KAPSL_GGUF_DISABLE_SHARED_KV".to_string());
+    }
+
+    // Escape hatch for deliberately exercising the shared-KV path on an
+    // architecture this guard would otherwise reject (e.g. measuring the
+    // sliding-window abort, or a model whose metadata trips the conservative
+    // detection below). Opt-in only; may abort or produce wrong output.
+    if gguf_env_is_truthy("KAPSL_GGUF_FORCE_SHARED_KV") {
+        log::warn!(
+            "[gguf] KAPSL_GGUF_FORCE_SHARED_KV set: bypassing shared-KV architecture guard; \
+             this may abort or yield incorrect output on unsupported models"
+        );
+        return None;
+    }
+
+    let arch = model.meta_val_str("general.architecture").unwrap_or_default();
+    if arch.is_empty() {
+        // Without a known architecture we cannot vet the KV geometry; stay on
+        // the safe native path rather than risk a mismatch or abort.
+        return Some("unknown architecture (no general.architecture metadata)".to_string());
+    }
+
+    let has_key = |suffix: &str| model.meta_val_str(&format!("{arch}.{suffix}")).is_ok();
+    let pos_int = |suffix: &str| {
+        model
+            .meta_val_str(&format!("{arch}.{suffix}"))
+            .ok()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .is_some_and(|n| n > 0)
+    };
+
+    // 1. Sliding-window / ISWA attention (Gemma 2/3, Phi-3-SWA, Cohere2, …):
+    //    llama.cpp asserts swa_type == NONE for the kapsl cache, so attaching
+    //    the pool would abort the process.
+    if pos_int("attention.sliding_window") {
+        return Some(format!("sliding-window attention (arch={arch})"));
+    }
+
+    // 2. Multi-head latent attention (DeepSeek-V2/V3-style): the compressed
+    //    latent KV does not fit the [2, num_kv_heads, head_dim] pool layout.
+    if has_key("attention.kv_lora_rank") {
+        return Some(format!("multi-head latent attention (arch={arch})"));
+    }
+
+    // 3. Recurrent / hybrid state-space memory (Mamba, RWKV, Jamba, Falcon-H1,
+    //    Nemotron-H, …): these route through llama.cpp's recurrent / hybrid
+    //    memory and ignore the external pool entirely. Detected by the presence
+    //    of SSM / WKV metadata rather than an exact architecture allowlist.
+    if has_key("ssm.state_size") || has_key("ssm.conv_kernel") || has_key("wkv.head_size") {
+        return Some(format!("recurrent/hybrid state-space memory (arch={arch})"));
+    }
+
+    None
+}
+
 #[cfg(feature = "gguf")]
 fn global_gguf_backend() -> Result<Arc<LlamaBackend>, EngineError> {
     if let Some(b) = GGUF_BACKEND.get() {
@@ -1892,6 +1980,49 @@ unsafe extern "C" fn gguf_kapsl_kv_touch(
 
 // ─── Backend ──────────────────────────────────────────────────────────────────
 
+/// Which KV-cache implementation a loaded GGUF engine actually ended up using.
+/// Recorded at load time so diagnostics and benchmarks can report the real path
+/// instead of inferring it from build features or env vars (which can be wrong:
+/// shared-KV silently falls back to native for unsupported architectures).
+#[cfg(feature = "gguf-cuda-shared-kv")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GgufKvPath {
+    /// Not yet loaded.
+    Unloaded,
+    /// Kapsl paged external KV pool (shared-KV).
+    SharedKv,
+    /// llama.cpp's native in-process KV cache (unified / ISWA / recurrent).
+    Native,
+}
+
+#[cfg(feature = "gguf-cuda-shared-kv")]
+impl GgufKvPath {
+    /// Stable lowercase label for logs, info endpoints, and benchmark output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GgufKvPath::Unloaded => "unloaded",
+            GgufKvPath::SharedKv => "shared-kv",
+            GgufKvPath::Native => "native",
+        }
+    }
+
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => GgufKvPath::SharedKv,
+            2 => GgufKvPath::Native,
+            _ => GgufKvPath::Unloaded,
+        }
+    }
+
+    fn as_u8(self) -> u8 {
+        match self {
+            GgufKvPath::Unloaded => 0,
+            GgufKvPath::SharedKv => 1,
+            GgufKvPath::Native => 2,
+        }
+    }
+}
+
 pub struct GgufBackend {
     #[cfg(feature = "gguf")]
     inner: Option<GgufInner>,
@@ -1900,6 +2031,9 @@ pub struct GgufBackend {
     device_id: usize,
     #[cfg(feature = "gguf-cuda-shared-kv")]
     pool_slot: Arc<Mutex<Option<GpuPoolHandle>>>,
+    /// Active KV path, set during `load()`. Read lock-free via `active_kv_path`.
+    #[cfg(feature = "gguf-cuda-shared-kv")]
+    kv_path: Arc<std::sync::atomic::AtomicU8>,
 }
 
 #[cfg(feature = "gguf")]
@@ -1919,6 +2053,8 @@ impl GgufBackend {
             device_id: 0,
             #[cfg(feature = "gguf-cuda-shared-kv")]
             pool_slot: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "gguf-cuda-shared-kv")]
+            kv_path: Arc::new(std::sync::atomic::AtomicU8::new(GgufKvPath::Unloaded.as_u8())),
         }
     }
 
@@ -1930,7 +2066,15 @@ impl GgufBackend {
             metrics: Arc::new(Mutex::new(EngineMetrics::new())),
             device_id,
             pool_slot: Arc::new(Mutex::new(handle)),
+            kv_path: Arc::new(std::sync::atomic::AtomicU8::new(GgufKvPath::Unloaded.as_u8())),
         }
+    }
+
+    /// The KV-cache path this engine is using after `load()`. Returns
+    /// [`GgufKvPath::Unloaded`] before a model is loaded.
+    #[cfg(feature = "gguf-cuda-shared-kv")]
+    pub fn active_kv_path(&self) -> GgufKvPath {
+        GgufKvPath::from_u8(self.kv_path.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     #[cfg(feature = "gguf-cuda-shared-kv")]
@@ -2758,7 +2902,20 @@ impl Engine for GgufBackend {
 
         let config = GgufServingConfig::from_model(&weights.model, weights.n_ctx_train);
         #[cfg(feature = "gguf-cuda-shared-kv")]
-        let shared_kv_pool = {
+        let shared_kv_pool = if let Some(reason) = gguf_shared_kv_disable_reason(&weights.model) {
+            // Architecture/geometry the uniform shared-KV pool cannot represent
+            // (or an explicit operator override): skip the pool and let
+            // llama.cpp build its native KV cache for this model.
+            log::info!(
+                "[gguf] kv_path=native shared-KV disabled for {} ({reason}); using llama.cpp native KV path",
+                model_path.display()
+            );
+            self.kv_path.store(
+                GgufKvPath::Native.as_u8(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            None
+        } else {
             let n_layers = weights.model.n_layer().max(1) as usize;
             let n_embd = weights.model.n_embd().max(1) as usize;
             let n_head = weights.model.n_head().max(1) as usize;
@@ -2839,6 +2996,13 @@ impl Engine for GgufBackend {
                 log::info!(
                     "[gguf] Prefix KV cache enabled: capacity={} logical positions",
                     prefix_cache_cap
+                );
+                self.kv_path.store(
+                    GgufKvPath::SharedKv.as_u8(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                log::info!(
+                    "[gguf] kv_path=shared-kv Kapsl paged external KV pool active on device {effective_device_id}"
                 );
                 Some(GgufSharedKvPool::new(
                     handle,
