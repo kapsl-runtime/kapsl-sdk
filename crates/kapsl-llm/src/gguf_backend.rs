@@ -950,6 +950,13 @@ struct GgufSharedKvPoolState {
     /// Stable model identity hash (set at pool construction time).
     model_fingerprint: u64,
     inner: Mutex<GgufSharedKvReservation>,
+    /// Number of concurrent sequence slots the combined block table holds
+    /// (= scheduler max_concurrent). 0 disables multi-sequence batching.
+    n_seq_slots: usize,
+    /// Multi-sequence reservation state: per-seq persistent block ownership plus
+    /// the combined block table shared by all slots. Only used by the
+    /// `reserve_seq` path; the single-sequence `inner` path is untouched.
+    multi: Mutex<GgufMultiSeqState>,
     /// CPU-side KV block backup, populated by `evict_to_cpu()`.
     /// Cleared by the next `reserve` call which uploads data back to GPU.
     evicted: Mutex<Option<CpuEvictedState>>,
@@ -992,6 +999,24 @@ struct GgufSharedKvReservation {
     n_tokens_reserved: usize,
 }
 
+/// Multi-sequence reservation state for concurrent paged decode.
+///
+/// Each active sequence (keyed by its scheduler seq_id, which doubles as its
+/// block-table slot) persistently owns physical blocks — grow-only, never freed
+/// mid-decode — so its KV data survives across steps. The combined block table
+/// is `[n_seq_slots, n_layers, max_blocks_per_seq]` flattened; the kernels select
+/// a token's slice via `seq_slot * (n_layers * max_blocks_per_seq)`.
+#[cfg(feature = "gguf-cuda-shared-kv")]
+#[derive(Default)]
+struct GgufMultiSeqState {
+    /// seq_id -> owned[layer] = logical-ordered physical block ids.
+    sessions: std::collections::HashMap<u64, Vec<Vec<u32>>>,
+    /// Host mirror of the combined block table, len `n_seq_slots * seq_stride`.
+    combined_host: Vec<u32>,
+    /// Device copy of `combined_host`; its pointer is handed to llama.cpp.
+    combined_device: Option<CudaSlice<u32>>,
+}
+
 #[cfg(feature = "gguf-cuda-shared-kv")]
 unsafe impl Send for GgufSharedKvPool {}
 #[cfg(feature = "gguf-cuda-shared-kv")]
@@ -1005,6 +1030,7 @@ impl GgufSharedKvPool {
         device_id: usize,
         n_layers: usize,
         max_ctx: usize,
+        max_concurrent: usize,
         prefix_cache: Option<Arc<Mutex<PrefixBlockCache>>>,
         model_fingerprint: u64,
     ) -> Self {
@@ -1012,6 +1038,10 @@ impl GgufSharedKvPool {
         let block_size = handle.pool.block_size().max(1);
         let max_blocks_per_seq = max_ctx.div_ceil(block_size).max(1);
         let has_prefix = prefix_cache.is_some();
+        // Combined block table geometry for multi-sequence batching.
+        let n_seq_slots = max_concurrent.max(1);
+        let block_table_seq_stride = n_layers * max_blocks_per_seq;
+        let combined_host = vec![0u32; n_seq_slots * block_table_seq_stride];
         let evict_when_idle = std::env::var("KAPSL_GGUF_EVICT_ON_IDLE")
             .map(|v| {
                 !matches!(
@@ -1030,6 +1060,11 @@ impl GgufSharedKvPool {
             prefix_cache,
             model_fingerprint,
             inner: Mutex::new(GgufSharedKvReservation::default()),
+            n_seq_slots,
+            multi: Mutex::new(GgufMultiSeqState {
+                combined_host,
+                ..Default::default()
+            }),
             evicted: Mutex::new(None),
             evict_when_idle,
         });
@@ -1048,8 +1083,12 @@ impl GgufSharedKvPool {
             block_table_layer_stride: max_blocks_per_seq as u32,
             n_layers: n_layers as u32,
             max_blocks_per_seq: max_blocks_per_seq as u32,
+            // Multi-sequence combined block table geometry.
+            block_table_seq_stride: block_table_seq_stride as u32,
+            n_seq_slots: n_seq_slots as u32,
             model_fingerprint,
             reserve: Some(gguf_kapsl_kv_reserve),
+            reserve_seq: Some(gguf_kapsl_kv_reserve_seq),
             release: Some(gguf_kapsl_kv_release),
             touch: Some(gguf_kapsl_kv_touch),
             reserve_prefix: if has_prefix {
@@ -1496,6 +1535,93 @@ unsafe extern "C" fn gguf_kapsl_kv_reserve(
     true
 }
 
+// ── Multi-sequence reserve callback ──────────────────────────────────────────
+//
+// Reserves blocks for ONE sequence slot (keyed by seq_id) in the combined block
+// table, growing the slot's per-layer block ownership as the sequence's context
+// grows. Block ownership is persistent across decode steps (never freed until
+// the sequence is released) so KV data survives. Returns the combined table's
+// device pointer, which is shared across all slots.
+#[cfg(feature = "gguf-cuda-shared-kv")]
+unsafe extern "C" fn gguf_kapsl_kv_reserve_seq(
+    user_data: *mut std::ffi::c_void,
+    seq_id: u64,
+    tokens_needed: u32,
+    block_table_device_out: *mut *mut u32,
+    n_blocks_out: *mut u32,
+) -> bool {
+    if user_data.is_null() || block_table_device_out.is_null() || n_blocks_out.is_null() {
+        return false;
+    }
+    let state = &*(user_data as *mut GgufSharedKvPoolState);
+    let block_size = state.handle.pool.block_size().max(1);
+    let logical = (tokens_needed as usize).div_ceil(block_size).max(1);
+    if logical > state.max_blocks_per_seq {
+        return false;
+    }
+    let slot = seq_id as usize;
+    if slot >= state.n_seq_slots {
+        return false;
+    }
+    let n_layers = state.n_layers;
+    let seq_stride = n_layers * state.max_blocks_per_seq;
+
+    let mut m = state.multi.lock().unwrap();
+
+    // Grow this sequence's per-layer block ownership to `logical` blocks. All
+    // layers stay the same length, so the fresh blocks are committed
+    // all-or-nothing to keep the slot consistent on allocation failure.
+    let have = m
+        .sessions
+        .get(&seq_id)
+        .map(|owned| owned.iter().map(|v| v.len()).min().unwrap_or(0))
+        .unwrap_or(0);
+    if logical > have {
+        let per_layer = logical - have;
+        let mut fresh: Vec<u32> = Vec::with_capacity(per_layer * n_layers);
+        if !alloc_blocks_with_cache_eviction(state, per_layer * n_layers, &mut fresh) {
+            return false;
+        }
+        let owned = m
+            .sessions
+            .entry(seq_id)
+            .or_insert_with(|| vec![Vec::new(); n_layers]);
+        for layer in 0..n_layers {
+            let start = layer * per_layer;
+            owned[layer].extend_from_slice(&fresh[start..start + per_layer]);
+        }
+    }
+
+    // Write this sequence's blocks into its slot of the combined block table.
+    {
+        let GgufMultiSeqState {
+            sessions,
+            combined_host,
+            ..
+        } = &mut *m;
+        let owned = &sessions[&seq_id];
+        let base = slot * seq_stride;
+        for layer in 0..n_layers {
+            let layer_base = base + layer * state.max_blocks_per_seq;
+            for l in 0..logical {
+                combined_host[layer_base + l] = owned[layer][l];
+            }
+        }
+    }
+
+    // Upload the combined table and hand its device pointer to llama.cpp.
+    let table = match state.handle.pool.device().htod_sync_copy(&m.combined_host) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    let table_ptr = *table.device_ptr() as *mut u32;
+    m.combined_device = Some(table);
+
+    *block_table_device_out = table_ptr;
+    *n_blocks_out = logical as u32;
+    true
+}
+
 // ── Reserve callback (with prefix cache) ─────────────────────────────────────
 
 #[cfg(feature = "gguf-cuda-shared-kv")]
@@ -1807,11 +1933,34 @@ fn gguf_release_reservation_inner(
 }
 
 #[cfg(feature = "gguf-cuda-shared-kv")]
-unsafe extern "C" fn gguf_kapsl_kv_release(user_data: *mut std::ffi::c_void, _session_id: u64) {
+unsafe extern "C" fn gguf_kapsl_kv_release(user_data: *mut std::ffi::c_void, session_id: u64) {
     if user_data.is_null() {
         return;
     }
     let state = &*(user_data as *mut GgufSharedKvPoolState);
+
+    // Multi-sequence path: free this sequence slot's persistent blocks and clear
+    // its block-table region so a future request reusing the seq_id starts fresh.
+    // No-op in single-sequence mode (sessions is empty).
+    {
+        let mut m = state.multi.lock().unwrap();
+        if let Some(owned) = m.sessions.remove(&session_id) {
+            for layer in owned {
+                for b in layer {
+                    state.handle.pool.free_block(b);
+                }
+            }
+            let slot = session_id as usize;
+            if slot < state.n_seq_slots {
+                let seq_stride = state.n_layers * state.max_blocks_per_seq;
+                let base = slot * seq_stride;
+                for x in &mut m.combined_host[base..base + seq_stride] {
+                    *x = 0;
+                }
+            }
+        }
+    }
+
     let mut inner = state.inner.lock().unwrap();
     gguf_release_reservation_inner(
         &mut inner,
@@ -2861,6 +3010,7 @@ impl Engine for GgufBackend {
                     effective_device_id,
                     n_layers,
                     config.total_ctx(),
+                    config.max_concurrent,
                     prefix_cache,
                     model_fingerprint,
                 ))
