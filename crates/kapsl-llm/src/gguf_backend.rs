@@ -1015,6 +1015,8 @@ struct GgufMultiSeqState {
     combined_host: Vec<u32>,
     /// Device copy of `combined_host`; its pointer is handed to llama.cpp.
     combined_device: Option<CudaSlice<u32>>,
+    /// True when `combined_host` has changed since `combined_device` was uploaded.
+    combined_dirty: bool,
 }
 
 #[cfg(feature = "gguf-cuda-shared-kv")]
@@ -1029,14 +1031,14 @@ impl GgufSharedKvPool {
         metrics: Arc<Mutex<EngineMetrics>>,
         device_id: usize,
         n_layers: usize,
-        max_ctx: usize,
+        ctx_per_seq: usize,
         max_concurrent: usize,
         prefix_cache: Option<Arc<Mutex<PrefixBlockCache>>>,
         model_fingerprint: u64,
     ) -> Self {
         let pool_arc = handle.pool.clone();
         let block_size = handle.pool.block_size().max(1);
-        let max_blocks_per_seq = max_ctx.div_ceil(block_size).max(1);
+        let max_blocks_per_seq = ctx_per_seq.div_ceil(block_size).max(1);
         let has_prefix = prefix_cache.is_some();
         // Combined block table geometry for multi-sequence batching.
         let n_seq_slots = max_concurrent.max(1);
@@ -1089,6 +1091,7 @@ impl GgufSharedKvPool {
             model_fingerprint,
             reserve: Some(gguf_kapsl_kv_reserve),
             reserve_seq: Some(gguf_kapsl_kv_reserve_seq),
+            commit_seq: Some(gguf_kapsl_kv_commit_seq),
             release: Some(gguf_kapsl_kv_release),
             touch: Some(gguf_kapsl_kv_touch),
             reserve_prefix: if has_prefix {
@@ -1540,8 +1543,9 @@ unsafe extern "C" fn gguf_kapsl_kv_reserve(
 // Reserves blocks for ONE sequence slot (keyed by seq_id) in the combined block
 // table, growing the slot's per-layer block ownership as the sequence's context
 // grows. Block ownership is persistent across decode steps (never freed until
-// the sequence is released) so KV data survives. Returns the combined table's
-// device pointer, which is shared across all slots.
+// the sequence is released) so KV data survives. The combined table upload is
+// deferred to `gguf_kapsl_kv_commit_seq` so one decode batch performs at most
+// one H2D copy.
 #[cfg(feature = "gguf-cuda-shared-kv")]
 unsafe extern "C" fn gguf_kapsl_kv_reserve_seq(
     user_data: *mut std::ffi::c_void,
@@ -1590,35 +1594,58 @@ unsafe extern "C" fn gguf_kapsl_kv_reserve_seq(
             let start = layer * per_layer;
             owned[layer].extend_from_slice(&fresh[start..start + per_layer]);
         }
-    }
-
-    // Write this sequence's blocks into its slot of the combined block table.
-    {
-        let GgufMultiSeqState {
-            sessions,
-            combined_host,
-            ..
-        } = &mut *m;
-        let owned = &sessions[&seq_id];
-        let base = slot * seq_stride;
-        for layer in 0..n_layers {
-            let layer_base = base + layer * state.max_blocks_per_seq;
-            for l in 0..logical {
-                combined_host[layer_base + l] = owned[layer][l];
+        {
+            let GgufMultiSeqState {
+                sessions,
+                combined_host,
+                combined_dirty,
+                ..
+            } = &mut *m;
+            let owned = &sessions[&seq_id];
+            let base = slot * seq_stride;
+            for layer in 0..n_layers {
+                let layer_base = base + layer * state.max_blocks_per_seq;
+                for l in 0..logical {
+                    combined_host[layer_base + l] = owned[layer][l];
+                }
             }
+            *combined_dirty = true;
         }
     }
 
-    // Upload the combined table and hand its device pointer to llama.cpp.
-    let table = match state.handle.pool.device().htod_sync_copy(&m.combined_host) {
-        Ok(t) => t,
-        Err(_) => return false,
-    };
-    let table_ptr = *table.device_ptr() as *mut u32;
-    m.combined_device = Some(table);
-
-    *block_table_device_out = table_ptr;
+    *block_table_device_out = m
+        .combined_device
+        .as_ref()
+        .map(|table| *table.device_ptr() as *mut u32)
+        .unwrap_or(std::ptr::null_mut());
     *n_blocks_out = logical as u32;
+    true
+}
+
+#[cfg(feature = "gguf-cuda-shared-kv")]
+unsafe extern "C" fn gguf_kapsl_kv_commit_seq(
+    user_data: *mut std::ffi::c_void,
+    block_table_device_out: *mut *mut u32,
+) -> bool {
+    if user_data.is_null() || block_table_device_out.is_null() {
+        return false;
+    }
+    let state = &*(user_data as *mut GgufSharedKvPoolState);
+    let mut m = state.multi.lock().unwrap();
+
+    if m.combined_dirty || m.combined_device.is_none() {
+        let table = match state.handle.pool.device().htod_sync_copy(&m.combined_host) {
+            Ok(t) => t,
+            Err(_) => return false,
+        };
+        m.combined_device = Some(table);
+        m.combined_dirty = false;
+    }
+
+    let Some(table) = m.combined_device.as_ref() else {
+        return false;
+    };
+    *block_table_device_out = *table.device_ptr() as *mut u32;
     true
 }
 
@@ -1957,6 +1984,7 @@ unsafe extern "C" fn gguf_kapsl_kv_release(user_data: *mut std::ffi::c_void, ses
                 for x in &mut m.combined_host[base..base + seq_stride] {
                     *x = 0;
                 }
+                m.combined_dirty = true;
             }
         }
     }
@@ -2148,6 +2176,18 @@ fn sequence_needs_kv_after_first(
 }
 
 #[cfg(feature = "gguf")]
+fn release_sequence_slot(
+    ctx: &mut llama_cpp_2::context::LlamaContext,
+    available_ids: &mut Vec<i32>,
+    seq_id: i32,
+) {
+    if let Ok(seq_id_u32) = u32::try_from(seq_id) {
+        let _ = ctx.clear_kv_cache_seq(Some(seq_id_u32), None, None);
+    }
+    available_ids.push(seq_id);
+}
+
+#[cfg(feature = "gguf")]
 fn finish_or_activate_prefilled_sequence(
     metrics: &Arc<Mutex<EngineMetrics>>,
     ctx: &mut llama_cpp_2::context::LlamaContext,
@@ -2167,16 +2207,14 @@ fn finish_or_activate_prefilled_sequence(
     let mut stop_filter = GgufStopFilter::new();
 
     if max_tokens <= 0 || (first_tok == eos_token && min_tokens <= 0) {
-        let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
-        available_ids.push(seq_id);
+        release_sequence_slot(ctx, available_ids, seq_id);
         record_gguf_token_metrics(metrics, prompt_len.max(0) as usize, 0);
         response.finish(output);
         return;
     }
 
     let Some(piece) = first_piece else {
-        let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
-        available_ids.push(seq_id);
+        release_sequence_slot(ctx, available_ids, seq_id);
         response.send_error(EngineError::backend("missing first token piece"));
         return;
     };
@@ -2187,27 +2225,23 @@ fn finish_or_activate_prefilled_sequence(
     match stop_filter.push_piece(&response, &mut output, piece.to_vec(), first_may_stop) {
         GgufEmitResult::Continue => {}
         GgufEmitResult::Stopped => {
-            let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
-            available_ids.push(seq_id);
+            release_sequence_slot(ctx, available_ids, seq_id);
             record_gguf_token_metrics(metrics, prompt_len.max(0) as usize, 1);
             response.finish(output);
             return;
         }
         GgufEmitResult::Disconnected => {
-            let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
-            available_ids.push(seq_id);
+            release_sequence_slot(ctx, available_ids, seq_id);
             return;
         }
     }
 
     if max_tokens <= 1 {
         if !stop_filter.flush(&response, &mut output) {
-            let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
-            available_ids.push(seq_id);
+            release_sequence_slot(ctx, available_ids, seq_id);
             return;
         }
-        let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
-        available_ids.push(seq_id);
+        release_sequence_slot(ctx, available_ids, seq_id);
         record_gguf_token_metrics(metrics, prompt_len.max(0) as usize, 1);
         response.finish(output);
     } else {
@@ -2262,13 +2296,11 @@ fn fail_pending_prefill(
     mut pref: PendingPrefill,
     message: &'static str,
 ) {
-    let _ = ctx.clear_kv_cache_seq(Some(pref.seq_id as u32), None, None);
-    available_ids.push(pref.seq_id);
+    release_sequence_slot(ctx, available_ids, pref.seq_id);
     pref.response.send_error(EngineError::backend(message));
 
     for copy in pref.copies.drain(..) {
-        let _ = ctx.clear_kv_cache_seq(Some(copy.seq_id as u32), None, None);
-        available_ids.push(copy.seq_id);
+        release_sequence_slot(ctx, available_ids, copy.seq_id);
         copy.response.send_error(EngineError::backend(message));
     }
 }
@@ -2371,6 +2403,18 @@ fn run_scheduler(
 
     let eos_token = model.token_eos();
     let mut samplers = GgufBackendSamplers::new(&model, config.max_concurrent, eos_token);
+    // Pre-install a sampler for every seq slot up front so the installed-sampler
+    // set (and thus the compute-graph topology) is stable from the first decode.
+    // `set_sampler` flips `sched_need_reserve`, forcing a worst-case
+    // `sched_reserve()` (sized for n_seq_max); installing lazily and clearing on
+    // retire churned that reservation on every request. Keeping all slots
+    // installed for the context lifetime makes it a one-time warmup cost, and
+    // `build_sampling` already routes inactive installed samplers to row 0.
+    for seq_id in 0..config.max_concurrent as i32 {
+        if !samplers.set_for_sequence(&mut ctx, seq_id, false) {
+            log::warn!("[gguf] failed to pre-install sampler for seq slot {seq_id}");
+        }
+    }
     let batch_cap = n_batch as usize;
     let mut batch = LlamaBatch::new(batch_cap, 1);
 
@@ -2603,14 +2647,23 @@ fn run_scheduler(
             for seq in active.drain(..) {
                 seq.response
                     .send_error(EngineError::backend("decode failed"));
-                let _ = ctx.clear_kv_cache_seq(Some(seq.seq_id as u32), None, None);
-                available_ids.push(seq.seq_id);
+                release_sequence_slot(&mut ctx, &mut available_ids, seq.seq_id);
             }
             for pref in partial_prefills.drain(..) {
-                fail_pending_prefill(&mut ctx, &mut available_ids, pref, "decode failed");
+                fail_pending_prefill(
+                    &mut ctx,
+                    &mut available_ids,
+                    pref,
+                    "decode failed",
+                );
             }
             for (pref, _) in completed_prefills.drain(..) {
-                fail_pending_prefill(&mut ctx, &mut available_ids, pref, "decode failed");
+                fail_pending_prefill(
+                    &mut ctx,
+                    &mut available_ids,
+                    pref,
+                    "decode failed",
+                );
             }
             update_gguf_metrics(&metrics, config, &waiting, &pending, &active, 0);
             continue;
@@ -2643,12 +2696,18 @@ fn run_scheduler(
                 match token_piece_bytes(&model, first_tok) {
                     Ok(piece) => Some(piece),
                     Err(e) => {
-                        let _ = ctx.clear_kv_cache_seq(Some(pref.seq_id as u32), None, None);
-                        available_ids.push(pref.seq_id);
+                        release_sequence_slot(
+                            &mut ctx,
+                            &mut available_ids,
+                            pref.seq_id,
+                        );
                         pref.response.send_error(e);
                         for copy in pref.copies.drain(..) {
-                            let _ = ctx.clear_kv_cache_seq(Some(copy.seq_id as u32), None, None);
-                            available_ids.push(copy.seq_id);
+                            release_sequence_slot(
+                                &mut ctx,
+                                &mut available_ids,
+                                copy.seq_id,
+                            );
                             copy.response
                                 .send_error(EngineError::backend("token decode failed"));
                         }
@@ -2678,8 +2737,11 @@ fn run_scheduler(
                             pref.seq_id,
                             copy.seq_id
                         );
-                        let _ = ctx.clear_kv_cache_seq(Some(copy.seq_id as u32), None, None);
-                        available_ids.push(copy.seq_id);
+                        release_sequence_slot(
+                            &mut ctx,
+                            &mut available_ids,
+                            copy.seq_id,
+                        );
                         copy.response
                             .send_error(EngineError::backend("KV cache copy failed"));
                         continue;
@@ -2690,8 +2752,7 @@ fn run_scheduler(
 
             let suppress_eos_sampler = pref.min_tokens > 1;
             if !suppress_eos_sampler && !samplers.set_for_sequence(&mut ctx, pref.seq_id, false) {
-                let _ = ctx.clear_kv_cache_seq(Some(pref.seq_id as u32), None, None);
-                available_ids.push(pref.seq_id);
+                release_sequence_slot(&mut ctx, &mut available_ids, pref.seq_id);
                 pref.response
                     .send_error(EngineError::backend("failed to install sampler"));
                 continue;
@@ -2718,8 +2779,7 @@ fn run_scheduler(
                 if !copy_suppress_eos_sampler
                     && !samplers.set_for_sequence(&mut ctx, copy.seq_id, false)
                 {
-                    let _ = ctx.clear_kv_cache_seq(Some(copy.seq_id as u32), None, None);
-                    available_ids.push(copy.seq_id);
+                    release_sequence_slot(&mut ctx, &mut available_ids, copy.seq_id);
                     copy.response
                         .send_error(EngineError::backend("failed to install sampler"));
                     continue;
@@ -2828,8 +2888,7 @@ fn run_scheduler(
 
         for &i in to_retire.iter().rev() {
             let done = active.remove(i);
-            let _ = ctx.clear_kv_cache_seq(Some(done.seq_id as u32), None, None);
-            available_ids.push(done.seq_id);
+            release_sequence_slot(&mut ctx, &mut available_ids, done.seq_id);
             if let Some(error) = done.error {
                 done.response.send_error(error);
             } else {
@@ -3009,7 +3068,7 @@ impl Engine for GgufBackend {
                     self.metrics.clone(),
                     effective_device_id,
                     n_layers,
-                    config.total_ctx(),
+                    config.ctx_per_seq as usize,
                     config.max_concurrent,
                     prefix_cache,
                     model_fingerprint,
