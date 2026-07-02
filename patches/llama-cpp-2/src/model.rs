@@ -683,6 +683,18 @@ impl LlamaModel {
             .unwrap()
     }
 
+    /// Returns the per-head key dimension used by the model KV cache.
+    pub fn n_embd_head_k(&self) -> u32 {
+        u32::try_from(unsafe { llama_cpp_sys_2::llama_model_n_embd_head_k(self.model.as_ptr()) })
+            .unwrap()
+    }
+
+    /// Returns the per-head value dimension used by the model KV cache.
+    pub fn n_embd_head_v(&self) -> u32 {
+        u32::try_from(unsafe { llama_cpp_sys_2::llama_model_n_embd_head_v(self.model.as_ptr()) })
+            .unwrap()
+    }
+
     /// Returns the sliding-window size (`hparams.n_swa`), or `0` when the model
     /// uses full (non-windowed) attention.
     ///
