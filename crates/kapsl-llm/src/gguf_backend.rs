@@ -353,15 +353,17 @@ impl GgufServingConfig {
 
 #[cfg(feature = "gguf")]
 fn estimate_kv_bytes_per_cell(model: &LlamaModel) -> usize {
-    let n_embd = model.n_embd().max(0) as usize;
-    let n_head = model.n_head().max(1) as usize;
     let n_head_kv = model.n_head_kv().max(1) as usize;
-    let n_embd_gqa = n_embd.saturating_mul(n_head_kv) / n_head;
+    let head_dim_k = model.n_embd_head_k().max(1) as usize;
+    let head_dim_v = model.n_embd_head_v().max(1) as usize;
 
     // llama.cpp reports this path as K/V f16 in the load log. Treat one KV cell
     // as K + V for every layer so Prometheus/admission logic has a comparable
     // capacity signal to the native/ONNX paths.
-    model.n_layer().max(1) as usize * n_embd_gqa * 2 * std::mem::size_of::<u16>()
+    model.n_layer().max(1) as usize
+        * n_head_kv
+        * (head_dim_k + head_dim_v)
+        * std::mem::size_of::<u16>()
 }
 
 #[cfg(feature = "gguf-cuda-shared-kv")]
@@ -512,7 +514,9 @@ fn gguf_shared_kv_disable_reason(model: &LlamaModel) -> Option<String> {
         return None;
     }
 
-    let arch = model.meta_val_str("general.architecture").unwrap_or_default();
+    let arch = model
+        .meta_val_str("general.architecture")
+        .unwrap_or_default();
     let has_key = |suffix: &str| model.meta_val_str(&format!("{arch}.{suffix}")).is_ok();
     let pos_int = |suffix: &str| {
         model
@@ -2126,7 +2130,9 @@ impl GgufBackend {
             #[cfg(feature = "gguf-cuda-shared-kv")]
             pool_slot: Arc::new(Mutex::new(None)),
             #[cfg(feature = "gguf-cuda-shared-kv")]
-            kv_path: Arc::new(std::sync::atomic::AtomicU8::new(GgufKvPath::Unloaded.as_u8())),
+            kv_path: Arc::new(std::sync::atomic::AtomicU8::new(
+                GgufKvPath::Unloaded.as_u8(),
+            )),
         }
     }
 
@@ -2138,7 +2144,9 @@ impl GgufBackend {
             metrics: Arc::new(Mutex::new(EngineMetrics::new())),
             device_id,
             pool_slot: Arc::new(Mutex::new(handle)),
-            kv_path: Arc::new(std::sync::atomic::AtomicU8::new(GgufKvPath::Unloaded.as_u8())),
+            kv_path: Arc::new(std::sync::atomic::AtomicU8::new(
+                GgufKvPath::Unloaded.as_u8(),
+            )),
         }
     }
 
@@ -2694,20 +2702,10 @@ fn run_scheduler(
                 release_sequence_slot(&mut ctx, &mut available_ids, seq.seq_id);
             }
             for pref in partial_prefills.drain(..) {
-                fail_pending_prefill(
-                    &mut ctx,
-                    &mut available_ids,
-                    pref,
-                    "decode failed",
-                );
+                fail_pending_prefill(&mut ctx, &mut available_ids, pref, "decode failed");
             }
             for (pref, _) in completed_prefills.drain(..) {
-                fail_pending_prefill(
-                    &mut ctx,
-                    &mut available_ids,
-                    pref,
-                    "decode failed",
-                );
+                fail_pending_prefill(&mut ctx, &mut available_ids, pref, "decode failed");
             }
             update_gguf_metrics(&metrics, config, &waiting, &pending, &active, 0);
             continue;
@@ -2740,18 +2738,10 @@ fn run_scheduler(
                 match token_piece_bytes(&model, first_tok) {
                     Ok(piece) => Some(piece),
                     Err(e) => {
-                        release_sequence_slot(
-                            &mut ctx,
-                            &mut available_ids,
-                            pref.seq_id,
-                        );
+                        release_sequence_slot(&mut ctx, &mut available_ids, pref.seq_id);
                         pref.response.send_error(e);
                         for copy in pref.copies.drain(..) {
-                            release_sequence_slot(
-                                &mut ctx,
-                                &mut available_ids,
-                                copy.seq_id,
-                            );
+                            release_sequence_slot(&mut ctx, &mut available_ids, copy.seq_id);
                             copy.response
                                 .send_error(EngineError::backend("token decode failed"));
                         }
@@ -2781,11 +2771,7 @@ fn run_scheduler(
                             pref.seq_id,
                             copy.seq_id
                         );
-                        release_sequence_slot(
-                            &mut ctx,
-                            &mut available_ids,
-                            copy.seq_id,
-                        );
+                        release_sequence_slot(&mut ctx, &mut available_ids, copy.seq_id);
                         copy.response
                             .send_error(EngineError::backend("KV cache copy failed"));
                         continue;
@@ -2881,10 +2867,12 @@ fn run_scheduler(
                             continue;
                         }
                     };
-                    match seq
-                        .stop_filter
-                        .push_piece(&seq.response, &mut seq.output, piece, may_stop)
-                    {
+                    match seq.stop_filter.push_piece(
+                        &seq.response,
+                        &mut seq.output,
+                        piece,
+                        may_stop,
+                    ) {
                         GgufEmitResult::Continue | GgufEmitResult::Stopped => {
                             seq.last_token = next_tok;
                             seq.n_generated = next_generated;
@@ -3020,10 +3008,15 @@ impl Engine for GgufBackend {
             None
         } else {
             let n_layers = weights.model.n_layer().max(1) as usize;
-            let n_embd = weights.model.n_embd().max(1) as usize;
-            let n_head = weights.model.n_head().max(1) as usize;
             let n_head_kv = weights.model.n_head_kv().max(1) as usize;
-            let head_dim = (n_embd / n_head).max(1);
+            let head_dim_k = weights.model.n_embd_head_k().max(1) as usize;
+            let head_dim_v = weights.model.n_embd_head_v().max(1) as usize;
+            if head_dim_k != head_dim_v {
+                return Err(EngineError::backend(format!(
+                    "shared KV pool requires equal K/V head dims, got K={head_dim_k} V={head_dim_v}"
+                )));
+            }
+            let head_dim = head_dim_k;
             let block_size = 16usize;
             // Auto-select the least-loaded registered device when KAPSL_GGUF_AUTO_DEVICE=1.
             let effective_device_id = gguf_select_device(self.device_id, n_head_kv, head_dim);
@@ -3081,7 +3074,7 @@ impl Engine for GgufBackend {
                     n_layers.hash(&mut h);
                     n_head_kv.hash(&mut h);
                     head_dim.hash(&mut h);
-                    n_embd.hash(&mut h);
+                    head_dim_v.hash(&mut h);
                     h.finish()
                 };
                 // Build a prefix block cache sized at 1/4 of the pool's logical capacity.
@@ -3319,7 +3312,12 @@ mod gguf_stop_filter_tests {
             GgufEmitResult::Continue
         );
         assert_eq!(
-            filter.push_piece(&response, &mut output, b"_turn>user\nignored".to_vec(), true),
+            filter.push_piece(
+                &response,
+                &mut output,
+                b"_turn>user\nignored".to_vec(),
+                true
+            ),
             GgufEmitResult::Stopped
         );
 
@@ -3436,7 +3434,11 @@ mod tests {
     use super::GgufServingConfig;
     use std::time::Duration;
 
-    fn test_config(ctx_per_seq: u32, max_concurrent: usize, prefill_chunk_size: usize) -> GgufServingConfig {
+    fn test_config(
+        ctx_per_seq: u32,
+        max_concurrent: usize,
+        prefill_chunk_size: usize,
+    ) -> GgufServingConfig {
         GgufServingConfig {
             max_concurrent,
             ctx_per_seq,
@@ -3470,12 +3472,21 @@ mod tests {
     /// Build (`has_key`, `pos_int`) closures over a fixed set of
     /// architecture-scoped metadata keys → values, mirroring how
     /// `gguf_shared_kv_disable_reason` prefixes lookups with `<arch>.`.
-    fn classify_swa(arch: &str, n_swa: u32, allow_swa: bool, keys: &[(&str, &str)]) -> Option<String> {
+    fn classify_swa(
+        arch: &str,
+        n_swa: u32,
+        allow_swa: bool,
+        keys: &[(&str, &str)],
+    ) -> Option<String> {
         let keys: Vec<(String, String)> = keys
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect();
-        let lookup = |suffix: &str| keys.iter().find(|(k, _)| k == suffix).map(|(_, v)| v.clone());
+        let lookup = |suffix: &str| {
+            keys.iter()
+                .find(|(k, _)| k == suffix)
+                .map(|(_, v)| v.clone())
+        };
         let has_key = |suffix: &str| lookup(suffix).is_some();
         let pos_int = |suffix: &str| {
             lookup(suffix)
@@ -3513,7 +3524,8 @@ mod tests {
     fn shared_kv_rejects_chunked_attention_without_metadata_key() {
         // Llama 4 hard-codes swa_type=CHUNKED / n_swa=8192 when the
         // `attention.sliding_window` key is absent — only n_swa catches it.
-        let reason = classify("llama4", 8192, &[]).expect("chunked-attention model must be rejected");
+        let reason =
+            classify("llama4", 8192, &[]).expect("chunked-attention model must be rejected");
         assert!(reason.contains("n_swa=8192"), "reason: {reason}");
     }
 
