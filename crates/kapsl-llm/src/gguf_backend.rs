@@ -522,11 +522,17 @@ fn gguf_shared_kv_disable_reason(model: &LlamaModel) -> Option<String> {
             .is_some_and(|n| n > 0)
     };
 
+    // Phase 1: the kapsl paged-attention kernel now applies a per-layer
+    // sliding-window mask, so SWA models can run on the shared-KV path. This is
+    // opt-in until GPU-verified — by default SWA still falls back to the native
+    // cache. Recurrent/hybrid and MLA remain unconditionally unsupported.
+    let allow_swa = gguf_env_is_truthy("KAPSL_GGUF_ENABLE_SWA_SHARED_KV");
+
     // `n_swa` is the authoritative post-load window size: it is populated by
     // llama.cpp's per-architecture hparam loader regardless of which GGUF key
     // (or hard-coded default) the window came from, so it catches models the
     // raw-metadata heuristics below would miss (see `classify_shared_kv_support`).
-    classify_shared_kv_support(&arch, model.n_swa(), has_key, pos_int)
+    classify_shared_kv_support(&arch, model.n_swa(), allow_swa, has_key, pos_int)
 }
 
 /// Pure classification core of [`gguf_shared_kv_disable_reason`], separated so it
@@ -535,12 +541,14 @@ fn gguf_shared_kv_disable_reason(model: &LlamaModel) -> Option<String> {
 /// back to llama.cpp's native KV cache.
 ///
 /// `n_swa` is the loaded model's sliding-window size (`0` for full attention);
-/// `has_key`/`pos_int` look up architecture-scoped GGUF metadata (already prefixed
-/// with `<arch>.` by the caller) — presence, and positive-integer value,
-/// respectively.
+/// `allow_swa` opts sliding-window models onto the shared-KV path (Phase 1,
+/// gated by `KAPSL_GGUF_ENABLE_SWA_SHARED_KV`); `has_key`/`pos_int` look up
+/// architecture-scoped GGUF metadata (already prefixed with `<arch>.` by the
+/// caller) — presence, and positive-integer value, respectively.
 fn classify_shared_kv_support(
     arch: &str,
     n_swa: u32,
+    allow_swa: bool,
     has_key: impl Fn(&str) -> bool,
     pos_int: impl Fn(&str) -> bool,
 ) -> Option<String> {
@@ -551,20 +559,24 @@ fn classify_shared_kv_support(
     }
 
     // 1. Sliding-window / ISWA / chunked attention (Gemma 2/3, Phi-3-SWA,
-    //    Cohere2, Llama 4, gpt-oss, …): llama.cpp asserts swa_type == NONE for
-    //    the kapsl cache, so attaching the pool would abort the process.
+    //    Cohere2, Llama 4, gpt-oss, …). The kapsl paged-attention kernel applies
+    //    the per-layer window mask (Phase 1), but this is opt-in until verified;
+    //    when disabled, keep these off the pool (llama.cpp would otherwise abort
+    //    on `swa_type == NONE`).
     //
     //    Prefer the authoritative `n_swa` over the metadata key: architectures
     //    such as Llama 4 hard-code a non-zero window (swa_type = CHUNKED,
     //    n_swa = 8192) when `attention.sliding_window` is absent, so the key
-    //    check alone lets them slip through to the abort.
-    if n_swa > 0 {
-        return Some(format!(
-            "sliding-window/chunked attention (arch={arch}, n_swa={n_swa})"
-        ));
-    }
-    if pos_int("attention.sliding_window") {
-        return Some(format!("sliding-window attention (arch={arch})"));
+    //    check alone lets them slip through.
+    if !allow_swa {
+        if n_swa > 0 {
+            return Some(format!(
+                "sliding-window/chunked attention (arch={arch}, n_swa={n_swa})"
+            ));
+        }
+        if pos_int("attention.sliding_window") {
+            return Some(format!("sliding-window attention (arch={arch})"));
+        }
     }
 
     // 2. Multi-head latent attention (DeepSeek-V2/V3-style): the compressed
@@ -3458,7 +3470,7 @@ mod tests {
     /// Build (`has_key`, `pos_int`) closures over a fixed set of
     /// architecture-scoped metadata keys → values, mirroring how
     /// `gguf_shared_kv_disable_reason` prefixes lookups with `<arch>.`.
-    fn classify(arch: &str, n_swa: u32, keys: &[(&str, &str)]) -> Option<String> {
+    fn classify_swa(arch: &str, n_swa: u32, allow_swa: bool, keys: &[(&str, &str)]) -> Option<String> {
         let keys: Vec<(String, String)> = keys
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
@@ -3470,7 +3482,11 @@ mod tests {
                 .and_then(|v| v.trim().parse::<i64>().ok())
                 .is_some_and(|n| n > 0)
         };
-        classify_shared_kv_support(arch, n_swa, has_key, pos_int)
+        classify_shared_kv_support(arch, n_swa, allow_swa, has_key, pos_int)
+    }
+
+    fn classify(arch: &str, n_swa: u32, keys: &[(&str, &str)]) -> Option<String> {
+        classify_swa(arch, n_swa, false, keys)
     }
 
     #[test]
@@ -3526,5 +3542,20 @@ mod tests {
         // A present-but-zero window must not be treated as SWA on the metadata
         // path (n_swa is the source of truth and is 0 here).
         assert!(classify("qwen2", 0, &[("attention.sliding_window", "0")]).is_none());
+    }
+
+    #[test]
+    fn shared_kv_allow_swa_admits_sliding_window_models() {
+        // Phase 1 opt-in: standard SWA and Llama 4 chunked attention are allowed
+        // onto the shared-KV path when the kernel-level window mask is enabled.
+        assert!(classify_swa("gemma2", 0, true, &[("attention.sliding_window", "4096")]).is_none());
+        assert!(classify_swa("llama4", 8192, true, &[]).is_none());
+    }
+
+    #[test]
+    fn shared_kv_allow_swa_still_rejects_recurrent_and_mla() {
+        // The SWA opt-in must not admit architectures the kernel cannot serve.
+        assert!(classify_swa("deepseek2", 0, true, &[("attention.kv_lora_rank", "512")]).is_some());
+        assert!(classify_swa("mamba", 0, true, &[("ssm.state_size", "16")]).is_some());
     }
 }
