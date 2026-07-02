@@ -513,12 +513,6 @@ fn gguf_shared_kv_disable_reason(model: &LlamaModel) -> Option<String> {
     }
 
     let arch = model.meta_val_str("general.architecture").unwrap_or_default();
-    if arch.is_empty() {
-        // Without a known architecture we cannot vet the KV geometry; stay on
-        // the safe native path rather than risk a mismatch or abort.
-        return Some("unknown architecture (no general.architecture metadata)".to_string());
-    }
-
     let has_key = |suffix: &str| model.meta_val_str(&format!("{arch}.{suffix}")).is_ok();
     let pos_int = |suffix: &str| {
         model
@@ -528,9 +522,47 @@ fn gguf_shared_kv_disable_reason(model: &LlamaModel) -> Option<String> {
             .is_some_and(|n| n > 0)
     };
 
-    // 1. Sliding-window / ISWA attention (Gemma 2/3, Phi-3-SWA, Cohere2, …):
-    //    llama.cpp asserts swa_type == NONE for the kapsl cache, so attaching
-    //    the pool would abort the process.
+    // `n_swa` is the authoritative post-load window size: it is populated by
+    // llama.cpp's per-architecture hparam loader regardless of which GGUF key
+    // (or hard-coded default) the window came from, so it catches models the
+    // raw-metadata heuristics below would miss (see `classify_shared_kv_support`).
+    classify_shared_kv_support(&arch, model.n_swa(), has_key, pos_int)
+}
+
+/// Pure classification core of [`gguf_shared_kv_disable_reason`], separated so it
+/// can be unit-tested without a loaded model. Returns `Some(reason)` when the
+/// uniform shared-KV pool cannot represent the model and the engine must fall
+/// back to llama.cpp's native KV cache.
+///
+/// `n_swa` is the loaded model's sliding-window size (`0` for full attention);
+/// `has_key`/`pos_int` look up architecture-scoped GGUF metadata (already prefixed
+/// with `<arch>.` by the caller) — presence, and positive-integer value,
+/// respectively.
+fn classify_shared_kv_support(
+    arch: &str,
+    n_swa: u32,
+    has_key: impl Fn(&str) -> bool,
+    pos_int: impl Fn(&str) -> bool,
+) -> Option<String> {
+    if arch.is_empty() {
+        // Without a known architecture we cannot vet the KV geometry; stay on
+        // the safe native path rather than risk a mismatch or abort.
+        return Some("unknown architecture (no general.architecture metadata)".to_string());
+    }
+
+    // 1. Sliding-window / ISWA / chunked attention (Gemma 2/3, Phi-3-SWA,
+    //    Cohere2, Llama 4, gpt-oss, …): llama.cpp asserts swa_type == NONE for
+    //    the kapsl cache, so attaching the pool would abort the process.
+    //
+    //    Prefer the authoritative `n_swa` over the metadata key: architectures
+    //    such as Llama 4 hard-code a non-zero window (swa_type = CHUNKED,
+    //    n_swa = 8192) when `attention.sliding_window` is absent, so the key
+    //    check alone lets them slip through to the abort.
+    if n_swa > 0 {
+        return Some(format!(
+            "sliding-window/chunked attention (arch={arch}, n_swa={n_swa})"
+        ));
+    }
     if pos_int("attention.sliding_window") {
         return Some(format!("sliding-window attention (arch={arch})"));
     }
@@ -3417,5 +3449,82 @@ mod tests {
 
         assert_eq!(config.total_ctx(), 32_768);
         assert_eq!(config.n_batch(), 136);
+    }
+
+    // ── shared-KV architecture guard (classify_shared_kv_support) ──────────────
+
+    use super::classify_shared_kv_support;
+
+    /// Build (`has_key`, `pos_int`) closures over a fixed set of
+    /// architecture-scoped metadata keys → values, mirroring how
+    /// `gguf_shared_kv_disable_reason` prefixes lookups with `<arch>.`.
+    fn classify(arch: &str, n_swa: u32, keys: &[(&str, &str)]) -> Option<String> {
+        let keys: Vec<(String, String)> = keys
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        let lookup = |suffix: &str| keys.iter().find(|(k, _)| k == suffix).map(|(_, v)| v.clone());
+        let has_key = |suffix: &str| lookup(suffix).is_some();
+        let pos_int = |suffix: &str| {
+            lookup(suffix)
+                .and_then(|v| v.trim().parse::<i64>().ok())
+                .is_some_and(|n| n > 0)
+        };
+        classify_shared_kv_support(arch, n_swa, has_key, pos_int)
+    }
+
+    #[test]
+    fn shared_kv_allows_plain_causal_transformer() {
+        // Qwen2 / TinyLlama-style: uniform KV, no SWA, no latent/recurrent state.
+        assert!(classify("qwen2", 0, &[("attention.head_count_kv", "8")]).is_none());
+    }
+
+    #[test]
+    fn shared_kv_rejects_unknown_architecture() {
+        assert!(classify("", 0, &[]).is_some());
+    }
+
+    #[test]
+    fn shared_kv_rejects_standard_sliding_window_via_metadata() {
+        // Gemma-style: window advertised only through the GGUF key, n_swa not yet
+        // surfaced (defends the metadata heuristic independently of n_swa).
+        let reason = classify("gemma2", 0, &[("attention.sliding_window", "4096")])
+            .expect("SWA model must be rejected");
+        assert!(reason.contains("sliding-window"), "reason: {reason}");
+    }
+
+    #[test]
+    fn shared_kv_rejects_chunked_attention_without_metadata_key() {
+        // Llama 4 hard-codes swa_type=CHUNKED / n_swa=8192 when the
+        // `attention.sliding_window` key is absent — only n_swa catches it.
+        let reason = classify("llama4", 8192, &[]).expect("chunked-attention model must be rejected");
+        assert!(reason.contains("n_swa=8192"), "reason: {reason}");
+    }
+
+    #[test]
+    fn shared_kv_rejects_multi_head_latent_attention() {
+        let reason = classify("deepseek2", 0, &[("attention.kv_lora_rank", "512")])
+            .expect("MLA model must be rejected");
+        assert!(reason.contains("latent"), "reason: {reason}");
+    }
+
+    #[test]
+    fn shared_kv_rejects_recurrent_and_hybrid_state_space() {
+        for (arch, key) in [
+            ("mamba", "ssm.state_size"),
+            ("jamba", "ssm.conv_kernel"),
+            ("rwkv6", "wkv.head_size"),
+        ] {
+            let reason = classify(arch, 0, &[(key, "16")])
+                .unwrap_or_else(|| panic!("{arch} must be rejected"));
+            assert!(reason.contains("recurrent/hybrid"), "reason: {reason}");
+        }
+    }
+
+    #[test]
+    fn shared_kv_sliding_window_key_value_zero_is_not_swa() {
+        // A present-but-zero window must not be treated as SWA on the metadata
+        // path (n_swa is the source of truth and is 0 here).
+        assert!(classify("qwen2", 0, &[("attention.sliding_window", "0")]).is_none());
     }
 }

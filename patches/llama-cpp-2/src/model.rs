@@ -683,6 +683,24 @@ impl LlamaModel {
             .unwrap()
     }
 
+    /// Returns the sliding-window size (`hparams.n_swa`), or `0` when the model
+    /// uses full (non-windowed) attention.
+    ///
+    /// This is the authoritative post-load signal for sliding-window / chunked
+    /// attention (`swa_type != NONE` implies `n_swa > 0`), independent of which
+    /// GGUF metadata key the architecture happened to read it from. Some
+    /// architectures (e.g. Llama 4) hard-code a non-zero window when the
+    /// `*.attention.sliding_window` key is absent, so inspecting raw metadata is
+    /// not sufficient to detect them.
+    pub fn n_swa(&self) -> u32 {
+        // The C API returns int32_t but the underlying `hparams.n_swa` is a
+        // uint32_t window size, so a negative value is not expected; clamp
+        // defensively rather than panic.
+        unsafe { llama_cpp_sys_2::llama_model_n_swa(self.model.as_ptr()) }
+            .try_into()
+            .unwrap_or(0)
+    }
+
     /// Get metadata value as a string by key name
     pub fn meta_val_str(&self, key: &str) -> Result<String, MetaValError> {
         let key_cstring = CString::new(key)?;
