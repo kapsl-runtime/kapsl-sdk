@@ -539,6 +539,16 @@ fn gguf_shared_kv_disable_reason(model: &LlamaModel) -> Option<String> {
     classify_shared_kv_support(&arch, model.n_swa(), allow_swa, has_key, pos_int)
 }
 
+/// Architectures whose sliding-window attention is quality-verified on the
+/// shared-KV paged path (sampled eval vs native shows no regression). The Gemma
+/// family is all-RoPE ISWA: gemma2/gemma3 are eval-verified; gemma3n/gemma4 share
+/// the same structure. Cohere2 (and other SWA families) are excluded — cohere2's
+/// NoPE global-attention layers degenerate on the paged path, and the rest are
+/// not yet eval-checked. Extend this as more families are verified.
+fn swa_shared_kv_arch_verified(arch: &str) -> bool {
+    matches!(arch, "gemma2" | "gemma3" | "gemma3n" | "gemma4")
+}
+
 /// Pure classification core of [`gguf_shared_kv_disable_reason`], separated so it
 /// can be unit-tested without a loaded model. Returns `Some(reason)` when the
 /// uniform shared-KV pool cannot represent the model and the engine must fall
@@ -572,14 +582,22 @@ fn classify_shared_kv_support(
     //    such as Llama 4 hard-code a non-zero window (swa_type = CHUNKED,
     //    n_swa = 8192) when `attention.sliding_window` is absent, so the key
     //    check alone lets them slip through.
-    if !allow_swa {
-        if n_swa > 0 {
+    let is_swa = n_swa > 0 || pos_int("attention.sliding_window");
+    if is_swa {
+        if !allow_swa {
+            // Opt-in disabled: keep every SWA model on the native cache.
             return Some(format!(
                 "sliding-window/chunked attention (arch={arch}, n_swa={n_swa})"
             ));
         }
-        if pos_int("attention.sliding_window") {
-            return Some(format!("sliding-window attention (arch={arch})"));
+        if !swa_shared_kv_arch_verified(arch) {
+            // Opt-in enabled but this architecture is not on the quality-verified
+            // allowlist. Cohere2 (NoPE global layers) regresses on the paged path
+            // and other SWA families are not yet eval-checked, so they stay native
+            // even with the flag set. Use KAPSL_GGUF_FORCE_SHARED_KV to override.
+            return Some(format!(
+                "sliding-window attention on unverified arch for shared-KV (arch={arch})"
+            ));
         }
     }
 
@@ -3557,11 +3575,19 @@ mod tests {
     }
 
     #[test]
-    fn shared_kv_allow_swa_admits_sliding_window_models() {
-        // Phase 1 opt-in: standard SWA and Llama 4 chunked attention are allowed
-        // onto the shared-KV path when the kernel-level window mask is enabled.
+    fn shared_kv_allow_swa_admits_verified_gemma_family_only() {
+        // Phase 1 opt-in admits SWA only for the quality-verified Gemma family.
         assert!(classify_swa("gemma2", 0, true, &[("attention.sliding_window", "4096")]).is_none());
-        assert!(classify_swa("llama4", 8192, true, &[]).is_none());
+        assert!(classify_swa("gemma3", 8192, true, &[]).is_none());
+    }
+
+    #[test]
+    fn shared_kv_allow_swa_still_gates_unverified_families() {
+        // Even with the opt-in set, non-allowlisted SWA archs stay native:
+        // cohere2 regresses (NoPE), llama4/phi3 are not eval-verified yet.
+        assert!(classify_swa("cohere2", 4096, true, &[("attention.sliding_window", "4096")]).is_some());
+        assert!(classify_swa("llama4", 8192, true, &[]).is_some());
+        assert!(classify_swa("phi3", 0, true, &[("attention.sliding_window", "2048")]).is_some());
     }
 
     #[test]
