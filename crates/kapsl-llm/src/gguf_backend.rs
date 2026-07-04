@@ -1215,10 +1215,15 @@ impl GgufSharedKvPool {
                 .map(|layer| inner.owned_blocks[layer * n_new + pos])
                 .collect();
 
-            if !c.insert(fp, hash, device_id, pool.clone(), block_ids, 1) {
-                break; // cache full, all entries referenced — stop
+            // Count a position as promoted ONLY when the cache actually took
+            // ownership of its blocks. On AlreadyPresent/Rejected the blocks stay
+            // session-owned (freed at release via the un-promoted range) and no
+            // cache refcount was taken for them, so counting them would leak the
+            // blocks and unbalance the release() accounting.
+            match c.insert(fp, hash, device_id, pool.clone(), block_ids, 1) {
+                kapsl_hal::prefix_cache::PrefixInsert::Inserted => promoted += 1,
+                _ => break, // cache full or hash already cached — stop
             }
-            promoted += 1;
         }
         inner.n_promoted_logical = promoted;
     }
