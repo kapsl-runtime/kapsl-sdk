@@ -371,6 +371,7 @@ fn gguf_shared_kv_block_count(
     n_layers: usize,
     config: GgufServingConfig,
     block_size: usize,
+    windowed: Option<&GgufWindowedKvConfig>,
 ) -> usize {
     if let Some(blocks) = std::env::var("KAPSL_GGUF_CUDA_SHARED_KV_POOL_BLOCKS")
         .ok()
@@ -382,10 +383,121 @@ fn gguf_shared_kv_block_count(
     let blocks_per_seq = (config.ctx_per_seq as usize)
         .div_ceil(block_size.max(1))
         .max(1);
-    n_layers
+    // Windowed SWA layers never hold more than their ring, so the pool can be
+    // sized for it — this is where the Phase 2 memory saving is realized.
+    let per_seq_blocks: usize = match windowed {
+        Some(w) => (0..n_layers)
+            .map(|il| windowed_layer_capacity(blocks_per_seq, w.layer_window(il)))
+            .sum(),
+        None => n_layers.saturating_mul(blocks_per_seq),
+    };
+    per_seq_blocks
         .saturating_mul(config.max_concurrent.max(1))
-        .saturating_mul(blocks_per_seq)
         .max(n_layers)
+}
+
+// ─── SWA windowed KV (Phase 2) ────────────────────────────────────────────────
+
+/// Windowed KV allocation for sliding-window models (Phase 2 of SWA on
+/// shared-KV). Instead of allocating `ctx_per_seq` worth of blocks on every
+/// layer, each SWA layer gets a fixed ring of `window_blocks` physical blocks;
+/// its block-table row maps logical block `P` to ring slot `P % window_blocks`,
+/// so a block is recycled exactly when every position in it has fallen out of
+/// every live query's attention window. Full-attention layers are unchanged.
+///
+/// The paged-attention kernel guarantees it never dereferences a block-table
+/// entry below the window start (see `kapsl_swa_window_start` in kapsl-kv.cu),
+/// which is what makes recycling safe.
+#[cfg(feature = "gguf-cuda-shared-kv")]
+struct GgufWindowedKvConfig {
+    /// Ring capacity, in blocks, for every sliding-window layer.
+    window_blocks: usize,
+    /// Per-layer flag: `true` = SWA layer (ring-mapped), `false` = full attention.
+    swa_layers: Vec<bool>,
+}
+
+#[cfg(feature = "gguf-cuda-shared-kv")]
+impl GgufWindowedKvConfig {
+    /// `Some(window_blocks)` when layer `il` is ring-mapped, `None` when full.
+    fn layer_window(&self, il: usize) -> Option<usize> {
+        self.swa_layers
+            .get(il)
+            .copied()
+            .unwrap_or(false)
+            .then_some(self.window_blocks)
+    }
+}
+
+/// Number of physical blocks a sliding-window layer's KV ring must hold.
+///
+/// A query at position `p` reads keys in `[win_start(p), p]` with
+/// `win_start(p) >= p - n_swa + 1` for every supported window type, and one
+/// ubatch writes up to `n_ubatch` positions before any of its queries run
+/// attention, so `n_swa + n_ubatch` positions must stay live simultaneously
+/// (the same bound llama.cpp's native iSWA cache uses for its SWA buffer).
+/// The `+ 1` covers block-boundary straddle at both ends.
+fn swa_window_blocks(n_swa: usize, n_ubatch: usize, block_size: usize) -> usize {
+    (n_swa + n_ubatch).div_ceil(block_size.max(1)) + 1
+}
+
+/// Physical blocks a layer needs to cover `logical` logical blocks: capped at
+/// the ring size on windowed layers, uncapped on full-attention layers.
+fn windowed_layer_capacity(logical: usize, layer_window: Option<usize>) -> usize {
+    match layer_window {
+        Some(window_blocks) => logical.min(window_blocks),
+        None => logical,
+    }
+}
+
+/// Build the windowed-KV config for a loaded model, or `None` when windowing
+/// is disabled, inapplicable, or would not save memory.
+///
+/// Opt-in via `KAPSL_GGUF_SWA_WINDOWED_KV` (on top of the Phase 1
+/// `KAPSL_GGUF_ENABLE_SWA_SHARED_KV` gate — a SWA model only reaches shared-KV
+/// at all when that admitted it).
+#[cfg(feature = "gguf-cuda-shared-kv")]
+fn gguf_windowed_kv_config(
+    model: &LlamaModel,
+    config: GgufServingConfig,
+    block_size: usize,
+) -> Option<GgufWindowedKvConfig> {
+    if !gguf_env_is_truthy("KAPSL_GGUF_SWA_WINDOWED_KV") {
+        return None;
+    }
+    let n_swa = model.n_swa() as usize;
+    if n_swa == 0 {
+        return None;
+    }
+    let n_layers = model.n_layer().max(1) as usize;
+    let swa_layers: Vec<bool> = (0..n_layers)
+        .map(|il| model.is_swa_layer(il as u32))
+        .collect();
+    let n_swa_layers = swa_layers.iter().filter(|&&s| s).count();
+    if n_swa_layers == 0 {
+        return None;
+    }
+    let window_blocks = swa_window_blocks(n_swa, config.n_batch() as usize, block_size);
+    let blocks_per_seq = (config.ctx_per_seq as usize)
+        .div_ceil(block_size.max(1))
+        .max(1);
+    if window_blocks >= blocks_per_seq {
+        log::info!(
+            "[gguf] SWA windowed KV requested but the ring ({window_blocks} blocks incl. \
+             ubatch slack) is not smaller than ctx_per_seq ({blocks_per_seq} blocks); \
+             keeping full allocation"
+        );
+        return None;
+    }
+    log::info!(
+        "[gguf] SWA windowed KV enabled: n_swa={n_swa}, swa_layers={n_swa_layers}/{n_layers}, \
+         ring={window_blocks} blocks/layer vs {blocks_per_seq} full (per-seq KV ~{}% of uniform)",
+        ((n_layers - n_swa_layers) * blocks_per_seq + n_swa_layers * window_blocks) * 100
+            / (n_layers * blocks_per_seq).max(1)
+    );
+    Some(GgufWindowedKvConfig {
+        window_blocks,
+        swa_layers,
+    })
 }
 
 // ─── Shared model weights cache ───────────────────────────────────────────────
@@ -1029,6 +1141,33 @@ struct GgufSharedKvPoolState {
     /// When true, `run_scheduler` calls `evict_to_cpu()` before blocking on
     /// the idle receive.  Controlled by `KAPSL_GGUF_EVICT_ON_IDLE`.
     evict_when_idle: bool,
+    /// Windowed KV allocation for SWA layers (Phase 2). `None` = uniform full
+    /// allocation on every layer (the only mode before Phase 2, and still the
+    /// default). When set, `reserve`/`reserve_prefix` route to the windowed
+    /// reservation below and the prefix cache and CPU eviction are bypassed
+    /// (ring blocks are overwritten in place, so their KV cannot be reused
+    /// across sessions or snapshotted).
+    windowed: Option<GgufWindowedKvConfig>,
+    /// Single-sequence windowed reservation, used instead of `inner` when
+    /// `windowed` is set. Per-layer block ownership: full layers hold one
+    /// block per logical position, SWA layers hold at most the ring.
+    windowed_inner: Mutex<GgufWindowedReservation>,
+}
+
+/// Single-sequence reservation state for windowed (Phase 2) allocation.
+///
+/// Unlike [`GgufSharedKvReservation`]'s flat `[layer * n_new + pos]` layout,
+/// ownership is per-layer because SWA layers cap out at the ring size while
+/// full layers keep growing with the context.
+#[cfg(feature = "gguf-cuda-shared-kv")]
+#[derive(Default)]
+struct GgufWindowedReservation {
+    /// Per-layer physical blocks, in logical order; SWA layers wrap around
+    /// (`len == min(n_logical_blocks, window_blocks)`).
+    layers: Vec<Vec<u32>>,
+    block_table: Option<CudaSlice<u32>>,
+    n_logical_blocks: usize,
+    n_tokens_reserved: usize,
 }
 
 /// Per-session reservation state.
@@ -1083,6 +1222,10 @@ struct GgufMultiSeqState {
     combined_device: Option<CudaSlice<u32>>,
     /// True when `combined_host` has changed since `combined_device` was uploaded.
     combined_dirty: bool,
+    /// seq_id -> logical blocks committed to its block-table region. Needed in
+    /// windowed mode, where per-layer ownership lengths cap at the ring size
+    /// and can no longer be used to infer the logical coverage.
+    seq_logical: std::collections::HashMap<u64, usize>,
 }
 
 #[cfg(feature = "gguf-cuda-shared-kv")]
@@ -1101,6 +1244,7 @@ impl GgufSharedKvPool {
         max_concurrent: usize,
         prefix_cache: Option<Arc<Mutex<PrefixBlockCache>>>,
         model_fingerprint: u64,
+        windowed: Option<GgufWindowedKvConfig>,
     ) -> Self {
         let pool_arc = handle.pool.clone();
         let block_size = handle.pool.block_size().max(1);
@@ -1135,6 +1279,8 @@ impl GgufSharedKvPool {
             }),
             evicted: Mutex::new(None),
             evict_when_idle,
+            windowed,
+            windowed_inner: Mutex::new(GgufWindowedReservation::default()),
         });
         let state_ptr = (&mut *state) as *mut GgufSharedKvPoolState;
         let pool = &state.handle.pool;
@@ -1334,6 +1480,14 @@ impl Drop for GgufSharedKvPoolState {
                 self.handle.pool.free_block(block);
             }
         }
+        drop(inner);
+        // Free the windowed (Phase 2) reservation's per-layer blocks.
+        let mut w = self.windowed_inner.lock().unwrap();
+        for layer in std::mem::take(&mut w.layers) {
+            for b in layer {
+                self.handle.pool.free_block(b);
+            }
+        }
     }
 }
 
@@ -1407,6 +1561,93 @@ fn alloc_blocks_with_cache_eviction(
         }
     }
     true
+}
+
+// ── Windowed (Phase 2) reserve handler ───────────────────────────────────────
+
+/// Reserve or grow the single-sequence windowed reservation.
+///
+/// Serves both the `reserve` and `reserve_prefix` callbacks when
+/// `state.windowed` is set (prefix hits are always 0 in windowed mode: ring
+/// blocks are overwritten in place, so cached prefixes would go stale).
+/// Returns `(block_table_device_ptr, n_logical_blocks)` on success.
+#[cfg(feature = "gguf-cuda-shared-kv")]
+fn gguf_windowed_reserve_impl(
+    state: &GgufSharedKvPoolState,
+    windowed: &GgufWindowedKvConfig,
+    tokens_needed: usize,
+) -> Option<(*mut u32, usize)> {
+    let pool = &state.handle.pool;
+    let block_size = pool.block_size().max(1);
+    let logical = tokens_needed.div_ceil(block_size).max(1);
+    if logical > state.max_blocks_per_seq {
+        return None;
+    }
+
+    let mut inner = state.windowed_inner.lock().unwrap();
+
+    // Fast path: the current reservation already covers the request.
+    if inner.block_table.is_some() && inner.n_logical_blocks >= logical {
+        inner.n_tokens_reserved = inner.n_tokens_reserved.max(tokens_needed);
+        let ptr = *inner.block_table.as_ref()?.device_ptr() as *mut u32;
+        GGUF_TIMING_KV_FAST_PATH_CALLS.fetch_add(1, Ordering::Relaxed);
+        return Some((ptr, inner.n_logical_blocks));
+    }
+
+    // Grow every layer to its (ring-capped) target, all-or-nothing. Existing
+    // blocks keep their KV data; only the extension is freshly allocated.
+    if inner.layers.is_empty() {
+        inner.layers = vec![Vec::new(); state.n_layers];
+    }
+    let targets: Vec<usize> = (0..state.n_layers)
+        .map(|il| windowed_layer_capacity(logical, windowed.layer_window(il)))
+        .collect();
+    let prev_lens: Vec<usize> = inner.layers.iter().map(|v| v.len()).collect();
+    let total_needed: usize = targets
+        .iter()
+        .zip(&prev_lens)
+        .map(|(t, c)| t.saturating_sub(*c))
+        .sum();
+    let mut fresh: Vec<u32> = Vec::with_capacity(total_needed);
+    if total_needed > 0 && !alloc_blocks_with_cache_eviction(state, total_needed, &mut fresh) {
+        return None;
+    }
+    let mut next = 0usize;
+    for (layer, (&target, &prev)) in targets.iter().zip(&prev_lens).enumerate() {
+        let take = target.saturating_sub(prev);
+        inner.layers[layer].extend_from_slice(&fresh[next..next + take]);
+        next += take;
+    }
+
+    // Rebuild the host table. Full layers index directly; SWA layers wrap
+    // around their ring so logical position P reuses ring slot P % ring_len —
+    // recycling a physical block exactly when it falls out of the window.
+    let mut host_table = vec![0u32; state.n_layers * state.max_blocks_per_seq];
+    for (layer, blocks) in inner.layers.iter().enumerate() {
+        for pos in 0..logical {
+            host_table[layer * state.max_blocks_per_seq + pos] = blocks[pos % blocks.len()];
+        }
+    }
+
+    let table = match pool.device().htod_sync_copy(&host_table) {
+        Ok(t) => t,
+        Err(_) => {
+            // Roll back the extension; established blocks keep their KV data.
+            for (layer, &prev) in prev_lens.iter().enumerate() {
+                for b in inner.layers[layer].drain(prev..) {
+                    pool.free_block(b);
+                }
+            }
+            return None;
+        }
+    };
+    let table_ptr = *table.device_ptr() as *mut u32;
+
+    inner.block_table = Some(table);
+    inner.n_logical_blocks = logical;
+    inner.n_tokens_reserved = tokens_needed;
+    GGUF_TIMING_KV_EXTEND_CALLS.fetch_add(1, Ordering::Relaxed);
+    Some((table_ptr, logical))
 }
 
 // ── CPU-restore helper ────────────────────────────────────────────────────────
@@ -1536,6 +1777,19 @@ unsafe extern "C" fn gguf_kapsl_kv_reserve(
         return false;
     }
     let state = &*(user_data as *mut GgufSharedKvPoolState);
+
+    // ── Windowed (Phase 2) path ───────────────────────────────────────────
+    if let Some(windowed) = &state.windowed {
+        return match gguf_windowed_reserve_impl(state, windowed, tokens_needed as usize) {
+            Some((table_ptr, logical)) => {
+                *block_table_device_out = table_ptr;
+                *n_blocks_out = logical as u32;
+                true
+            }
+            None => false,
+        };
+    }
+
     let block_size = state.handle.pool.block_size().max(1);
     let logical_blocks = (tokens_needed as usize).div_ceil(block_size).max(1);
     if logical_blocks > state.max_blocks_per_seq {
@@ -1643,44 +1897,69 @@ unsafe extern "C" fn gguf_kapsl_kv_reserve_seq(
 
     let mut m = state.multi.lock().unwrap();
 
-    // Grow this sequence's per-layer block ownership to `logical` blocks. All
-    // layers stay the same length, so the fresh blocks are committed
-    // all-or-nothing to keep the slot consistent on allocation failure.
-    let have = m
-        .sessions
-        .get(&seq_id)
-        .map(|owned| owned.iter().map(|v| v.len()).min().unwrap_or(0))
-        .unwrap_or(0);
+    // Grow this sequence's per-layer block ownership to cover `logical`
+    // blocks, all-or-nothing to keep the slot consistent on allocation
+    // failure. Without windowing every layer's target is `logical` and the
+    // ring mapping below degenerates to the identity; with windowing (Phase 2)
+    // SWA layers cap at the ring size and their table entries wrap around.
+    let have = m.seq_logical.get(&seq_id).copied().unwrap_or_else(|| {
+        m.sessions
+            .get(&seq_id)
+            .map(|owned| owned.iter().map(|v| v.len()).min().unwrap_or(0))
+            .unwrap_or(0)
+    });
     if logical > have {
-        let per_layer = logical - have;
-        let mut fresh: Vec<u32> = Vec::with_capacity(per_layer * n_layers);
-        if !alloc_blocks_with_cache_eviction(state, per_layer * n_layers, &mut fresh) {
+        let targets: Vec<usize> = (0..n_layers)
+            .map(|il| {
+                windowed_layer_capacity(
+                    logical,
+                    state.windowed.as_ref().and_then(|w| w.layer_window(il)),
+                )
+            })
+            .collect();
+        let cur_lens: Vec<usize> = m
+            .sessions
+            .get(&seq_id)
+            .map(|owned| owned.iter().map(|v| v.len()).collect())
+            .unwrap_or_else(|| vec![0; n_layers]);
+        let total_needed: usize = targets
+            .iter()
+            .zip(&cur_lens)
+            .map(|(t, c)| t.saturating_sub(*c))
+            .sum();
+        let mut fresh: Vec<u32> = Vec::with_capacity(total_needed);
+        if total_needed > 0 && !alloc_blocks_with_cache_eviction(state, total_needed, &mut fresh) {
             return false;
         }
         let owned = m
             .sessions
             .entry(seq_id)
             .or_insert_with(|| vec![Vec::new(); n_layers]);
+        let mut next = 0usize;
         for layer in 0..n_layers {
-            let start = layer * per_layer;
-            owned[layer].extend_from_slice(&fresh[start..start + per_layer]);
+            let take = targets[layer].saturating_sub(owned[layer].len());
+            owned[layer].extend_from_slice(&fresh[next..next + take]);
+            next += take;
         }
         {
             let GgufMultiSeqState {
                 sessions,
                 combined_host,
                 combined_dirty,
+                seq_logical,
                 ..
             } = &mut *m;
             let owned = &sessions[&seq_id];
             let base = slot * seq_stride;
             for layer in 0..n_layers {
                 let layer_base = base + layer * state.max_blocks_per_seq;
+                let blocks = &owned[layer];
                 for l in 0..logical {
-                    combined_host[layer_base + l] = owned[layer][l];
+                    combined_host[layer_base + l] = blocks[l % blocks.len()];
                 }
             }
             *combined_dirty = true;
+            seq_logical.insert(seq_id, logical);
         }
     }
 
@@ -1742,6 +2021,29 @@ unsafe extern "C" fn gguf_kapsl_kv_reserve_prefix(
         return false;
     }
     let state = &*(user_data as *mut GgufSharedKvPoolState);
+
+    // ── Windowed (Phase 2) path ───────────────────────────────────────────
+    // No prefix lookup or promotion: ring blocks are overwritten in place as
+    // the context slides, so cached prefixes would silently go stale.
+    if let Some(windowed) = &state.windowed {
+        let previous_tokens = state.windowed_inner.lock().unwrap().n_tokens_reserved;
+        return match gguf_windowed_reserve_impl(state, windowed, n_tokens as usize) {
+            Some((table_ptr, logical)) => {
+                unsafe {
+                    *block_table_device_out = table_ptr;
+                    *n_logical_blocks_out = logical as u32;
+                    *n_prefix_hits_out = 0;
+                }
+                if previous_tokens > 0 {
+                    let delta = (n_tokens as usize).saturating_sub(previous_tokens).max(1);
+                    record_gguf_decode_work_metrics(&state.metrics, 1, delta as u64);
+                }
+                true
+            }
+            None => false,
+        };
+    }
+
     let Some(cache) = &state.prefix_cache else {
         // Prefix cache disabled — fall back to plain reserve.
         return gguf_kapsl_kv_reserve(
@@ -2042,6 +2344,7 @@ unsafe extern "C" fn gguf_kapsl_kv_release(user_data: *mut std::ffi::c_void, ses
     // No-op in single-sequence mode (sessions is empty).
     {
         let mut m = state.multi.lock().unwrap();
+        m.seq_logical.remove(&session_id);
         if let Some(owned) = m.sessions.remove(&session_id) {
             for layer in owned {
                 for b in layer {
@@ -2058,6 +2361,17 @@ unsafe extern "C" fn gguf_kapsl_kv_release(user_data: *mut std::ffi::c_void, ses
                 m.combined_dirty = true;
             }
         }
+    }
+
+    // Windowed (Phase 2) reservation: free every per-layer block.
+    {
+        let mut w = state.windowed_inner.lock().unwrap();
+        for layer in std::mem::take(&mut w.layers) {
+            for b in layer {
+                state.handle.pool.free_block(b);
+            }
+        }
+        *w = GgufWindowedReservation::default();
     }
 
     let mut inner = state.inner.lock().unwrap();
@@ -3041,6 +3355,10 @@ impl Engine for GgufBackend {
             }
             let head_dim = head_dim_k;
             let block_size = 16usize;
+            // Windowed KV for SWA layers (Phase 2): ring-capped per-layer
+            // allocation, opt-in via KAPSL_GGUF_SWA_WINDOWED_KV. None keeps the
+            // uniform full allocation.
+            let windowed = gguf_windowed_kv_config(&weights.model, config, block_size);
             // Auto-select the least-loaded registered device when KAPSL_GGUF_AUTO_DEVICE=1.
             let effective_device_id = gguf_select_device(self.device_id, n_head_kv, head_dim);
             if effective_device_id != self.device_id {
@@ -3064,7 +3382,7 @@ impl Engine for GgufBackend {
                         );
                         let device = CudaDevice::new(effective_device_id)
                             .map_err(|e| EngineError::backend(format!("CUDA: {e}")))?;
-                        let num_blocks = gguf_shared_kv_block_count(n_layers, config, block_size);
+                        let num_blocks = gguf_shared_kv_block_count(n_layers, config, block_size, windowed.as_ref());
                         let pool = Arc::new(
                             GpuBlockPool::new(device, num_blocks, block_size, n_head_kv, head_dim)
                                 .map_err(|e| {
@@ -3078,7 +3396,7 @@ impl Engine for GgufBackend {
                 } else {
                     let device = CudaDevice::new(effective_device_id)
                         .map_err(|e| EngineError::backend(format!("CUDA: {e}")))?;
-                    let num_blocks = gguf_shared_kv_block_count(n_layers, config, block_size);
+                    let num_blocks = gguf_shared_kv_block_count(n_layers, config, block_size, windowed.as_ref());
                     let pool = Arc::new(
                         GpuBlockPool::new(device, num_blocks, block_size, n_head_kv, head_dim)
                             .map_err(|e| EngineError::backend(format!("shared KV pool: {e}")))?,
@@ -3132,6 +3450,7 @@ impl Engine for GgufBackend {
                     config.max_concurrent,
                     prefix_cache,
                     model_fingerprint,
+                    windowed,
                 ))
             }
         };
@@ -3600,5 +3919,80 @@ mod tests {
         // The SWA opt-in must not admit architectures the kernel cannot serve.
         assert!(classify_swa("deepseek2", 0, true, &[("attention.kv_lora_rank", "512")]).is_some());
         assert!(classify_swa("mamba", 0, true, &[("ssm.state_size", "16")]).is_some());
+    }
+
+    // ── SWA windowed KV ring math (Phase 2) ─────────────────────────────────────
+
+    use super::{swa_window_blocks, windowed_layer_capacity};
+
+    #[test]
+    fn swa_window_blocks_covers_window_plus_ubatch() {
+        // Gemma3 1B defaults: n_swa=512, n_batch=512+32, block_size=16.
+        assert_eq!(swa_window_blocks(512, 544, 16), 67);
+        // Gemma2: n_swa=4096.
+        assert_eq!(swa_window_blocks(4096, 544, 16), 291);
+        // Degenerate block size clamps to 1.
+        assert_eq!(swa_window_blocks(4, 2, 0), 7);
+    }
+
+    #[test]
+    fn windowed_layer_capacity_caps_only_windowed_layers() {
+        assert_eq!(windowed_layer_capacity(500, Some(67)), 67);
+        assert_eq!(windowed_layer_capacity(50, Some(67)), 50);
+        assert_eq!(windowed_layer_capacity(500, None), 500);
+    }
+
+    /// The ring must never recycle a block that any live query can still read.
+    ///
+    /// Brute-force the invariant behind `swa_window_blocks`: after writing up
+    /// to position `p_max`, every query in the current ubatch
+    /// (`p_max - n_ubatch + 1 ..= p_max`) must find all keys in its standard
+    /// window (`p - n_swa + 1 ..= p`, the loosest of the three window types)
+    /// in logical blocks whose ring slot has not been overwritten — i.e.
+    /// within the last `window_blocks` logical blocks written.
+    #[test]
+    fn swa_window_ring_never_recycles_live_blocks() {
+        for &(block_size, n_swa, n_ubatch) in &[
+            (4usize, 6usize, 3usize),
+            (4, 8, 8),
+            (16, 512, 544),
+            (16, 4096, 544),
+            (1, 5, 2),
+            (7, 13, 29),
+        ] {
+            let wb = swa_window_blocks(n_swa, n_ubatch, block_size);
+            for p_max in 0..(4 * (n_swa + n_ubatch) + 64) {
+                let newest_block = p_max / block_size;
+                for p in p_max.saturating_sub(n_ubatch - 1)..=p_max {
+                    let win_start = p.saturating_sub(n_swa - 1);
+                    let oldest_live_block = win_start / block_size;
+                    assert!(
+                        oldest_live_block + wb > newest_block,
+                        "recycled live block: bs={block_size} n_swa={n_swa} \
+                         n_ubatch={n_ubatch} wb={wb} p_max={p_max} p={p}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The block-table ring mapping (`pos % ring_len`) must keep all blocks in
+    /// any `window_blocks`-sized span of logical positions distinct, and reuse
+    /// exactly the slot from one ring revolution ago.
+    #[test]
+    fn swa_ring_mapping_wraps_without_collisions() {
+        let wb = 5usize;
+        let ring: Vec<u32> = (100..100 + wb as u32).collect();
+        let entry = |pos: usize| ring[pos % ring.len()];
+        for start in 0..3 * wb {
+            let span: Vec<u32> = (start..start + wb).map(entry).collect();
+            let mut dedup = span.clone();
+            dedup.sort_unstable();
+            dedup.dedup();
+            assert_eq!(dedup.len(), wb, "collision within one window span");
+        }
+        for pos in wb..4 * wb {
+            assert_eq!(entry(pos), entry(pos - wb), "slot not reused after one revolution");
+        }
     }
 }
