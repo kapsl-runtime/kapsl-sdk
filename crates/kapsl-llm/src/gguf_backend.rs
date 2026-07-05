@@ -323,6 +323,16 @@ struct GgufServingConfig {
     prefill_chunk_size: usize,
     exact_prompt_kv_reuse: bool,
     kv_bytes_per_cell: usize,
+    /// True when the model's memory includes recurrent/SSM state (Mamba,
+    /// RWKV, or a hybrid mix like Jamba/Granite) rather than being a pure
+    /// per-token attention KV cache. `update_gguf_metrics` uses this to avoid
+    /// reporting KV pressure that scales with generated token count: real
+    /// recurrent-state footprint is ~constant per active sequence, not
+    /// proportional to how far each sequence has decoded. These models always
+    /// run on llama.cpp's native memory (the shared-KV pool guard rejects
+    /// them unconditionally), regardless of which KV backend feature is
+    /// compiled in.
+    uses_state_space_memory: bool,
 }
 
 #[cfg(feature = "gguf")]
@@ -338,6 +348,7 @@ impl GgufServingConfig {
             prefill_chunk_size,
             exact_prompt_kv_reuse: gguf_exact_prompt_kv_reuse(),
             kv_bytes_per_cell: estimate_kv_bytes_per_cell(model),
+            uses_state_space_memory: gguf_model_uses_state_space_memory(model),
         }
     }
 
@@ -723,11 +734,41 @@ fn classify_shared_kv_support(
     //    Nemotron-H, …): these route through llama.cpp's recurrent / hybrid
     //    memory and ignore the external pool entirely. Detected by the presence
     //    of SSM / WKV metadata rather than an exact architecture allowlist.
-    if has_key("ssm.state_size") || has_key("ssm.conv_kernel") || has_key("wkv.head_size") {
+    if gguf_uses_state_space_memory(&has_key) {
         return Some(format!("recurrent/hybrid state-space memory (arch={arch})"));
     }
 
     None
+}
+
+/// True when the model's memory is (partly or fully) recurrent state-space
+/// (Mamba/RWKV) rather than a pure growing per-token attention KV cache —
+/// detected via the same SSM/WKV metadata keys llama.cpp's own hparam loader
+/// requires to build any of these architectures (Mamba, Mamba2, RWKV6/7,
+/// Jamba, Falcon-H1, Nemotron-H, Granite-hybrid, …), so this generalizes
+/// without an exact architecture allowlist. `has_key` takes an
+/// architecture-scoped GGUF metadata suffix, matching the shared-KV guard's
+/// convention.
+///
+/// Available whenever GGUF serving is compiled in (not gated behind the CUDA
+/// shared-KV pool feature): these models always run on llama.cpp's native
+/// memory regardless of which KV backend feature is enabled, so callers that
+/// need to reason about their memory shape (e.g. KV metrics) need this
+/// outside the shared-KV-only code paths too.
+#[cfg(feature = "gguf")]
+fn gguf_uses_state_space_memory(has_key: impl Fn(&str) -> bool) -> bool {
+    has_key("ssm.state_size") || has_key("ssm.conv_kernel") || has_key("wkv.head_size")
+}
+
+/// [`gguf_uses_state_space_memory`] applied to a loaded model's own
+/// architecture-scoped metadata.
+#[cfg(feature = "gguf")]
+fn gguf_model_uses_state_space_memory(model: &LlamaModel) -> bool {
+    let arch = model
+        .meta_val_str("general.architecture")
+        .unwrap_or_default();
+    let has_key = |suffix: &str| model.meta_val_str(&format!("{arch}.{suffix}")).is_ok();
+    gguf_uses_state_space_memory(has_key)
 }
 
 #[cfg(feature = "gguf")]
@@ -2704,15 +2745,25 @@ fn update_gguf_metrics(
     batch_tokens: usize,
 ) {
     let total_cells = config.total_ctx();
-    let pending_cells = pending
-        .iter()
-        .map(|pref| pref.next_token.min(pref.tokens.len()))
-        .sum::<usize>();
-    let active_cells = active
-        .iter()
-        .map(|seq| seq.pos.max(0) as usize)
-        .sum::<usize>();
-    let used_cells = pending_cells.saturating_add(active_cells).min(total_cells);
+    let used_cells = if config.uses_state_space_memory {
+        // Recurrent/hybrid memory holds one constant-size state per active
+        // sequence, not a per-token cell — the position-scaled formula below
+        // would report KV usage growing as generation progresses even though
+        // real memory stays flat, which would feed a false pressure signal to
+        // autoscaling/admission. Approximate as one used cell per in-flight
+        // sequence instead.
+        pending.len().saturating_add(active.len()).min(total_cells)
+    } else {
+        let pending_cells = pending
+            .iter()
+            .map(|pref| pref.next_token.min(pref.tokens.len()))
+            .sum::<usize>();
+        let active_cells = active
+            .iter()
+            .map(|seq| seq.pos.max(0) as usize)
+            .sum::<usize>();
+        pending_cells.saturating_add(active_cells).min(total_cells)
+    };
     let capacity_bytes = total_cells.saturating_mul(config.kv_bytes_per_cell);
 
     if let Ok(mut snapshot) = metrics.lock() {
@@ -3382,7 +3433,12 @@ impl Engine for GgufBackend {
                         );
                         let device = CudaDevice::new(effective_device_id)
                             .map_err(|e| EngineError::backend(format!("CUDA: {e}")))?;
-                        let num_blocks = gguf_shared_kv_block_count(n_layers, config, block_size, windowed.as_ref());
+                        let num_blocks = gguf_shared_kv_block_count(
+                            n_layers,
+                            config,
+                            block_size,
+                            windowed.as_ref(),
+                        );
                         let pool = Arc::new(
                             GpuBlockPool::new(device, num_blocks, block_size, n_head_kv, head_dim)
                                 .map_err(|e| {
@@ -3396,7 +3452,8 @@ impl Engine for GgufBackend {
                 } else {
                     let device = CudaDevice::new(effective_device_id)
                         .map_err(|e| EngineError::backend(format!("CUDA: {e}")))?;
-                    let num_blocks = gguf_shared_kv_block_count(n_layers, config, block_size, windowed.as_ref());
+                    let num_blocks =
+                        gguf_shared_kv_block_count(n_layers, config, block_size, windowed.as_ref());
                     let pool = Arc::new(
                         GpuBlockPool::new(device, num_blocks, block_size, n_head_kv, head_dim)
                             .map_err(|e| EngineError::backend(format!("shared KV pool: {e}")))?,
@@ -3788,6 +3845,7 @@ mod tests {
             prefill_chunk_size,
             exact_prompt_kv_reuse: false,
             kv_bytes_per_cell: 0,
+            uses_state_space_memory: false,
         }
     }
 
@@ -3891,6 +3949,37 @@ mod tests {
         }
     }
 
+    // ── state-space memory detection (feeds KV metrics, Phase 3) ────────────────
+
+    use super::gguf_uses_state_space_memory;
+
+    #[test]
+    fn state_space_memory_detected_by_any_ssm_or_wkv_key() {
+        let has = |present: &'static [&'static str]| move |suffix: &str| present.contains(&suffix);
+        assert!(gguf_uses_state_space_memory(has(&["ssm.state_size"])));
+        assert!(gguf_uses_state_space_memory(has(&["ssm.conv_kernel"])));
+        assert!(gguf_uses_state_space_memory(has(&["wkv.head_size"])));
+        // Hybrid archs (Jamba/Granite) carry both attention and ssm keys.
+        assert!(gguf_uses_state_space_memory(has(&[
+            "attention.head_count",
+            "ssm.state_size"
+        ])));
+    }
+
+    #[test]
+    fn state_space_memory_not_detected_for_plain_attention() {
+        assert!(!gguf_uses_state_space_memory(has_none));
+        let has = |present: &'static [&'static str]| move |suffix: &str| present.contains(&suffix);
+        assert!(!gguf_uses_state_space_memory(has(&[
+            "attention.head_count",
+            "attention.sliding_window"
+        ])));
+    }
+
+    fn has_none(_: &str) -> bool {
+        false
+    }
+
     #[test]
     fn shared_kv_sliding_window_key_value_zero_is_not_swa() {
         // A present-but-zero window must not be treated as SWA on the metadata
@@ -3909,7 +3998,13 @@ mod tests {
     fn shared_kv_allow_swa_still_gates_unverified_families() {
         // Even with the opt-in set, non-allowlisted SWA archs stay native:
         // cohere2 regresses (NoPE), llama4/phi3 are not eval-verified yet.
-        assert!(classify_swa("cohere2", 4096, true, &[("attention.sliding_window", "4096")]).is_some());
+        assert!(classify_swa(
+            "cohere2",
+            4096,
+            true,
+            &[("attention.sliding_window", "4096")]
+        )
+        .is_some());
         assert!(classify_swa("llama4", 8192, true, &[]).is_some());
         assert!(classify_swa("phi3", 0, true, &[("attention.sliding_window", "2048")]).is_some());
     }
@@ -3992,7 +4087,11 @@ mod tests {
             assert_eq!(dedup.len(), wb, "collision within one window span");
         }
         for pos in wb..4 * wb {
-            assert_eq!(entry(pos), entry(pos - wb), "slot not reused after one revolution");
+            assert_eq!(
+                entry(pos),
+                entry(pos - wb),
+                "slot not reused after one revolution"
+            );
         }
     }
 }
