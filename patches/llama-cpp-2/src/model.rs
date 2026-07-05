@@ -713,6 +713,17 @@ impl LlamaModel {
             .unwrap_or(0)
     }
 
+    /// Returns whether layer `il` uses sliding-window attention
+    /// (`hparams.is_swa(il)`); `false` for out-of-range layers.
+    ///
+    /// Layers of iSWA models (e.g. the Gemma family) alternate between
+    /// windowed and full attention, so callers sizing per-layer KV storage
+    /// need the per-layer answer in addition to the model-wide [`Self::n_swa`].
+    pub fn is_swa_layer(&self, il: u32) -> bool {
+        let il = i32::try_from(il).unwrap_or(i32::MAX);
+        unsafe { llama_cpp_sys_2::llama_model_is_swa_layer(self.model.as_ptr(), il) }
+    }
+
     /// Get metadata value as a string by key name
     pub fn meta_val_str(&self, key: &str) -> Result<String, MetaValError> {
         let key_cstring = CString::new(key)?;
