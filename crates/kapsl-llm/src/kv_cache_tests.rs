@@ -432,7 +432,10 @@ mod tests {
         // Seq 3 asks for the original prefix: it must not be served the block
         // that now holds [20, 21].
         let cached = cache.allocate_sequence(3, &[10, 11]).unwrap();
-        assert_eq!(cached, 0, "must not reuse a block repurposed for new tokens");
+        assert_eq!(
+            cached, 0,
+            "must not reuse a block repurposed for new tokens"
+        );
     }
 
     #[test]
