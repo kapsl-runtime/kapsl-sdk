@@ -618,6 +618,25 @@ impl LlamaSampler {
 
         Self { sampler }
     }
+
+    /// Replaces the bias entries of a [`LlamaSampler::logit_bias`] sampler nested inside this
+    /// chain, in place. The sampler stays installed in the context, so the update never triggers
+    /// a backend scheduler reserve; the next decode uploads the new values.
+    ///
+    /// Returns `false` if `index` is out of bounds, the sampler at `index` is not a logit-bias
+    /// sampler (including one created with an empty bias slice), or a token is out of the
+    /// sampler's vocab range.
+    pub fn chain_logit_bias_set(&mut self, index: i32, biases: &[LlamaLogitBias]) -> bool {
+        let data = biases.as_ptr().cast::<llama_cpp_sys_2::llama_logit_bias>();
+
+        unsafe {
+            let inner = llama_cpp_sys_2::llama_sampler_chain_get(self.sampler, index);
+            if inner.is_null() {
+                return false;
+            }
+            llama_cpp_sys_2::llama_sampler_logit_bias_set(inner, biases.len() as i32, data)
+        }
+    }
 }
 
 impl Drop for LlamaSampler {
