@@ -798,13 +798,16 @@ fn gguf_model_uses_state_space_memory(model: &LlamaModel) -> bool {
 struct SsmStateCache {
     /// chain-hash of the covered token prefix -> snapshot.
     entries: std::collections::HashMap<u64, SsmStateEntry>,
-    /// session_id -> resume snapshot taken when the session's last request
-    /// retired. Unlike chunk checkpoints these sit at arbitrary positions
-    /// (prompt + generated tokens), so they are keyed by session and matched
-    /// by exact token-prefix comparison instead of chunk-boundary hashes: a
-    /// multi-turn client resends the whole history, and if it retokenizes to
-    /// exactly what the model absorbed last turn, prefill skips all of it.
-    sessions: std::collections::HashMap<String, SsmSessionEntry>,
+    /// session_id -> resume snapshots. Unlike chunk checkpoints these sit at
+    /// arbitrary positions, so they are keyed by session and matched by exact
+    /// token-prefix comparison instead of chunk-boundary hashes. Each session
+    /// keeps up to [`SSM_SESSION_SLOTS`] entries — the post-prompt state and
+    /// the post-retirement state (prompt + generated reply). The retirement
+    /// entry skips the most, but only matches when the client's resent history
+    /// retokenizes to exactly the tokens the model produced; the reply seam
+    /// often drifts, and the post-prompt entry survives that (the next turn
+    /// begins with the previous prompt text verbatim).
+    sessions: std::collections::HashMap<String, Vec<SsmSessionEntry>>,
     total_bytes: usize,
     max_bytes: usize,
     max_entry_bytes: usize,
@@ -823,12 +826,17 @@ struct SsmStateEntry {
     last_used: u64,
 }
 
+/// Resume snapshots retained per session: the post-prompt state and the
+/// post-retirement state.
+#[cfg(feature = "gguf")]
+const SSM_SESSION_SLOTS: usize = 2;
+
 #[cfg(feature = "gguf")]
 struct SsmSessionEntry {
-    /// The exact tokens the state has absorbed (prompt + decoded generation).
-    /// Token-compare beats hashing here: retokenized history can diverge from
-    /// generation-time tokens at the seam, and an exact compare degrades that
-    /// to a clean miss instead of a wrong-state restore.
+    /// The exact tokens the state has absorbed (prompt, or prompt + decoded
+    /// generation). Token-compare beats hashing here: retokenized history can
+    /// diverge from generation-time tokens at the seam, and an exact compare
+    /// degrades that to a clean miss instead of a wrong-state restore.
     tokens: Vec<LlamaToken>,
     data: Vec<u8>,
     last_used: u64,
@@ -933,19 +941,50 @@ impl SsmStateCache {
     /// The session whose stored token stream is a strict prefix of `prompt`,
     /// as its absorbed-token count. Exact comparison — a divergent history is
     /// a clean miss. Bumps the entry's LRU tick.
-    fn session_match(&mut self, session_id: &str, prompt: &[LlamaToken]) -> Option<usize> {
-        let entry = self.sessions.get_mut(session_id)?;
-        let n = entry.tokens.len();
-        if n == 0 || n >= prompt.len() || prompt[..n] != entry.tokens[..] {
-            return None;
+    /// The longest of the session's snapshots whose stored token stream is a
+    /// strict prefix of `prompt`, as `(entry_index, absorbed_len)`. Exact
+    /// comparison — a divergent history is a clean miss. Bumps the winner's
+    /// LRU tick.
+    fn session_match(&mut self, session_id: &str, prompt: &[LlamaToken]) -> Option<(usize, usize)> {
+        let entries = self.sessions.get_mut(session_id)?;
+        let mut best: Option<(usize, usize)> = None;
+        for (idx, entry) in entries.iter().enumerate() {
+            let n = entry.tokens.len();
+            if n == 0 || n >= prompt.len() {
+                continue;
+            }
+            if prompt[..n] != entry.tokens[..] {
+                // Usually retokenization drift: the client-side history text
+                // tokenizes differently from the tokens the model actually
+                // produced, most often right at the reply seam. The divergence
+                // index tells that apart from a real mismatch when debugging.
+                let divergence = prompt
+                    .iter()
+                    .zip(&entry.tokens)
+                    .position(|(a, b)| a != b)
+                    .unwrap_or(n);
+                log::debug!(
+                    "[gguf] SSM session miss: session={session_id} stored={n} \
+                     prompt={} first_divergence={divergence}",
+                    prompt.len(),
+                );
+                continue;
+            }
+            if best.is_none_or(|(_, best_n)| n > best_n) {
+                best = Some((idx, n));
+            }
         }
+        let (idx, n) = best?;
         self.tick += 1;
-        entry.last_used = self.tick;
-        Some(n)
+        entries[idx].last_used = self.tick;
+        Some((idx, n))
     }
 
-    fn session_data(&self, session_id: &str) -> Option<&[u8]> {
-        self.sessions.get(session_id).map(|e| e.data.as_slice())
+    fn session_data(&self, session_id: &str, idx: usize) -> Option<&[u8]> {
+        self.sessions
+            .get(session_id)
+            .and_then(|entries| entries.get(idx))
+            .map(|e| e.data.as_slice())
     }
 
     /// True when the session already stores a snapshot for exactly `tokens` —
@@ -953,10 +992,11 @@ impl SsmStateCache {
     fn session_is_current(&self, session_id: &str, tokens: &[LlamaToken]) -> bool {
         self.sessions
             .get(session_id)
-            .is_some_and(|e| e.tokens == tokens)
+            .is_some_and(|entries| entries.iter().any(|e| e.tokens == tokens))
     }
 
-    /// Insert or replace a session's resume snapshot.
+    /// Insert a session resume snapshot, keeping at most [`SSM_SESSION_SLOTS`]
+    /// per session (the oldest is dropped once full).
     fn insert_session(&mut self, session_id: &str, tokens: Vec<LlamaToken>, data: Vec<u8>) {
         if data.is_empty()
             || tokens.is_empty()
@@ -965,25 +1005,47 @@ impl SsmStateCache {
         {
             return;
         }
-        self.remove_session(session_id);
+        self.tick += 1;
+        let tick = self.tick;
+        if let Some(entries) = self.sessions.get_mut(session_id) {
+            if let Some(existing) = entries.iter_mut().find(|e| e.tokens == tokens) {
+                existing.last_used = tick;
+                return;
+            }
+            while entries.len() >= SSM_SESSION_SLOTS {
+                let oldest = entries
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, e)| e.last_used)
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                self.total_bytes -= entries.remove(oldest).data.len();
+            }
+        }
         if !self.make_room(data.len()) {
             return;
         }
-        self.tick += 1;
         self.total_bytes += data.len();
-        self.sessions.insert(
-            session_id.to_string(),
-            SsmSessionEntry {
+        self.sessions
+            .entry(session_id.to_string())
+            .or_default()
+            .push(SsmSessionEntry {
                 tokens,
                 data,
-                last_used: self.tick,
-            },
-        );
+                last_used: tick,
+            });
     }
 
-    fn remove_session(&mut self, session_id: &str) {
-        if let Some(entry) = self.sessions.remove(session_id) {
-            self.total_bytes -= entry.data.len();
+    /// Drop one snapshot of a session (after a failed restore), or the whole
+    /// session when it was the last one.
+    fn remove_session_entry(&mut self, session_id: &str, idx: usize) {
+        if let Some(entries) = self.sessions.get_mut(session_id) {
+            if idx < entries.len() {
+                self.total_bytes -= entries.remove(idx).data.len();
+            }
+            if entries.is_empty() {
+                self.sessions.remove(session_id);
+            }
         }
     }
 
@@ -1000,11 +1062,16 @@ impl SsmStateCache {
             let session_lru = self
                 .sessions
                 .iter()
-                .min_by_key(|(_, e)| e.last_used)
-                .map(|(k, e)| (e.last_used, k.clone()));
+                .flat_map(|(k, entries)| {
+                    entries
+                        .iter()
+                        .enumerate()
+                        .map(move |(i, e)| (e.last_used, k.clone(), i))
+                })
+                .min_by_key(|(t, _, _)| *t);
             match (chunk_lru, session_lru) {
-                (Some((ct, hash)), Some((st, _))) if ct <= st => self.remove(hash),
-                (_, Some((_, sid))) => self.remove_session(&sid),
+                (Some((ct, hash)), Some((st, _, _))) if ct <= st => self.remove(hash),
+                (_, Some((_, sid, idx))) => self.remove_session_entry(&sid, idx),
                 (Some((_, hash)), None) => self.remove(hash),
                 (None, None) => return false,
             }
@@ -1141,10 +1208,16 @@ fn restore_ssm_state(
     seq_id: i32,
 ) -> usize {
     if let Some(sid) = session_id {
-        if let Some(n_tokens) = cache.session_match(sid, tokens) {
-            let ok = cache.session_data(sid).is_some_and(|data| unsafe {
-                ctx.state_seq_set_data_ext(data, seq_id, llama_cpp_2::LlamaStateSeqFlags::empty())
-            });
+        if let Some((entry_idx, n_tokens)) = cache.session_match(sid, tokens) {
+            let ok = cache
+                .session_data(sid, entry_idx)
+                .is_some_and(|data| unsafe {
+                    ctx.state_seq_set_data_ext(
+                        data,
+                        seq_id,
+                        llama_cpp_2::LlamaStateSeqFlags::empty(),
+                    )
+                });
             if ok {
                 log::debug!(
                     "[gguf] SSM session state restored: session={sid} seq={seq_id} pos={n_tokens}"
@@ -1154,7 +1227,7 @@ fn restore_ssm_state(
             log::warn!(
                 "[gguf] SSM session restore failed: session={sid} seq={seq_id}; dropping entry"
             );
-            cache.remove_session(sid);
+            cache.remove_session_entry(sid, entry_idx);
             let _ = ctx.clear_kv_cache_seq(u32::try_from(seq_id).ok(), None, None);
         }
     }
@@ -3568,10 +3641,16 @@ fn run_scheduler(
         }
         // Completed prefills whose prompt length lands exactly on a chunk
         // boundary produce that boundary's checkpoint here (the partial loop
-        // never sees them).
+        // never sees them). Session requests additionally save the post-prompt
+        // state as a session resume point: unlike the post-retirement snapshot
+        // it survives reply-seam retokenization drift, because the next turn's
+        // prompt begins with this prompt's text verbatim.
         if let Some(cache) = ssm_cache.as_mut() {
             for (pref, _) in completed_prefills.iter() {
                 maybe_snapshot_ssm_state(&ctx, cache, &pref.tokens, pref.next_token, pref.seq_id);
+                if let Some(sid) = pref.session_id.as_deref() {
+                    snapshot_ssm_session_state(&ctx, cache, sid, &pref.tokens, pref.seq_id);
+                }
             }
         }
 
@@ -4698,26 +4777,30 @@ mod tests {
     }
 
     #[test]
-    fn ssm_session_matches_only_strict_token_prefix() {
+    fn ssm_session_matches_longest_strict_token_prefix() {
         let mut cache = SsmStateCache::new(4, 1 << 20, 1 << 20);
-        // Session states sit at arbitrary (non-chunk-aligned) positions.
+        // A session holds up to two snapshots at arbitrary positions: the
+        // post-prompt state and the post-retirement state.
+        cache.insert_session("s1", toks(&[1, 2, 3, 4, 5]), vec![0u8; 10]);
         cache.insert_session("s1", toks(&[1, 2, 3, 4, 5, 6, 7]), vec![0u8; 10]);
 
-        // Next turn resends the history plus new tokens: hit at 7.
-        assert_eq!(
-            cache.session_match("s1", &toks(&[1, 2, 3, 4, 5, 6, 7, 8, 9])),
-            Some(7)
-        );
+        // Next turn resends the full history: the longer snapshot wins.
+        let hit = cache.session_match("s1", &toks(&[1, 2, 3, 4, 5, 6, 7, 8, 9]));
+        assert_eq!(hit.map(|(_, n)| n), Some(7));
+
+        // Reply-seam retokenization drift kills only the longer snapshot; the
+        // post-prompt one still matches.
+        let hit = cache.session_match("s1", &toks(&[1, 2, 3, 4, 5, 99, 7, 8, 9]));
+        assert_eq!(hit.map(|(_, n)| n), Some(5));
+
         // Identical prompt (no token left to decode): miss.
         assert_eq!(
-            cache.session_match("s1", &toks(&[1, 2, 3, 4, 5, 6, 7])),
-            None
+            cache
+                .session_match("s1", &toks(&[1, 2, 3, 4, 5, 6, 7]))
+                .map(|(_, n)| n),
+            Some(5)
         );
-        // Retokenization drift at the seam: exact compare -> clean miss.
-        assert_eq!(
-            cache.session_match("s1", &toks(&[1, 2, 3, 4, 5, 6, 99, 8, 9])),
-            None
-        );
+        assert_eq!(cache.session_match("s1", &toks(&[1, 2, 3, 4, 5])), None);
         // Unknown session: miss.
         assert_eq!(
             cache.session_match("s2", &toks(&[1, 2, 3, 4, 5, 6, 7, 8])),
@@ -4726,20 +4809,29 @@ mod tests {
     }
 
     #[test]
-    fn ssm_session_insert_replaces_and_shares_byte_budget_with_checkpoints() {
+    fn ssm_session_slots_cap_and_share_byte_budget_with_checkpoints() {
         let mut cache = SsmStateCache::new(4, 100, 100);
-        cache.insert_session("s1", toks(&[1, 2, 3]), vec![0u8; 40]);
-        // Replacing the same session swaps the bytes, not accumulates them.
-        cache.insert_session("s1", toks(&[1, 2, 3, 4]), vec![0u8; 50]);
-        assert_eq!(cache.total_bytes, 50);
+        cache.insert_session("s1", toks(&[1, 2]), vec![0u8; 20]);
+        cache.insert_session("s1", toks(&[1, 2, 3]), vec![0u8; 20]);
+        assert_eq!(cache.total_bytes, 40);
+        // Third snapshot exceeds the per-session slot cap: the oldest goes.
+        cache.insert_session("s1", toks(&[1, 2, 3, 4]), vec![0u8; 20]);
+        assert_eq!(cache.total_bytes, 40);
+        assert!(!cache.session_is_current("s1", &toks(&[1, 2])));
+        assert!(cache.session_is_current("s1", &toks(&[1, 2, 3])));
         assert!(cache.session_is_current("s1", &toks(&[1, 2, 3, 4])));
+        // Re-inserting an identical snapshot only refreshes it.
+        cache.insert_session("s1", toks(&[1, 2, 3, 4]), vec![0u8; 20]);
+        assert_eq!(cache.total_bytes, 40);
 
-        // A chunk checkpoint that overflows the shared budget evicts the
-        // older of the two kinds — here the session entry is the LRU.
-        cache.insert(11, 4, vec![0u8; 60]);
-        assert!(!cache.session_is_current("s1", &toks(&[1, 2, 3, 4])));
+        // A chunk checkpoint overflowing the shared budget evicts session
+        // snapshots (LRU across both kinds) — only as many as needed: the
+        // refreshed [1,2,3,4] snapshot survives at exactly full budget.
+        cache.insert(11, 4, vec![0u8; 80]);
         assert!(cache.contains(11));
-        assert_eq!(cache.total_bytes, 60);
+        assert!(!cache.session_is_current("s1", &toks(&[1, 2, 3])));
+        assert!(cache.session_is_current("s1", &toks(&[1, 2, 3, 4])));
+        assert_eq!(cache.total_bytes, 100);
 
         // And a session insert can evict LRU chunk checkpoints in turn.
         cache.insert_session("s2", toks(&[9, 9]), vec![0u8; 70]);
