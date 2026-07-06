@@ -1000,9 +1000,13 @@ struct ActiveSeq {
 
 #[cfg(feature = "gguf")]
 struct GgufBackendSamplers {
-    greedy: Vec<LlamaSampler>,
-    no_eos: Vec<LlamaSampler>,
-    mode_by_seq_id: Vec<Option<bool>>,
+    // One [logit_bias(eos), greedy] chain per slot, installed once and kept for the context
+    // lifetime. EOS suppression toggles the bias between -inf and 0 in place, so steady-state
+    // mode changes never call set_sampler and never re-trigger a backend scheduler reserve.
+    chains: Vec<LlamaSampler>,
+    installed_by_seq_id: Vec<bool>,
+    mode_by_seq_id: Vec<bool>,
+    eos_token: LlamaToken,
     sample: LlamaSampler,
 }
 
@@ -1010,11 +1014,8 @@ struct GgufBackendSamplers {
 impl GgufBackendSamplers {
     fn new(model: &LlamaModel, max_concurrent: usize, eos_token: LlamaToken) -> Self {
         let n_vocab = model.n_vocab();
-        let eos_bias = [LlamaLogitBias::new(eos_token, f32::NEG_INFINITY)];
-        let greedy = (0..max_concurrent)
-            .map(|_| LlamaSampler::chain_simple([LlamaSampler::greedy()]))
-            .collect();
-        let no_eos = (0..max_concurrent)
+        let eos_bias = [LlamaLogitBias::new(eos_token, 0.0)];
+        let chains = (0..max_concurrent)
             .map(|_| {
                 LlamaSampler::chain_simple([
                     LlamaSampler::logit_bias(n_vocab, &eos_bias),
@@ -1024,9 +1025,10 @@ impl GgufBackendSamplers {
             .collect();
 
         Self {
-            greedy,
-            no_eos,
-            mode_by_seq_id: vec![None; max_concurrent],
+            chains,
+            installed_by_seq_id: vec![false; max_concurrent],
+            mode_by_seq_id: vec![false; max_concurrent],
+            eos_token,
             sample: LlamaSampler::greedy(),
         }
     }
@@ -1040,31 +1042,23 @@ impl GgufBackendSamplers {
         let Some(slot) = usize::try_from(seq_id).ok() else {
             return false;
         };
-        if self
-            .mode_by_seq_id
-            .get(slot)
-            .copied()
-            .flatten()
-            .is_some_and(|mode| mode == suppress_eos)
-        {
-            return true;
-        }
-        let sampler = if suppress_eos {
-            self.no_eos.get_mut(slot)
-        } else {
-            self.greedy.get_mut(slot)
-        };
-        let Some(sampler) = sampler else {
+        let Some(chain) = self.chains.get_mut(slot) else {
             return false;
         };
-        if unsafe { ctx.set_sampler(seq_id, Some(sampler)) } {
-            if let Some(mode) = self.mode_by_seq_id.get_mut(slot) {
-                *mode = Some(suppress_eos);
+        if self.mode_by_seq_id[slot] != suppress_eos {
+            let bias = if suppress_eos { f32::NEG_INFINITY } else { 0.0 };
+            if !chain.chain_logit_bias_set(0, &[LlamaLogitBias::new(self.eos_token, bias)]) {
+                return false;
             }
-            true
-        } else {
-            false
+            self.mode_by_seq_id[slot] = suppress_eos;
         }
+        if !self.installed_by_seq_id[slot] {
+            if !unsafe { ctx.set_sampler(seq_id, Some(chain)) } {
+                return false;
+            }
+            self.installed_by_seq_id[slot] = true;
+        }
+        true
     }
 
     fn sample_token(
