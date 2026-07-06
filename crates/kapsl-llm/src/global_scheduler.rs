@@ -320,7 +320,9 @@ impl GlobalKvScheduler {
         // ── Guarantee phase ───────────────────────────────────────────────────
         // Only healthy engines reserve guaranteed tokens: an unhealthy engine
         // cannot use its guarantee, so it must not shrink the elastic pool.
-        let total_guaranteed: usize = self.engine_order.iter()
+        let total_guaranteed: usize = self
+            .engine_order
+            .iter()
             .filter_map(|id| self.engines.get(id))
             .filter(|s| s.health == EngineHealth::Healthy)
             .map(|s| s.guaranteed_min_tokens)
@@ -330,14 +332,18 @@ impl GlobalKvScheduler {
         let elastic_pool = self.global_max_tokens.saturating_sub(total_guaranteed);
 
         // ── Weight totals ─────────────────────────────────────────────────────
-        let active_total_weight: u64 = self.engine_order.iter()
+        let active_total_weight: u64 = self
+            .engine_order
+            .iter()
             .filter_map(|id| self.engines.get(id))
             .filter(|s| s.was_active && s.health == EngineHealth::Healthy)
             .map(|s| s.share_weight as u64)
             .sum();
         let treat_all_active = active_total_weight == 0;
 
-        let all_total_weight: u64 = self.engines.values()
+        let all_total_weight: u64 = self
+            .engines
+            .values()
             .map(|s| s.share_weight as u64)
             .sum::<u64>()
             .max(1);
@@ -352,7 +358,9 @@ impl GlobalKvScheduler {
         let mut natural_elastic_sum: usize = 0;
 
         for &engine_id in &self.engine_order {
-            let Some(state) = self.engines.get(&engine_id) else { continue };
+            let Some(state) = self.engines.get(&engine_id) else {
+                continue;
+            };
 
             // Natural elastic share based on weight (before caps).
             let natural_elastic =
@@ -364,7 +372,10 @@ impl GlobalKvScheduler {
             // no guarantee they cannot use.
             if state.health != EngineHealth::Healthy {
                 idle_elastic_pool += natural_elastic;
-                budgets.push(EngineTokenBudget { engine_id, max_tokens: 0 });
+                budgets.push(EngineTokenBudget {
+                    engine_id,
+                    max_tokens: 0,
+                });
                 continue;
             }
 
@@ -372,10 +383,13 @@ impl GlobalKvScheduler {
 
             let elastic_share = if is_active {
                 // Cap by per-mille limit and by the engine's own max_tokens bound.
-                let per_engine_cap = state.max_tokens
+                let per_engine_cap = state
+                    .max_tokens
                     .map(|m| m.saturating_sub(state.guaranteed_min_tokens))
                     .unwrap_or(elastic_pool);
-                natural_elastic.min(elastic_permille_cap).min(per_engine_cap)
+                natural_elastic
+                    .min(elastic_permille_cap)
+                    .min(per_engine_cap)
             } else {
                 idle_elastic_pool += natural_elastic;
                 0
@@ -392,7 +406,8 @@ impl GlobalKvScheduler {
             if let Some(b) = budgets.iter_mut().find(|b| b.max_tokens > 0) {
                 let state = self.engines.get(&b.engine_id).unwrap();
                 let elastic_used = b.max_tokens.saturating_sub(state.guaranteed_min_tokens);
-                let per_engine_cap = state.max_tokens
+                let per_engine_cap = state
+                    .max_tokens
                     .map(|m| m.saturating_sub(state.guaranteed_min_tokens))
                     .unwrap_or(elastic_pool);
                 let headroom = per_engine_cap.saturating_sub(elastic_used);
@@ -406,7 +421,8 @@ impl GlobalKvScheduler {
             if let Some(b) = budgets.iter_mut().find(|b| b.max_tokens > 0) {
                 let state = self.engines.get(&b.engine_id).unwrap();
                 let elastic_used = b.max_tokens.saturating_sub(state.guaranteed_min_tokens);
-                let per_engine_cap = state.max_tokens
+                let per_engine_cap = state
+                    .max_tokens
                     .map(|m| m.saturating_sub(state.guaranteed_min_tokens))
                     .unwrap_or(elastic_pool);
                 let headroom = per_engine_cap.saturating_sub(elastic_used);
@@ -442,7 +458,7 @@ impl GlobalKvScheduler {
     pub fn try_reserve_tokens(&mut self, engine_id: u32, tokens: usize) -> bool {
         let budget = match self.budget_for(engine_id) {
             Some(b) => b,
-            None    => return false,
+            None => return false,
         };
         let already = self.reserved_tokens.get(&engine_id).copied().unwrap_or(0);
         if already + tokens > budget {
@@ -532,7 +548,8 @@ impl GlobalKvScheduler {
         // Among other engines, find the one with the lowest minimum priority
         // (most evictable) that has enough freeable blocks and hasn't hit
         // its per-round donation cap.
-        let donor = self.engine_order
+        let donor = self
+            .engine_order
             .iter()
             .filter(|&&id| id != request.requesting_engine_id)
             .filter(|&&id| self.engines.contains_key(&id))
@@ -732,8 +749,16 @@ mod global_scheduler_tests {
         let mut sched = make_scheduler(1000, &[(0, 1, true), (1, 1, true)]);
         sched.set_health(1, EngineHealth::Degraded);
         let budgets = sched.allocate_budgets();
-        let b0 = budgets.iter().find(|b| b.engine_id == 0).unwrap().max_tokens;
-        let b1 = budgets.iter().find(|b| b.engine_id == 1).unwrap().max_tokens;
+        let b0 = budgets
+            .iter()
+            .find(|b| b.engine_id == 0)
+            .unwrap()
+            .max_tokens;
+        let b1 = budgets
+            .iter()
+            .find(|b| b.engine_id == 1)
+            .unwrap()
+            .max_tokens;
         // Degraded engine gets nothing; healthy engine absorbs its share.
         assert_eq!(b1, 0, "degraded engine should get zero budget");
         assert_eq!(b0, 1000, "healthy engine should absorb the degraded share");
@@ -810,7 +835,11 @@ mod global_scheduler_tests {
         }
         // After the cap is reached for engine 1, it must not be selected again this round.
         // Engine 2 may be selected instead (also at priority 1), but engine 1 is blocked.
-        let donations_1 = sched.preemption_donations_this_round.get(&1).copied().unwrap_or(0);
+        let donations_1 = sched
+            .preemption_donations_this_round
+            .get(&1)
+            .copied()
+            .unwrap_or(0);
         assert_eq!(donations_1, MAX_PREEMPTIONS_DONATED_PER_ROUND);
 
         // Reset clears the cap for the next round.
