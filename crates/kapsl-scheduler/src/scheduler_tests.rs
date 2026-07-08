@@ -118,6 +118,79 @@ impl Engine for BatchRecordingEngine {
     }
 }
 
+/// Self-batching engine whose `infer` blocks until released and whose reported
+/// KV occupancy is toggleable, so tests can drive the executor's
+/// occupancy-driven admission gate deterministically.
+struct GatedEngine {
+    started: Arc<AtomicUsize>,
+    release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    saturated: Arc<std::sync::atomic::AtomicBool>,
+    kv_total: usize,
+}
+
+impl GatedEngine {
+    fn new(kv_total: usize) -> Self {
+        Self {
+            started: Arc::new(AtomicUsize::new(0)),
+            release: Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())),
+            saturated: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            kv_total,
+        }
+    }
+
+    fn release_all(&self) {
+        let (lock, cvar) = &*self.release;
+        *lock.lock().unwrap() = true;
+        cvar.notify_all();
+    }
+}
+
+#[async_trait]
+impl Engine for GatedEngine {
+    async fn load(&mut self, _model_path: &std::path::Path) -> Result<(), EngineError> {
+        Ok(())
+    }
+
+    fn infer(&self, request: &InferenceRequest) -> Result<BinaryTensorPacket, EngineError> {
+        self.started
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let (lock, cvar) = &*self.release;
+        let mut released = lock.lock().unwrap();
+        while !*released {
+            released = cvar.wait(released).unwrap();
+        }
+        Ok(request.input.clone())
+    }
+
+    fn self_batches(&self) -> bool {
+        true
+    }
+
+    fn infer_stream(&self, request: &InferenceRequest) -> EngineStream {
+        let output = Ok(request.input.clone());
+        Box::pin(futures::stream::once(async move { output }))
+    }
+
+    fn unload(&mut self) {}
+
+    fn metrics(&self) -> EngineMetrics {
+        let free = if self.saturated.load(std::sync::atomic::Ordering::SeqCst) {
+            0
+        } else {
+            self.kv_total
+        };
+        EngineMetrics {
+            kv_cache_blocks_total: self.kv_total,
+            kv_cache_blocks_free: free,
+            ..EngineMetrics::default()
+        }
+    }
+
+    fn health_check(&self) -> Result<(), EngineError> {
+        Ok(())
+    }
+}
+
 fn make_inference_request(session_id: Option<&str>) -> InferenceRequest {
     let input = BinaryTensorPacket {
         shape: vec![1],
@@ -370,6 +443,77 @@ async fn test_gpu_executor_never_coalesces_self_batching_backend() {
         "self-batching backend must never be coalesced, got {:?}",
         recorded
     );
+}
+
+#[tokio::test]
+async fn test_gpu_executor_admission_gates_saturated_self_batching_backend() {
+    use crate::gpu_executor::{GpuExecutor, WorkQueue};
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    // Free-KV headroom = 50%: with kv_total=100, free=0 (saturated) blocks
+    // admission, free=100 (unsaturated) allows it.
+    let gated = Arc::new(GatedEngine::new(100));
+    let engine: EngineHandle = gated.clone();
+
+    let high = WorkQueue::new(64);
+    let low = WorkQueue::new(64);
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let executor = GpuExecutor::new(high.clone(), low.clone(), engine, 8, 2, in_flight)
+        .with_admission_min_free_pct(50);
+
+    // First request: admitted even though saturated, because nothing is in
+    // flight yet (liveness escape). Its infer() then blocks, holding in_flight.
+    let (tx1, _rx1) = oneshot::channel();
+    high.push_block(Request {
+        input: make_inference_request(None),
+        response_tx: tx1,
+    })
+    .await;
+
+    tokio::spawn(executor.run());
+
+    // Wait until req1 is actually running inside infer().
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while gated.started.load(Ordering::SeqCst) < 1 {
+        assert!(std::time::Instant::now() < deadline, "req1 never started");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+
+    // Second request arrives while the backend is saturated AND req1 is in
+    // flight: it must be held in the queue, not dispatched.
+    let (tx2, rx2) = oneshot::channel();
+    high.push_block(Request {
+        input: make_inference_request(None),
+        response_tx: tx2,
+    })
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert_eq!(
+        gated.started.load(Ordering::SeqCst),
+        1,
+        "saturated self-batching backend must not admit a second request"
+    );
+
+    // Free the KV cache: admission should now let req2 through even though req1
+    // is still in flight (proves the gate keys on occupancy, not just in_flight).
+    gated.saturated.store(false, Ordering::SeqCst);
+    while gated.started.load(Ordering::SeqCst) < 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "req2 not admitted after KV freed"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+
+    // Drain: release both blocked infers and confirm req2 completes.
+    gated.release_all();
+    tokio::time::timeout(Duration::from_secs(5), rx2)
+        .await
+        .expect("req2 did not respond in time")
+        .expect("response channel dropped")
+        .expect("inference failed");
 }
 
 #[tokio::test]

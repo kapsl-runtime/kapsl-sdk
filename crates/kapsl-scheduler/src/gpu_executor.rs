@@ -147,6 +147,14 @@ impl WorkQueue {
     }
 }
 
+/// Default admission headroom: pause admission to a self-batching backend once
+/// its free KV cache falls below this percentage of total capacity. Overridable
+/// via `KAPSL_ADMISSION_MIN_FREE_PCT`. 0 disables occupancy-driven admission.
+const DEFAULT_ADMISSION_MIN_FREE_PCT: usize = 5;
+
+/// Back-off between occupancy re-checks while admission is paused.
+const ADMISSION_POLL: Duration = Duration::from_millis(2);
+
 /// GPU Executor that processes requests from priority queues
 pub struct GpuExecutor {
     high_priority_queue: WorkQueue,
@@ -155,6 +163,9 @@ pub struct GpuExecutor {
     max_micro_batch: usize,
     queue_delay: Duration,
     in_flight: Arc<AtomicUsize>,
+    /// Minimum free-KV headroom (percent of total) below which a self-batching
+    /// backend stops accepting new requests. 0 disables the gate.
+    admission_min_free_pct: usize,
 }
 
 impl GpuExecutor {
@@ -166,6 +177,11 @@ impl GpuExecutor {
         queue_delay_ms: u64,
         in_flight: Arc<AtomicUsize>,
     ) -> Self {
+        let admission_min_free_pct = std::env::var("KAPSL_ADMISSION_MIN_FREE_PCT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_ADMISSION_MIN_FREE_PCT)
+            .min(100);
         Self {
             high_priority_queue,
             low_priority_queue,
@@ -173,7 +189,34 @@ impl GpuExecutor {
             max_micro_batch: max_micro_batch.max(1),
             queue_delay: Duration::from_millis(queue_delay_ms),
             in_flight,
+            admission_min_free_pct,
         }
+    }
+
+    /// Override the free-KV admission headroom (percent). Used by tests and
+    /// tuning; production reads the default / `KAPSL_ADMISSION_MIN_FREE_PCT`.
+    #[cfg(test)]
+    pub(crate) fn with_admission_min_free_pct(mut self, pct: usize) -> Self {
+        self.admission_min_free_pct = pct.min(100);
+        self
+    }
+
+    /// Whether a self-batching backend has exhausted its admission headroom,
+    /// based on its published KV-cache occupancy. Returns `false` when the gate
+    /// is disabled or the backend exposes no KV signal yet (nothing to gate on),
+    /// so backends without KV telemetry are never throttled.
+    fn backend_saturated(&self) -> bool {
+        if self.admission_min_free_pct == 0 {
+            return false;
+        }
+        let metrics = self.engine.metrics();
+        if metrics.kv_cache_blocks_total == 0 {
+            return false;
+        }
+        metrics.kv_cache_blocks_free.saturating_mul(100)
+            < metrics
+                .kv_cache_blocks_total
+                .saturating_mul(self.admission_min_free_pct)
     }
 
     fn dispatch_single(engine: EngineHandle, req: Request, in_flight: Arc<AtomicUsize>) {
@@ -352,6 +395,21 @@ impl GpuExecutor {
         let batch_capable = batch_cap > 1 && !self_batches;
 
         loop {
+            // Occupancy-driven admission (self-batching backends only): when the
+            // backend signals it is saturated, stop pulling from the priority
+            // queues so requests stay priority-ordered there instead of piling
+            // into the backend's internal FIFO. Always admit when nothing is in
+            // flight, so a full/stale occupancy snapshot can never stall forward
+            // progress (an isolated request that alone exceeds the headroom must
+            // still run).
+            if self_batches
+                && self.in_flight.load(Ordering::Relaxed) > 0
+                && self.backend_saturated()
+            {
+                tokio::time::sleep(ADMISSION_POLL).await;
+                continue;
+            }
+
             if batch_capable {
                 // Latency-critical first, then throughput; coalesce either queue.
                 if let Some(req) = self.high_priority_queue.pop_nowait() {
