@@ -55,29 +55,113 @@ fn manifest_metadata_bool(manifest: &Manifest, section: &str, key: &str, default
 }
 
 /// Wrap a freshly built ONNX engine in the task post-processor the manifest asks
-/// for (embedding pooling or classification softmax); otherwise return it
-/// unchanged.
+/// for (embedding pooling, classification softmax, or detection box-decode+NMS);
+/// otherwise return it unchanged.
 fn maybe_wrap_onnx_postprocess(
     engine_kind: EngineKind,
     manifest: &Manifest,
     inner: Box<dyn Engine>,
-) -> Box<dyn Engine> {
+) -> Result<Box<dyn Engine>, String> {
     match engine_kind {
         EngineKind::OnnxEmbed => {
             // Default true: cosine == dot product for vector stores.
             let normalize = manifest_metadata_bool(manifest, "embed", "normalize", true);
-            Box::new(crate::onnx_embed::OnnxEmbedBackend::new(inner, normalize))
+            Ok(Box::new(crate::onnx_embed::OnnxEmbedBackend::new(
+                inner, normalize,
+            )))
         }
         EngineKind::OnnxClassify => {
             // Default true: most classifier exports emit raw logits.
             let apply_softmax = manifest_metadata_bool(manifest, "classify", "apply_softmax", true);
-            Box::new(crate::onnx_classify::OnnxClassifyBackend::new(
+            Ok(Box::new(crate::onnx_classify::OnnxClassifyBackend::new(
                 inner,
                 apply_softmax,
-            ))
+            )))
         }
-        _ => inner,
+        EngineKind::OnnxDetect => {
+            let spec = manifest
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("detect"))
+                .ok_or_else(|| {
+                    "detect task requires a `metadata.detect` block (num_classes at minimum)"
+                        .to_string()
+                })?;
+            let cfg: crate::onnx_detect::DetectConfig = serde_yaml::from_value(spec.clone())
+                .map_err(|e| format!("invalid metadata.detect: {e}"))?;
+            let backend = crate::onnx_detect::OnnxDetectBackend::new(inner, cfg)
+                .map_err(|e| format!("detector init failed: {e}"))?;
+            Ok(Box::new(backend))
+        }
+        EngineKind::OnnxTranscribe => {
+            // metadata.transcribe is optional (defaults to blank-0, collapse on).
+            let cfg = match manifest.metadata.as_ref().and_then(|m| m.get("transcribe")) {
+                Some(spec) => serde_yaml::from_value(spec.clone())
+                    .map_err(|e| format!("invalid metadata.transcribe: {e}"))?,
+                None => crate::onnx_transcribe::TranscribeConfig::default(),
+            };
+            Ok(Box::new(crate::onnx_transcribe::OnnxTranscribeBackend::new(
+                inner, cfg,
+            )))
+        }
+        _ => Ok(inner),
     }
+}
+
+/// Wrap an ONNX engine in the input *pre*-processing stage its manifest asks for
+/// (`metadata.preprocess`), if any. Only ONNX-session engines are eligible.
+///
+/// This is applied *outside* the post-processor so the runtime pipeline reads
+/// `preprocess -> onnx forward -> postprocess`: e.g. an image classifier decodes
+/// and normalizes the incoming JPEG, runs the forward pass, then softmaxes.
+fn maybe_wrap_onnx_preprocess(
+    engine_kind: EngineKind,
+    manifest: &Manifest,
+    engine: Box<dyn Engine>,
+) -> Result<Box<dyn Engine>, String> {
+    if !engine_kind.uses_onnx_session() {
+        return Ok(engine);
+    }
+    let Some(spec) = manifest.metadata.as_ref().and_then(|m| m.get("preprocess")) else {
+        return Ok(engine);
+    };
+    match spec.get("kind").and_then(|k| k.as_str()) {
+        Some("vision") => {
+            let cfg: crate::preprocess::vision::VisionConfig = serde_yaml::from_value(spec.clone())
+                .map_err(|e| format!("invalid metadata.preprocess (vision): {e}"))?;
+            let pre = crate::preprocess::VisionPreprocessor::new(cfg)
+                .map_err(|e| format!("vision preprocess init failed: {e}"))?;
+            log::info!("✓ Wrapping ONNX engine with vision input preprocessing");
+            Ok(Box::new(crate::preprocess::PreprocessBackend::new(
+                engine,
+                Box::new(pre),
+            )))
+        }
+        Some("audio") => {
+            let cfg: crate::preprocess::audio::AudioConfig = serde_yaml::from_value(spec.clone())
+                .map_err(|e| format!("invalid metadata.preprocess (audio): {e}"))?;
+            let pre = crate::preprocess::AudioPreprocessor::new(cfg)
+                .map_err(|e| format!("audio preprocess init failed: {e}"))?;
+            log::info!("✓ Wrapping ONNX engine with audio (log-mel) input preprocessing");
+            Ok(Box::new(crate::preprocess::PreprocessBackend::new(
+                engine,
+                Box::new(pre),
+            )))
+        }
+        Some(other) => Err(format!("unknown metadata.preprocess kind `{other}`")),
+        None => Err("metadata.preprocess is set but missing a `kind`".to_string()),
+    }
+}
+
+/// Apply the ONNX task post-processor then the input pre-processor, yielding the
+/// full serving pipeline for a freshly built ONNX engine.
+fn finalize_onnx_pipeline(
+    engine_kind: EngineKind,
+    manifest: &Manifest,
+    inner: Box<dyn Engine>,
+) -> Result<Box<dyn Engine>, String> {
+    let post = maybe_wrap_onnx_postprocess(engine_kind, manifest, inner)?;
+    maybe_wrap_onnx_preprocess(engine_kind, manifest, post)
 }
 
 pub fn parse_optimization_level(level: Option<&String>) -> Result<GraphOptimizationLevel, String> {
@@ -292,7 +376,7 @@ impl BackendFactory {
             match Self::try_create_provider(provider, device_info, opt_level, device_id, tuning) {
                 Ok(backend) => {
                     log::info!("✓ Using provider: {}", provider);
-                    return Ok(maybe_wrap_onnx_postprocess(engine_kind, manifest, backend));
+                    return finalize_onnx_pipeline(engine_kind, manifest, backend);
                 }
                 Err(err) => {
                     log::warn!("⚠ Provider '{}' not available: {}", provider, err);
@@ -305,7 +389,7 @@ impl BackendFactory {
         let opt_cpu = parse_optimization_level(requirements.graph_optimization_level.as_ref())
             .unwrap_or(GraphOptimizationLevel::Level3);
         let inner = Self::build_onnx_backend(ExecutionProvider::CPU, opt_cpu, 0, tuning)?;
-        Ok(maybe_wrap_onnx_postprocess(engine_kind, manifest, inner))
+        finalize_onnx_pipeline(engine_kind, manifest, inner)
     }
 
     /// Create a backend for a specific device
@@ -395,7 +479,7 @@ impl BackendFactory {
             .map_err(|e| format!("Invalid graph optimization level in manifest: {}", e))?;
         let inner =
             Self::try_create_provider(provider, device_info, opt_level, device_id as i32, tuning)?;
-        Ok(maybe_wrap_onnx_postprocess(engine_kind, manifest, inner))
+        finalize_onnx_pipeline(engine_kind, manifest, inner)
     }
 
     fn try_create_provider(
