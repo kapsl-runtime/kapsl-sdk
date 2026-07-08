@@ -29,6 +29,8 @@ serde_yaml = "0.9"
 # Image decode/resize for the vision preprocessing stage. Kept minimal: only the
 # common encoded formats, no default codecs we don't serve.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+# FFT for the audio log-mel spectrogram preprocessing stage.
+rustfft = "6"
 
 [features]
 default = []

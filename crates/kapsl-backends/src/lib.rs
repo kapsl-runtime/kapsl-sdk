@@ -25,4 +25,4 @@ pub use onnx_classify::OnnxClassifyBackend;
 pub use onnx_detect::OnnxDetectBackend;
 pub use onnx_embed::OnnxEmbedBackend;
 pub use onnx_transcribe::OnnxTranscribeBackend;
-pub use preprocess::{PreprocessBackend, Preprocessor, VisionPreprocessor};
+pub use preprocess::{AudioPreprocessor, PreprocessBackend, Preprocessor, VisionPreprocessor};

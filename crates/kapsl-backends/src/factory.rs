@@ -137,6 +137,17 @@ fn maybe_wrap_onnx_preprocess(
                 Box::new(pre),
             )))
         }
+        Some("audio") => {
+            let cfg: crate::preprocess::audio::AudioConfig = serde_yaml::from_value(spec.clone())
+                .map_err(|e| format!("invalid metadata.preprocess (audio): {e}"))?;
+            let pre = crate::preprocess::AudioPreprocessor::new(cfg)
+                .map_err(|e| format!("audio preprocess init failed: {e}"))?;
+            log::info!("✓ Wrapping ONNX engine with audio (log-mel) input preprocessing");
+            Ok(Box::new(crate::preprocess::PreprocessBackend::new(
+                engine,
+                Box::new(pre),
+            )))
+        }
         Some(other) => Err(format!("unknown metadata.preprocess kind `{other}`")),
         None => Err("metadata.preprocess is set but missing a `kind`".to_string()),
     }

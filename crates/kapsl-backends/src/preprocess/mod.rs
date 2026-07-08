@@ -19,8 +19,11 @@
 //! [`crate::factory::maybe_wrap_onnx_postprocess`]: the pipeline becomes
 //! `preprocess -> onnx forward -> postprocess`.
 
+pub mod audio;
 pub mod vision;
 
+#[cfg(test)]
+mod audio_tests;
 #[cfg(test)]
 mod vision_tests;
 
@@ -31,6 +34,7 @@ use kapsl_engine_api::{
 };
 use std::path::Path;
 
+pub use audio::AudioPreprocessor;
 pub use vision::VisionPreprocessor;
 
 /// Transforms a raw client input packet into the tensor a model expects.
