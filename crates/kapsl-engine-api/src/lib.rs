@@ -653,6 +653,18 @@ pub trait Engine: Send + Sync {
         self.infer_batch(requests)
     }
 
+    /// Maximum number of independent requests this engine can coalesce into a
+    /// single batched execution via [`Engine::infer_batch`].
+    ///
+    /// Returns 1 when batching is unsupported or unprofitable (the default), so
+    /// the scheduler dispatches requests one at a time. Backends that implement
+    /// a real (non-serial) `infer_batch` — e.g. an ONNX model with a dynamic
+    /// batch dimension — return a value > 1 so the scheduler's micro-batcher
+    /// coalesces pending requests before dispatch.
+    fn max_batch(&self) -> usize {
+        1
+    }
+
     /// Run a streaming inference request.
     fn infer_stream(&self, request: &InferenceRequest) -> EngineStream;
 
@@ -753,6 +765,10 @@ impl Engine for Box<dyn Engine> {
         requests: &[InferenceRequest],
     ) -> Result<Vec<BinaryTensorPacket>, EngineError> {
         (**self).infer_batch_async(requests).await
+    }
+
+    fn max_batch(&self) -> usize {
+        (**self).max_batch()
     }
 
     fn infer_stream(&self, request: &InferenceRequest) -> EngineStream {
