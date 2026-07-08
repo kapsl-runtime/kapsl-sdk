@@ -52,11 +52,26 @@ impl Engine for MockEngine {
 struct BatchRecordingEngine {
     calls: Arc<std::sync::Mutex<Vec<usize>>>,
     max_batch: usize,
+    self_batches: bool,
 }
 
 impl BatchRecordingEngine {
     fn new(calls: Arc<std::sync::Mutex<Vec<usize>>>, max_batch: usize) -> Self {
-        Self { calls, max_batch }
+        Self {
+            calls,
+            max_batch,
+            self_batches: false,
+        }
+    }
+
+    /// A backend that advertises batching capacity yet self-batches internally,
+    /// so the executor must dispatch each request individually anyway.
+    fn new_self_batching(calls: Arc<std::sync::Mutex<Vec<usize>>>, max_batch: usize) -> Self {
+        Self {
+            calls,
+            max_batch,
+            self_batches: true,
+        }
     }
 }
 
@@ -81,6 +96,10 @@ impl Engine for BatchRecordingEngine {
 
     fn max_batch(&self) -> usize {
         self.max_batch
+    }
+
+    fn self_batches(&self) -> bool {
+        self.self_batches
     }
 
     fn infer_stream(&self, request: &InferenceRequest) -> EngineStream {
@@ -296,6 +315,59 @@ async fn test_gpu_executor_coalesces_capable_backend() {
     assert!(
         recorded.iter().any(|&n| n > 1),
         "expected the executor to coalesce a capable backend, got {:?}",
+        recorded
+    );
+}
+
+#[tokio::test]
+async fn test_gpu_executor_never_coalesces_self_batching_backend() {
+    use crate::gpu_executor::{GpuExecutor, WorkQueue};
+    use std::time::Duration;
+
+    // A backend advertising max_batch() == 8 but self_batches() == true must
+    // never be routed through infer_batch: it multiplexes internally, so every
+    // request has to be dispatched individually (recorded call size 1).
+    let calls = Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+    let engine: EngineHandle = Arc::new(BatchRecordingEngine::new_self_batching(calls.clone(), 8));
+
+    let high = WorkQueue::new(64);
+    let low = WorkQueue::new(64);
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let executor = GpuExecutor::new(high.clone(), low.clone(), engine, 8, 2, in_flight);
+
+    // Burst on the low-priority queue too, where the single-dispatch path would
+    // otherwise accumulate a serial infer_batch group.
+    let mut receivers = Vec::new();
+    for _ in 0..6 {
+        let (response_tx, response_rx) = oneshot::channel();
+        low.push_block(Request {
+            input: make_inference_request(None),
+            response_tx,
+        })
+        .await;
+        receivers.push(response_rx);
+    }
+
+    tokio::spawn(executor.run());
+
+    for rx in receivers {
+        tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .expect("executor did not respond in time")
+            .expect("response channel dropped")
+            .expect("inference failed");
+    }
+
+    let recorded = calls.lock().unwrap().clone();
+    assert_eq!(
+        recorded.iter().sum::<usize>(),
+        6,
+        "every request must be dispatched exactly once, got {:?}",
+        recorded
+    );
+    assert!(
+        recorded.iter().all(|&n| n == 1),
+        "self-batching backend must never be coalesced, got {:?}",
         recorded
     );
 }

@@ -341,8 +341,15 @@ impl GpuExecutor {
         // classified latency-critical yet benefit most from batching. Backends
         // that don't (max_batch() == 1, the default) keep the original
         // single-dispatch / throughput-only micro-batch behavior untouched.
+        //
+        // Self-batching backends (e.g. an autoregressive LLM that continuously
+        // batches active sequences at the decode step) must never be coalesced
+        // here: request-level `infer_batch` would run the whole batch to
+        // completion in one call and fight the backend's own batcher. They are
+        // always dispatched individually and left to multiplex internally.
+        let self_batches = self.engine.self_batches();
         let batch_cap = self.engine.max_batch().min(self.max_micro_batch);
-        let batch_capable = batch_cap > 1;
+        let batch_capable = batch_cap > 1 && !self_batches;
 
         loop {
             if batch_capable {
@@ -375,7 +382,10 @@ impl GpuExecutor {
 
                 if let Some(req) = self.low_priority_queue.pop_nowait() {
                     let engine = self.engine.clone();
-                    if self.max_micro_batch <= 1 || self.queue_delay.is_zero() {
+                    // Self-batching backends multiplex internally, so hand each
+                    // request over immediately rather than holding it back to
+                    // build a serial `infer_batch` group.
+                    if self_batches || self.max_micro_batch <= 1 || self.queue_delay.is_zero() {
                         Self::dispatch_single(engine, req, self.in_flight.clone());
                         continue;
                     }

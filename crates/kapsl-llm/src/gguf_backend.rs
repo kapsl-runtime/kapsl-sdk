@@ -4241,6 +4241,15 @@ impl Engine for GgufBackend {
         self.metrics_snapshot()
     }
 
+    /// The GGUF backend runs its own continuous batcher (`run_scheduler`) that
+    /// multiplexes concurrent requests across `max_concurrent` sequence slots.
+    /// The scheduler must dispatch requests individually rather than coalesce
+    /// them via `infer_batch`, so it advertises self-batching (and keeps
+    /// `max_batch()` at the default 1).
+    fn self_batches(&self) -> bool {
+        true
+    }
+
     fn health_check(&self) -> Result<(), EngineError> {
         if self.inner.is_some() {
             Ok(())
