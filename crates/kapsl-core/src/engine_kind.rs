@@ -40,6 +40,10 @@ pub enum EngineKind {
     /// ONNX classifier (forward pass + softmax over logits). Selected by
     /// `format=onnx`, `task=classify`.
     OnnxClassify,
+    /// ONNX object detector (forward pass + box decode + non-max suppression).
+    /// Emits `[num_detections, 6]` = `[x1, y1, x2, y2, score, class_id]`.
+    /// Selected by `format=onnx`, `task=detect`.
+    OnnxDetect,
 }
 
 impl EngineKind {
@@ -78,6 +82,7 @@ impl EngineKind {
                 "generate" => Self::OnnxGenerate,
                 "embed" => Self::OnnxEmbed,
                 "classify" => Self::OnnxClassify,
+                "detect" => Self::OnnxDetect,
                 _ => Self::OnnxForward,
             },
         }
@@ -116,6 +121,7 @@ impl EngineKind {
             "causal-lm" => matches!(task.as_str(), "generate" | "embed" | "forward"),
             "embedding" => task == "embed",
             "seq-classifier" => task == "classify",
+            "detector" => task == "detect",
             "seq2seq" => matches!(task.as_str(), "generate" | "forward"),
             // opaque graphs only support a raw forward pass.
             _ => task == "forward",
@@ -160,7 +166,11 @@ impl EngineKind {
     pub fn uses_onnx_session(&self) -> bool {
         matches!(
             self,
-            Self::OnnxGenerate | Self::OnnxForward | Self::OnnxEmbed | Self::OnnxClassify
+            Self::OnnxGenerate
+                | Self::OnnxForward
+                | Self::OnnxEmbed
+                | Self::OnnxClassify
+                | Self::OnnxDetect
         )
     }
 
@@ -177,7 +187,8 @@ impl EngineKind {
             | Self::Native
             | Self::OnnxForward
             | Self::OnnxEmbed
-            | Self::OnnxClassify => true,
+            | Self::OnnxClassify
+            | Self::OnnxDetect => true,
         }
     }
 
@@ -190,6 +201,7 @@ impl EngineKind {
             Self::OnnxForward => "onnx-forward",
             Self::OnnxEmbed => "onnx-embed",
             Self::OnnxClassify => "onnx-classify",
+            Self::OnnxDetect => "onnx-detect",
         }
     }
 }
@@ -197,10 +209,17 @@ impl EngineKind {
 /// Known model file formats / loaders.
 pub const VALID_FORMATS: &[&str] = &["onnx", "gguf", "safetensors"];
 /// Known model capability classes.
-pub const VALID_MODEL_TYPES: &[&str] =
-    &["causal-lm", "embedding", "seq-classifier", "seq2seq", "opaque"];
+pub const VALID_MODEL_TYPES: &[&str] = &[
+    "causal-lm",
+    "embedding",
+    "seq-classifier",
+    "detector",
+    "seq2seq",
+    "opaque",
+];
 /// Known serving operations.
-pub const VALID_TASKS: &[&str] = &["generate", "embed", "classify", "rerank", "forward"];
+pub const VALID_TASKS: &[&str] =
+    &["generate", "embed", "classify", "detect", "rerank", "forward"];
 
 fn check_known(field: &str, value: Option<&str>, allowed: &[&str]) -> Result<(), String> {
     if let Some(v) = value {
@@ -261,6 +280,7 @@ pub fn effective_task(manifest: &Manifest) -> String {
         "causal-lm" => "generate",
         "embedding" => "embed",
         "seq-classifier" => "classify",
+        "detector" => "detect",
         "seq2seq" => "generate",
         _ => "forward",
     }
