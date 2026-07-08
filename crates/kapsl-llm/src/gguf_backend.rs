@@ -1283,6 +1283,9 @@ struct GgufRequest {
     tokens: Vec<LlamaToken>,
     max_tokens: i32,
     min_tokens: i32,
+    /// Resolved scheduling priority (0 = latency-critical, higher = lower).
+    /// Drives priority-aware promotion out of the `waiting` queue.
+    priority: u8,
     /// Client session key, used for SSM session resume-state snapshots.
     session_id: Option<String>,
     response: GgufResponse,
@@ -3065,12 +3068,36 @@ impl GgufBackend {
             .and_then(|m| m.min_new_tokens)
             .unwrap_or(0) as i32
     }
+
+    /// Resolved scheduling priority (0 = latency-critical, higher = lower). The
+    /// scheduler stamps this on the request's metadata before dispatch; the
+    /// internal `run_scheduler` promotes lower values ahead of the FIFO order.
+    /// Defaults to 1 (throughput) when unset.
+    fn priority(request: &InferenceRequest) -> u8 {
+        request
+            .metadata
+            .as_ref()
+            .and_then(|m| m.priority)
+            .unwrap_or(1)
+    }
 }
 
 impl Default for GgufBackend {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Index of the highest-priority (lowest value) item, breaking ties toward the
+/// earliest position so requests at the same priority keep FIFO order. Returns
+/// `None` for an empty iterator.
+#[cfg(feature = "gguf")]
+fn highest_priority_index<I: IntoIterator<Item = u8>>(priorities: I) -> Option<usize> {
+    priorities
+        .into_iter()
+        .enumerate()
+        .min_by_key(|&(idx, priority)| (priority, idx))
+        .map(|(idx, _)| idx)
 }
 
 // ─── Scheduler loop ───────────────────────────────────────────────────────────
@@ -3384,8 +3411,14 @@ fn run_scheduler(
         }
 
         // ── 2. Promote waiting → pending (assign seq_id) ─────────────────────
-        while !waiting.is_empty() && !available_ids.is_empty() {
-            let req = waiting.pop_front().unwrap();
+        // Priority-aware, not strict FIFO: pull the lowest-priority-value
+        // (latency-critical first) waiting request, breaking ties toward the
+        // earliest arrival so requests at the same level keep FIFO order.
+        while !available_ids.is_empty() {
+            let Some(idx) = highest_priority_index(waiting.iter().map(|r| r.priority)) else {
+                break;
+            };
+            let req = waiting.remove(idx).expect("index came from waiting");
             let seq_id = available_ids.pop().unwrap();
 
             if req.tokens.len() as u32 > config.ctx_per_seq {
@@ -4146,6 +4179,7 @@ impl Engine for GgufBackend {
                 tokens,
                 max_tokens: Self::max_new_tokens(request),
                 min_tokens: Self::min_new_tokens(request),
+                priority: Self::priority(request),
                 session_id: request.session_id.clone(),
                 response: GgufResponse::Final(resp_tx),
             })
@@ -4199,6 +4233,7 @@ impl Engine for GgufBackend {
                 tokens,
                 max_tokens: Self::max_new_tokens(request),
                 min_tokens: Self::min_new_tokens(request),
+                priority: Self::priority(request),
                 session_id: request.session_id.clone(),
                 response: GgufResponse::Stream(resp_tx),
             })
@@ -4239,6 +4274,15 @@ impl Engine for GgufBackend {
 
     fn metrics(&self) -> EngineMetrics {
         self.metrics_snapshot()
+    }
+
+    /// The GGUF backend runs its own continuous batcher (`run_scheduler`) that
+    /// multiplexes concurrent requests across `max_concurrent` sequence slots.
+    /// The scheduler must dispatch requests individually rather than coalesce
+    /// them via `infer_batch`, so it advertises self-batching (and keeps
+    /// `max_batch()` at the default 1).
+    fn self_batches(&self) -> bool {
+        true
     }
 
     fn health_check(&self) -> Result<(), EngineError> {
@@ -4412,8 +4456,28 @@ impl Engine for GgufBackend {
 
 #[cfg(all(test, feature = "gguf"))]
 mod tests {
-    use super::GgufServingConfig;
+    use super::{highest_priority_index, GgufServingConfig};
     use std::time::Duration;
+
+    #[test]
+    fn highest_priority_index_prefers_lowest_value_then_earliest() {
+        // Empty → None.
+        assert_eq!(highest_priority_index(std::iter::empty()), None);
+
+        // Single element.
+        assert_eq!(highest_priority_index([3u8]), Some(0));
+
+        // Latency-critical (0) jumps ahead of throughput (1), regardless of
+        // arrival order.
+        assert_eq!(highest_priority_index([1u8, 1, 0, 1]), Some(2));
+
+        // Ties on priority break toward the earliest arrival (FIFO within a
+        // level): two 0s at indices 1 and 3 → picks 1.
+        assert_eq!(highest_priority_index([2u8, 0, 1, 0]), Some(1));
+
+        // All equal → front (pure FIFO fallback).
+        assert_eq!(highest_priority_index([5u8, 5, 5]), Some(0));
+    }
 
     fn test_config(
         ctx_per_seq: u32,
