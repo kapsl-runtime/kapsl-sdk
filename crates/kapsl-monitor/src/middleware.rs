@@ -312,6 +312,59 @@ impl<E: Engine> Engine for MonitoringMiddleware<E> {
         result
     }
 
+    fn infer_batch(
+        &self,
+        requests: &[InferenceRequest],
+    ) -> Result<Vec<BinaryTensorPacket>, EngineError> {
+        if requests.is_empty() {
+            return self.inner.infer_batch(requests);
+        }
+
+        let model_id = self.model_id.as_str();
+        for request in requests {
+            self.metrics
+                .active_inferences
+                .with_label_values(&[model_id])
+                .inc();
+            self.auto_tune.on_request_start();
+            self.metrics
+                .batch_size_hist
+                .with_label_values(&[model_id])
+                .observe(request.input.shape.first().copied().unwrap_or(0) as f64);
+        }
+
+        let start = Instant::now();
+        let result = self.inner.infer_batch(requests);
+        let elapsed = start.elapsed().as_secs_f64();
+
+        let status = if result.is_ok() { "ok" } else { "err" };
+        for _ in requests {
+            self.metrics
+                .inference_count
+                .with_label_values(&[model_id, status])
+                .inc();
+            self.metrics
+                .inference_latency
+                .with_label_values(&[model_id, self.version.as_str(), status])
+                .observe(elapsed);
+            self.metrics
+                .active_inferences
+                .with_label_values(&[model_id])
+                .dec();
+            self.auto_tune.on_request_end();
+        }
+
+        result
+    }
+
+    fn max_batch(&self) -> usize {
+        self.inner.max_batch()
+    }
+
+    fn self_batches(&self) -> bool {
+        self.inner.self_batches()
+    }
+
     fn infer_stream(
         &self,
         request: &InferenceRequest,

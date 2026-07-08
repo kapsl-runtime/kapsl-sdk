@@ -683,6 +683,47 @@ impl LlamaModel {
             .unwrap()
     }
 
+    /// Returns the per-head key dimension used by the model KV cache.
+    pub fn n_embd_head_k(&self) -> u32 {
+        u32::try_from(unsafe { llama_cpp_sys_2::llama_model_n_embd_head_k(self.model.as_ptr()) })
+            .unwrap()
+    }
+
+    /// Returns the per-head value dimension used by the model KV cache.
+    pub fn n_embd_head_v(&self) -> u32 {
+        u32::try_from(unsafe { llama_cpp_sys_2::llama_model_n_embd_head_v(self.model.as_ptr()) })
+            .unwrap()
+    }
+
+    /// Returns the sliding-window size (`hparams.n_swa`), or `0` when the model
+    /// uses full (non-windowed) attention.
+    ///
+    /// This is the authoritative post-load signal for sliding-window / chunked
+    /// attention (`swa_type != NONE` implies `n_swa > 0`), independent of which
+    /// GGUF metadata key the architecture happened to read it from. Some
+    /// architectures (e.g. Llama 4) hard-code a non-zero window when the
+    /// `*.attention.sliding_window` key is absent, so inspecting raw metadata is
+    /// not sufficient to detect them.
+    pub fn n_swa(&self) -> u32 {
+        // The C API returns int32_t but the underlying `hparams.n_swa` is a
+        // uint32_t window size, so a negative value is not expected; clamp
+        // defensively rather than panic.
+        unsafe { llama_cpp_sys_2::llama_model_n_swa(self.model.as_ptr()) }
+            .try_into()
+            .unwrap_or(0)
+    }
+
+    /// Returns whether layer `il` uses sliding-window attention
+    /// (`hparams.is_swa(il)`); `false` for out-of-range layers.
+    ///
+    /// Layers of iSWA models (e.g. the Gemma family) alternate between
+    /// windowed and full attention, so callers sizing per-layer KV storage
+    /// need the per-layer answer in addition to the model-wide [`Self::n_swa`].
+    pub fn is_swa_layer(&self, il: u32) -> bool {
+        let il = i32::try_from(il).unwrap_or(i32::MAX);
+        unsafe { llama_cpp_sys_2::llama_model_is_swa_layer(self.model.as_ptr(), il) }
+    }
+
     /// Get metadata value as a string by key name
     pub fn meta_val_str(&self, key: &str) -> Result<String, MetaValError> {
         let key_cstring = CString::new(key)?;

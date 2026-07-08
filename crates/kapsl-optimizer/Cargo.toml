@@ -7,8 +7,8 @@ repository.workspace = true
 description = "Inference optimization strategies and graph transformations for Kapsl"
 
 [dependencies]
-kapsl-core = { version = "0.1.0", path = "../kapsl-core" }
-kapsl-engine-api = { version = "0.1.0", path = "../kapsl-engine-api" }
+kapsl-core = { version = "0.1.1", path = "../kapsl-core" }
+kapsl-engine-api = { version = "0.1.1", path = "../kapsl-engine-api" }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

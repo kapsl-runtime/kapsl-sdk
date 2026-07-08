@@ -1,5 +1,5 @@
 use crate::request::Request;
-use kapsl_engine_api::{EngineError, EngineHandle, InferenceRequest};
+use kapsl_engine_api::{EngineError, EngineHandle, InferenceRequest, RequestMetadata};
 use log::info;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -147,6 +147,14 @@ impl WorkQueue {
     }
 }
 
+/// Default admission headroom: pause admission to a self-batching backend once
+/// its free KV cache falls below this percentage of total capacity. Overridable
+/// via `KAPSL_ADMISSION_MIN_FREE_PCT`. 0 disables occupancy-driven admission.
+const DEFAULT_ADMISSION_MIN_FREE_PCT: usize = 5;
+
+/// Back-off between occupancy re-checks while admission is paused.
+const ADMISSION_POLL: Duration = Duration::from_millis(2);
+
 /// GPU Executor that processes requests from priority queues
 pub struct GpuExecutor {
     high_priority_queue: WorkQueue,
@@ -155,6 +163,9 @@ pub struct GpuExecutor {
     max_micro_batch: usize,
     queue_delay: Duration,
     in_flight: Arc<AtomicUsize>,
+    /// Minimum free-KV headroom (percent of total) below which a self-batching
+    /// backend stops accepting new requests. 0 disables the gate.
+    admission_min_free_pct: usize,
 }
 
 impl GpuExecutor {
@@ -166,6 +177,11 @@ impl GpuExecutor {
         queue_delay_ms: u64,
         in_flight: Arc<AtomicUsize>,
     ) -> Self {
+        let admission_min_free_pct = std::env::var("KAPSL_ADMISSION_MIN_FREE_PCT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_ADMISSION_MIN_FREE_PCT)
+            .min(100);
         Self {
             high_priority_queue,
             low_priority_queue,
@@ -173,7 +189,47 @@ impl GpuExecutor {
             max_micro_batch: max_micro_batch.max(1),
             queue_delay: Duration::from_millis(queue_delay_ms),
             in_flight,
+            admission_min_free_pct,
         }
+    }
+
+    /// Override the free-KV admission headroom (percent). Used by tests and
+    /// tuning; production reads the default / `KAPSL_ADMISSION_MIN_FREE_PCT`.
+    #[cfg(test)]
+    pub(crate) fn with_admission_min_free_pct(mut self, pct: usize) -> Self {
+        self.admission_min_free_pct = pct.min(100);
+        self
+    }
+
+    /// Whether a self-batching backend has exhausted its admission headroom,
+    /// based on its published KV-cache occupancy. Returns `false` when the gate
+    /// is disabled or the backend exposes no KV signal yet (nothing to gate on),
+    /// so backends without KV telemetry are never throttled.
+    fn backend_saturated(&self) -> bool {
+        if self.admission_min_free_pct == 0 {
+            return false;
+        }
+        let metrics = self.engine.metrics();
+        if metrics.kv_cache_blocks_total == 0 {
+            return false;
+        }
+        metrics.kv_cache_blocks_free.saturating_mul(100)
+            < metrics
+                .kv_cache_blocks_total
+                .saturating_mul(self.admission_min_free_pct)
+    }
+
+    /// Stamp the resolved queue priority onto a request's metadata so a
+    /// self-batching backend can honor it in its own internal queue. The
+    /// scheduler's queue choice is the authoritative priority (it already folds
+    /// in SLA/size promotion), so this overwrites any raw hint the caller set.
+    /// Uses the engine-api convention: 0 = latency-critical, 1 = throughput.
+    fn stamp_priority(req: &mut Request, latency_critical: bool) {
+        let priority = if latency_critical { 0 } else { 1 };
+        req.input
+            .metadata
+            .get_or_insert_with(RequestMetadata::default)
+            .priority = Some(priority);
     }
 
     fn dispatch_single(engine: EngineHandle, req: Request, in_flight: Arc<AtomicUsize>) {
@@ -279,45 +335,164 @@ impl GpuExecutor {
         });
     }
 
+    /// Coalesce pending requests into a batch of at most `cap`, starting from an
+    /// already-dequeued `first` taken from `queue`.
+    ///
+    /// Greedily takes anything already queued without waiting (zero added
+    /// latency when a burst has already arrived). Only if room remains AND there
+    /// is concurrent work in flight does it wait up to `queue_delay` for
+    /// stragglers — so an isolated request (`in_flight == 0`) is dispatched
+    /// immediately with no latency penalty. `interrupt`, when set, aborts the
+    /// straggler wait as soon as that higher-priority queue has items.
+    async fn accumulate_batch(
+        &self,
+        queue: &WorkQueue,
+        first: Request,
+        cap: usize,
+        interrupt: Option<&WorkQueue>,
+    ) -> Vec<Request> {
+        let mut batch = Vec::with_capacity(cap);
+        batch.push(first);
+
+        // Greedy, non-blocking: grab co-arrived requests with no delay.
+        while batch.len() < cap {
+            match queue.pop_nowait() {
+                Some(req) => batch.push(req),
+                None => break,
+            }
+        }
+
+        // Adaptive window: only pay latency to gather stragglers when the model
+        // is already under concurrent load. Skipped entirely for isolated
+        // requests so single-stream latency does not regress.
+        if batch.len() < cap
+            && !self.queue_delay.is_zero()
+            && self.in_flight.load(Ordering::Relaxed) > 0
+        {
+            let deadline = Instant::now() + self.queue_delay;
+            while batch.len() < cap {
+                if interrupt.is_some_and(|q| q.len() > 0) {
+                    break;
+                }
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                let remaining = deadline.saturating_duration_since(now);
+                match queue.pop_timeout(remaining).await {
+                    Some(req) => batch.push(req),
+                    None => break,
+                }
+            }
+        }
+
+        batch
+    }
+
     pub async fn run(self) {
         info!("GPU Executor started");
+        // Backends that advertise max_batch() > 1 (e.g. an ONNX model with a
+        // dynamic batch dim) implement a real stacked infer_batch. For those we
+        // coalesce requests from BOTH priority queues, since small models are
+        // classified latency-critical yet benefit most from batching. Backends
+        // that don't (max_batch() == 1, the default) keep the original
+        // single-dispatch / throughput-only micro-batch behavior untouched.
+        //
+        // Self-batching backends (e.g. an autoregressive LLM that continuously
+        // batches active sequences at the decode step) must never be coalesced
+        // here: request-level `infer_batch` would run the whole batch to
+        // completion in one call and fight the backend's own batcher. They are
+        // always dispatched individually and left to multiplex internally.
+        let self_batches = self.engine.self_batches();
+        let batch_cap = self.engine.max_batch().min(self.max_micro_batch);
+        let batch_capable = batch_cap > 1 && !self_batches;
+
         loop {
-            if let Some(req) = self.high_priority_queue.pop_nowait() {
-                let engine = self.engine.clone();
-                Self::dispatch_single(engine, req, self.in_flight.clone());
+            // Occupancy-driven admission (self-batching backends only): when the
+            // backend signals it is saturated, stop pulling from the priority
+            // queues so requests stay priority-ordered there instead of piling
+            // into the backend's internal FIFO. Always admit when nothing is in
+            // flight, so a full/stale occupancy snapshot can never stall forward
+            // progress (an isolated request that alone exceeds the headroom must
+            // still run).
+            if self_batches
+                && self.in_flight.load(Ordering::Relaxed) > 0
+                && self.backend_saturated()
+            {
+                tokio::time::sleep(ADMISSION_POLL).await;
                 continue;
             }
 
-            if let Some(req) = self.low_priority_queue.pop_nowait() {
-                let engine = self.engine.clone();
-                if self.max_micro_batch <= 1 || self.queue_delay.is_zero() {
+            if batch_capable {
+                // Latency-critical first, then throughput; coalesce either queue.
+                if let Some(req) = self.high_priority_queue.pop_nowait() {
+                    let batch = self
+                        .accumulate_batch(&self.high_priority_queue, req, batch_cap, None)
+                        .await;
+                    Self::dispatch_batch(self.engine.clone(), batch, self.in_flight.clone());
+                    continue;
+                }
+                if let Some(req) = self.low_priority_queue.pop_nowait() {
+                    let batch = self
+                        .accumulate_batch(
+                            &self.low_priority_queue,
+                            req,
+                            batch_cap,
+                            Some(&self.high_priority_queue),
+                        )
+                        .await;
+                    Self::dispatch_batch(self.engine.clone(), batch, self.in_flight.clone());
+                    continue;
+                }
+            } else {
+                if let Some(mut req) = self.high_priority_queue.pop_nowait() {
+                    let engine = self.engine.clone();
+                    // Propagate the resolved priority so a self-batching backend
+                    // can jump this request ahead in its internal queue.
+                    if self_batches {
+                        Self::stamp_priority(&mut req, true);
+                    }
                     Self::dispatch_single(engine, req, self.in_flight.clone());
                     continue;
                 }
 
-                let mut batch = Vec::with_capacity(self.max_micro_batch);
-                batch.push(req);
-                let deadline = Instant::now() + self.queue_delay;
-
-                while batch.len() < self.max_micro_batch {
-                    if self.high_priority_queue.len() > 0 {
-                        break;
+                if let Some(mut req) = self.low_priority_queue.pop_nowait() {
+                    let engine = self.engine.clone();
+                    // Self-batching backends multiplex internally, so hand each
+                    // request over immediately rather than holding it back to
+                    // build a serial `infer_batch` group.
+                    if self_batches || self.max_micro_batch <= 1 || self.queue_delay.is_zero() {
+                        if self_batches {
+                            Self::stamp_priority(&mut req, false);
+                        }
+                        Self::dispatch_single(engine, req, self.in_flight.clone());
+                        continue;
                     }
 
-                    let now = Instant::now();
-                    if now >= deadline {
-                        break;
+                    let mut batch = Vec::with_capacity(self.max_micro_batch);
+                    batch.push(req);
+                    let deadline = Instant::now() + self.queue_delay;
+
+                    while batch.len() < self.max_micro_batch {
+                        if self.high_priority_queue.len() > 0 {
+                            break;
+                        }
+
+                        let now = Instant::now();
+                        if now >= deadline {
+                            break;
+                        }
+
+                        let remaining = deadline.saturating_duration_since(now);
+                        match self.low_priority_queue.pop_timeout(remaining).await {
+                            Some(next_req) => batch.push(next_req),
+                            None => break,
+                        }
                     }
 
-                    let remaining = deadline.saturating_duration_since(now);
-                    match self.low_priority_queue.pop_timeout(remaining).await {
-                        Some(next_req) => batch.push(next_req),
-                        None => break,
-                    }
+                    Self::dispatch_batch(engine, batch, self.in_flight.clone());
+                    continue;
                 }
-
-                Self::dispatch_batch(engine, batch, self.in_flight.clone());
-                continue;
             }
 
             tokio::select! {

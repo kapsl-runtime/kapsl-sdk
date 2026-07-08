@@ -7,9 +7,9 @@ repository.workspace = true
 description = "Shared memory transport for high-throughput inter-process tensor transfer in Kapsl"
 
 [dependencies]
-kapsl-transport = { version = "0.1.0", path = "../kapsl-transport" }
-kapsl-engine-api = { version = "0.1.0", path = "../kapsl-engine-api" }
-kapsl-scheduler = { version = "0.1.0", path = "../kapsl-scheduler" }
+kapsl-transport = { version = "0.1.1", path = "../kapsl-transport" }
+kapsl-engine-api = { version = "0.1.1", path = "../kapsl-engine-api" }
+kapsl-scheduler = { version = "0.1.1", path = "../kapsl-scheduler" }
 shared_memory = "0.12"
 memmap2 = "0.9"
 crossbeam = "0.8"

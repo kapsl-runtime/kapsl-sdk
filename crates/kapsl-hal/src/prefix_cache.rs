@@ -87,6 +87,21 @@ pub struct CachedBlockRef {
     pub block_hash: u64,
 }
 
+/// Outcome of [`PrefixBlockCache::insert`]. Ownership of the offered blocks
+/// transfers to the cache only on `Inserted`; on the other variants the caller
+/// retains ownership.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrefixInsert {
+    /// Entry stored; the cache now owns the blocks.
+    Inserted,
+    /// Same (fingerprint, hash) already cached — likely by another session with
+    /// its own physical blocks. The caller's blocks were NOT taken.
+    AlreadyPresent,
+    /// Cache full and every entry has a live borrow. The caller's blocks were
+    /// NOT taken.
+    Rejected,
+}
+
 // ── Cache ─────────────────────────────────────────────────────────────────────
 
 /// In-process GPU KV-block prefix cache.
@@ -188,9 +203,13 @@ impl PrefixBlockCache {
     /// `refcount` should be `1` if the caller still actively uses the blocks,
     /// or `0` if they are immediately available for sharing.
     ///
-    /// If the entry already exists, returns `true` (idempotent). If the cache is
-    /// at capacity and no zero-refcount entry can be evicted, all blocks in
-    /// `block_ids` are freed and `false` is returned.
+    /// Ownership of `block_ids` transfers to the cache ONLY on
+    /// [`PrefixInsert::Inserted`]. On `AlreadyPresent` and `Rejected` the caller
+    /// keeps ownership and must free the blocks itself when done — the cache
+    /// must never free them: callers pass blocks that are still referenced by a
+    /// live sequence's block table, so freeing here puts in-use blocks back on
+    /// the allocator free list (use-after-free, and a double-free when the
+    /// session later releases the same blocks).
     pub fn insert(
         &mut self,
         model_fingerprint: u64,
@@ -199,14 +218,14 @@ impl PrefixBlockCache {
         pool: Arc<GpuBlockPool>,
         block_ids: Vec<u32>,
         refcount: usize,
-    ) -> bool {
+    ) -> PrefixInsert {
         let key = BlockCacheKey { model_fingerprint, block_hash };
-        if self.entries.contains_key(&key) {
-            return true;
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.last_used = Instant::now();
+            return PrefixInsert::AlreadyPresent;
         }
         if self.entries.len() >= self.capacity && !self.evict_one_lru() {
-            for id in block_ids { pool.free_block(id); }
-            return false;
+            return PrefixInsert::Rejected;
         }
         self.entries.insert(key, PrefixCacheEntry {
             device_id,
@@ -215,7 +234,7 @@ impl PrefixBlockCache {
             refcount,
             last_used: Instant::now(),
         });
-        true
+        PrefixInsert::Inserted
     }
 
     /// Release one borrow on a cached block group (decrement refcount).

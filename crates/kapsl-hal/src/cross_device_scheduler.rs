@@ -386,10 +386,12 @@ mod inner {
             for (i, &block_id) in blocks_copy.iter().enumerate() {
                 let Some(&hash) = hashes.get(i) else { break };
                 // Pure-Rust path: one physical block per logical position (vec of length 1).
-                if cache.insert(model_fingerprint, hash, device_id, pool.clone(), vec![block_id], 1) {
-                    promoted += 1;
-                } else {
-                    break;
+                // Ownership transfers to the cache only on Inserted; on
+                // AlreadyPresent/Rejected the session keeps the block (freed on
+                // release_session), exactly as documented above.
+                match cache.insert(model_fingerprint, hash, device_id, pool.clone(), vec![block_id], 1) {
+                    crate::prefix_cache::PrefixInsert::Inserted => promoted += 1,
+                    _ => break,
                 }
             }
 

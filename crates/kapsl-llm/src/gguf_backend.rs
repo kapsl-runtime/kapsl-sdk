@@ -323,6 +323,16 @@ struct GgufServingConfig {
     prefill_chunk_size: usize,
     exact_prompt_kv_reuse: bool,
     kv_bytes_per_cell: usize,
+    /// True when the model's memory includes recurrent/SSM state (Mamba,
+    /// RWKV, or a hybrid mix like Jamba/Granite) rather than being a pure
+    /// per-token attention KV cache. `update_gguf_metrics` uses this to avoid
+    /// reporting KV pressure that scales with generated token count: real
+    /// recurrent-state footprint is ~constant per active sequence, not
+    /// proportional to how far each sequence has decoded. These models always
+    /// run on llama.cpp's native memory (the shared-KV pool guard rejects
+    /// them unconditionally), regardless of which KV backend feature is
+    /// compiled in.
+    uses_state_space_memory: bool,
 }
 
 #[cfg(feature = "gguf")]
@@ -338,6 +348,7 @@ impl GgufServingConfig {
             prefill_chunk_size,
             exact_prompt_kv_reuse: gguf_exact_prompt_kv_reuse(),
             kv_bytes_per_cell: estimate_kv_bytes_per_cell(model),
+            uses_state_space_memory: gguf_model_uses_state_space_memory(model),
         }
     }
 
@@ -353,15 +364,17 @@ impl GgufServingConfig {
 
 #[cfg(feature = "gguf")]
 fn estimate_kv_bytes_per_cell(model: &LlamaModel) -> usize {
-    let n_embd = model.n_embd().max(0) as usize;
-    let n_head = model.n_head().max(1) as usize;
     let n_head_kv = model.n_head_kv().max(1) as usize;
-    let n_embd_gqa = n_embd.saturating_mul(n_head_kv) / n_head;
+    let head_dim_k = model.n_embd_head_k().max(1) as usize;
+    let head_dim_v = model.n_embd_head_v().max(1) as usize;
 
     // llama.cpp reports this path as K/V f16 in the load log. Treat one KV cell
     // as K + V for every layer so Prometheus/admission logic has a comparable
     // capacity signal to the native/ONNX paths.
-    model.n_layer().max(1) as usize * n_embd_gqa * 2 * std::mem::size_of::<u16>()
+    model.n_layer().max(1) as usize
+        * n_head_kv
+        * (head_dim_k + head_dim_v)
+        * std::mem::size_of::<u16>()
 }
 
 #[cfg(feature = "gguf-cuda-shared-kv")]
@@ -369,6 +382,7 @@ fn gguf_shared_kv_block_count(
     n_layers: usize,
     config: GgufServingConfig,
     block_size: usize,
+    windowed: Option<&GgufWindowedKvConfig>,
 ) -> usize {
     if let Some(blocks) = std::env::var("KAPSL_GGUF_CUDA_SHARED_KV_POOL_BLOCKS")
         .ok()
@@ -380,10 +394,121 @@ fn gguf_shared_kv_block_count(
     let blocks_per_seq = (config.ctx_per_seq as usize)
         .div_ceil(block_size.max(1))
         .max(1);
-    n_layers
+    // Windowed SWA layers never hold more than their ring, so the pool can be
+    // sized for it — this is where the Phase 2 memory saving is realized.
+    let per_seq_blocks: usize = match windowed {
+        Some(w) => (0..n_layers)
+            .map(|il| windowed_layer_capacity(blocks_per_seq, w.layer_window(il)))
+            .sum(),
+        None => n_layers.saturating_mul(blocks_per_seq),
+    };
+    per_seq_blocks
         .saturating_mul(config.max_concurrent.max(1))
-        .saturating_mul(blocks_per_seq)
         .max(n_layers)
+}
+
+// ─── SWA windowed KV (Phase 2) ────────────────────────────────────────────────
+
+/// Windowed KV allocation for sliding-window models (Phase 2 of SWA on
+/// shared-KV). Instead of allocating `ctx_per_seq` worth of blocks on every
+/// layer, each SWA layer gets a fixed ring of `window_blocks` physical blocks;
+/// its block-table row maps logical block `P` to ring slot `P % window_blocks`,
+/// so a block is recycled exactly when every position in it has fallen out of
+/// every live query's attention window. Full-attention layers are unchanged.
+///
+/// The paged-attention kernel guarantees it never dereferences a block-table
+/// entry below the window start (see `kapsl_swa_window_start` in kapsl-kv.cu),
+/// which is what makes recycling safe.
+#[cfg(feature = "gguf-cuda-shared-kv")]
+struct GgufWindowedKvConfig {
+    /// Ring capacity, in blocks, for every sliding-window layer.
+    window_blocks: usize,
+    /// Per-layer flag: `true` = SWA layer (ring-mapped), `false` = full attention.
+    swa_layers: Vec<bool>,
+}
+
+#[cfg(feature = "gguf-cuda-shared-kv")]
+impl GgufWindowedKvConfig {
+    /// `Some(window_blocks)` when layer `il` is ring-mapped, `None` when full.
+    fn layer_window(&self, il: usize) -> Option<usize> {
+        self.swa_layers
+            .get(il)
+            .copied()
+            .unwrap_or(false)
+            .then_some(self.window_blocks)
+    }
+}
+
+/// Number of physical blocks a sliding-window layer's KV ring must hold.
+///
+/// A query at position `p` reads keys in `[win_start(p), p]` with
+/// `win_start(p) >= p - n_swa + 1` for every supported window type, and one
+/// ubatch writes up to `n_ubatch` positions before any of its queries run
+/// attention, so `n_swa + n_ubatch` positions must stay live simultaneously
+/// (the same bound llama.cpp's native iSWA cache uses for its SWA buffer).
+/// The `+ 1` covers block-boundary straddle at both ends.
+fn swa_window_blocks(n_swa: usize, n_ubatch: usize, block_size: usize) -> usize {
+    (n_swa + n_ubatch).div_ceil(block_size.max(1)) + 1
+}
+
+/// Physical blocks a layer needs to cover `logical` logical blocks: capped at
+/// the ring size on windowed layers, uncapped on full-attention layers.
+fn windowed_layer_capacity(logical: usize, layer_window: Option<usize>) -> usize {
+    match layer_window {
+        Some(window_blocks) => logical.min(window_blocks),
+        None => logical,
+    }
+}
+
+/// Build the windowed-KV config for a loaded model, or `None` when windowing
+/// is disabled, inapplicable, or would not save memory.
+///
+/// Opt-in via `KAPSL_GGUF_SWA_WINDOWED_KV` (on top of the Phase 1
+/// `KAPSL_GGUF_ENABLE_SWA_SHARED_KV` gate — a SWA model only reaches shared-KV
+/// at all when that admitted it).
+#[cfg(feature = "gguf-cuda-shared-kv")]
+fn gguf_windowed_kv_config(
+    model: &LlamaModel,
+    config: GgufServingConfig,
+    block_size: usize,
+) -> Option<GgufWindowedKvConfig> {
+    if !gguf_env_is_truthy("KAPSL_GGUF_SWA_WINDOWED_KV") {
+        return None;
+    }
+    let n_swa = model.n_swa() as usize;
+    if n_swa == 0 {
+        return None;
+    }
+    let n_layers = model.n_layer().max(1) as usize;
+    let swa_layers: Vec<bool> = (0..n_layers)
+        .map(|il| model.is_swa_layer(il as u32))
+        .collect();
+    let n_swa_layers = swa_layers.iter().filter(|&&s| s).count();
+    if n_swa_layers == 0 {
+        return None;
+    }
+    let window_blocks = swa_window_blocks(n_swa, config.n_batch() as usize, block_size);
+    let blocks_per_seq = (config.ctx_per_seq as usize)
+        .div_ceil(block_size.max(1))
+        .max(1);
+    if window_blocks >= blocks_per_seq {
+        log::info!(
+            "[gguf] SWA windowed KV requested but the ring ({window_blocks} blocks incl. \
+             ubatch slack) is not smaller than ctx_per_seq ({blocks_per_seq} blocks); \
+             keeping full allocation"
+        );
+        return None;
+    }
+    log::info!(
+        "[gguf] SWA windowed KV enabled: n_swa={n_swa}, swa_layers={n_swa_layers}/{n_layers}, \
+         ring={window_blocks} blocks/layer vs {blocks_per_seq} full (per-seq KV ~{}% of uniform)",
+        ((n_layers - n_swa_layers) * blocks_per_seq + n_swa_layers * window_blocks) * 100
+            / (n_layers * blocks_per_seq).max(1)
+    );
+    Some(GgufWindowedKvConfig {
+        window_blocks,
+        swa_layers,
+    })
 }
 
 // ─── Shared model weights cache ───────────────────────────────────────────────
@@ -464,6 +589,676 @@ fn gguf_select_device(fallback_device_id: usize, kv_heads: usize, head_dim: usiz
         .unwrap_or(fallback_device_id)
 }
 
+/// Parse an environment variable using the same truthiness rules as the other
+/// `KAPSL_GGUF_*` boolean toggles: unset, empty, `0`, `false`, `no`, `off`
+/// (case-insensitive) are false; anything else is true.
+#[cfg(feature = "gguf")]
+fn gguf_env_is_truthy(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| {
+            !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "" | "0" | "false" | "no" | "off"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Decide whether the Kapsl shared-KV (paged external KV) path can serve a
+/// loaded GGUF model. Returns `Some(reason)` when it cannot and the engine must
+/// fall back to llama.cpp's native KV cache instead.
+///
+/// The shared-KV ABI (`llama_kapsl_kv_pool_desc`) describes a *single uniform*
+/// KV geometry: one `num_kv_heads`/`head_dim`, a separate-K/V `[2, …]` block
+/// layout, and full causal attention only. Architectures that violate those
+/// assumptions either hard-abort inside llama.cpp — `create_memory()` runs
+/// `GGML_ASSERT(hparams.swa_type == LLAMA_SWA_TYPE_NONE)` when a kapsl pool is
+/// attached — or silently bypass the external pool (recurrent / hybrid memory),
+/// wasting the allocation. We detect those here, before the pool is built, via
+/// architecture-scoped GGUF metadata so the model runs correctly on the native
+/// path rather than crashing or producing a mislabeled benchmark.
+#[cfg(feature = "gguf-cuda-shared-kv")]
+fn gguf_shared_kv_disable_reason(model: &LlamaModel) -> Option<String> {
+    // Operator override — this is the real wiring for the flag the benchmark
+    // scripts already pass (previously a no-op read by nothing).
+    if gguf_env_is_truthy("KAPSL_GGUF_DISABLE_SHARED_KV") {
+        return Some("disabled by KAPSL_GGUF_DISABLE_SHARED_KV".to_string());
+    }
+
+    // Escape hatch for deliberately exercising the shared-KV path on an
+    // architecture this guard would otherwise reject (e.g. measuring the
+    // sliding-window abort, or a model whose metadata trips the conservative
+    // detection below). Opt-in only; may abort or produce wrong output.
+    if gguf_env_is_truthy("KAPSL_GGUF_FORCE_SHARED_KV") {
+        log::warn!(
+            "[gguf] KAPSL_GGUF_FORCE_SHARED_KV set: bypassing shared-KV architecture guard; \
+             this may abort or yield incorrect output on unsupported models"
+        );
+        return None;
+    }
+
+    let arch = model
+        .meta_val_str("general.architecture")
+        .unwrap_or_default();
+    let has_key = |suffix: &str| model.meta_val_str(&format!("{arch}.{suffix}")).is_ok();
+    let pos_int = |suffix: &str| {
+        model
+            .meta_val_str(&format!("{arch}.{suffix}"))
+            .ok()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .is_some_and(|n| n > 0)
+    };
+
+    // Phase 1: the kapsl paged-attention kernel now applies a per-layer
+    // sliding-window mask, so SWA models can run on the shared-KV path. This is
+    // opt-in until GPU-verified — by default SWA still falls back to the native
+    // cache. Recurrent/hybrid and MLA remain unconditionally unsupported.
+    let allow_swa = gguf_env_is_truthy("KAPSL_GGUF_ENABLE_SWA_SHARED_KV");
+
+    // `n_swa` is the authoritative post-load window size: it is populated by
+    // llama.cpp's per-architecture hparam loader regardless of which GGUF key
+    // (or hard-coded default) the window came from, so it catches models the
+    // raw-metadata heuristics below would miss (see `classify_shared_kv_support`).
+    classify_shared_kv_support(&arch, model.n_swa(), allow_swa, has_key, pos_int)
+}
+
+/// Architectures whose sliding-window attention is quality-verified on the
+/// shared-KV paged path (sampled eval vs native shows no regression). The Gemma
+/// family is all-RoPE ISWA: gemma2/gemma3 are eval-verified; gemma3n/gemma4 share
+/// the same structure. Cohere2 (and other SWA families) are excluded — cohere2's
+/// NoPE global-attention layers degenerate on the paged path, and the rest are
+/// not yet eval-checked. Extend this as more families are verified.
+fn swa_shared_kv_arch_verified(arch: &str) -> bool {
+    matches!(arch, "gemma2" | "gemma3" | "gemma3n" | "gemma4")
+}
+
+/// Pure classification core of [`gguf_shared_kv_disable_reason`], separated so it
+/// can be unit-tested without a loaded model. Returns `Some(reason)` when the
+/// uniform shared-KV pool cannot represent the model and the engine must fall
+/// back to llama.cpp's native KV cache.
+///
+/// `n_swa` is the loaded model's sliding-window size (`0` for full attention);
+/// `allow_swa` opts sliding-window models onto the shared-KV path (Phase 1,
+/// gated by `KAPSL_GGUF_ENABLE_SWA_SHARED_KV`); `has_key`/`pos_int` look up
+/// architecture-scoped GGUF metadata (already prefixed with `<arch>.` by the
+/// caller) — presence, and positive-integer value, respectively.
+fn classify_shared_kv_support(
+    arch: &str,
+    n_swa: u32,
+    allow_swa: bool,
+    has_key: impl Fn(&str) -> bool,
+    pos_int: impl Fn(&str) -> bool,
+) -> Option<String> {
+    if arch.is_empty() {
+        // Without a known architecture we cannot vet the KV geometry; stay on
+        // the safe native path rather than risk a mismatch or abort.
+        return Some("unknown architecture (no general.architecture metadata)".to_string());
+    }
+
+    // 1. Sliding-window / ISWA / chunked attention (Gemma 2/3, Phi-3-SWA,
+    //    Cohere2, Llama 4, gpt-oss, …). The kapsl paged-attention kernel applies
+    //    the per-layer window mask (Phase 1), but this is opt-in until verified;
+    //    when disabled, keep these off the pool (llama.cpp would otherwise abort
+    //    on `swa_type == NONE`).
+    //
+    //    Prefer the authoritative `n_swa` over the metadata key: architectures
+    //    such as Llama 4 hard-code a non-zero window (swa_type = CHUNKED,
+    //    n_swa = 8192) when `attention.sliding_window` is absent, so the key
+    //    check alone lets them slip through.
+    let is_swa = n_swa > 0 || pos_int("attention.sliding_window");
+    if is_swa {
+        if !allow_swa {
+            // Opt-in disabled: keep every SWA model on the native cache.
+            return Some(format!(
+                "sliding-window/chunked attention (arch={arch}, n_swa={n_swa})"
+            ));
+        }
+        if !swa_shared_kv_arch_verified(arch) {
+            // Opt-in enabled but this architecture is not on the quality-verified
+            // allowlist. Cohere2 (NoPE global layers) regresses on the paged path
+            // and other SWA families are not yet eval-checked, so they stay native
+            // even with the flag set. Use KAPSL_GGUF_FORCE_SHARED_KV to override.
+            return Some(format!(
+                "sliding-window attention on unverified arch for shared-KV (arch={arch})"
+            ));
+        }
+    }
+
+    // 2. Multi-head latent attention (DeepSeek-V2/V3-style): the compressed
+    //    latent KV does not fit the [2, num_kv_heads, head_dim] pool layout.
+    if has_key("attention.kv_lora_rank") {
+        return Some(format!("multi-head latent attention (arch={arch})"));
+    }
+
+    // 3. Recurrent / hybrid state-space memory (Mamba, RWKV, Jamba, Falcon-H1,
+    //    Nemotron-H, …): these route through llama.cpp's recurrent / hybrid
+    //    memory and ignore the external pool entirely. Detected by the presence
+    //    of SSM / WKV metadata rather than an exact architecture allowlist.
+    if gguf_uses_state_space_memory(&has_key) {
+        return Some(format!("recurrent/hybrid state-space memory (arch={arch})"));
+    }
+
+    None
+}
+
+/// True when the model's memory is (partly or fully) recurrent state-space
+/// (Mamba/RWKV) rather than a pure growing per-token attention KV cache —
+/// detected via the same SSM/WKV metadata keys llama.cpp's own hparam loader
+/// requires to build any of these architectures (Mamba, Mamba2, RWKV6/7,
+/// Jamba, Falcon-H1, Nemotron-H, Granite-hybrid, …), so this generalizes
+/// without an exact architecture allowlist. `has_key` takes an
+/// architecture-scoped GGUF metadata suffix, matching the shared-KV guard's
+/// convention.
+///
+/// Available whenever GGUF serving is compiled in (not gated behind the CUDA
+/// shared-KV pool feature): these models always run on llama.cpp's native
+/// memory regardless of which KV backend feature is enabled, so callers that
+/// need to reason about their memory shape (e.g. KV metrics) need this
+/// outside the shared-KV-only code paths too.
+#[cfg(feature = "gguf")]
+fn gguf_uses_state_space_memory(has_key: impl Fn(&str) -> bool) -> bool {
+    has_key("ssm.state_size") || has_key("ssm.conv_kernel") || has_key("wkv.head_size")
+}
+
+/// [`gguf_uses_state_space_memory`] applied to a loaded model's own
+/// architecture-scoped metadata.
+#[cfg(feature = "gguf")]
+fn gguf_model_uses_state_space_memory(model: &LlamaModel) -> bool {
+    let arch = model
+        .meta_val_str("general.architecture")
+        .unwrap_or_default();
+    let has_key = |suffix: &str| model.meta_val_str(&format!("{arch}.{suffix}")).is_ok();
+    gguf_uses_state_space_memory(has_key)
+}
+
+// ─── SSM recurrent-state checkpoint cache (Phase 4) ──────────────────────────
+
+/// Host-RAM cache of per-sequence recurrent-state snapshots, taken at prefill
+/// chunk boundaries and keyed by the chained hash of the token prefix they
+/// cover. The SSM analog of the attention prefix cache: recurrent models
+/// collapse their whole context into a fixed-size state, so a snapshot at
+/// position N lets a later request that shares the first N prompt tokens skip
+/// prefilling them — `llama_state_seq_set_data` restores the state and prefill
+/// resumes at N.
+///
+/// Two properties make this safe:
+/// - the state at N depends only on tokens 0..N (never on sampling params), so
+///   the chained token hash fully identifies it;
+/// - a checkpoint is only reused when N <= prompt_len - 1, so at least one
+///   prompt token is always decoded afterwards — that decode produces the
+///   logits for sampling the first output token (restoring a state gives no
+///   logits, and re-decoding an already-absorbed token would corrupt the
+///   state).
+///
+/// Entries hold whatever `llama_state_seq_get_data` serializes: a small
+/// constant-size state for pure-recurrent models (Mamba/RWKV ~tens of MB), but
+/// state + per-token attention KV for hybrids — `max_entry_bytes` keeps
+/// oversized hybrid snapshots out of the cache.
+#[cfg(feature = "gguf")]
+struct SsmStateCache {
+    /// chain-hash of the covered token prefix -> snapshot.
+    entries: std::collections::HashMap<u64, SsmStateEntry>,
+    /// session_id -> resume snapshots. Unlike chunk checkpoints these sit at
+    /// arbitrary positions, so they are keyed by session and matched by exact
+    /// token-prefix comparison instead of chunk-boundary hashes. Each session
+    /// keeps up to [`SSM_SESSION_SLOTS`] entries — the post-prompt state and
+    /// the post-retirement state (prompt + generated reply). The retirement
+    /// entry skips the most, but only matches when the client's resent history
+    /// retokenizes to exactly the tokens the model produced; the reply seam
+    /// often drifts, and the post-prompt entry survives that (the next turn
+    /// begins with the previous prompt text verbatim).
+    sessions: std::collections::HashMap<String, Vec<SsmSessionEntry>>,
+    total_bytes: usize,
+    max_bytes: usize,
+    max_entry_bytes: usize,
+    /// Checkpoint stride in tokens (= the prefill chunk size, so snapshots
+    /// align with the positions prefill naturally pauses at).
+    chunk: usize,
+    /// Monotonic tick for LRU accounting.
+    tick: u64,
+}
+
+#[cfg(feature = "gguf")]
+struct SsmStateEntry {
+    /// Number of prompt tokens the snapshot has absorbed.
+    n_tokens: usize,
+    data: Vec<u8>,
+    last_used: u64,
+}
+
+/// Resume snapshots retained per session: the post-prompt state and the
+/// post-retirement state.
+#[cfg(feature = "gguf")]
+const SSM_SESSION_SLOTS: usize = 2;
+
+#[cfg(feature = "gguf")]
+struct SsmSessionEntry {
+    /// The exact tokens the state has absorbed (prompt, or prompt + decoded
+    /// generation). Token-compare beats hashing here: retokenized history can
+    /// diverge from generation-time tokens at the seam, and an exact compare
+    /// degrades that to a clean miss instead of a wrong-state restore.
+    tokens: Vec<LlamaToken>,
+    data: Vec<u8>,
+    last_used: u64,
+}
+
+#[cfg(feature = "gguf")]
+impl SsmStateCache {
+    fn new(chunk: usize, max_bytes: usize, max_entry_bytes: usize) -> Self {
+        Self {
+            entries: std::collections::HashMap::new(),
+            sessions: std::collections::HashMap::new(),
+            total_bytes: 0,
+            max_bytes,
+            max_entry_bytes,
+            chunk: chunk.max(1),
+            tick: 0,
+        }
+    }
+
+    /// Chained hashes at every chunk boundary of `tokens`; `hashes[i]` covers
+    /// tokens `0..(i+1)*chunk`, and each hash folds in its predecessor so a
+    /// hash identifies the entire prefix, not just its own chunk. Local
+    /// implementation (rather than `PrefixBlockCache`'s) because kapsl-hal's
+    /// prefix cache is CUDA-gated while this cache also serves CPU/Metal
+    /// builds; no fingerprint is needed since the cache is scheduler-local and
+    /// only ever holds one model's states.
+    fn prefix_hashes(&self, tokens: &[LlamaToken]) -> Vec<u64> {
+        use std::hash::{Hash, Hasher};
+        let n_chunks = tokens.len() / self.chunk;
+        let mut hashes = Vec::with_capacity(n_chunks);
+        let mut prev: u64 = 0;
+        for c in 0..n_chunks {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            prev.hash(&mut h);
+            for t in &tokens[c * self.chunk..(c + 1) * self.chunk] {
+                t.0.hash(&mut h);
+            }
+            prev = h.finish();
+            hashes.push(prev);
+        }
+        hashes
+    }
+
+    /// Longest cached checkpoint covering a strict prefix of a `prompt_len`
+    /// prompt (`n_tokens <= prompt_len - 1`), as `(hash, n_tokens)`. Bumps the
+    /// entry's LRU tick.
+    fn lookup_longest(&mut self, hashes: &[u64], prompt_len: usize) -> Option<(u64, usize)> {
+        for (i, &hash) in hashes.iter().enumerate().rev() {
+            let n_tokens = (i + 1) * self.chunk;
+            if n_tokens >= prompt_len {
+                continue;
+            }
+            if let Some(entry) = self.entries.get_mut(&hash) {
+                debug_assert_eq!(entry.n_tokens, n_tokens);
+                self.tick += 1;
+                entry.last_used = self.tick;
+                return Some((hash, entry.n_tokens));
+            }
+        }
+        None
+    }
+
+    fn data(&self, hash: u64) -> Option<&[u8]> {
+        self.entries.get(&hash).map(|e| e.data.as_slice())
+    }
+
+    fn contains(&self, hash: u64) -> bool {
+        self.entries.contains_key(&hash)
+    }
+
+    /// Insert a snapshot, evicting least-recently-used entries until it fits.
+    /// Oversized or unfittable snapshots are dropped.
+    fn insert(&mut self, hash: u64, n_tokens: usize, data: Vec<u8>) {
+        if data.is_empty() || data.len() > self.max_entry_bytes || data.len() > self.max_bytes {
+            return;
+        }
+        self.tick += 1;
+        if let Some(existing) = self.entries.get_mut(&hash) {
+            existing.last_used = self.tick;
+            return;
+        }
+        if !self.make_room(data.len()) {
+            return;
+        }
+        self.total_bytes += data.len();
+        self.entries.insert(
+            hash,
+            SsmStateEntry {
+                n_tokens,
+                data,
+                last_used: self.tick,
+            },
+        );
+    }
+
+    fn remove(&mut self, hash: u64) {
+        if let Some(entry) = self.entries.remove(&hash) {
+            self.total_bytes -= entry.data.len();
+        }
+    }
+
+    /// The session whose stored token stream is a strict prefix of `prompt`,
+    /// as its absorbed-token count. Exact comparison — a divergent history is
+    /// a clean miss. Bumps the entry's LRU tick.
+    /// The longest of the session's snapshots whose stored token stream is a
+    /// strict prefix of `prompt`, as `(entry_index, absorbed_len)`. Exact
+    /// comparison — a divergent history is a clean miss. Bumps the winner's
+    /// LRU tick.
+    fn session_match(&mut self, session_id: &str, prompt: &[LlamaToken]) -> Option<(usize, usize)> {
+        let entries = self.sessions.get_mut(session_id)?;
+        let mut best: Option<(usize, usize)> = None;
+        for (idx, entry) in entries.iter().enumerate() {
+            let n = entry.tokens.len();
+            if n == 0 || n >= prompt.len() {
+                continue;
+            }
+            if prompt[..n] != entry.tokens[..] {
+                // Usually retokenization drift: the client-side history text
+                // tokenizes differently from the tokens the model actually
+                // produced, most often right at the reply seam. The divergence
+                // index tells that apart from a real mismatch when debugging.
+                let divergence = prompt
+                    .iter()
+                    .zip(&entry.tokens)
+                    .position(|(a, b)| a != b)
+                    .unwrap_or(n);
+                log::debug!(
+                    "[gguf] SSM session miss: session={session_id} stored={n} \
+                     prompt={} first_divergence={divergence}",
+                    prompt.len(),
+                );
+                continue;
+            }
+            if best.is_none_or(|(_, best_n)| n > best_n) {
+                best = Some((idx, n));
+            }
+        }
+        let (idx, n) = best?;
+        self.tick += 1;
+        entries[idx].last_used = self.tick;
+        Some((idx, n))
+    }
+
+    fn session_data(&self, session_id: &str, idx: usize) -> Option<&[u8]> {
+        self.sessions
+            .get(session_id)
+            .and_then(|entries| entries.get(idx))
+            .map(|e| e.data.as_slice())
+    }
+
+    /// True when the session already stores a snapshot for exactly `tokens` —
+    /// lets the caller skip the device→host copy for an identical re-insert.
+    fn session_is_current(&self, session_id: &str, tokens: &[LlamaToken]) -> bool {
+        self.sessions
+            .get(session_id)
+            .is_some_and(|entries| entries.iter().any(|e| e.tokens == tokens))
+    }
+
+    /// Insert a session resume snapshot, keeping at most [`SSM_SESSION_SLOTS`]
+    /// per session (the oldest is dropped once full).
+    fn insert_session(&mut self, session_id: &str, tokens: Vec<LlamaToken>, data: Vec<u8>) {
+        if data.is_empty()
+            || tokens.is_empty()
+            || data.len() > self.max_entry_bytes
+            || data.len() > self.max_bytes
+        {
+            return;
+        }
+        self.tick += 1;
+        let tick = self.tick;
+        if let Some(entries) = self.sessions.get_mut(session_id) {
+            if let Some(existing) = entries.iter_mut().find(|e| e.tokens == tokens) {
+                existing.last_used = tick;
+                return;
+            }
+            while entries.len() >= SSM_SESSION_SLOTS {
+                let oldest = entries
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, e)| e.last_used)
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                self.total_bytes -= entries.remove(oldest).data.len();
+            }
+        }
+        if !self.make_room(data.len()) {
+            return;
+        }
+        self.total_bytes += data.len();
+        self.sessions
+            .entry(session_id.to_string())
+            .or_default()
+            .push(SsmSessionEntry {
+                tokens,
+                data,
+                last_used: tick,
+            });
+    }
+
+    /// Drop one snapshot of a session (after a failed restore), or the whole
+    /// session when it was the last one.
+    fn remove_session_entry(&mut self, session_id: &str, idx: usize) {
+        if let Some(entries) = self.sessions.get_mut(session_id) {
+            if idx < entries.len() {
+                self.total_bytes -= entries.remove(idx).data.len();
+            }
+            if entries.is_empty() {
+                self.sessions.remove(session_id);
+            }
+        }
+    }
+
+    /// Evict least-recently-used snapshots (chunk checkpoints and session
+    /// states share one byte budget) until `incoming` fits. False when it
+    /// cannot fit even with everything evicted.
+    fn make_room(&mut self, incoming: usize) -> bool {
+        while self.total_bytes + incoming > self.max_bytes {
+            let chunk_lru = self
+                .entries
+                .iter()
+                .min_by_key(|(_, e)| e.last_used)
+                .map(|(&h, e)| (e.last_used, h));
+            let session_lru = self
+                .sessions
+                .iter()
+                .flat_map(|(k, entries)| {
+                    entries
+                        .iter()
+                        .enumerate()
+                        .map(move |(i, e)| (e.last_used, k.clone(), i))
+                })
+                .min_by_key(|(t, _, _)| *t);
+            match (chunk_lru, session_lru) {
+                (Some((ct, hash)), Some((st, _, _))) if ct <= st => self.remove(hash),
+                (_, Some((_, sid, idx))) => self.remove_session_entry(&sid, idx),
+                (Some((_, hash)), None) => self.remove(hash),
+                (None, None) => return false,
+            }
+        }
+        true
+    }
+}
+
+#[cfg(feature = "gguf")]
+fn gguf_ssm_state_cache_config(config: GgufServingConfig) -> Option<SsmStateCache> {
+    if !config.uses_state_space_memory || !gguf_env_is_truthy("KAPSL_GGUF_SSM_STATE_CACHE") {
+        return None;
+    }
+    let mb = |name: &str, default: usize| {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(default)
+            .saturating_mul(1024 * 1024)
+    };
+    let max_bytes = mb("KAPSL_GGUF_SSM_STATE_CACHE_MB", 512);
+    let max_entry_bytes = mb("KAPSL_GGUF_SSM_STATE_MAX_ENTRY_MB", 128);
+    log::info!(
+        "[gguf] SSM state cache enabled: stride={} tokens, cap={} MiB, max-entry={} MiB",
+        config.prefill_chunk_size,
+        max_bytes / (1024 * 1024),
+        max_entry_bytes / (1024 * 1024),
+    );
+    Some(SsmStateCache::new(
+        config.prefill_chunk_size,
+        max_bytes,
+        max_entry_bytes,
+    ))
+}
+
+/// Serialize `seq_id`'s per-sequence state to host RAM, or `None` when it is
+/// empty or exceeds `max_entry_bytes`.
+#[cfg(feature = "gguf")]
+fn read_seq_state(
+    ctx: &llama_cpp_2::context::LlamaContext,
+    seq_id: i32,
+    max_entry_bytes: usize,
+) -> Option<Vec<u8>> {
+    let size = ctx.state_seq_get_size_ext(seq_id, llama_cpp_2::LlamaStateSeqFlags::empty());
+    if size == 0 || size > max_entry_bytes {
+        return None;
+    }
+    let mut data: Vec<u8> = Vec::with_capacity(size);
+    let copied = unsafe {
+        let n = ctx.state_seq_get_data_ext(
+            data.as_mut_ptr(),
+            seq_id,
+            llama_cpp_2::LlamaStateSeqFlags::empty(),
+        );
+        data.set_len(n.min(size));
+        n
+    };
+    if copied == 0 || copied > size {
+        return None;
+    }
+    Some(data)
+}
+
+/// Snapshot `seq_id`'s recurrent state if the prefill just paused exactly on a
+/// chunk boundary that is not cached yet. Called after a successful decode, so
+/// the live state has absorbed exactly `tokens[..n_decoded]`.
+#[cfg(feature = "gguf")]
+fn maybe_snapshot_ssm_state(
+    ctx: &llama_cpp_2::context::LlamaContext,
+    cache: &mut SsmStateCache,
+    tokens: &[LlamaToken],
+    n_decoded: usize,
+    seq_id: i32,
+) {
+    if n_decoded == 0 || !n_decoded.is_multiple_of(cache.chunk) || n_decoded > tokens.len() {
+        return;
+    }
+    let hashes = cache.prefix_hashes(&tokens[..n_decoded]);
+    let Some(&hash) = hashes.last() else {
+        return;
+    };
+    if cache.contains(hash) {
+        return;
+    }
+    let Some(data) = read_seq_state(ctx, seq_id, cache.max_entry_bytes) else {
+        return;
+    };
+    log::debug!(
+        "[gguf] SSM state checkpoint: seq={seq_id} pos={n_decoded} bytes={} (cache {} MiB)",
+        data.len(),
+        (cache.total_bytes + data.len()) / (1024 * 1024)
+    );
+    cache.insert(hash, n_decoded, data);
+}
+
+/// Snapshot a retiring sequence's state as its session's resume point. The
+/// state covers exactly `absorbed` (prompt + decoded generation), so the next
+/// turn of the same session — whose prompt begins with that history — resumes
+/// past it instead of re-prefilling the whole conversation.
+#[cfg(feature = "gguf")]
+fn snapshot_ssm_session_state(
+    ctx: &llama_cpp_2::context::LlamaContext,
+    cache: &mut SsmStateCache,
+    session_id: &str,
+    absorbed: &[LlamaToken],
+    seq_id: i32,
+) {
+    if absorbed.is_empty() || cache.session_is_current(session_id, absorbed) {
+        return;
+    }
+    let Some(data) = read_seq_state(ctx, seq_id, cache.max_entry_bytes) else {
+        return;
+    };
+    log::debug!(
+        "[gguf] SSM session state saved: session={session_id} seq={seq_id} pos={} bytes={}",
+        absorbed.len(),
+        data.len(),
+    );
+    cache.insert_session(session_id, absorbed.to_vec(), data);
+}
+
+/// Restore the best cached state for `tokens` into `seq_id`: the session's
+/// resume snapshot when its history is a strict prefix of the prompt (skips
+/// prompt + previous generation), else the longest chunk-boundary checkpoint.
+/// Returns the number of prompt tokens the restored state already covers
+/// (0 = no hit, start prefill from scratch).
+#[cfg(feature = "gguf")]
+fn restore_ssm_state(
+    ctx: &mut llama_cpp_2::context::LlamaContext,
+    cache: &mut SsmStateCache,
+    session_id: Option<&str>,
+    tokens: &[LlamaToken],
+    seq_id: i32,
+) -> usize {
+    if let Some(sid) = session_id {
+        if let Some((entry_idx, n_tokens)) = cache.session_match(sid, tokens) {
+            let ok = cache
+                .session_data(sid, entry_idx)
+                .is_some_and(|data| unsafe {
+                    ctx.state_seq_set_data_ext(
+                        data,
+                        seq_id,
+                        llama_cpp_2::LlamaStateSeqFlags::empty(),
+                    )
+                });
+            if ok {
+                log::debug!(
+                    "[gguf] SSM session state restored: session={sid} seq={seq_id} pos={n_tokens}"
+                );
+                return n_tokens;
+            }
+            log::warn!(
+                "[gguf] SSM session restore failed: session={sid} seq={seq_id}; dropping entry"
+            );
+            cache.remove_session_entry(sid, entry_idx);
+            let _ = ctx.clear_kv_cache_seq(u32::try_from(seq_id).ok(), None, None);
+        }
+    }
+
+    if tokens.len() <= cache.chunk {
+        return 0;
+    }
+    let hashes = cache.prefix_hashes(tokens);
+    let Some((hash, n_tokens)) = cache.lookup_longest(&hashes, tokens.len()) else {
+        return 0;
+    };
+    let ok = cache.data(hash).is_some_and(|data| unsafe {
+        ctx.state_seq_set_data_ext(data, seq_id, llama_cpp_2::LlamaStateSeqFlags::empty())
+    });
+    if !ok {
+        // A failed restore may leave the sequence's memory partially written;
+        // clear it and fall back to a full prefill. Drop the entry — it is
+        // no longer trusted.
+        log::warn!(
+            "[gguf] SSM state restore failed for seq={seq_id} pos={n_tokens}; dropping entry"
+        );
+        cache.remove(hash);
+        let _ = ctx.clear_kv_cache_seq(u32::try_from(seq_id).ok(), None, None);
+        return 0;
+    }
+    log::debug!(
+        "[gguf] SSM state restored: seq={seq_id} pos={n_tokens} (prefill skips {n_tokens} tokens)"
+    );
+    n_tokens
+}
+
 #[cfg(feature = "gguf")]
 fn global_gguf_backend() -> Result<Arc<LlamaBackend>, EngineError> {
     if let Some(b) = GGUF_BACKEND.get() {
@@ -488,6 +1283,11 @@ struct GgufRequest {
     tokens: Vec<LlamaToken>,
     max_tokens: i32,
     min_tokens: i32,
+    /// Resolved scheduling priority (0 = latency-critical, higher = lower).
+    /// Drives priority-aware promotion out of the `waiting` queue.
+    priority: u8,
+    /// Client session key, used for SSM session resume-state snapshots.
+    session_id: Option<String>,
     response: GgufResponse,
 }
 
@@ -568,33 +1368,64 @@ impl GgufStopFilter {
             .unwrap_or(0)
     }
 
-    fn find_stop(bytes: &[u8]) -> Option<usize> {
+    /// Locate the earliest chat stop-marker in `bytes`, returning its start
+    /// offset and length.
+    fn find_stop(bytes: &[u8]) -> Option<(usize, usize)> {
         GGUF_CHAT_STOP_SEQUENCES
             .iter()
-            .filter_map(|stop| bytes.windows(stop.len()).position(|window| window == *stop))
-            .min()
+            .filter_map(|stop| {
+                bytes
+                    .windows(stop.len())
+                    .position(|window| window == *stop)
+                    .map(|start| (start, stop.len()))
+            })
+            .min_by_key(|&(start, _)| start)
     }
 
+    /// Feed a freshly decoded token `piece` into the filter.
+    ///
+    /// When `may_stop` is true a chat stop-marker latches the filter and
+    /// retires the sequence (emitting only the text before the marker). When
+    /// `may_stop` is false — i.e. the sequence is still below its `min_tokens`
+    /// floor — stop-markers are *not* honored: the text before each marker is
+    /// emitted, the marker bytes themselves are dropped (so they never leak
+    /// into the output), and generation continues. This mirrors the EOS gate
+    /// so `min_tokens` is enforced even when the model emits a turn-marker
+    /// (e.g. Qwen's `<|im_end|>`) before the floor is reached.
     fn push_piece(
         &mut self,
         response: &GgufResponse,
         output: &mut Vec<u8>,
         piece: Vec<u8>,
+        may_stop: bool,
     ) -> GgufEmitResult {
         if self.stopped {
             return GgufEmitResult::Stopped;
         }
 
         self.pending.extend_from_slice(&piece);
-        if let Some(stop_at) = Self::find_stop(&self.pending) {
-            let emit = self.pending[..stop_at].to_vec();
-            self.pending.clear();
-            self.stopped = true;
-            return if response.emit_bytes(output, emit) {
-                GgufEmitResult::Stopped
-            } else {
-                GgufEmitResult::Disconnected
-            };
+
+        if may_stop {
+            if let Some((stop_at, _stop_len)) = Self::find_stop(&self.pending) {
+                let emit = self.pending[..stop_at].to_vec();
+                self.pending.clear();
+                self.stopped = true;
+                return if response.emit_bytes(output, emit) {
+                    GgufEmitResult::Stopped
+                } else {
+                    GgufEmitResult::Disconnected
+                };
+            }
+        } else {
+            // Below the min_tokens floor: emit the text preceding each marker,
+            // discard the marker bytes, and keep decoding.
+            while let Some((stop_at, stop_len)) = Self::find_stop(&self.pending) {
+                let emit = self.pending[..stop_at].to_vec();
+                self.pending.drain(..stop_at + stop_len);
+                if !response.emit_bytes(output, emit) {
+                    return GgufEmitResult::Disconnected;
+                }
+            }
         }
 
         let keep = Self::max_stop_len().saturating_sub(1);
@@ -629,6 +1460,7 @@ struct PendingPrefill {
     next_token: usize,
     max_tokens: i32,
     min_tokens: i32,
+    session_id: Option<String>,
     response: GgufResponse,
     copies: Vec<PendingPrefillCopy>,
 }
@@ -638,6 +1470,7 @@ struct PendingPrefillCopy {
     seq_id: i32,
     max_tokens: i32,
     min_tokens: i32,
+    session_id: Option<String>,
     response: GgufResponse,
 }
 
@@ -658,13 +1491,23 @@ struct ActiveSeq {
     stop_filter: GgufStopFilter,
     response: GgufResponse,
     error: Option<EngineError>,
+    /// Session key for the SSM resume-state snapshot taken at retirement.
+    session_id: Option<String>,
+    /// Every token the model has decoded for this sequence (prompt + fed-back
+    /// generation) — the recurrent state at any instant covers exactly these.
+    /// Only tracked while the SSM state cache is on; empty otherwise.
+    absorbed: Vec<LlamaToken>,
 }
 
 #[cfg(feature = "gguf")]
 struct GgufBackendSamplers {
-    greedy: Vec<LlamaSampler>,
-    no_eos: Vec<LlamaSampler>,
-    mode_by_seq_id: Vec<Option<bool>>,
+    // One [logit_bias(eos), greedy] chain per slot, installed once and kept for the context
+    // lifetime. EOS suppression toggles the bias between -inf and 0 in place, so steady-state
+    // mode changes never call set_sampler and never re-trigger a backend scheduler reserve.
+    chains: Vec<LlamaSampler>,
+    installed_by_seq_id: Vec<bool>,
+    mode_by_seq_id: Vec<bool>,
+    eos_token: LlamaToken,
     sample: LlamaSampler,
 }
 
@@ -672,11 +1515,8 @@ struct GgufBackendSamplers {
 impl GgufBackendSamplers {
     fn new(model: &LlamaModel, max_concurrent: usize, eos_token: LlamaToken) -> Self {
         let n_vocab = model.n_vocab();
-        let eos_bias = [LlamaLogitBias::new(eos_token, f32::NEG_INFINITY)];
-        let greedy = (0..max_concurrent)
-            .map(|_| LlamaSampler::chain_simple([LlamaSampler::greedy()]))
-            .collect();
-        let no_eos = (0..max_concurrent)
+        let eos_bias = [LlamaLogitBias::new(eos_token, 0.0)];
+        let chains = (0..max_concurrent)
             .map(|_| {
                 LlamaSampler::chain_simple([
                     LlamaSampler::logit_bias(n_vocab, &eos_bias),
@@ -686,9 +1526,10 @@ impl GgufBackendSamplers {
             .collect();
 
         Self {
-            greedy,
-            no_eos,
-            mode_by_seq_id: vec![None; max_concurrent],
+            chains,
+            installed_by_seq_id: vec![false; max_concurrent],
+            mode_by_seq_id: vec![false; max_concurrent],
+            eos_token,
             sample: LlamaSampler::greedy(),
         }
     }
@@ -702,31 +1543,23 @@ impl GgufBackendSamplers {
         let Some(slot) = usize::try_from(seq_id).ok() else {
             return false;
         };
-        if self
-            .mode_by_seq_id
-            .get(slot)
-            .copied()
-            .flatten()
-            .is_some_and(|mode| mode == suppress_eos)
-        {
-            return true;
-        }
-        let sampler = if suppress_eos {
-            self.no_eos.get_mut(slot)
-        } else {
-            self.greedy.get_mut(slot)
-        };
-        let Some(sampler) = sampler else {
+        let Some(chain) = self.chains.get_mut(slot) else {
             return false;
         };
-        if unsafe { ctx.set_sampler(seq_id, Some(sampler)) } {
-            if let Some(mode) = self.mode_by_seq_id.get_mut(slot) {
-                *mode = Some(suppress_eos);
+        if self.mode_by_seq_id[slot] != suppress_eos {
+            let bias = if suppress_eos { f32::NEG_INFINITY } else { 0.0 };
+            if !chain.chain_logit_bias_set(0, &[LlamaLogitBias::new(self.eos_token, bias)]) {
+                return false;
             }
-            true
-        } else {
-            false
+            self.mode_by_seq_id[slot] = suppress_eos;
         }
+        if !self.installed_by_seq_id[slot] {
+            if !unsafe { ctx.set_sampler(seq_id, Some(chain)) } {
+                return false;
+            }
+            self.installed_by_seq_id[slot] = true;
+        }
+        true
     }
 
     fn sample_token(
@@ -775,7 +1608,7 @@ fn record_gguf_decode_work_metrics(
     }
 }
 
-#[cfg(feature = "gguf-cuda-shared-kv")]
+#[cfg(feature = "gguf")]
 fn record_gguf_partial_reuse_metrics(
     metrics: &Arc<Mutex<EngineMetrics>>,
     hits: u64,
@@ -831,12 +1664,46 @@ struct GgufSharedKvPoolState {
     /// Stable model identity hash (set at pool construction time).
     model_fingerprint: u64,
     inner: Mutex<GgufSharedKvReservation>,
+    /// Number of concurrent sequence slots the combined block table holds
+    /// (= scheduler max_concurrent). 0 disables multi-sequence batching.
+    n_seq_slots: usize,
+    /// Multi-sequence reservation state: per-seq persistent block ownership plus
+    /// the combined block table shared by all slots. Only used by the
+    /// `reserve_seq` path; the single-sequence `inner` path is untouched.
+    multi: Mutex<GgufMultiSeqState>,
     /// CPU-side KV block backup, populated by `evict_to_cpu()`.
     /// Cleared by the next `reserve` call which uploads data back to GPU.
     evicted: Mutex<Option<CpuEvictedState>>,
     /// When true, `run_scheduler` calls `evict_to_cpu()` before blocking on
     /// the idle receive.  Controlled by `KAPSL_GGUF_EVICT_ON_IDLE`.
     evict_when_idle: bool,
+    /// Windowed KV allocation for SWA layers (Phase 2). `None` = uniform full
+    /// allocation on every layer (the only mode before Phase 2, and still the
+    /// default). When set, `reserve`/`reserve_prefix` route to the windowed
+    /// reservation below and the prefix cache and CPU eviction are bypassed
+    /// (ring blocks are overwritten in place, so their KV cannot be reused
+    /// across sessions or snapshotted).
+    windowed: Option<GgufWindowedKvConfig>,
+    /// Single-sequence windowed reservation, used instead of `inner` when
+    /// `windowed` is set. Per-layer block ownership: full layers hold one
+    /// block per logical position, SWA layers hold at most the ring.
+    windowed_inner: Mutex<GgufWindowedReservation>,
+}
+
+/// Single-sequence reservation state for windowed (Phase 2) allocation.
+///
+/// Unlike [`GgufSharedKvReservation`]'s flat `[layer * n_new + pos]` layout,
+/// ownership is per-layer because SWA layers cap out at the ring size while
+/// full layers keep growing with the context.
+#[cfg(feature = "gguf-cuda-shared-kv")]
+#[derive(Default)]
+struct GgufWindowedReservation {
+    /// Per-layer physical blocks, in logical order; SWA layers wrap around
+    /// (`len == min(n_logical_blocks, window_blocks)`).
+    layers: Vec<Vec<u32>>,
+    block_table: Option<CudaSlice<u32>>,
+    n_logical_blocks: usize,
+    n_tokens_reserved: usize,
 }
 
 /// Per-session reservation state.
@@ -873,6 +1740,30 @@ struct GgufSharedKvReservation {
     n_tokens_reserved: usize,
 }
 
+/// Multi-sequence reservation state for concurrent paged decode.
+///
+/// Each active sequence (keyed by its scheduler seq_id, which doubles as its
+/// block-table slot) persistently owns physical blocks — grow-only, never freed
+/// mid-decode — so its KV data survives across steps. The combined block table
+/// is `[n_seq_slots, n_layers, max_blocks_per_seq]` flattened; the kernels select
+/// a token's slice via `seq_slot * (n_layers * max_blocks_per_seq)`.
+#[cfg(feature = "gguf-cuda-shared-kv")]
+#[derive(Default)]
+struct GgufMultiSeqState {
+    /// seq_id -> owned[layer] = logical-ordered physical block ids.
+    sessions: std::collections::HashMap<u64, Vec<Vec<u32>>>,
+    /// Host mirror of the combined block table, len `n_seq_slots * seq_stride`.
+    combined_host: Vec<u32>,
+    /// Device copy of `combined_host`; its pointer is handed to llama.cpp.
+    combined_device: Option<CudaSlice<u32>>,
+    /// True when `combined_host` has changed since `combined_device` was uploaded.
+    combined_dirty: bool,
+    /// seq_id -> logical blocks committed to its block-table region. Needed in
+    /// windowed mode, where per-layer ownership lengths cap at the ring size
+    /// and can no longer be used to infer the logical coverage.
+    seq_logical: std::collections::HashMap<u64, usize>,
+}
+
 #[cfg(feature = "gguf-cuda-shared-kv")]
 unsafe impl Send for GgufSharedKvPool {}
 #[cfg(feature = "gguf-cuda-shared-kv")]
@@ -885,14 +1776,20 @@ impl GgufSharedKvPool {
         metrics: Arc<Mutex<EngineMetrics>>,
         device_id: usize,
         n_layers: usize,
-        max_ctx: usize,
+        ctx_per_seq: usize,
+        max_concurrent: usize,
         prefix_cache: Option<Arc<Mutex<PrefixBlockCache>>>,
         model_fingerprint: u64,
+        windowed: Option<GgufWindowedKvConfig>,
     ) -> Self {
         let pool_arc = handle.pool.clone();
         let block_size = handle.pool.block_size().max(1);
-        let max_blocks_per_seq = max_ctx.div_ceil(block_size).max(1);
+        let max_blocks_per_seq = ctx_per_seq.div_ceil(block_size).max(1);
         let has_prefix = prefix_cache.is_some();
+        // Combined block table geometry for multi-sequence batching.
+        let n_seq_slots = max_concurrent.max(1);
+        let block_table_seq_stride = n_layers * max_blocks_per_seq;
+        let combined_host = vec![0u32; n_seq_slots * block_table_seq_stride];
         let evict_when_idle = std::env::var("KAPSL_GGUF_EVICT_ON_IDLE")
             .map(|v| {
                 !matches!(
@@ -911,8 +1808,15 @@ impl GgufSharedKvPool {
             prefix_cache,
             model_fingerprint,
             inner: Mutex::new(GgufSharedKvReservation::default()),
+            n_seq_slots,
+            multi: Mutex::new(GgufMultiSeqState {
+                combined_host,
+                ..Default::default()
+            }),
             evicted: Mutex::new(None),
             evict_when_idle,
+            windowed,
+            windowed_inner: Mutex::new(GgufWindowedReservation::default()),
         });
         let state_ptr = (&mut *state) as *mut GgufSharedKvPoolState;
         let pool = &state.handle.pool;
@@ -929,8 +1833,13 @@ impl GgufSharedKvPool {
             block_table_layer_stride: max_blocks_per_seq as u32,
             n_layers: n_layers as u32,
             max_blocks_per_seq: max_blocks_per_seq as u32,
+            // Multi-sequence combined block table geometry.
+            block_table_seq_stride: block_table_seq_stride as u32,
+            n_seq_slots: n_seq_slots as u32,
             model_fingerprint,
             reserve: Some(gguf_kapsl_kv_reserve),
+            reserve_seq: Some(gguf_kapsl_kv_reserve_seq),
+            commit_seq: Some(gguf_kapsl_kv_commit_seq),
             release: Some(gguf_kapsl_kv_release),
             touch: Some(gguf_kapsl_kv_touch),
             reserve_prefix: if has_prefix {
@@ -988,10 +1897,15 @@ impl GgufSharedKvPool {
                 .map(|layer| inner.owned_blocks[layer * n_new + pos])
                 .collect();
 
-            if !c.insert(fp, hash, device_id, pool.clone(), block_ids, 1) {
-                break; // cache full, all entries referenced — stop
+            // Count a position as promoted ONLY when the cache actually took
+            // ownership of its blocks. On AlreadyPresent/Rejected the blocks stay
+            // session-owned (freed at release via the un-promoted range) and no
+            // cache refcount was taken for them, so counting them would leak the
+            // blocks and unbalance the release() accounting.
+            match c.insert(fp, hash, device_id, pool.clone(), block_ids, 1) {
+                kapsl_hal::prefix_cache::PrefixInsert::Inserted => promoted += 1,
+                _ => break, // cache full or hash already cached — stop
             }
-            promoted += 1;
         }
         inner.n_promoted_logical = promoted;
     }
@@ -1102,6 +2016,14 @@ impl Drop for GgufSharedKvPoolState {
                 self.handle.pool.free_block(block);
             }
         }
+        drop(inner);
+        // Free the windowed (Phase 2) reservation's per-layer blocks.
+        let mut w = self.windowed_inner.lock().unwrap();
+        for layer in std::mem::take(&mut w.layers) {
+            for b in layer {
+                self.handle.pool.free_block(b);
+            }
+        }
     }
 }
 
@@ -1175,6 +2097,93 @@ fn alloc_blocks_with_cache_eviction(
         }
     }
     true
+}
+
+// ── Windowed (Phase 2) reserve handler ───────────────────────────────────────
+
+/// Reserve or grow the single-sequence windowed reservation.
+///
+/// Serves both the `reserve` and `reserve_prefix` callbacks when
+/// `state.windowed` is set (prefix hits are always 0 in windowed mode: ring
+/// blocks are overwritten in place, so cached prefixes would go stale).
+/// Returns `(block_table_device_ptr, n_logical_blocks)` on success.
+#[cfg(feature = "gguf-cuda-shared-kv")]
+fn gguf_windowed_reserve_impl(
+    state: &GgufSharedKvPoolState,
+    windowed: &GgufWindowedKvConfig,
+    tokens_needed: usize,
+) -> Option<(*mut u32, usize)> {
+    let pool = &state.handle.pool;
+    let block_size = pool.block_size().max(1);
+    let logical = tokens_needed.div_ceil(block_size).max(1);
+    if logical > state.max_blocks_per_seq {
+        return None;
+    }
+
+    let mut inner = state.windowed_inner.lock().unwrap();
+
+    // Fast path: the current reservation already covers the request.
+    if inner.block_table.is_some() && inner.n_logical_blocks >= logical {
+        inner.n_tokens_reserved = inner.n_tokens_reserved.max(tokens_needed);
+        let ptr = *inner.block_table.as_ref()?.device_ptr() as *mut u32;
+        GGUF_TIMING_KV_FAST_PATH_CALLS.fetch_add(1, Ordering::Relaxed);
+        return Some((ptr, inner.n_logical_blocks));
+    }
+
+    // Grow every layer to its (ring-capped) target, all-or-nothing. Existing
+    // blocks keep their KV data; only the extension is freshly allocated.
+    if inner.layers.is_empty() {
+        inner.layers = vec![Vec::new(); state.n_layers];
+    }
+    let targets: Vec<usize> = (0..state.n_layers)
+        .map(|il| windowed_layer_capacity(logical, windowed.layer_window(il)))
+        .collect();
+    let prev_lens: Vec<usize> = inner.layers.iter().map(|v| v.len()).collect();
+    let total_needed: usize = targets
+        .iter()
+        .zip(&prev_lens)
+        .map(|(t, c)| t.saturating_sub(*c))
+        .sum();
+    let mut fresh: Vec<u32> = Vec::with_capacity(total_needed);
+    if total_needed > 0 && !alloc_blocks_with_cache_eviction(state, total_needed, &mut fresh) {
+        return None;
+    }
+    let mut next = 0usize;
+    for (layer, (&target, &prev)) in targets.iter().zip(&prev_lens).enumerate() {
+        let take = target.saturating_sub(prev);
+        inner.layers[layer].extend_from_slice(&fresh[next..next + take]);
+        next += take;
+    }
+
+    // Rebuild the host table. Full layers index directly; SWA layers wrap
+    // around their ring so logical position P reuses ring slot P % ring_len —
+    // recycling a physical block exactly when it falls out of the window.
+    let mut host_table = vec![0u32; state.n_layers * state.max_blocks_per_seq];
+    for (layer, blocks) in inner.layers.iter().enumerate() {
+        for pos in 0..logical {
+            host_table[layer * state.max_blocks_per_seq + pos] = blocks[pos % blocks.len()];
+        }
+    }
+
+    let table = match pool.device().htod_sync_copy(&host_table) {
+        Ok(t) => t,
+        Err(_) => {
+            // Roll back the extension; established blocks keep their KV data.
+            for (layer, &prev) in prev_lens.iter().enumerate() {
+                for b in inner.layers[layer].drain(prev..) {
+                    pool.free_block(b);
+                }
+            }
+            return None;
+        }
+    };
+    let table_ptr = *table.device_ptr() as *mut u32;
+
+    inner.block_table = Some(table);
+    inner.n_logical_blocks = logical;
+    inner.n_tokens_reserved = tokens_needed;
+    GGUF_TIMING_KV_EXTEND_CALLS.fetch_add(1, Ordering::Relaxed);
+    Some((table_ptr, logical))
 }
 
 // ── CPU-restore helper ────────────────────────────────────────────────────────
@@ -1304,6 +2313,19 @@ unsafe extern "C" fn gguf_kapsl_kv_reserve(
         return false;
     }
     let state = &*(user_data as *mut GgufSharedKvPoolState);
+
+    // ── Windowed (Phase 2) path ───────────────────────────────────────────
+    if let Some(windowed) = &state.windowed {
+        return match gguf_windowed_reserve_impl(state, windowed, tokens_needed as usize) {
+            Some((table_ptr, logical)) => {
+                *block_table_device_out = table_ptr;
+                *n_blocks_out = logical as u32;
+                true
+            }
+            None => false,
+        };
+    }
+
     let block_size = state.handle.pool.block_size().max(1);
     let logical_blocks = (tokens_needed as usize).div_ceil(block_size).max(1);
     if logical_blocks > state.max_blocks_per_seq {
@@ -1377,6 +2399,142 @@ unsafe extern "C" fn gguf_kapsl_kv_reserve(
     true
 }
 
+// ── Multi-sequence reserve callback ──────────────────────────────────────────
+//
+// Reserves blocks for ONE sequence slot (keyed by seq_id) in the combined block
+// table, growing the slot's per-layer block ownership as the sequence's context
+// grows. Block ownership is persistent across decode steps (never freed until
+// the sequence is released) so KV data survives. The combined table upload is
+// deferred to `gguf_kapsl_kv_commit_seq` so one decode batch performs at most
+// one H2D copy.
+#[cfg(feature = "gguf-cuda-shared-kv")]
+unsafe extern "C" fn gguf_kapsl_kv_reserve_seq(
+    user_data: *mut std::ffi::c_void,
+    seq_id: u64,
+    tokens_needed: u32,
+    block_table_device_out: *mut *mut u32,
+    n_blocks_out: *mut u32,
+) -> bool {
+    if user_data.is_null() || block_table_device_out.is_null() || n_blocks_out.is_null() {
+        return false;
+    }
+    let state = &*(user_data as *mut GgufSharedKvPoolState);
+    let block_size = state.handle.pool.block_size().max(1);
+    let logical = (tokens_needed as usize).div_ceil(block_size).max(1);
+    if logical > state.max_blocks_per_seq {
+        return false;
+    }
+    let slot = seq_id as usize;
+    if slot >= state.n_seq_slots {
+        return false;
+    }
+    let n_layers = state.n_layers;
+    let seq_stride = n_layers * state.max_blocks_per_seq;
+
+    let mut m = state.multi.lock().unwrap();
+
+    // Grow this sequence's per-layer block ownership to cover `logical`
+    // blocks, all-or-nothing to keep the slot consistent on allocation
+    // failure. Without windowing every layer's target is `logical` and the
+    // ring mapping below degenerates to the identity; with windowing (Phase 2)
+    // SWA layers cap at the ring size and their table entries wrap around.
+    let have = m.seq_logical.get(&seq_id).copied().unwrap_or_else(|| {
+        m.sessions
+            .get(&seq_id)
+            .map(|owned| owned.iter().map(|v| v.len()).min().unwrap_or(0))
+            .unwrap_or(0)
+    });
+    if logical > have {
+        let targets: Vec<usize> = (0..n_layers)
+            .map(|il| {
+                windowed_layer_capacity(
+                    logical,
+                    state.windowed.as_ref().and_then(|w| w.layer_window(il)),
+                )
+            })
+            .collect();
+        let cur_lens: Vec<usize> = m
+            .sessions
+            .get(&seq_id)
+            .map(|owned| owned.iter().map(|v| v.len()).collect())
+            .unwrap_or_else(|| vec![0; n_layers]);
+        let total_needed: usize = targets
+            .iter()
+            .zip(&cur_lens)
+            .map(|(t, c)| t.saturating_sub(*c))
+            .sum();
+        let mut fresh: Vec<u32> = Vec::with_capacity(total_needed);
+        if total_needed > 0 && !alloc_blocks_with_cache_eviction(state, total_needed, &mut fresh) {
+            return false;
+        }
+        let owned = m
+            .sessions
+            .entry(seq_id)
+            .or_insert_with(|| vec![Vec::new(); n_layers]);
+        let mut next = 0usize;
+        for layer in 0..n_layers {
+            let take = targets[layer].saturating_sub(owned[layer].len());
+            owned[layer].extend_from_slice(&fresh[next..next + take]);
+            next += take;
+        }
+        {
+            let GgufMultiSeqState {
+                sessions,
+                combined_host,
+                combined_dirty,
+                seq_logical,
+                ..
+            } = &mut *m;
+            let owned = &sessions[&seq_id];
+            let base = slot * seq_stride;
+            for layer in 0..n_layers {
+                let layer_base = base + layer * state.max_blocks_per_seq;
+                let blocks = &owned[layer];
+                for l in 0..logical {
+                    combined_host[layer_base + l] = blocks[l % blocks.len()];
+                }
+            }
+            *combined_dirty = true;
+            seq_logical.insert(seq_id, logical);
+        }
+    }
+
+    *block_table_device_out = m
+        .combined_device
+        .as_ref()
+        .map(|table| *table.device_ptr() as *mut u32)
+        .unwrap_or(std::ptr::null_mut());
+    *n_blocks_out = logical as u32;
+    true
+}
+
+#[cfg(feature = "gguf-cuda-shared-kv")]
+unsafe extern "C" fn gguf_kapsl_kv_commit_seq(
+    user_data: *mut std::ffi::c_void,
+    block_table_device_out: *mut *mut u32,
+) -> bool {
+    if user_data.is_null() || block_table_device_out.is_null() {
+        return false;
+    }
+    let state = &*(user_data as *mut GgufSharedKvPoolState);
+    let mut m = state.multi.lock().unwrap();
+
+    if m.combined_dirty || m.combined_device.is_none() {
+        let table = match state.handle.pool.device().htod_sync_copy(&m.combined_host) {
+            Ok(t) => t,
+            Err(_) => return false,
+        };
+        m.combined_device = Some(table);
+        m.combined_dirty = false;
+    }
+
+    let Some(table) = m.combined_device.as_ref() else {
+        return false;
+    };
+    *block_table_device_out = *table.device_ptr() as *mut u32;
+    true
+}
+
 // ── Reserve callback (with prefix cache) ─────────────────────────────────────
 
 #[cfg(feature = "gguf-cuda-shared-kv")]
@@ -1399,6 +2557,29 @@ unsafe extern "C" fn gguf_kapsl_kv_reserve_prefix(
         return false;
     }
     let state = &*(user_data as *mut GgufSharedKvPoolState);
+
+    // ── Windowed (Phase 2) path ───────────────────────────────────────────
+    // No prefix lookup or promotion: ring blocks are overwritten in place as
+    // the context slides, so cached prefixes would silently go stale.
+    if let Some(windowed) = &state.windowed {
+        let previous_tokens = state.windowed_inner.lock().unwrap().n_tokens_reserved;
+        return match gguf_windowed_reserve_impl(state, windowed, n_tokens as usize) {
+            Some((table_ptr, logical)) => {
+                unsafe {
+                    *block_table_device_out = table_ptr;
+                    *n_logical_blocks_out = logical as u32;
+                    *n_prefix_hits_out = 0;
+                }
+                if previous_tokens > 0 {
+                    let delta = (n_tokens as usize).saturating_sub(previous_tokens).max(1);
+                    record_gguf_decode_work_metrics(&state.metrics, 1, delta as u64);
+                }
+                true
+            }
+            None => false,
+        };
+    }
+
     let Some(cache) = &state.prefix_cache else {
         // Prefix cache disabled — fall back to plain reserve.
         return gguf_kapsl_kv_reserve(
@@ -1688,11 +2869,47 @@ fn gguf_release_reservation_inner(
 }
 
 #[cfg(feature = "gguf-cuda-shared-kv")]
-unsafe extern "C" fn gguf_kapsl_kv_release(user_data: *mut std::ffi::c_void, _session_id: u64) {
+unsafe extern "C" fn gguf_kapsl_kv_release(user_data: *mut std::ffi::c_void, session_id: u64) {
     if user_data.is_null() {
         return;
     }
     let state = &*(user_data as *mut GgufSharedKvPoolState);
+
+    // Multi-sequence path: free this sequence slot's persistent blocks and clear
+    // its block-table region so a future request reusing the seq_id starts fresh.
+    // No-op in single-sequence mode (sessions is empty).
+    {
+        let mut m = state.multi.lock().unwrap();
+        m.seq_logical.remove(&session_id);
+        if let Some(owned) = m.sessions.remove(&session_id) {
+            for layer in owned {
+                for b in layer {
+                    state.handle.pool.free_block(b);
+                }
+            }
+            let slot = session_id as usize;
+            if slot < state.n_seq_slots {
+                let seq_stride = state.n_layers * state.max_blocks_per_seq;
+                let base = slot * seq_stride;
+                for x in &mut m.combined_host[base..base + seq_stride] {
+                    *x = 0;
+                }
+                m.combined_dirty = true;
+            }
+        }
+    }
+
+    // Windowed (Phase 2) reservation: free every per-layer block.
+    {
+        let mut w = state.windowed_inner.lock().unwrap();
+        for layer in std::mem::take(&mut w.layers) {
+            for b in layer {
+                state.handle.pool.free_block(b);
+            }
+        }
+        *w = GgufWindowedReservation::default();
+    }
+
     let mut inner = state.inner.lock().unwrap();
     gguf_release_reservation_inner(
         &mut inner,
@@ -1712,6 +2929,49 @@ unsafe extern "C" fn gguf_kapsl_kv_touch(
 
 // ─── Backend ──────────────────────────────────────────────────────────────────
 
+/// Which KV-cache implementation a loaded GGUF engine actually ended up using.
+/// Recorded at load time so diagnostics and benchmarks can report the real path
+/// instead of inferring it from build features or env vars (which can be wrong:
+/// shared-KV silently falls back to native for unsupported architectures).
+#[cfg(feature = "gguf-cuda-shared-kv")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GgufKvPath {
+    /// Not yet loaded.
+    Unloaded,
+    /// Kapsl paged external KV pool (shared-KV).
+    SharedKv,
+    /// llama.cpp's native in-process KV cache (unified / ISWA / recurrent).
+    Native,
+}
+
+#[cfg(feature = "gguf-cuda-shared-kv")]
+impl GgufKvPath {
+    /// Stable lowercase label for logs, info endpoints, and benchmark output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GgufKvPath::Unloaded => "unloaded",
+            GgufKvPath::SharedKv => "shared-kv",
+            GgufKvPath::Native => "native",
+        }
+    }
+
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => GgufKvPath::SharedKv,
+            2 => GgufKvPath::Native,
+            _ => GgufKvPath::Unloaded,
+        }
+    }
+
+    fn as_u8(self) -> u8 {
+        match self {
+            GgufKvPath::Unloaded => 0,
+            GgufKvPath::SharedKv => 1,
+            GgufKvPath::Native => 2,
+        }
+    }
+}
+
 pub struct GgufBackend {
     #[cfg(feature = "gguf")]
     inner: Option<GgufInner>,
@@ -1720,6 +2980,9 @@ pub struct GgufBackend {
     device_id: usize,
     #[cfg(feature = "gguf-cuda-shared-kv")]
     pool_slot: Arc<Mutex<Option<GpuPoolHandle>>>,
+    /// Active KV path, set during `load()`. Read lock-free via `active_kv_path`.
+    #[cfg(feature = "gguf-cuda-shared-kv")]
+    kv_path: Arc<std::sync::atomic::AtomicU8>,
 }
 
 #[cfg(feature = "gguf")]
@@ -1739,6 +3002,10 @@ impl GgufBackend {
             device_id: 0,
             #[cfg(feature = "gguf-cuda-shared-kv")]
             pool_slot: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "gguf-cuda-shared-kv")]
+            kv_path: Arc::new(std::sync::atomic::AtomicU8::new(
+                GgufKvPath::Unloaded.as_u8(),
+            )),
         }
     }
 
@@ -1750,7 +3017,17 @@ impl GgufBackend {
             metrics: Arc::new(Mutex::new(EngineMetrics::new())),
             device_id,
             pool_slot: Arc::new(Mutex::new(handle)),
+            kv_path: Arc::new(std::sync::atomic::AtomicU8::new(
+                GgufKvPath::Unloaded.as_u8(),
+            )),
         }
+    }
+
+    /// The KV-cache path this engine is using after `load()`. Returns
+    /// [`GgufKvPath::Unloaded`] before a model is loaded.
+    #[cfg(feature = "gguf-cuda-shared-kv")]
+    pub fn active_kv_path(&self) -> GgufKvPath {
+        GgufKvPath::from_u8(self.kv_path.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     #[cfg(feature = "gguf-cuda-shared-kv")]
@@ -1791,12 +3068,36 @@ impl GgufBackend {
             .and_then(|m| m.min_new_tokens)
             .unwrap_or(0) as i32
     }
+
+    /// Resolved scheduling priority (0 = latency-critical, higher = lower). The
+    /// scheduler stamps this on the request's metadata before dispatch; the
+    /// internal `run_scheduler` promotes lower values ahead of the FIFO order.
+    /// Defaults to 1 (throughput) when unset.
+    fn priority(request: &InferenceRequest) -> u8 {
+        request
+            .metadata
+            .as_ref()
+            .and_then(|m| m.priority)
+            .unwrap_or(1)
+    }
 }
 
 impl Default for GgufBackend {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Index of the highest-priority (lowest value) item, breaking ties toward the
+/// earliest position so requests at the same priority keep FIFO order. Returns
+/// `None` for an empty iterator.
+#[cfg(feature = "gguf")]
+fn highest_priority_index<I: IntoIterator<Item = u8>>(priorities: I) -> Option<usize> {
+    priorities
+        .into_iter()
+        .enumerate()
+        .min_by_key(|&(idx, priority)| (priority, idx))
+        .map(|(idx, _)| idx)
 }
 
 // ─── Scheduler loop ───────────────────────────────────────────────────────────
@@ -1824,6 +3125,18 @@ fn sequence_needs_kv_after_first(
 }
 
 #[cfg(feature = "gguf")]
+fn release_sequence_slot(
+    ctx: &mut llama_cpp_2::context::LlamaContext,
+    available_ids: &mut Vec<i32>,
+    seq_id: i32,
+) {
+    if let Ok(seq_id_u32) = u32::try_from(seq_id) {
+        let _ = ctx.clear_kv_cache_seq(Some(seq_id_u32), None, None);
+    }
+    available_ids.push(seq_id);
+}
+
+#[cfg(feature = "gguf")]
 fn finish_or_activate_prefilled_sequence(
     metrics: &Arc<Mutex<EngineMetrics>>,
     ctx: &mut llama_cpp_2::context::LlamaContext,
@@ -1838,49 +3151,48 @@ fn finish_or_activate_prefilled_sequence(
     first_tok: LlamaToken,
     first_piece: Option<&[u8]>,
     suppress_eos_sampler: bool,
+    session_id: Option<String>,
+    absorbed: Vec<LlamaToken>,
 ) {
     let mut output = Vec::with_capacity((max_tokens.max(0) as usize).saturating_mul(4));
     let mut stop_filter = GgufStopFilter::new();
 
     if max_tokens <= 0 || (first_tok == eos_token && min_tokens <= 0) {
-        let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
-        available_ids.push(seq_id);
+        release_sequence_slot(ctx, available_ids, seq_id);
         record_gguf_token_metrics(metrics, prompt_len.max(0) as usize, 0);
         response.finish(output);
         return;
     }
 
     let Some(piece) = first_piece else {
-        let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
-        available_ids.push(seq_id);
+        release_sequence_slot(ctx, available_ids, seq_id);
         response.send_error(EngineError::backend("missing first token piece"));
         return;
     };
 
-    match stop_filter.push_piece(&response, &mut output, piece.to_vec()) {
+    // The first generated token sits at generated-count 0, so it may only stop
+    // on a marker once the min_tokens floor is already satisfied.
+    let first_may_stop = min_tokens <= 0;
+    match stop_filter.push_piece(&response, &mut output, piece.to_vec(), first_may_stop) {
         GgufEmitResult::Continue => {}
         GgufEmitResult::Stopped => {
-            let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
-            available_ids.push(seq_id);
+            release_sequence_slot(ctx, available_ids, seq_id);
             record_gguf_token_metrics(metrics, prompt_len.max(0) as usize, 1);
             response.finish(output);
             return;
         }
         GgufEmitResult::Disconnected => {
-            let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
-            available_ids.push(seq_id);
+            release_sequence_slot(ctx, available_ids, seq_id);
             return;
         }
     }
 
     if max_tokens <= 1 {
         if !stop_filter.flush(&response, &mut output) {
-            let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
-            available_ids.push(seq_id);
+            release_sequence_slot(ctx, available_ids, seq_id);
             return;
         }
-        let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
-        available_ids.push(seq_id);
+        release_sequence_slot(ctx, available_ids, seq_id);
         record_gguf_token_metrics(metrics, prompt_len.max(0) as usize, 1);
         response.finish(output);
     } else {
@@ -1897,6 +3209,8 @@ fn finish_or_activate_prefilled_sequence(
             stop_filter,
             response,
             error: None,
+            session_id,
+            absorbed,
         });
     }
 }
@@ -1918,6 +3232,7 @@ fn coalesce_exact_prompt_copies(pref: &mut PendingPrefill, pending: &mut VecDequ
                 seq_id: candidate.seq_id,
                 max_tokens: candidate.max_tokens,
                 min_tokens: candidate.min_tokens,
+                session_id: candidate.session_id,
                 response: candidate.response,
             });
         } else {
@@ -1935,13 +3250,11 @@ fn fail_pending_prefill(
     mut pref: PendingPrefill,
     message: &'static str,
 ) {
-    let _ = ctx.clear_kv_cache_seq(Some(pref.seq_id as u32), None, None);
-    available_ids.push(pref.seq_id);
+    release_sequence_slot(ctx, available_ids, pref.seq_id);
     pref.response.send_error(EngineError::backend(message));
 
     for copy in pref.copies.drain(..) {
-        let _ = ctx.clear_kv_cache_seq(Some(copy.seq_id as u32), None, None);
-        available_ids.push(copy.seq_id);
+        release_sequence_slot(ctx, available_ids, copy.seq_id);
         copy.response.send_error(EngineError::backend(message));
     }
 }
@@ -1956,15 +3269,25 @@ fn update_gguf_metrics(
     batch_tokens: usize,
 ) {
     let total_cells = config.total_ctx();
-    let pending_cells = pending
-        .iter()
-        .map(|pref| pref.next_token.min(pref.tokens.len()))
-        .sum::<usize>();
-    let active_cells = active
-        .iter()
-        .map(|seq| seq.pos.max(0) as usize)
-        .sum::<usize>();
-    let used_cells = pending_cells.saturating_add(active_cells).min(total_cells);
+    let used_cells = if config.uses_state_space_memory {
+        // Recurrent/hybrid memory holds one constant-size state per active
+        // sequence, not a per-token cell — the position-scaled formula below
+        // would report KV usage growing as generation progresses even though
+        // real memory stays flat, which would feed a false pressure signal to
+        // autoscaling/admission. Approximate as one used cell per in-flight
+        // sequence instead.
+        pending.len().saturating_add(active.len()).min(total_cells)
+    } else {
+        let pending_cells = pending
+            .iter()
+            .map(|pref| pref.next_token.min(pref.tokens.len()))
+            .sum::<usize>();
+        let active_cells = active
+            .iter()
+            .map(|seq| seq.pos.max(0) as usize)
+            .sum::<usize>();
+        pending_cells.saturating_add(active_cells).min(total_cells)
+    };
     let capacity_bytes = total_cells.saturating_mul(config.kv_bytes_per_cell);
 
     if let Ok(mut snapshot) = metrics.lock() {
@@ -2044,8 +3367,25 @@ fn run_scheduler(
 
     let eos_token = model.token_eos();
     let mut samplers = GgufBackendSamplers::new(&model, config.max_concurrent, eos_token);
+    // Pre-install a sampler for every seq slot up front so the installed-sampler
+    // set (and thus the compute-graph topology) is stable from the first decode.
+    // `set_sampler` flips `sched_need_reserve`, forcing a worst-case
+    // `sched_reserve()` (sized for n_seq_max); installing lazily and clearing on
+    // retire churned that reservation on every request. Keeping all slots
+    // installed for the context lifetime makes it a one-time warmup cost, and
+    // `build_sampling` already routes inactive installed samplers to row 0.
+    for seq_id in 0..config.max_concurrent as i32 {
+        if !samplers.set_for_sequence(&mut ctx, seq_id, false) {
+            log::warn!("[gguf] failed to pre-install sampler for seq slot {seq_id}");
+        }
+    }
     let batch_cap = n_batch as usize;
     let mut batch = LlamaBatch::new(batch_cap, 1);
+
+    // Recurrent-state checkpoint cache for SSM/hybrid models (Phase 4),
+    // opt-in via KAPSL_GGUF_SSM_STATE_CACHE. None for attention models (they
+    // have the block-level prefix cache) and when the flag is off.
+    let mut ssm_cache: Option<SsmStateCache> = gguf_ssm_state_cache_config(config);
 
     // seq_id pool: 0..max_concurrent are valid sequence identifiers for the KV cache.
     let mut available_ids: Vec<i32> = (0..config.max_concurrent as i32).rev().collect();
@@ -2071,8 +3411,14 @@ fn run_scheduler(
         }
 
         // ── 2. Promote waiting → pending (assign seq_id) ─────────────────────
-        while !waiting.is_empty() && !available_ids.is_empty() {
-            let req = waiting.pop_front().unwrap();
+        // Priority-aware, not strict FIFO: pull the lowest-priority-value
+        // (latency-critical first) waiting request, breaking ties toward the
+        // earliest arrival so requests at the same level keep FIFO order.
+        while !available_ids.is_empty() {
+            let Some(idx) = highest_priority_index(waiting.iter().map(|r| r.priority)) else {
+                break;
+            };
+            let req = waiting.remove(idx).expect("index came from waiting");
             let seq_id = available_ids.pop().unwrap();
 
             if req.tokens.len() as u32 > config.ctx_per_seq {
@@ -2097,12 +3443,35 @@ fn run_scheduler(
                 continue;
             }
 
+            // Skip prompt tokens already absorbed by a cached recurrent-state
+            // snapshot (the session's resume state, else the longest chunk
+            // checkpoint). 0 when the cache is off, missed, or failed (a
+            // failed restore clears the seq slot so a full prefill stays
+            // correct).
+            let next_token = match ssm_cache.as_mut() {
+                Some(cache) => {
+                    let restored = restore_ssm_state(
+                        &mut ctx,
+                        cache,
+                        req.session_id.as_deref(),
+                        &req.tokens,
+                        seq_id,
+                    );
+                    if restored > 0 {
+                        record_gguf_partial_reuse_metrics(&metrics, 1, restored as u64);
+                    }
+                    restored
+                }
+                None => 0,
+            };
+
             pending.push_back(PendingPrefill {
                 seq_id,
                 tokens: req.tokens,
-                next_token: 0,
+                next_token,
                 max_tokens: req.max_tokens,
                 min_tokens: req.min_tokens,
+                session_id: req.session_id,
                 response: req.response,
                 copies: Vec::new(),
             });
@@ -2276,8 +3645,7 @@ fn run_scheduler(
             for seq in active.drain(..) {
                 seq.response
                     .send_error(EngineError::backend("decode failed"));
-                let _ = ctx.clear_kv_cache_seq(Some(seq.seq_id as u32), None, None);
-                available_ids.push(seq.seq_id);
+                release_sequence_slot(&mut ctx, &mut available_ids, seq.seq_id);
             }
             for pref in partial_prefills.drain(..) {
                 fail_pending_prefill(&mut ctx, &mut available_ids, pref, "decode failed");
@@ -2290,7 +3658,27 @@ fn run_scheduler(
         }
 
         for pref in partial_prefills.drain(..) {
+            // Prefill pauses exactly on chunk boundaries, which is where
+            // recurrent-state checkpoints live; the state now covers
+            // tokens[..next_token].
+            if let Some(cache) = ssm_cache.as_mut() {
+                maybe_snapshot_ssm_state(&ctx, cache, &pref.tokens, pref.next_token, pref.seq_id);
+            }
             pending.push_back(pref);
+        }
+        // Completed prefills whose prompt length lands exactly on a chunk
+        // boundary produce that boundary's checkpoint here (the partial loop
+        // never sees them). Session requests additionally save the post-prompt
+        // state as a session resume point: unlike the post-retirement snapshot
+        // it survives reply-seam retokenization drift, because the next turn's
+        // prompt begins with this prompt's text verbatim.
+        if let Some(cache) = ssm_cache.as_mut() {
+            for (pref, _) in completed_prefills.iter() {
+                maybe_snapshot_ssm_state(&ctx, cache, &pref.tokens, pref.next_token, pref.seq_id);
+                if let Some(sid) = pref.session_id.as_deref() {
+                    snapshot_ssm_session_state(&ctx, cache, sid, &pref.tokens, pref.seq_id);
+                }
+            }
         }
 
         // ── 5b. Promote newly computed prefix KV blocks to cache ──────────────
@@ -2316,12 +3704,10 @@ fn run_scheduler(
                 match token_piece_bytes(&model, first_tok) {
                     Ok(piece) => Some(piece),
                     Err(e) => {
-                        let _ = ctx.clear_kv_cache_seq(Some(pref.seq_id as u32), None, None);
-                        available_ids.push(pref.seq_id);
+                        release_sequence_slot(&mut ctx, &mut available_ids, pref.seq_id);
                         pref.response.send_error(e);
                         for copy in pref.copies.drain(..) {
-                            let _ = ctx.clear_kv_cache_seq(Some(copy.seq_id as u32), None, None);
-                            available_ids.push(copy.seq_id);
+                            release_sequence_slot(&mut ctx, &mut available_ids, copy.seq_id);
                             copy.response
                                 .send_error(EngineError::backend("token decode failed"));
                         }
@@ -2351,8 +3737,7 @@ fn run_scheduler(
                             pref.seq_id,
                             copy.seq_id
                         );
-                        let _ = ctx.clear_kv_cache_seq(Some(copy.seq_id as u32), None, None);
-                        available_ids.push(copy.seq_id);
+                        release_sequence_slot(&mut ctx, &mut available_ids, copy.seq_id);
                         copy.response
                             .send_error(EngineError::backend("KV cache copy failed"));
                         continue;
@@ -2363,12 +3748,25 @@ fn run_scheduler(
 
             let suppress_eos_sampler = pref.min_tokens > 1;
             if !suppress_eos_sampler && !samplers.set_for_sequence(&mut ctx, pref.seq_id, false) {
-                let _ = ctx.clear_kv_cache_seq(Some(pref.seq_id as u32), None, None);
-                available_ids.push(pref.seq_id);
+                release_sequence_slot(&mut ctx, &mut available_ids, pref.seq_id);
                 pref.response
                     .send_error(EngineError::backend("failed to install sampler"));
                 continue;
             }
+
+            // Absorbed-token tracking for SSM session resume snapshots: the
+            // leader takes the prompt Vec, copies (identical prompt) clone it.
+            let absorbed_for_copies: Vec<LlamaToken> =
+                if ssm_cache.is_some() && !ready_copies.is_empty() {
+                    pref.tokens.clone()
+                } else {
+                    Vec::new()
+                };
+            let leader_absorbed = if ssm_cache.is_some() {
+                std::mem::take(&mut pref.tokens)
+            } else {
+                Vec::new()
+            };
 
             finish_or_activate_prefilled_sequence(
                 &metrics,
@@ -2384,6 +3782,8 @@ fn run_scheduler(
                 first_tok,
                 first_piece.as_deref(),
                 suppress_eos_sampler,
+                pref.session_id.take(),
+                leader_absorbed,
             );
 
             for copy in ready_copies {
@@ -2391,8 +3791,7 @@ fn run_scheduler(
                 if !copy_suppress_eos_sampler
                     && !samplers.set_for_sequence(&mut ctx, copy.seq_id, false)
                 {
-                    let _ = ctx.clear_kv_cache_seq(Some(copy.seq_id as u32), None, None);
-                    available_ids.push(copy.seq_id);
+                    release_sequence_slot(&mut ctx, &mut available_ids, copy.seq_id);
                     copy.response
                         .send_error(EngineError::backend("failed to install sampler"));
                     continue;
@@ -2412,6 +3811,8 @@ fn run_scheduler(
                     first_tok,
                     first_piece.as_deref(),
                     copy_suppress_eos_sampler,
+                    copy.session_id,
+                    absorbed_for_copies.clone(),
                 );
             }
         }
@@ -2427,6 +3828,13 @@ fn run_scheduler(
                 continue; // this sequence was not in the batch this step
             }
 
+            // This step's decode absorbed the token fed back at batch-build
+            // time into the recurrent state. Non-empty only while the SSM
+            // state cache tracks this sequence (it starts as the prompt).
+            if !seq.absorbed.is_empty() {
+                seq.absorbed.push(seq.last_token);
+            }
+
             // The active sampler chain suppresses EOS until min_tokens is reached.
             let next_tok = samplers.sample_token(&ctx, batch_pos);
             seq.pos += 1;
@@ -2434,6 +3842,9 @@ fn run_scheduler(
             let eos_and_ready = next_tok == eos_token && seq.n_generated >= seq.min_tokens;
             let next_generated = seq.n_generated + 1;
             let max_reached = next_generated >= seq.max_tokens;
+            // A chat stop-marker may only retire the sequence once the
+            // min_tokens floor is met — mirrors the EOS gate above.
+            let may_stop = seq.n_generated >= seq.min_tokens;
 
             if eos_and_ready || max_reached {
                 if eos_and_ready {
@@ -2447,10 +3858,12 @@ fn run_scheduler(
                             continue;
                         }
                     };
-                    match seq
-                        .stop_filter
-                        .push_piece(&seq.response, &mut seq.output, piece)
-                    {
+                    match seq.stop_filter.push_piece(
+                        &seq.response,
+                        &mut seq.output,
+                        piece,
+                        may_stop,
+                    ) {
                         GgufEmitResult::Continue | GgufEmitResult::Stopped => {
                             seq.last_token = next_tok;
                             seq.n_generated = next_generated;
@@ -2470,7 +3883,7 @@ fn run_scheduler(
                 };
                 match seq
                     .stop_filter
-                    .push_piece(&seq.response, &mut seq.output, piece)
+                    .push_piece(&seq.response, &mut seq.output, piece, may_stop)
                 {
                     GgufEmitResult::Disconnected => {
                         to_retire.push(i);
@@ -2498,8 +3911,17 @@ fn run_scheduler(
 
         for &i in to_retire.iter().rev() {
             let done = active.remove(i);
-            let _ = ctx.clear_kv_cache_seq(Some(done.seq_id as u32), None, None);
-            available_ids.push(done.seq_id);
+            // Save the retiring state as the session's resume point before the
+            // slot release clears it. Error retirements are excluded — their
+            // state may not match the absorbed-token record.
+            if let (Some(cache), Some(sid), true) = (
+                ssm_cache.as_mut(),
+                done.session_id.as_deref(),
+                done.error.is_none(),
+            ) {
+                snapshot_ssm_session_state(&ctx, cache, sid, &done.absorbed, done.seq_id);
+            }
+            release_sequence_slot(&mut ctx, &mut available_ids, done.seq_id);
             if let Some(error) = done.error {
                 done.response.send_error(error);
             } else {
@@ -2572,13 +3994,35 @@ impl Engine for GgufBackend {
 
         let config = GgufServingConfig::from_model(&weights.model, weights.n_ctx_train);
         #[cfg(feature = "gguf-cuda-shared-kv")]
-        let shared_kv_pool = {
+        let shared_kv_pool = if let Some(reason) = gguf_shared_kv_disable_reason(&weights.model) {
+            // Architecture/geometry the uniform shared-KV pool cannot represent
+            // (or an explicit operator override): skip the pool and let
+            // llama.cpp build its native KV cache for this model.
+            log::info!(
+                "[gguf] kv_path=native shared-KV disabled for {} ({reason}); using llama.cpp native KV path",
+                model_path.display()
+            );
+            self.kv_path.store(
+                GgufKvPath::Native.as_u8(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            None
+        } else {
             let n_layers = weights.model.n_layer().max(1) as usize;
-            let n_embd = weights.model.n_embd().max(1) as usize;
-            let n_head = weights.model.n_head().max(1) as usize;
             let n_head_kv = weights.model.n_head_kv().max(1) as usize;
-            let head_dim = (n_embd / n_head).max(1);
+            let head_dim_k = weights.model.n_embd_head_k().max(1) as usize;
+            let head_dim_v = weights.model.n_embd_head_v().max(1) as usize;
+            if head_dim_k != head_dim_v {
+                return Err(EngineError::backend(format!(
+                    "shared KV pool requires equal K/V head dims, got K={head_dim_k} V={head_dim_v}"
+                )));
+            }
+            let head_dim = head_dim_k;
             let block_size = 16usize;
+            // Windowed KV for SWA layers (Phase 2): ring-capped per-layer
+            // allocation, opt-in via KAPSL_GGUF_SWA_WINDOWED_KV. None keeps the
+            // uniform full allocation.
+            let windowed = gguf_windowed_kv_config(&weights.model, config, block_size);
             // Auto-select the least-loaded registered device when KAPSL_GGUF_AUTO_DEVICE=1.
             let effective_device_id = gguf_select_device(self.device_id, n_head_kv, head_dim);
             if effective_device_id != self.device_id {
@@ -2602,7 +4046,12 @@ impl Engine for GgufBackend {
                         );
                         let device = CudaDevice::new(effective_device_id)
                             .map_err(|e| EngineError::backend(format!("CUDA: {e}")))?;
-                        let num_blocks = gguf_shared_kv_block_count(n_layers, config, block_size);
+                        let num_blocks = gguf_shared_kv_block_count(
+                            n_layers,
+                            config,
+                            block_size,
+                            windowed.as_ref(),
+                        );
                         let pool = Arc::new(
                             GpuBlockPool::new(device, num_blocks, block_size, n_head_kv, head_dim)
                                 .map_err(|e| {
@@ -2616,7 +4065,8 @@ impl Engine for GgufBackend {
                 } else {
                     let device = CudaDevice::new(effective_device_id)
                         .map_err(|e| EngineError::backend(format!("CUDA: {e}")))?;
-                    let num_blocks = gguf_shared_kv_block_count(n_layers, config, block_size);
+                    let num_blocks =
+                        gguf_shared_kv_block_count(n_layers, config, block_size, windowed.as_ref());
                     let pool = Arc::new(
                         GpuBlockPool::new(device, num_blocks, block_size, n_head_kv, head_dim)
                             .map_err(|e| EngineError::backend(format!("shared KV pool: {e}")))?,
@@ -2635,7 +4085,7 @@ impl Engine for GgufBackend {
                     n_layers.hash(&mut h);
                     n_head_kv.hash(&mut h);
                     head_dim.hash(&mut h);
-                    n_embd.hash(&mut h);
+                    head_dim_v.hash(&mut h);
                     h.finish()
                 };
                 // Build a prefix block cache sized at 1/4 of the pool's logical capacity.
@@ -2654,14 +4104,23 @@ impl Engine for GgufBackend {
                     "[gguf] Prefix KV cache enabled: capacity={} logical positions",
                     prefix_cache_cap
                 );
+                self.kv_path.store(
+                    GgufKvPath::SharedKv.as_u8(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                log::info!(
+                    "[gguf] kv_path=shared-kv Kapsl paged external KV pool active on device {effective_device_id}"
+                );
                 Some(GgufSharedKvPool::new(
                     handle,
                     self.metrics.clone(),
                     effective_device_id,
                     n_layers,
-                    config.total_ctx(),
+                    config.ctx_per_seq as usize,
+                    config.max_concurrent,
                     prefix_cache,
                     model_fingerprint,
+                    windowed,
                 ))
             }
         };
@@ -2720,6 +4179,8 @@ impl Engine for GgufBackend {
                 tokens,
                 max_tokens: Self::max_new_tokens(request),
                 min_tokens: Self::min_new_tokens(request),
+                priority: Self::priority(request),
+                session_id: request.session_id.clone(),
                 response: GgufResponse::Final(resp_tx),
             })
             .map_err(|_| EngineError::backend("gguf scheduler disconnected"))?;
@@ -2772,6 +4233,8 @@ impl Engine for GgufBackend {
                 tokens,
                 max_tokens: Self::max_new_tokens(request),
                 min_tokens: Self::min_new_tokens(request),
+                priority: Self::priority(request),
+                session_id: request.session_id.clone(),
                 response: GgufResponse::Stream(resp_tx),
             })
             .is_err()
@@ -2813,6 +4276,15 @@ impl Engine for GgufBackend {
         self.metrics_snapshot()
     }
 
+    /// The GGUF backend runs its own continuous batcher (`run_scheduler`) that
+    /// multiplexes concurrent requests across `max_concurrent` sequence slots.
+    /// The scheduler must dispatch requests individually rather than coalesce
+    /// them via `infer_batch`, so it advertises self-batching (and keeps
+    /// `max_batch()` at the default 1).
+    fn self_batches(&self) -> bool {
+        true
+    }
+
     fn health_check(&self) -> Result<(), EngineError> {
         if self.inner.is_some() {
             Ok(())
@@ -2842,6 +4314,13 @@ mod gguf_stop_filter_tests {
     use super::{GgufEmitResult, GgufResponse, GgufStopFilter};
     use std::sync::mpsc;
 
+    fn drain_chunks(rx: &mpsc::Receiver<Result<Vec<u8>, super::EngineError>>) -> String {
+        rx.try_iter()
+            .map(|chunk| String::from_utf8(chunk.expect("chunk")).expect("utf8"))
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
     #[test]
     fn stop_filter_hides_split_gemma_user_turn_marker() {
         let (tx, rx) = mpsc::channel();
@@ -2850,24 +4329,24 @@ mod gguf_stop_filter_tests {
         let mut filter = GgufStopFilter::new();
 
         assert_eq!(
-            filter.push_piece(&response, &mut output, b"answer ".to_vec()),
+            filter.push_piece(&response, &mut output, b"answer ".to_vec(), true),
             GgufEmitResult::Continue
         );
         assert_eq!(
-            filter.push_piece(&response, &mut output, b"<start_of".to_vec()),
+            filter.push_piece(&response, &mut output, b"<start_of".to_vec(), true),
             GgufEmitResult::Continue
         );
         assert_eq!(
-            filter.push_piece(&response, &mut output, b"_turn>user\nignored".to_vec()),
+            filter.push_piece(
+                &response,
+                &mut output,
+                b"_turn>user\nignored".to_vec(),
+                true
+            ),
             GgufEmitResult::Stopped
         );
 
-        let chunks = rx
-            .try_iter()
-            .map(|chunk| String::from_utf8(chunk.expect("chunk")).expect("utf8"))
-            .collect::<Vec<_>>()
-            .join("");
-        assert_eq!(chunks, "answer ");
+        assert_eq!(drain_chunks(&rx), "answer ");
     }
 
     #[test]
@@ -2878,17 +4357,62 @@ mod gguf_stop_filter_tests {
         let mut filter = GgufStopFilter::new();
 
         assert_eq!(
-            filter.push_piece(&response, &mut output, b"hello".to_vec()),
+            filter.push_piece(&response, &mut output, b"hello".to_vec(), true),
             GgufEmitResult::Continue
         );
         assert!(filter.flush(&response, &mut output));
 
-        let chunks = rx
-            .try_iter()
-            .map(|chunk| String::from_utf8(chunk.expect("chunk")).expect("utf8"))
-            .collect::<Vec<_>>()
-            .join("");
-        assert_eq!(chunks, "hello");
+        assert_eq!(drain_chunks(&rx), "hello");
+    }
+
+    #[test]
+    fn stop_filter_keeps_going_past_marker_below_floor() {
+        // Below the min_tokens floor (may_stop = false), a turn-marker must not
+        // retire the sequence: surrounding text is emitted, the marker bytes are
+        // dropped, and generation continues.
+        let (tx, rx) = mpsc::channel();
+        let response = GgufResponse::Stream(tx);
+        let mut output = Vec::new();
+        let mut filter = GgufStopFilter::new();
+
+        assert_eq!(
+            filter.push_piece(&response, &mut output, b"answer<|im_end|>".to_vec(), false),
+            GgufEmitResult::Continue
+        );
+        assert_eq!(
+            filter.push_piece(&response, &mut output, b"more".to_vec(), false),
+            GgufEmitResult::Continue
+        );
+        assert!(filter.flush(&response, &mut output));
+
+        // The marker text never leaks; the text around it is preserved.
+        assert_eq!(drain_chunks(&rx), "answermore");
+    }
+
+    #[test]
+    fn stop_filter_drops_marker_below_floor_then_stops_at_floor() {
+        // First marker (below floor) is dropped; once at the floor the next
+        // marker latches the filter as usual.
+        let (tx, rx) = mpsc::channel();
+        let response = GgufResponse::Stream(tx);
+        let mut output = Vec::new();
+        let mut filter = GgufStopFilter::new();
+
+        assert_eq!(
+            filter.push_piece(&response, &mut output, b"a<|im_end|>b".to_vec(), false),
+            GgufEmitResult::Continue
+        );
+        assert_eq!(
+            filter.push_piece(&response, &mut output, b"c<|im_end|>d".to_vec(), true),
+            GgufEmitResult::Stopped
+        );
+        // Subsequent pushes stay stopped.
+        assert_eq!(
+            filter.push_piece(&response, &mut output, b"e".to_vec(), true),
+            GgufEmitResult::Stopped
+        );
+
+        assert_eq!(drain_chunks(&rx), "abc");
     }
 }
 
@@ -2932,10 +4456,34 @@ impl Engine for GgufBackend {
 
 #[cfg(all(test, feature = "gguf"))]
 mod tests {
-    use super::GgufServingConfig;
+    use super::{highest_priority_index, GgufServingConfig};
     use std::time::Duration;
 
-    fn test_config(ctx_per_seq: u32, max_concurrent: usize, prefill_chunk_size: usize) -> GgufServingConfig {
+    #[test]
+    fn highest_priority_index_prefers_lowest_value_then_earliest() {
+        // Empty → None.
+        assert_eq!(highest_priority_index(std::iter::empty()), None);
+
+        // Single element.
+        assert_eq!(highest_priority_index([3u8]), Some(0));
+
+        // Latency-critical (0) jumps ahead of throughput (1), regardless of
+        // arrival order.
+        assert_eq!(highest_priority_index([1u8, 1, 0, 1]), Some(2));
+
+        // Ties on priority break toward the earliest arrival (FIFO within a
+        // level): two 0s at indices 1 and 3 → picks 1.
+        assert_eq!(highest_priority_index([2u8, 0, 1, 0]), Some(1));
+
+        // All equal → front (pure FIFO fallback).
+        assert_eq!(highest_priority_index([5u8, 5, 5]), Some(0));
+    }
+
+    fn test_config(
+        ctx_per_seq: u32,
+        max_concurrent: usize,
+        prefill_chunk_size: usize,
+    ) -> GgufServingConfig {
         GgufServingConfig {
             max_concurrent,
             ctx_per_seq,
@@ -2943,6 +4491,7 @@ mod tests {
             prefill_chunk_size,
             exact_prompt_kv_reuse: false,
             kv_bytes_per_cell: 0,
+            uses_state_space_memory: false,
         }
     }
 
@@ -2960,5 +4509,392 @@ mod tests {
 
         assert_eq!(config.total_ctx(), 32_768);
         assert_eq!(config.n_batch(), 136);
+    }
+
+    // ── shared-KV architecture guard (classify_shared_kv_support) ──────────────
+
+    use super::classify_shared_kv_support;
+
+    /// Build (`has_key`, `pos_int`) closures over a fixed set of
+    /// architecture-scoped metadata keys → values, mirroring how
+    /// `gguf_shared_kv_disable_reason` prefixes lookups with `<arch>.`.
+    fn classify_swa(
+        arch: &str,
+        n_swa: u32,
+        allow_swa: bool,
+        keys: &[(&str, &str)],
+    ) -> Option<String> {
+        let keys: Vec<(String, String)> = keys
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        let lookup = |suffix: &str| {
+            keys.iter()
+                .find(|(k, _)| k == suffix)
+                .map(|(_, v)| v.clone())
+        };
+        let has_key = |suffix: &str| lookup(suffix).is_some();
+        let pos_int = |suffix: &str| {
+            lookup(suffix)
+                .and_then(|v| v.trim().parse::<i64>().ok())
+                .is_some_and(|n| n > 0)
+        };
+        classify_shared_kv_support(arch, n_swa, allow_swa, has_key, pos_int)
+    }
+
+    fn classify(arch: &str, n_swa: u32, keys: &[(&str, &str)]) -> Option<String> {
+        classify_swa(arch, n_swa, false, keys)
+    }
+
+    #[test]
+    fn shared_kv_allows_plain_causal_transformer() {
+        // Qwen2 / TinyLlama-style: uniform KV, no SWA, no latent/recurrent state.
+        assert!(classify("qwen2", 0, &[("attention.head_count_kv", "8")]).is_none());
+    }
+
+    #[test]
+    fn shared_kv_rejects_unknown_architecture() {
+        assert!(classify("", 0, &[]).is_some());
+    }
+
+    #[test]
+    fn shared_kv_rejects_standard_sliding_window_via_metadata() {
+        // Gemma-style: window advertised only through the GGUF key, n_swa not yet
+        // surfaced (defends the metadata heuristic independently of n_swa).
+        let reason = classify("gemma2", 0, &[("attention.sliding_window", "4096")])
+            .expect("SWA model must be rejected");
+        assert!(reason.contains("sliding-window"), "reason: {reason}");
+    }
+
+    #[test]
+    fn shared_kv_rejects_chunked_attention_without_metadata_key() {
+        // Llama 4 hard-codes swa_type=CHUNKED / n_swa=8192 when the
+        // `attention.sliding_window` key is absent — only n_swa catches it.
+        let reason =
+            classify("llama4", 8192, &[]).expect("chunked-attention model must be rejected");
+        assert!(reason.contains("n_swa=8192"), "reason: {reason}");
+    }
+
+    #[test]
+    fn shared_kv_rejects_multi_head_latent_attention() {
+        let reason = classify("deepseek2", 0, &[("attention.kv_lora_rank", "512")])
+            .expect("MLA model must be rejected");
+        assert!(reason.contains("latent"), "reason: {reason}");
+    }
+
+    #[test]
+    fn shared_kv_rejects_recurrent_and_hybrid_state_space() {
+        for (arch, key) in [
+            ("mamba", "ssm.state_size"),
+            ("jamba", "ssm.conv_kernel"),
+            ("rwkv6", "wkv.head_size"),
+        ] {
+            let reason = classify(arch, 0, &[(key, "16")])
+                .unwrap_or_else(|| panic!("{arch} must be rejected"));
+            assert!(reason.contains("recurrent/hybrid"), "reason: {reason}");
+        }
+    }
+
+    // ── state-space memory detection (feeds KV metrics, Phase 3) ────────────────
+
+    use super::gguf_uses_state_space_memory;
+
+    #[test]
+    fn state_space_memory_detected_by_any_ssm_or_wkv_key() {
+        let has = |present: &'static [&'static str]| move |suffix: &str| present.contains(&suffix);
+        assert!(gguf_uses_state_space_memory(has(&["ssm.state_size"])));
+        assert!(gguf_uses_state_space_memory(has(&["ssm.conv_kernel"])));
+        assert!(gguf_uses_state_space_memory(has(&["wkv.head_size"])));
+        // Hybrid archs (Jamba/Granite) carry both attention and ssm keys.
+        assert!(gguf_uses_state_space_memory(has(&[
+            "attention.head_count",
+            "ssm.state_size"
+        ])));
+    }
+
+    #[test]
+    fn state_space_memory_not_detected_for_plain_attention() {
+        assert!(!gguf_uses_state_space_memory(has_none));
+        let has = |present: &'static [&'static str]| move |suffix: &str| present.contains(&suffix);
+        assert!(!gguf_uses_state_space_memory(has(&[
+            "attention.head_count",
+            "attention.sliding_window"
+        ])));
+    }
+
+    fn has_none(_: &str) -> bool {
+        false
+    }
+
+    #[test]
+    fn shared_kv_sliding_window_key_value_zero_is_not_swa() {
+        // A present-but-zero window must not be treated as SWA on the metadata
+        // path (n_swa is the source of truth and is 0 here).
+        assert!(classify("qwen2", 0, &[("attention.sliding_window", "0")]).is_none());
+    }
+
+    #[test]
+    fn shared_kv_allow_swa_admits_verified_gemma_family_only() {
+        // Phase 1 opt-in admits SWA only for the quality-verified Gemma family.
+        assert!(classify_swa("gemma2", 0, true, &[("attention.sliding_window", "4096")]).is_none());
+        assert!(classify_swa("gemma3", 8192, true, &[]).is_none());
+    }
+
+    #[test]
+    fn shared_kv_allow_swa_still_gates_unverified_families() {
+        // Even with the opt-in set, non-allowlisted SWA archs stay native:
+        // cohere2 regresses (NoPE), llama4/phi3 are not eval-verified yet.
+        assert!(classify_swa(
+            "cohere2",
+            4096,
+            true,
+            &[("attention.sliding_window", "4096")]
+        )
+        .is_some());
+        assert!(classify_swa("llama4", 8192, true, &[]).is_some());
+        assert!(classify_swa("phi3", 0, true, &[("attention.sliding_window", "2048")]).is_some());
+    }
+
+    #[test]
+    fn shared_kv_allow_swa_still_rejects_recurrent_and_mla() {
+        // The SWA opt-in must not admit architectures the kernel cannot serve.
+        assert!(classify_swa("deepseek2", 0, true, &[("attention.kv_lora_rank", "512")]).is_some());
+        assert!(classify_swa("mamba", 0, true, &[("ssm.state_size", "16")]).is_some());
+    }
+
+    // ── SWA windowed KV ring math (Phase 2) ─────────────────────────────────────
+
+    use super::{swa_window_blocks, windowed_layer_capacity};
+
+    #[test]
+    fn swa_window_blocks_covers_window_plus_ubatch() {
+        // Gemma3 1B defaults: n_swa=512, n_batch=512+32, block_size=16.
+        assert_eq!(swa_window_blocks(512, 544, 16), 67);
+        // Gemma2: n_swa=4096.
+        assert_eq!(swa_window_blocks(4096, 544, 16), 291);
+        // Degenerate block size clamps to 1.
+        assert_eq!(swa_window_blocks(4, 2, 0), 7);
+    }
+
+    #[test]
+    fn windowed_layer_capacity_caps_only_windowed_layers() {
+        assert_eq!(windowed_layer_capacity(500, Some(67)), 67);
+        assert_eq!(windowed_layer_capacity(50, Some(67)), 50);
+        assert_eq!(windowed_layer_capacity(500, None), 500);
+    }
+
+    /// The ring must never recycle a block that any live query can still read.
+    ///
+    /// Brute-force the invariant behind `swa_window_blocks`: after writing up
+    /// to position `p_max`, every query in the current ubatch
+    /// (`p_max - n_ubatch + 1 ..= p_max`) must find all keys in its standard
+    /// window (`p - n_swa + 1 ..= p`, the loosest of the three window types)
+    /// in logical blocks whose ring slot has not been overwritten — i.e.
+    /// within the last `window_blocks` logical blocks written.
+    #[test]
+    fn swa_window_ring_never_recycles_live_blocks() {
+        for &(block_size, n_swa, n_ubatch) in &[
+            (4usize, 6usize, 3usize),
+            (4, 8, 8),
+            (16, 512, 544),
+            (16, 4096, 544),
+            (1, 5, 2),
+            (7, 13, 29),
+        ] {
+            let wb = swa_window_blocks(n_swa, n_ubatch, block_size);
+            for p_max in 0..(4 * (n_swa + n_ubatch) + 64) {
+                let newest_block = p_max / block_size;
+                for p in p_max.saturating_sub(n_ubatch - 1)..=p_max {
+                    let win_start = p.saturating_sub(n_swa - 1);
+                    let oldest_live_block = win_start / block_size;
+                    assert!(
+                        oldest_live_block + wb > newest_block,
+                        "recycled live block: bs={block_size} n_swa={n_swa} \
+                         n_ubatch={n_ubatch} wb={wb} p_max={p_max} p={p}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The block-table ring mapping (`pos % ring_len`) must keep all blocks in
+    /// any `window_blocks`-sized span of logical positions distinct, and reuse
+    /// exactly the slot from one ring revolution ago.
+    #[test]
+    fn swa_ring_mapping_wraps_without_collisions() {
+        let wb = 5usize;
+        let ring: Vec<u32> = (100..100 + wb as u32).collect();
+        let entry = |pos: usize| ring[pos % ring.len()];
+        for start in 0..3 * wb {
+            let span: Vec<u32> = (start..start + wb).map(entry).collect();
+            let mut dedup = span.clone();
+            dedup.sort_unstable();
+            dedup.dedup();
+            assert_eq!(dedup.len(), wb, "collision within one window span");
+        }
+        for pos in wb..4 * wb {
+            assert_eq!(
+                entry(pos),
+                entry(pos - wb),
+                "slot not reused after one revolution"
+            );
+        }
+    }
+
+    // ── SSM recurrent-state checkpoint cache (Phase 4) ──────────────────────
+
+    use super::{SsmStateCache, SsmStateEntry};
+    use llama_cpp_2::token::LlamaToken;
+
+    fn toks(ids: &[i32]) -> Vec<LlamaToken> {
+        ids.iter().copied().map(LlamaToken).collect()
+    }
+
+    /// Insert an entry directly, bypassing the size/eviction policy, so lookup
+    /// tests don't depend on insert behavior.
+    fn put(cache: &mut SsmStateCache, hash: u64, n_tokens: usize, bytes: usize) {
+        cache.total_bytes += bytes;
+        cache.entries.insert(
+            hash,
+            SsmStateEntry {
+                n_tokens,
+                data: vec![0u8; bytes],
+                last_used: cache.tick,
+            },
+        );
+    }
+
+    #[test]
+    fn ssm_prefix_hashes_chain_and_align_to_chunks() {
+        let cache = SsmStateCache::new(4, 1 << 20, 1 << 20);
+        let a = cache.prefix_hashes(&toks(&[1, 2, 3, 4, 5, 6, 7, 8, 9]));
+        // 9 tokens, chunk 4 -> checkpoints at 4 and 8 only.
+        assert_eq!(a.len(), 2);
+        // Shared prefix -> shared leading hash; divergence changes the rest.
+        let b = cache.prefix_hashes(&toks(&[1, 2, 3, 4, 99, 6, 7, 8]));
+        assert_eq!(a[0], b[0]);
+        assert_ne!(a[1], b[1]);
+    }
+
+    #[test]
+    fn ssm_lookup_picks_longest_strict_prefix_checkpoint() {
+        let mut cache = SsmStateCache::new(4, 1 << 20, 1 << 20);
+        let prompt = toks(&[1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        let hashes = cache.prefix_hashes(&prompt);
+        put(&mut cache, hashes[0], 4, 10);
+        put(&mut cache, hashes[1], 8, 10);
+
+        // Longest checkpoint (8) is a strict prefix of the 9-token prompt.
+        assert_eq!(cache.lookup_longest(&hashes, 9), Some((hashes[1], 8)));
+
+        // For an 8-token prompt the position-8 checkpoint covers the WHOLE
+        // prompt: no token would remain to decode for first-token logits, so
+        // the shorter checkpoint must win.
+        assert_eq!(cache.lookup_longest(&hashes, 8), Some((hashes[0], 4)));
+
+        // Unrelated prompt: no hit.
+        let other = cache.prefix_hashes(&toks(&[9, 9, 9, 9, 9, 9, 9, 9, 9]));
+        assert_eq!(cache.lookup_longest(&other, 9), None);
+    }
+
+    #[test]
+    fn ssm_insert_evicts_lru_and_caps_entry_size() {
+        let mut cache = SsmStateCache::new(4, 100, 60);
+
+        // Oversized entry (> max_entry_bytes) is refused outright.
+        cache.insert(1, 4, vec![0u8; 61]);
+        assert!(!cache.contains(1));
+
+        cache.insert(2, 4, vec![0u8; 50]);
+        cache.insert(3, 8, vec![0u8; 40]);
+        assert_eq!(cache.total_bytes, 90);
+
+        // Touch entry 2 so entry 3 becomes the LRU victim.
+        let hashes = [2u64];
+        assert!(cache.lookup_longest(&hashes, 5).is_some());
+
+        cache.insert(4, 4, vec![0u8; 30]);
+        assert!(cache.contains(2), "recently used entry evicted");
+        assert!(
+            !cache.contains(3),
+            "LRU entry survived over-capacity insert"
+        );
+        assert!(cache.contains(4));
+        assert_eq!(cache.total_bytes, 80);
+    }
+
+    #[test]
+    fn ssm_insert_refreshes_existing_entry_without_double_count() {
+        let mut cache = SsmStateCache::new(4, 100, 100);
+        cache.insert(7, 4, vec![0u8; 40]);
+        cache.insert(7, 4, vec![0u8; 40]);
+        assert_eq!(cache.total_bytes, 40);
+        cache.remove(7);
+        assert_eq!(cache.total_bytes, 0);
+        assert!(!cache.contains(7));
+    }
+
+    #[test]
+    fn ssm_session_matches_longest_strict_token_prefix() {
+        let mut cache = SsmStateCache::new(4, 1 << 20, 1 << 20);
+        // A session holds up to two snapshots at arbitrary positions: the
+        // post-prompt state and the post-retirement state.
+        cache.insert_session("s1", toks(&[1, 2, 3, 4, 5]), vec![0u8; 10]);
+        cache.insert_session("s1", toks(&[1, 2, 3, 4, 5, 6, 7]), vec![0u8; 10]);
+
+        // Next turn resends the full history: the longer snapshot wins.
+        let hit = cache.session_match("s1", &toks(&[1, 2, 3, 4, 5, 6, 7, 8, 9]));
+        assert_eq!(hit.map(|(_, n)| n), Some(7));
+
+        // Reply-seam retokenization drift kills only the longer snapshot; the
+        // post-prompt one still matches.
+        let hit = cache.session_match("s1", &toks(&[1, 2, 3, 4, 5, 99, 7, 8, 9]));
+        assert_eq!(hit.map(|(_, n)| n), Some(5));
+
+        // Identical prompt (no token left to decode): miss.
+        assert_eq!(
+            cache
+                .session_match("s1", &toks(&[1, 2, 3, 4, 5, 6, 7]))
+                .map(|(_, n)| n),
+            Some(5)
+        );
+        assert_eq!(cache.session_match("s1", &toks(&[1, 2, 3, 4, 5])), None);
+        // Unknown session: miss.
+        assert_eq!(
+            cache.session_match("s2", &toks(&[1, 2, 3, 4, 5, 6, 7, 8])),
+            None
+        );
+    }
+
+    #[test]
+    fn ssm_session_slots_cap_and_share_byte_budget_with_checkpoints() {
+        let mut cache = SsmStateCache::new(4, 100, 100);
+        cache.insert_session("s1", toks(&[1, 2]), vec![0u8; 20]);
+        cache.insert_session("s1", toks(&[1, 2, 3]), vec![0u8; 20]);
+        assert_eq!(cache.total_bytes, 40);
+        // Third snapshot exceeds the per-session slot cap: the oldest goes.
+        cache.insert_session("s1", toks(&[1, 2, 3, 4]), vec![0u8; 20]);
+        assert_eq!(cache.total_bytes, 40);
+        assert!(!cache.session_is_current("s1", &toks(&[1, 2])));
+        assert!(cache.session_is_current("s1", &toks(&[1, 2, 3])));
+        assert!(cache.session_is_current("s1", &toks(&[1, 2, 3, 4])));
+        // Re-inserting an identical snapshot only refreshes it.
+        cache.insert_session("s1", toks(&[1, 2, 3, 4]), vec![0u8; 20]);
+        assert_eq!(cache.total_bytes, 40);
+
+        // A chunk checkpoint overflowing the shared budget evicts session
+        // snapshots (LRU across both kinds) — only as many as needed: the
+        // refreshed [1,2,3,4] snapshot survives at exactly full budget.
+        cache.insert(11, 4, vec![0u8; 80]);
+        assert!(cache.contains(11));
+        assert!(!cache.session_is_current("s1", &toks(&[1, 2, 3])));
+        assert!(cache.session_is_current("s1", &toks(&[1, 2, 3, 4])));
+        assert_eq!(cache.total_bytes, 100);
+
+        // And a session insert can evict LRU chunk checkpoints in turn.
+        cache.insert_session("s2", toks(&[9, 9]), vec![0u8; 70]);
+        assert!(!cache.contains(11));
+        assert!(cache.session_is_current("s2", &toks(&[9, 9])));
+        assert_eq!(cache.total_bytes, 70);
     }
 }

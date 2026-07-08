@@ -394,12 +394,14 @@ fn prompt_template_from_manifest_or_config(
 struct GlobalTokenGuard {
     scheduler: Arc<GlobalSchedulerMutex>,
     engine_id: u32,
-    tokens:    usize,
+    tokens: usize,
 }
 
 impl Drop for GlobalTokenGuard {
     fn drop(&mut self) {
-        self.scheduler.lock().complete_tokens(self.engine_id, self.tokens);
+        self.scheduler
+            .lock()
+            .complete_tokens(self.engine_id, self.tokens);
     }
 }
 
@@ -662,8 +664,7 @@ impl Engine for LLMBackend {
             // (load failure or run_loop exit), so dead engines don't leave stale
             // registry / cap entries behind.
             if let Some(cb) = on_engine_death {
-                engine = engine
-                    .with_death_notifier(Box::new(move || cb(engine_id_for_engine)));
+                engine = engine.with_death_notifier(Box::new(move || cb(engine_id_for_engine)));
             }
             let load_result = engine.load(&engine_path).await;
             if let Err(e) = load_tx.send(load_result) {
@@ -826,8 +827,9 @@ impl Engine for LLMBackend {
         // Estimate tokens before prompt and sampling_params are consumed.
         // prompt.len()/4 is a conservative byte→token heuristic; actual
         // tokenisation happens inside the engine after the request is queued.
-        let estimated_tokens =
-            sampling_params.max_tokens.saturating_add(prompt.len() / 4 + 1);
+        let estimated_tokens = sampling_params
+            .max_tokens
+            .saturating_add(prompt.len() / 4 + 1);
 
         // If a live cap is set, clamp estimated_tokens to the current block cap
         // (blocks can hold at most block_size tokens each; the live cap is in
@@ -856,26 +858,26 @@ impl Engine for LLMBackend {
 
         // Hard admission gate: reserve against the global budget.  If the budget
         // is exhausted we reject immediately rather than queuing silently.
-        let global_guard: Option<GlobalTokenGuard> =
-            if let Some(ref sched) = self.global_scheduler {
-                let admitted = sched
-                    .lock()
-                    .try_reserve_tokens(self.engine_id, estimated_tokens);
-                if !admitted {
-                    return Box::pin(stream::once(async {
-                        Err(EngineError::overloaded(
-                            "Global KV admission rejected: budget exhausted across all models",
-                        ))
-                    }));
-                }
-                Some(GlobalTokenGuard {
-                    scheduler: sched.clone(),
-                    engine_id: self.engine_id,
-                    tokens: estimated_tokens,
-                })
-            } else {
-                None
-            };
+        let global_guard: Option<GlobalTokenGuard> = if let Some(ref sched) = self.global_scheduler
+        {
+            let admitted = sched
+                .lock()
+                .try_reserve_tokens(self.engine_id, estimated_tokens);
+            if !admitted {
+                return Box::pin(stream::once(async {
+                    Err(EngineError::overloaded(
+                        "Global KV admission rejected: budget exhausted across all models",
+                    ))
+                }));
+            }
+            Some(GlobalTokenGuard {
+                scheduler: sched.clone(),
+                engine_id: self.engine_id,
+                tokens: estimated_tokens,
+            })
+        } else {
+            None
+        };
 
         let tx_guard = self.request_tx.read().unwrap();
         if let Some(tx) = tx_guard.as_ref() {
