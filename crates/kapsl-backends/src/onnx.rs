@@ -41,6 +41,11 @@ pub struct ModelMetadata {
     pub output_dtypes: Vec<Option<TensorDtype>>,
 }
 
+/// Upper bound on how many independent requests the ONNX backend advertises it
+/// can coalesce into one stacked `session.run` (see [`OnnxBackend::max_batch`]).
+/// The scheduler's micro-batcher caps its accumulation to this value.
+const ONNX_MAX_MICRO_BATCH: usize = 32;
+
 pub struct OnnxBackend {
     session: Arc<RwLock<Option<Arc<SessionPool>>>>,
     bucket_sessions: Arc<RwLock<BucketSessionState>>,
@@ -695,6 +700,26 @@ impl OnnxBackend {
             .get(bucket_key)
             .cloned()
             .ok_or(EngineError::ModelNotLoaded)
+    }
+
+    /// Stack a group of requests along dim 0 into a single tensor, run one
+    /// inference, then split the batched output back into per-request packets.
+    ///
+    /// All `indices` must share dtype and trailing dims (`shape[1..]`); dim 0
+    /// (the batch axis) may differ per request. Operates on raw bytes so it is
+    /// dtype-agnostic. Returns an error (so the caller can fall back to
+    /// sequential inference) if the inputs are inconsistent or the model does
+    /// not actually honor a batch dimension.
+    fn infer_stacked_group(
+        &self,
+        requests: &[InferenceRequest],
+        indices: &[usize],
+    ) -> Result<Vec<BinaryTensorPacket>, EngineError> {
+        let inputs: Vec<&BinaryTensorPacket> =
+            indices.iter().map(|&idx| &requests[idx].input).collect();
+        let (stacked, row_counts) = stack_group_inputs(&inputs)?;
+        let output = self.infer(&InferenceRequest::new(stacked))?;
+        split_batched_output(&output, &row_counts)
     }
 
     fn create_session(
@@ -1825,6 +1850,105 @@ impl Engine for OnnxBackend {
         Ok(output_packet)
     }
 
+    /// Batched inference: stack shape-compatible requests into a single
+    /// `session.run` to amortize per-call GPU/dispatch overhead, which dominates
+    /// wall time for small models. Requests that cannot be safely stacked
+    /// (multi-input models, requests with additional inputs or top-k logit
+    /// reduction, or a group of one) fall back to sequential single inference,
+    /// so this is always correctness-equivalent to calling `infer` per request.
+    fn infer_batch(
+        &self,
+        requests: &[InferenceRequest],
+    ) -> Result<Vec<BinaryTensorPacket>, EngineError> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        if requests.len() == 1 {
+            return Ok(vec![self.infer(&requests[0])?]);
+        }
+
+        // Only single-input models are eligible for tensor stacking. Multi-input
+        // graphs (LLM-style with auto-filled masks / KV) keep the existing
+        // per-request path.
+        let single_input_model = {
+            let metadata = self.metadata.read().map_err(|_| EngineError::Backend {
+                message: "Lock poisoned".to_string(),
+                source: None,
+            })?;
+            metadata
+                .as_ref()
+                .map(|meta| meta.input_names.len() == 1)
+                .unwrap_or(false)
+        };
+
+        let mut results: Vec<Option<BinaryTensorPacket>> =
+            (0..requests.len()).map(|_| None).collect();
+
+        if !single_input_model {
+            for (idx, req) in requests.iter().enumerate() {
+                results[idx] = Some(self.infer(req)?);
+            }
+            return Ok(results
+                .into_iter()
+                .map(|r| r.expect("all results filled"))
+                .collect());
+        }
+
+        // Group stack-eligible requests by (dtype, trailing dims). A request is
+        // eligible when it has a real batch axis (rank >= 2), carries no
+        // additional inputs, and requests no top-k logit reduction (whose
+        // last-token semantics don't split trivially across a stacked batch).
+        let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+        for (idx, req) in requests.iter().enumerate() {
+            if req.input.shape.len() < 2
+                || !req.additional_inputs.is_empty()
+                || request_wants_top_k(req)
+            {
+                results[idx] = Some(self.infer(req)?);
+                continue;
+            }
+            let mut key = String::from(req.input.dtype.as_str());
+            for dim in &req.input.shape[1..] {
+                key.push(':');
+                key.push_str(&dim.to_string());
+            }
+            groups.entry(key).or_default().push(idx);
+        }
+
+        for indices in groups.into_values() {
+            if indices.len() == 1 {
+                let idx = indices[0];
+                results[idx] = Some(self.infer(&requests[idx])?);
+                continue;
+            }
+            match self.infer_stacked_group(requests, &indices) {
+                Ok(outputs) => {
+                    for (idx, output) in indices.iter().zip(outputs) {
+                        results[*idx] = Some(output);
+                    }
+                }
+                Err(err) => {
+                    // A stacked run can fail if the model rejects batch > 1
+                    // (e.g. a fixed batch dim we couldn't detect). Fall back to
+                    // per-request inference so the group still gets answers.
+                    log::warn!(
+                        "ONNX batched group of {} failed ({}); falling back to sequential",
+                        indices.len(),
+                        err
+                    );
+                    for idx in indices {
+                        results[idx] = Some(self.infer(&requests[idx])?);
+                    }
+                }
+            }
+        }
+
+        Ok(results
+            .into_iter()
+            .map(|r| r.expect("all results filled"))
+            .collect())
+    }
+
     // Single-shot models (classifiers, vision, embeddings) produce one result,
     // so a one-item stream is the correct semantics here. Token-by-token LLM
     // streaming lives in kapsl_llm::LLMBackend, which the factory selects for
@@ -1930,6 +2054,137 @@ impl Engine for OnnxBackend {
             peak_concurrency: self.peak_concurrency_hint,
         })
     }
+
+    fn max_batch(&self) -> usize {
+        let Ok(metadata) = self.metadata.read() else {
+            return 1;
+        };
+        let Some(metadata) = metadata.as_ref() else {
+            return 1;
+        };
+        // Batching is only safe/profitable for single-input models whose primary
+        // input has a dynamic batch axis (dim 0 <= 0 in ONNX symbolic shapes).
+        // Fixed-batch or scalar-shaped graphs cannot accept stacked inputs.
+        if metadata.input_names.len() != 1 {
+            return 1;
+        }
+        match metadata.input_shapes.first() {
+            Some(shape) if shape.len() >= 2 && shape[0] <= 0 => ONNX_MAX_MICRO_BATCH,
+            _ => 1,
+        }
+    }
+}
+
+fn request_wants_top_k(request: &InferenceRequest) -> bool {
+    request
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.top_k)
+        .and_then(|top_k| usize::try_from(top_k).ok())
+        .is_some_and(|top_k| top_k > 0)
+}
+
+/// Concatenate a group of shape-compatible input packets along dim 0 into one
+/// stacked packet. All inputs must share dtype and trailing dims (`shape[1..]`);
+/// dim 0 (the batch axis) may differ per input. Returns the stacked packet and
+/// each input's dim-0 size, used to split the batched output back apart.
+/// Operates on raw bytes, so it is dtype-agnostic.
+fn stack_group_inputs(
+    inputs: &[&BinaryTensorPacket],
+) -> Result<(BinaryTensorPacket, Vec<i64>), EngineError> {
+    let first = inputs
+        .first()
+        .ok_or_else(|| EngineError::backend("empty ONNX batch group".to_string()))?;
+    let dtype = first.dtype;
+    let trailing: Vec<i64> = first.shape.get(1..).unwrap_or(&[]).to_vec();
+    let row_elems: usize = trailing.iter().map(|dim| *dim as usize).product();
+    let row_bytes = row_elems * dtype.size_bytes();
+
+    let mut stacked_data: Vec<u8> = Vec::new();
+    let mut row_counts: Vec<i64> = Vec::with_capacity(inputs.len());
+    let mut total_rows: i64 = 0;
+
+    for input in inputs {
+        if input.dtype != dtype || input.shape.get(1..).unwrap_or(&[]) != trailing.as_slice() {
+            return Err(EngineError::backend(
+                "inconsistent dtype/shape within ONNX batch group".to_string(),
+            ));
+        }
+        let batch_dim = *input.shape.first().unwrap_or(&0);
+        if batch_dim <= 0 {
+            return Err(EngineError::backend(
+                "non-positive batch dimension in ONNX batch group".to_string(),
+            ));
+        }
+        let expected = batch_dim as usize * row_bytes;
+        if input.data.len() != expected {
+            return Err(EngineError::backend(format!(
+                "ONNX input byte length {} != expected {} for shape {:?}",
+                input.data.len(),
+                expected,
+                input.shape
+            )));
+        }
+        stacked_data.extend_from_slice(&input.data);
+        row_counts.push(batch_dim);
+        total_rows += batch_dim;
+    }
+
+    let mut stacked_shape = Vec::with_capacity(1 + trailing.len());
+    stacked_shape.push(total_rows);
+    stacked_shape.extend_from_slice(&trailing);
+
+    Ok((
+        BinaryTensorPacket {
+            shape: stacked_shape,
+            dtype,
+            data: stacked_data,
+        },
+        row_counts,
+    ))
+}
+
+/// Split a batched output packet along dim 0 back into per-request packets,
+/// giving `row_counts[i]` rows to output `i`. Errors if the output batch dim
+/// does not match the total stacked rows (which indicates the model ignored the
+/// batch axis), so the caller can fall back to sequential inference.
+fn split_batched_output(
+    output: &BinaryTensorPacket,
+    row_counts: &[i64],
+) -> Result<Vec<BinaryTensorPacket>, EngineError> {
+    let total_rows: i64 = row_counts.iter().sum();
+    let out_batch_dim = *output.shape.first().unwrap_or(&0);
+    if out_batch_dim != total_rows {
+        return Err(EngineError::backend(format!(
+            "batched ONNX output batch dim {} != stacked input rows {} (model may not support batching)",
+            out_batch_dim, total_rows
+        )));
+    }
+    let out_trailing: Vec<i64> = output.shape.get(1..).unwrap_or(&[]).to_vec();
+    let out_row_elems: usize = out_trailing.iter().map(|dim| *dim as usize).product();
+    let out_row_bytes = out_row_elems * output.dtype.size_bytes();
+
+    let mut split = Vec::with_capacity(row_counts.len());
+    let mut cursor = 0usize;
+    for &batch_dim in row_counts {
+        let n_bytes = batch_dim as usize * out_row_bytes;
+        let end = cursor + n_bytes;
+        if end > output.data.len() {
+            return Err(EngineError::backend(
+                "batched ONNX output shorter than expected while splitting".to_string(),
+            ));
+        }
+        let mut shape = Vec::with_capacity(1 + out_trailing.len());
+        shape.push(batch_dim);
+        shape.extend_from_slice(&out_trailing);
+        split.push(BinaryTensorPacket {
+            shape,
+            dtype: output.dtype,
+            data: output.data[cursor..end].to_vec(),
+        });
+        cursor = end;
+    }
+    Ok(split)
 }
 
 fn get_shape_usize(shape: &[i64]) -> Vec<usize> {

@@ -47,6 +47,58 @@ impl Engine for MockEngine {
     }
 }
 
+/// Engine that advertises batching (`max_batch() > 1`) and records the size of
+/// every dispatched call, so tests can assert the executor coalesced requests.
+struct BatchRecordingEngine {
+    calls: Arc<std::sync::Mutex<Vec<usize>>>,
+    max_batch: usize,
+}
+
+impl BatchRecordingEngine {
+    fn new(calls: Arc<std::sync::Mutex<Vec<usize>>>, max_batch: usize) -> Self {
+        Self { calls, max_batch }
+    }
+}
+
+#[async_trait]
+impl Engine for BatchRecordingEngine {
+    async fn load(&mut self, _model_path: &std::path::Path) -> Result<(), EngineError> {
+        Ok(())
+    }
+
+    fn infer(&self, request: &InferenceRequest) -> Result<BinaryTensorPacket, EngineError> {
+        self.calls.lock().unwrap().push(1);
+        Ok(request.input.clone())
+    }
+
+    fn infer_batch(
+        &self,
+        requests: &[InferenceRequest],
+    ) -> Result<Vec<BinaryTensorPacket>, EngineError> {
+        self.calls.lock().unwrap().push(requests.len());
+        Ok(requests.iter().map(|req| req.input.clone()).collect())
+    }
+
+    fn max_batch(&self) -> usize {
+        self.max_batch
+    }
+
+    fn infer_stream(&self, request: &InferenceRequest) -> EngineStream {
+        let output = Ok(request.input.clone());
+        Box::pin(futures::stream::once(async move { output }))
+    }
+
+    fn unload(&mut self) {}
+
+    fn metrics(&self) -> EngineMetrics {
+        EngineMetrics::default()
+    }
+
+    fn health_check(&self) -> Result<(), EngineError> {
+        Ok(())
+    }
+}
+
 fn make_inference_request(session_id: Option<&str>) -> InferenceRequest {
     let input = BinaryTensorPacket {
         shape: vec![1],
@@ -195,4 +247,90 @@ fn test_metrics_aggregation() {
     assert_eq!(metrics.queue_depth, 3);
     assert_eq!(metrics.kv_cache_cpu_offloaded_blocks, 5);
     assert!((metrics.gpu_utilization - 0.4).abs() < 1e-6);
+}
+
+#[tokio::test]
+async fn test_gpu_executor_coalesces_capable_backend() {
+    use crate::gpu_executor::{GpuExecutor, WorkQueue};
+    use std::time::Duration;
+
+    let calls = Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+    let engine: EngineHandle = Arc::new(BatchRecordingEngine::new(calls.clone(), 8));
+
+    let high = WorkQueue::new(64);
+    let low = WorkQueue::new(64);
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let executor = GpuExecutor::new(high.clone(), low.clone(), engine, 8, 2, in_flight);
+
+    // Enqueue a burst of latency-critical requests before the executor starts,
+    // so its first greedy drain sees all of them already queued.
+    let mut receivers = Vec::new();
+    for _ in 0..6 {
+        let (response_tx, response_rx) = oneshot::channel();
+        high.push_block(Request {
+            input: make_inference_request(None),
+            response_tx,
+        })
+        .await;
+        receivers.push(response_rx);
+    }
+
+    tokio::spawn(executor.run());
+
+    for rx in receivers {
+        let output = tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .expect("executor did not respond in time")
+            .expect("response channel dropped")
+            .expect("inference failed");
+        assert_eq!(output.shape, vec![1]);
+    }
+
+    let recorded = calls.lock().unwrap().clone();
+    assert_eq!(
+        recorded.iter().sum::<usize>(),
+        6,
+        "every request must be dispatched exactly once, got {:?}",
+        recorded
+    );
+    assert!(
+        recorded.iter().any(|&n| n > 1),
+        "expected the executor to coalesce a capable backend, got {:?}",
+        recorded
+    );
+}
+
+#[tokio::test]
+async fn test_gpu_executor_no_batch_for_non_capable_backend() {
+    use crate::gpu_executor::{GpuExecutor, WorkQueue};
+    use std::time::Duration;
+
+    // MockEngine keeps the default max_batch() == 1, so high-priority requests
+    // must stay on the single-dispatch path even when a burst is queued.
+    let engine: EngineHandle = Arc::new(MockEngine::new(EngineMetrics::default()));
+    let high = WorkQueue::new(64);
+    let low = WorkQueue::new(64);
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let executor = GpuExecutor::new(high.clone(), low.clone(), engine, 8, 2, in_flight);
+
+    let mut receivers = Vec::new();
+    for _ in 0..4 {
+        let (response_tx, response_rx) = oneshot::channel();
+        high.push_block(Request {
+            input: make_inference_request(None),
+            response_tx,
+        })
+        .await;
+        receivers.push(response_rx);
+    }
+
+    tokio::spawn(executor.run());
+
+    for rx in receivers {
+        tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .expect("executor did not respond in time")
+            .expect("response channel dropped")
+            .expect("inference failed");
+    }
 }

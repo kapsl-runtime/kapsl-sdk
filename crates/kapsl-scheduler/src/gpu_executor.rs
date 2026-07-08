@@ -279,45 +279,131 @@ impl GpuExecutor {
         });
     }
 
+    /// Coalesce pending requests into a batch of at most `cap`, starting from an
+    /// already-dequeued `first` taken from `queue`.
+    ///
+    /// Greedily takes anything already queued without waiting (zero added
+    /// latency when a burst has already arrived). Only if room remains AND there
+    /// is concurrent work in flight does it wait up to `queue_delay` for
+    /// stragglers — so an isolated request (`in_flight == 0`) is dispatched
+    /// immediately with no latency penalty. `interrupt`, when set, aborts the
+    /// straggler wait as soon as that higher-priority queue has items.
+    async fn accumulate_batch(
+        &self,
+        queue: &WorkQueue,
+        first: Request,
+        cap: usize,
+        interrupt: Option<&WorkQueue>,
+    ) -> Vec<Request> {
+        let mut batch = Vec::with_capacity(cap);
+        batch.push(first);
+
+        // Greedy, non-blocking: grab co-arrived requests with no delay.
+        while batch.len() < cap {
+            match queue.pop_nowait() {
+                Some(req) => batch.push(req),
+                None => break,
+            }
+        }
+
+        // Adaptive window: only pay latency to gather stragglers when the model
+        // is already under concurrent load. Skipped entirely for isolated
+        // requests so single-stream latency does not regress.
+        if batch.len() < cap
+            && !self.queue_delay.is_zero()
+            && self.in_flight.load(Ordering::Relaxed) > 0
+        {
+            let deadline = Instant::now() + self.queue_delay;
+            while batch.len() < cap {
+                if interrupt.is_some_and(|q| q.len() > 0) {
+                    break;
+                }
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                let remaining = deadline.saturating_duration_since(now);
+                match queue.pop_timeout(remaining).await {
+                    Some(req) => batch.push(req),
+                    None => break,
+                }
+            }
+        }
+
+        batch
+    }
+
     pub async fn run(self) {
         info!("GPU Executor started");
-        loop {
-            if let Some(req) = self.high_priority_queue.pop_nowait() {
-                let engine = self.engine.clone();
-                Self::dispatch_single(engine, req, self.in_flight.clone());
-                continue;
-            }
+        // Backends that advertise max_batch() > 1 (e.g. an ONNX model with a
+        // dynamic batch dim) implement a real stacked infer_batch. For those we
+        // coalesce requests from BOTH priority queues, since small models are
+        // classified latency-critical yet benefit most from batching. Backends
+        // that don't (max_batch() == 1, the default) keep the original
+        // single-dispatch / throughput-only micro-batch behavior untouched.
+        let batch_cap = self.engine.max_batch().min(self.max_micro_batch);
+        let batch_capable = batch_cap > 1;
 
-            if let Some(req) = self.low_priority_queue.pop_nowait() {
-                let engine = self.engine.clone();
-                if self.max_micro_batch <= 1 || self.queue_delay.is_zero() {
+        loop {
+            if batch_capable {
+                // Latency-critical first, then throughput; coalesce either queue.
+                if let Some(req) = self.high_priority_queue.pop_nowait() {
+                    let batch = self
+                        .accumulate_batch(&self.high_priority_queue, req, batch_cap, None)
+                        .await;
+                    Self::dispatch_batch(self.engine.clone(), batch, self.in_flight.clone());
+                    continue;
+                }
+                if let Some(req) = self.low_priority_queue.pop_nowait() {
+                    let batch = self
+                        .accumulate_batch(
+                            &self.low_priority_queue,
+                            req,
+                            batch_cap,
+                            Some(&self.high_priority_queue),
+                        )
+                        .await;
+                    Self::dispatch_batch(self.engine.clone(), batch, self.in_flight.clone());
+                    continue;
+                }
+            } else {
+                if let Some(req) = self.high_priority_queue.pop_nowait() {
+                    let engine = self.engine.clone();
                     Self::dispatch_single(engine, req, self.in_flight.clone());
                     continue;
                 }
 
-                let mut batch = Vec::with_capacity(self.max_micro_batch);
-                batch.push(req);
-                let deadline = Instant::now() + self.queue_delay;
-
-                while batch.len() < self.max_micro_batch {
-                    if self.high_priority_queue.len() > 0 {
-                        break;
+                if let Some(req) = self.low_priority_queue.pop_nowait() {
+                    let engine = self.engine.clone();
+                    if self.max_micro_batch <= 1 || self.queue_delay.is_zero() {
+                        Self::dispatch_single(engine, req, self.in_flight.clone());
+                        continue;
                     }
 
-                    let now = Instant::now();
-                    if now >= deadline {
-                        break;
+                    let mut batch = Vec::with_capacity(self.max_micro_batch);
+                    batch.push(req);
+                    let deadline = Instant::now() + self.queue_delay;
+
+                    while batch.len() < self.max_micro_batch {
+                        if self.high_priority_queue.len() > 0 {
+                            break;
+                        }
+
+                        let now = Instant::now();
+                        if now >= deadline {
+                            break;
+                        }
+
+                        let remaining = deadline.saturating_duration_since(now);
+                        match self.low_priority_queue.pop_timeout(remaining).await {
+                            Some(next_req) => batch.push(next_req),
+                            None => break,
+                        }
                     }
 
-                    let remaining = deadline.saturating_duration_since(now);
-                    match self.low_priority_queue.pop_timeout(remaining).await {
-                        Some(next_req) => batch.push(next_req),
-                        None => break,
-                    }
+                    Self::dispatch_batch(engine, batch, self.in_flight.clone());
+                    continue;
                 }
-
-                Self::dispatch_batch(engine, batch, self.in_flight.clone());
-                continue;
             }
 
             tokio::select! {

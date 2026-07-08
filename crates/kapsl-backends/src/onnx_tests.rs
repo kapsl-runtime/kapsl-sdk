@@ -468,4 +468,114 @@ mod tests {
         let result = ensure_unique_additional_input_names(&additional_inputs);
         assert!(matches!(result, Err(EngineError::InvalidInput { .. })));
     }
+
+    fn f32_packet(shape: Vec<i64>, values: &[f32]) -> BinaryTensorPacket {
+        BinaryTensorPacket {
+            shape,
+            dtype: TensorDtype::Float32,
+            data: f32_bytes(values),
+        }
+    }
+
+    #[test]
+    fn test_stack_group_inputs_concatenates_along_batch() {
+        let a = f32_packet(vec![1, 3], &[1.0, 2.0, 3.0]);
+        let b = f32_packet(vec![1, 3], &[4.0, 5.0, 6.0]);
+        let inputs = [&a, &b];
+
+        let (stacked, row_counts) = stack_group_inputs(&inputs).expect("stack ok");
+
+        assert_eq!(stacked.shape, vec![2, 3]);
+        assert_eq!(stacked.dtype, TensorDtype::Float32);
+        assert_eq!(stacked.data, f32_bytes(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]));
+        assert_eq!(row_counts, vec![1, 1]);
+    }
+
+    #[test]
+    fn test_stack_group_inputs_preserves_multi_row_batches() {
+        // dim 0 may differ per request; row_counts must record each so the
+        // output split gives every request the right number of rows back.
+        let a = f32_packet(vec![2, 2], &[1.0, 2.0, 3.0, 4.0]);
+        let b = f32_packet(vec![1, 2], &[5.0, 6.0]);
+        let inputs = [&a, &b];
+
+        let (stacked, row_counts) = stack_group_inputs(&inputs).expect("stack ok");
+
+        assert_eq!(stacked.shape, vec![3, 2]);
+        assert_eq!(row_counts, vec![2, 1]);
+    }
+
+    #[test]
+    fn test_stack_group_inputs_rejects_mismatched_trailing_dims() {
+        let a = f32_packet(vec![1, 3], &[1.0, 2.0, 3.0]);
+        let b = f32_packet(vec![1, 4], &[1.0, 2.0, 3.0, 4.0]);
+        let inputs = [&a, &b];
+
+        assert!(stack_group_inputs(&inputs).is_err());
+    }
+
+    #[test]
+    fn test_stack_group_inputs_rejects_bad_byte_length() {
+        let good = f32_packet(vec![1, 3], &[1.0, 2.0, 3.0]);
+        // Shape claims 3 elements but only 2 provided.
+        let bad = BinaryTensorPacket {
+            shape: vec![1, 3],
+            dtype: TensorDtype::Float32,
+            data: f32_bytes(&[1.0, 2.0]),
+        };
+        let inputs = [&good, &bad];
+
+        assert!(stack_group_inputs(&inputs).is_err());
+    }
+
+    #[test]
+    fn test_split_batched_output_round_trips_stack() {
+        // Model with a [batch, 3] -> [batch, 2] shape: stack two requests,
+        // then split a synthetic [2, 2] output back into two [1, 2] packets.
+        let a = f32_packet(vec![1, 3], &[1.0, 2.0, 3.0]);
+        let b = f32_packet(vec![1, 3], &[4.0, 5.0, 6.0]);
+        let (_stacked, row_counts) = stack_group_inputs(&[&a, &b]).expect("stack ok");
+
+        let batched_output = f32_packet(vec![2, 2], &[10.0, 11.0, 20.0, 21.0]);
+        let split = split_batched_output(&batched_output, &row_counts).expect("split ok");
+
+        assert_eq!(split.len(), 2);
+        assert_eq!(split[0].shape, vec![1, 2]);
+        assert_eq!(split[0].data, f32_bytes(&[10.0, 11.0]));
+        assert_eq!(split[1].shape, vec![1, 2]);
+        assert_eq!(split[1].data, f32_bytes(&[20.0, 21.0]));
+    }
+
+    #[test]
+    fn test_split_batched_output_respects_multi_row_counts() {
+        let batched_output = f32_packet(vec![3, 2], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let split = split_batched_output(&batched_output, &[2, 1]).expect("split ok");
+
+        assert_eq!(split.len(), 2);
+        assert_eq!(split[0].shape, vec![2, 2]);
+        assert_eq!(split[0].data, f32_bytes(&[1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(split[1].shape, vec![1, 2]);
+        assert_eq!(split[1].data, f32_bytes(&[5.0, 6.0]));
+    }
+
+    #[test]
+    fn test_split_batched_output_rejects_batch_dim_mismatch() {
+        // Model ignored the batch axis and returned a single row: must error so
+        // the caller falls back to per-request inference.
+        let batched_output = f32_packet(vec![1, 2], &[1.0, 2.0]);
+        assert!(split_batched_output(&batched_output, &[1, 1]).is_err());
+    }
+
+    #[test]
+    fn test_request_wants_top_k() {
+        use kapsl_engine_api::RequestMetadata;
+
+        let plain = InferenceRequest::new(f32_packet(vec![1, 3], &[1.0, 2.0, 3.0]));
+        assert!(!request_wants_top_k(&plain));
+
+        let mut meta = RequestMetadata::default();
+        meta.top_k = Some(5);
+        let with_top_k = plain.clone().with_metadata(meta);
+        assert!(request_wants_top_k(&with_top_k));
+    }
 }
