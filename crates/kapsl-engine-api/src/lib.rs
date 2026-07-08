@@ -665,6 +665,22 @@ pub trait Engine: Send + Sync {
         1
     }
 
+    /// Whether this backend performs its own internal batching over concurrent
+    /// requests (e.g. an autoregressive LLM that continuously batches active
+    /// sequences at the decode step).
+    ///
+    /// Returns `false` by default. When `true`, the scheduler must NOT coalesce
+    /// this backend's requests via [`Engine::infer_batch`] — doing so would run
+    /// a request-level batch to completion in one call and fight the backend's
+    /// own continuous batcher, reintroducing head-of-line blocking. Instead the
+    /// scheduler dispatches such requests individually and lets the backend
+    /// multiplex them, gating concurrency by the backend's published occupancy
+    /// (see [`Engine::metrics`]). A self-batching backend therefore keeps
+    /// [`Engine::max_batch`] at 1.
+    fn self_batches(&self) -> bool {
+        false
+    }
+
     /// Run a streaming inference request.
     fn infer_stream(&self, request: &InferenceRequest) -> EngineStream;
 
@@ -769,6 +785,10 @@ impl Engine for Box<dyn Engine> {
 
     fn max_batch(&self) -> usize {
         (**self).max_batch()
+    }
+
+    fn self_batches(&self) -> bool {
+        (**self).self_batches()
     }
 
     fn infer_stream(&self, request: &InferenceRequest) -> EngineStream {

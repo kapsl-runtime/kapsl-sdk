@@ -361,6 +361,10 @@ impl<E: Engine> Engine for MonitoringMiddleware<E> {
         self.inner.max_batch()
     }
 
+    fn self_batches(&self) -> bool {
+        self.inner.self_batches()
+    }
+
     fn infer_stream(
         &self,
         request: &InferenceRequest,
