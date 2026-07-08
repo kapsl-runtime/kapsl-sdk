@@ -186,4 +186,14 @@ mod tests {
         };
         assert!(BackendFactory::validate_requirements(&req, &info).is_ok());
     }
+
+    #[test]
+    fn test_fastest_candidates_do_not_auto_insert_tensorrt() {
+        let info = mock_device_info();
+        let mut providers = Vec::new();
+
+        BackendFactory::append_fastest_candidates(&info, &mut providers);
+
+        assert_eq!(providers, vec!["cuda".to_string(), "cpu".to_string()]);
+    }
 }

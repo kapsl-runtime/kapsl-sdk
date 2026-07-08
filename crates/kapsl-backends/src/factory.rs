@@ -247,7 +247,6 @@ impl BackendFactory {
 
     fn append_fastest_candidates(device_info: &DeviceInfo, providers: &mut Vec<String>) {
         if device_info.has_cuda {
-            Self::push_unique_provider(providers, "tensorrt");
             Self::push_unique_provider(providers, "cuda");
         }
         if device_info.has_metal {

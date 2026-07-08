@@ -289,21 +289,56 @@ fn directml_provider_available() -> bool {
     false
 }
 
-fn fastest_llm_provider() -> &'static str {
-    if llm_provider_available("tensorrt") {
-        "tensorrt"
-    } else if llm_provider_available("cuda") {
+fn fastest_llm_auto_provider() -> &'static str {
+    fastest_llm_auto_provider_from_available(
+        llm_provider_available("cuda"),
+        llm_provider_available("coreml"),
+        llm_provider_available("rocm"),
+        llm_provider_available("directml"),
+        llm_provider_available("openvino"),
+    )
+}
+
+fn fastest_llm_auto_provider_from_available(
+    cuda: bool,
+    coreml: bool,
+    rocm: bool,
+    directml: bool,
+    openvino: bool,
+) -> &'static str {
+    if cuda {
         "cuda"
-    } else if llm_provider_available("coreml") {
+    } else if coreml {
         "coreml"
-    } else if llm_provider_available("rocm") {
+    } else if rocm {
         "rocm"
-    } else if llm_provider_available("directml") {
+    } else if directml {
         "directml"
-    } else if llm_provider_available("openvino") {
+    } else if openvino {
         "openvino"
     } else {
         "cpu"
+    }
+}
+
+#[cfg(test)]
+mod provider_selection_tests {
+    use super::fastest_llm_auto_provider_from_available;
+
+    #[test]
+    fn auto_provider_prefers_cuda_without_considering_tensorrt() {
+        assert_eq!(
+            fastest_llm_auto_provider_from_available(true, true, true, true, true),
+            "cuda"
+        );
+    }
+
+    #[test]
+    fn auto_provider_falls_back_to_cpu_when_no_accelerator_is_available() {
+        assert_eq!(
+            fastest_llm_auto_provider_from_available(false, false, false, false, false),
+            "cpu"
+        );
     }
 }
 
@@ -1551,7 +1586,7 @@ impl LLMEngine {
                 .map(|provider| provider.trim().eq_ignore_ascii_case("cpu"))
                 .unwrap_or(true);
             if provider_is_cpu_or_missing {
-                let fastest = fastest_llm_provider().to_string();
+                let fastest = fastest_llm_auto_provider().to_string();
                 if fastest != "cpu" {
                     log::info!(
                         "LLM auto-selecting fastest provider `{}` (set KAPSL_PROVIDER_POLICY=manifest to keep package provider)",
