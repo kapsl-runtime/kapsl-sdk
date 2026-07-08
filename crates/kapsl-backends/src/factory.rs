@@ -93,6 +93,17 @@ fn maybe_wrap_onnx_postprocess(
                 .map_err(|e| format!("detector init failed: {e}"))?;
             Ok(Box::new(backend))
         }
+        EngineKind::OnnxTranscribe => {
+            // metadata.transcribe is optional (defaults to blank-0, collapse on).
+            let cfg = match manifest.metadata.as_ref().and_then(|m| m.get("transcribe")) {
+                Some(spec) => serde_yaml::from_value(spec.clone())
+                    .map_err(|e| format!("invalid metadata.transcribe: {e}"))?,
+                None => crate::onnx_transcribe::TranscribeConfig::default(),
+            };
+            Ok(Box::new(crate::onnx_transcribe::OnnxTranscribeBackend::new(
+                inner, cfg,
+            )))
+        }
         _ => Ok(inner),
     }
 }

@@ -44,6 +44,11 @@ pub enum EngineKind {
     /// Emits `[num_detections, 6]` = `[x1, y1, x2, y2, score, class_id]`.
     /// Selected by `format=onnx`, `task=detect`.
     OnnxDetect,
+    /// ONNX CTC speech recognizer (forward pass over acoustic features +
+    /// greedy CTC decode). Emits `[num_tokens]` token ids. Selected by
+    /// `format=onnx`, `task=transcribe`. Encoder-decoder ASR (Whisper) is out of
+    /// scope: it is an autoregressive decode loop, not a single forward pass.
+    OnnxTranscribe,
 }
 
 impl EngineKind {
@@ -83,6 +88,7 @@ impl EngineKind {
                 "embed" => Self::OnnxEmbed,
                 "classify" => Self::OnnxClassify,
                 "detect" => Self::OnnxDetect,
+                "transcribe" => Self::OnnxTranscribe,
                 _ => Self::OnnxForward,
             },
         }
@@ -122,6 +128,7 @@ impl EngineKind {
             "embedding" => task == "embed",
             "seq-classifier" => task == "classify",
             "detector" => task == "detect",
+            "asr" => task == "transcribe",
             "seq2seq" => matches!(task.as_str(), "generate" | "forward"),
             // opaque graphs only support a raw forward pass.
             _ => task == "forward",
@@ -171,6 +178,7 @@ impl EngineKind {
                 | Self::OnnxEmbed
                 | Self::OnnxClassify
                 | Self::OnnxDetect
+                | Self::OnnxTranscribe
         )
     }
 
@@ -188,7 +196,8 @@ impl EngineKind {
             | Self::OnnxForward
             | Self::OnnxEmbed
             | Self::OnnxClassify
-            | Self::OnnxDetect => true,
+            | Self::OnnxDetect
+            | Self::OnnxTranscribe => true,
         }
     }
 
@@ -202,6 +211,7 @@ impl EngineKind {
             Self::OnnxEmbed => "onnx-embed",
             Self::OnnxClassify => "onnx-classify",
             Self::OnnxDetect => "onnx-detect",
+            Self::OnnxTranscribe => "onnx-transcribe",
         }
     }
 }
@@ -214,12 +224,20 @@ pub const VALID_MODEL_TYPES: &[&str] = &[
     "embedding",
     "seq-classifier",
     "detector",
+    "asr",
     "seq2seq",
     "opaque",
 ];
 /// Known serving operations.
-pub const VALID_TASKS: &[&str] =
-    &["generate", "embed", "classify", "detect", "rerank", "forward"];
+pub const VALID_TASKS: &[&str] = &[
+    "generate",
+    "embed",
+    "classify",
+    "detect",
+    "transcribe",
+    "rerank",
+    "forward",
+];
 
 fn check_known(field: &str, value: Option<&str>, allowed: &[&str]) -> Result<(), String> {
     if let Some(v) = value {
@@ -281,6 +299,7 @@ pub fn effective_task(manifest: &Manifest) -> String {
         "embedding" => "embed",
         "seq-classifier" => "classify",
         "detector" => "detect",
+        "asr" => "transcribe",
         "seq2seq" => "generate",
         _ => "forward",
     }
