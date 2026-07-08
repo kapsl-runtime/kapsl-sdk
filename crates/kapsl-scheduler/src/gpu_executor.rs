@@ -1,5 +1,5 @@
 use crate::request::Request;
-use kapsl_engine_api::{EngineError, EngineHandle, InferenceRequest};
+use kapsl_engine_api::{EngineError, EngineHandle, InferenceRequest, RequestMetadata};
 use log::info;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -219,6 +219,19 @@ impl GpuExecutor {
                 .saturating_mul(self.admission_min_free_pct)
     }
 
+    /// Stamp the resolved queue priority onto a request's metadata so a
+    /// self-batching backend can honor it in its own internal queue. The
+    /// scheduler's queue choice is the authoritative priority (it already folds
+    /// in SLA/size promotion), so this overwrites any raw hint the caller set.
+    /// Uses the engine-api convention: 0 = latency-critical, 1 = throughput.
+    fn stamp_priority(req: &mut Request, latency_critical: bool) {
+        let priority = if latency_critical { 0 } else { 1 };
+        req.input
+            .metadata
+            .get_or_insert_with(RequestMetadata::default)
+            .priority = Some(priority);
+    }
+
     fn dispatch_single(engine: EngineHandle, req: Request, in_flight: Arc<AtomicUsize>) {
         if req
             .input
@@ -432,18 +445,26 @@ impl GpuExecutor {
                     continue;
                 }
             } else {
-                if let Some(req) = self.high_priority_queue.pop_nowait() {
+                if let Some(mut req) = self.high_priority_queue.pop_nowait() {
                     let engine = self.engine.clone();
+                    // Propagate the resolved priority so a self-batching backend
+                    // can jump this request ahead in its internal queue.
+                    if self_batches {
+                        Self::stamp_priority(&mut req, true);
+                    }
                     Self::dispatch_single(engine, req, self.in_flight.clone());
                     continue;
                 }
 
-                if let Some(req) = self.low_priority_queue.pop_nowait() {
+                if let Some(mut req) = self.low_priority_queue.pop_nowait() {
                     let engine = self.engine.clone();
                     // Self-batching backends multiplex internally, so hand each
                     // request over immediately rather than holding it back to
                     // build a serial `infer_batch` group.
                     if self_batches || self.max_micro_batch <= 1 || self.queue_delay.is_zero() {
+                        if self_batches {
+                            Self::stamp_priority(&mut req, false);
+                        }
                         Self::dispatch_single(engine, req, self.in_flight.clone());
                         continue;
                     }

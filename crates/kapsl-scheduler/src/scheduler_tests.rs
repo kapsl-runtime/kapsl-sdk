@@ -191,6 +191,44 @@ impl Engine for GatedEngine {
     }
 }
 
+/// Self-batching engine that records the `metadata.priority` seen on each infer
+/// call, so tests can assert the executor stamped the resolved queue priority.
+struct PriorityRecordingEngine {
+    seen: Arc<std::sync::Mutex<Vec<Option<u8>>>>,
+}
+
+#[async_trait]
+impl Engine for PriorityRecordingEngine {
+    async fn load(&mut self, _model_path: &std::path::Path) -> Result<(), EngineError> {
+        Ok(())
+    }
+
+    fn infer(&self, request: &InferenceRequest) -> Result<BinaryTensorPacket, EngineError> {
+        let priority = request.metadata.as_ref().and_then(|m| m.priority);
+        self.seen.lock().unwrap().push(priority);
+        Ok(request.input.clone())
+    }
+
+    fn self_batches(&self) -> bool {
+        true
+    }
+
+    fn infer_stream(&self, request: &InferenceRequest) -> EngineStream {
+        let output = Ok(request.input.clone());
+        Box::pin(futures::stream::once(async move { output }))
+    }
+
+    fn unload(&mut self) {}
+
+    fn metrics(&self) -> EngineMetrics {
+        EngineMetrics::default()
+    }
+
+    fn health_check(&self) -> Result<(), EngineError> {
+        Ok(())
+    }
+}
+
 fn make_inference_request(session_id: Option<&str>) -> InferenceRequest {
     let input = BinaryTensorPacket {
         shape: vec![1],
@@ -514,6 +552,53 @@ async fn test_gpu_executor_admission_gates_saturated_self_batching_backend() {
         .expect("req2 did not respond in time")
         .expect("response channel dropped")
         .expect("inference failed");
+}
+
+#[tokio::test]
+async fn test_gpu_executor_stamps_queue_priority_for_self_batching_backend() {
+    use crate::gpu_executor::{GpuExecutor, WorkQueue};
+    use std::time::Duration;
+
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<Option<u8>>::new()));
+    let engine: EngineHandle = Arc::new(PriorityRecordingEngine { seen: seen.clone() });
+
+    let high = WorkQueue::new(64);
+    let low = WorkQueue::new(64);
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let executor = GpuExecutor::new(high.clone(), low.clone(), engine, 8, 2, in_flight);
+
+    // One request on each queue, priority left unset so we observe the stamp.
+    let (htx, hrx) = oneshot::channel();
+    high.push_block(Request {
+        input: make_inference_request(None),
+        response_tx: htx,
+    })
+    .await;
+    let (ltx, lrx) = oneshot::channel();
+    low.push_block(Request {
+        input: make_inference_request(None),
+        response_tx: ltx,
+    })
+    .await;
+
+    tokio::spawn(executor.run());
+
+    for rx in [hrx, lrx] {
+        tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .expect("executor did not respond in time")
+            .expect("response channel dropped")
+            .expect("inference failed");
+    }
+
+    let mut recorded = seen.lock().unwrap().clone();
+    recorded.sort();
+    assert_eq!(
+        recorded,
+        vec![Some(0), Some(1)],
+        "high-queue request must be stamped priority 0 and low-queue 1, got {:?}",
+        recorded
+    );
 }
 
 #[tokio::test]
