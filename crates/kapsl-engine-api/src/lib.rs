@@ -621,6 +621,95 @@ pub struct EngineModelInfo {
 
 pub type EngineStream = Pin<Box<dyn Stream<Item = Result<BinaryTensorPacket, EngineError>> + Send>>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchingMode {
+    /// Do not intentionally coalesce requests in the outer scheduler.
+    None,
+    /// Stack compatible independent requests and execute them via `infer_batch`.
+    RequestCoalescing,
+    /// Backend owns active-sequence/token batching internally.
+    Continuous,
+    /// Backend or downstream service owns batching; the local scheduler should
+    /// avoid request-level coalescing.
+    Delegated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchingPolicy {
+    pub mode: BatchingMode,
+    pub max_requests: usize,
+    pub queue_delay_ms: Option<u64>,
+    pub max_batched_tokens: Option<usize>,
+    pub supports_priority: bool,
+}
+
+impl BatchingPolicy {
+    pub fn none() -> Self {
+        Self {
+            mode: BatchingMode::None,
+            max_requests: 1,
+            queue_delay_ms: None,
+            max_batched_tokens: None,
+            supports_priority: false,
+        }
+    }
+
+    pub fn request_coalescing(max_requests: usize) -> Self {
+        Self {
+            mode: BatchingMode::RequestCoalescing,
+            max_requests: max_requests.max(1),
+            queue_delay_ms: None,
+            max_batched_tokens: None,
+            supports_priority: false,
+        }
+    }
+
+    pub fn continuous(max_requests: usize) -> Self {
+        Self {
+            mode: BatchingMode::Continuous,
+            max_requests: max_requests.max(1),
+            queue_delay_ms: None,
+            max_batched_tokens: None,
+            supports_priority: false,
+        }
+    }
+
+    pub fn delegated() -> Self {
+        Self {
+            mode: BatchingMode::Delegated,
+            max_requests: 1,
+            queue_delay_ms: None,
+            max_batched_tokens: None,
+            supports_priority: false,
+        }
+    }
+
+    pub fn with_queue_delay_ms(mut self, queue_delay_ms: u64) -> Self {
+        self.queue_delay_ms = Some(queue_delay_ms);
+        self
+    }
+
+    pub fn with_max_batched_tokens(mut self, max_batched_tokens: usize) -> Self {
+        self.max_batched_tokens = Some(max_batched_tokens);
+        self
+    }
+
+    pub fn with_priority_support(mut self) -> Self {
+        self.supports_priority = true;
+        self
+    }
+
+    pub fn from_legacy(max_batch: usize, self_batches: bool) -> Self {
+        if self_batches {
+            Self::continuous(max_batch.max(1)).with_priority_support()
+        } else if max_batch > 1 {
+            Self::request_coalescing(max_batch)
+        } else {
+            Self::none()
+        }
+    }
+}
+
 #[async_trait]
 pub trait Engine: Send + Sync {
     /// Load model weights and prepare runtime state.
@@ -679,6 +768,15 @@ pub trait Engine: Send + Sync {
     /// [`Engine::max_batch`] at 1.
     fn self_batches(&self) -> bool {
         false
+    }
+
+    /// Explicit batching/admission contract for this backend.
+    ///
+    /// The default preserves legacy behavior by deriving the policy from
+    /// `max_batch()` and `self_batches()`. Backends and wrappers should override
+    /// this when they need to preserve richer policy details.
+    fn batching_policy(&self) -> BatchingPolicy {
+        BatchingPolicy::from_legacy(self.max_batch(), self.self_batches())
     }
 
     /// Run a streaming inference request.
@@ -789,6 +887,10 @@ impl Engine for Box<dyn Engine> {
 
     fn self_batches(&self) -> bool {
         (**self).self_batches()
+    }
+
+    fn batching_policy(&self) -> BatchingPolicy {
+        (**self).batching_policy()
     }
 
     fn infer_stream(&self, request: &InferenceRequest) -> EngineStream {
@@ -934,5 +1036,22 @@ mod tests {
         assert!(err
             .to_string()
             .contains("only one of `data` or `data_base64`"));
+    }
+
+    #[test]
+    fn batching_policy_derives_from_legacy_capabilities() {
+        assert_eq!(
+            BatchingPolicy::from_legacy(1, false),
+            BatchingPolicy::none()
+        );
+
+        let coalescing = BatchingPolicy::from_legacy(8, false);
+        assert_eq!(coalescing.mode, BatchingMode::RequestCoalescing);
+        assert_eq!(coalescing.max_requests, 8);
+
+        let continuous = BatchingPolicy::from_legacy(1, true);
+        assert_eq!(continuous.mode, BatchingMode::Continuous);
+        assert_eq!(continuous.max_requests, 1);
+        assert!(continuous.supports_priority);
     }
 }

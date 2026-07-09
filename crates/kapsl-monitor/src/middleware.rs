@@ -1,7 +1,9 @@
 use async_trait::async_trait;
 use futures::Stream;
 use kapsl_engine_api::Engine;
-use kapsl_engine_api::{BinaryTensorPacket, EngineError, EngineModelInfo, InferenceRequest};
+use kapsl_engine_api::{
+    BatchingPolicy, BinaryTensorPacket, EngineError, EngineModelInfo, InferenceRequest,
+};
 use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -168,11 +170,7 @@ impl Stream for MetricStream {
                     let ttft = this.start.elapsed().as_secs_f64();
                     this.metrics
                         .ttft_latency
-                        .with_label_values(&[
-                            this.model_id.as_str(),
-                            this.version.as_str(),
-                            "ok",
-                        ])
+                        .with_label_values(&[this.model_id.as_str(), this.version.as_str(), "ok"])
                         .observe(ttft);
                     this.metrics
                         .model_ttft_ms
@@ -187,11 +185,7 @@ impl Stream for MetricStream {
                     let ttft = this.start.elapsed().as_secs_f64();
                     this.metrics
                         .ttft_latency
-                        .with_label_values(&[
-                            this.model_id.as_str(),
-                            this.version.as_str(),
-                            "err",
-                        ])
+                        .with_label_values(&[this.model_id.as_str(), this.version.as_str(), "err"])
                         .observe(ttft);
                     this.metrics
                         .model_ttft_ms
@@ -363,6 +357,10 @@ impl<E: Engine> Engine for MonitoringMiddleware<E> {
 
     fn self_batches(&self) -> bool {
         self.inner.self_batches()
+    }
+
+    fn batching_policy(&self) -> BatchingPolicy {
+        self.inner.batching_policy()
     }
 
     fn infer_stream(

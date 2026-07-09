@@ -1,5 +1,7 @@
 use crate::request::Request;
-use kapsl_engine_api::{EngineError, EngineHandle, InferenceRequest, RequestMetadata};
+use kapsl_engine_api::{
+    BatchingMode, EngineError, EngineHandle, InferenceRequest, RequestMetadata,
+};
 use log::info;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -391,21 +393,24 @@ impl GpuExecutor {
 
     pub async fn run(self) {
         info!("GPU Executor started");
-        // Backends that advertise max_batch() > 1 (e.g. an ONNX model with a
-        // dynamic batch dim) implement a real stacked infer_batch. For those we
-        // coalesce requests from BOTH priority queues, since small models are
-        // classified latency-critical yet benefit most from batching. Backends
-        // that don't (max_batch() == 1, the default) keep the original
-        // single-dispatch / throughput-only micro-batch behavior untouched.
+        // Request-coalescing backends (e.g. an ONNX model with a dynamic batch
+        // dim) implement a real stacked infer_batch. For those we coalesce
+        // requests from BOTH priority queues, since small models are classified
+        // latency-critical yet benefit most from batching.
         //
-        // Self-batching backends (e.g. an autoregressive LLM that continuously
-        // batches active sequences at the decode step) must never be coalesced
-        // here: request-level `infer_batch` would run the whole batch to
-        // completion in one call and fight the backend's own batcher. They are
-        // always dispatched individually and left to multiplex internally.
-        let self_batches = self.engine.self_batches();
-        let batch_cap = self.engine.max_batch().min(self.max_micro_batch);
-        let batch_capable = batch_cap > 1 && !self_batches;
+        // Continuous/delegated batching backends must never be coalesced here:
+        // request-level `infer_batch` would fight the backend's own batcher and
+        // reintroduce head-of-line blocking.
+        let batching_policy = self.engine.batching_policy();
+        let request_coalescing = matches!(batching_policy.mode, BatchingMode::RequestCoalescing);
+        let continuous_batches = matches!(batching_policy.mode, BatchingMode::Continuous);
+        let delegated_batches = matches!(batching_policy.mode, BatchingMode::Delegated);
+        let batch_cap = if request_coalescing {
+            batching_policy.max_requests.min(self.max_micro_batch)
+        } else {
+            1
+        };
+        let batch_capable = request_coalescing && batch_cap > 1;
 
         loop {
             // Occupancy-driven admission (self-batching backends only): when the
@@ -415,7 +420,7 @@ impl GpuExecutor {
             // flight, so a full/stale occupancy snapshot can never stall forward
             // progress (an isolated request that alone exceeds the headroom must
             // still run).
-            if self_batches
+            if continuous_batches
                 && self.in_flight.load(Ordering::Relaxed) > 0
                 && self.backend_saturated()
             {
@@ -447,9 +452,9 @@ impl GpuExecutor {
             } else {
                 if let Some(mut req) = self.high_priority_queue.pop_nowait() {
                     let engine = self.engine.clone();
-                    // Propagate the resolved priority so a self-batching backend
-                    // can jump this request ahead in its internal queue.
-                    if self_batches {
+                    // Propagate the resolved priority only to backends whose
+                    // batching policy says their internal queue understands it.
+                    if continuous_batches && batching_policy.supports_priority {
                         Self::stamp_priority(&mut req, true);
                     }
                     Self::dispatch_single(engine, req, self.in_flight.clone());
@@ -458,11 +463,18 @@ impl GpuExecutor {
 
                 if let Some(mut req) = self.low_priority_queue.pop_nowait() {
                     let engine = self.engine.clone();
-                    // Self-batching backends multiplex internally, so hand each
-                    // request over immediately rather than holding it back to
-                    // build a serial `infer_batch` group.
-                    if self_batches || self.max_micro_batch <= 1 || self.queue_delay.is_zero() {
-                        if self_batches {
+                    // Continuous/delegated backends multiplex internally or
+                    // elsewhere, so hand each request over immediately rather
+                    // than holding it back to build a serial `infer_batch`
+                    // group. The legacy throughput-only micro-batch fallback is
+                    // kept only for explicitly non-batching backends.
+                    if continuous_batches
+                        || delegated_batches
+                        || request_coalescing
+                        || self.max_micro_batch <= 1
+                        || self.queue_delay.is_zero()
+                    {
+                        if continuous_batches && batching_policy.supports_priority {
                             Self::stamp_priority(&mut req, false);
                         }
                         Self::dispatch_single(engine, req, self.in_flight.clone());

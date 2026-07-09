@@ -1,4 +1,11 @@
 use super::*;
+use async_trait::async_trait;
+use kapsl_engine_api::{
+    BatchingMode, BatchingPolicy, Engine, EngineMetrics, EngineStream, InferenceRequest,
+};
+use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 fn approx(a: &[f32], b: &[f32]) {
     assert_eq!(a.len(), b.len(), "length mismatch: {a:?} vs {b:?}");
@@ -67,4 +74,90 @@ fn classify_rejects_non_float32() {
 fn classify_rejects_bad_rank() {
     let bad = f32_packet(vec![1, 2, 2], vec![1.0, 2.0, 3.0, 4.0]);
     assert!(classify_from_output(&bad, true).is_err());
+}
+
+struct BatchCapableInner {
+    single_calls: Arc<AtomicUsize>,
+    batch_calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Engine for BatchCapableInner {
+    async fn load(&mut self, _model_path: &Path) -> Result<(), EngineError> {
+        Ok(())
+    }
+
+    fn infer(&self, _request: &InferenceRequest) -> Result<BinaryTensorPacket, EngineError> {
+        self.single_calls.fetch_add(1, Ordering::Relaxed);
+        Ok(f32_packet(vec![1, 2], vec![0.25, 0.75]))
+    }
+
+    fn infer_batch(
+        &self,
+        requests: &[InferenceRequest],
+    ) -> Result<Vec<BinaryTensorPacket>, EngineError> {
+        self.batch_calls.fetch_add(1, Ordering::Relaxed);
+        Ok(requests
+            .iter()
+            .map(|_| f32_packet(vec![1, 2], vec![0.25, 0.75]))
+            .collect())
+    }
+
+    fn max_batch(&self) -> usize {
+        8
+    }
+
+    fn batching_policy(&self) -> BatchingPolicy {
+        BatchingPolicy::request_coalescing(8).with_queue_delay_ms(3)
+    }
+
+    fn infer_stream(&self, request: &InferenceRequest) -> EngineStream {
+        let result = self.infer(request);
+        Box::pin(futures::stream::once(async move { result }))
+    }
+
+    fn unload(&mut self) {}
+
+    fn metrics(&self) -> EngineMetrics {
+        EngineMetrics::new()
+    }
+
+    fn health_check(&self) -> Result<(), EngineError> {
+        Ok(())
+    }
+}
+
+#[test]
+fn classify_wrapper_preserves_inner_batching_policy_and_uses_infer_batch() {
+    let single_calls = Arc::new(AtomicUsize::new(0));
+    let batch_calls = Arc::new(AtomicUsize::new(0));
+    let backend = OnnxClassifyBackend::new(
+        Box::new(BatchCapableInner {
+            single_calls: single_calls.clone(),
+            batch_calls: batch_calls.clone(),
+        }),
+        false,
+    );
+
+    assert_eq!(backend.max_batch(), 8);
+    let policy = backend.batching_policy();
+    assert_eq!(policy.mode, BatchingMode::RequestCoalescing);
+    assert_eq!(policy.max_requests, 8);
+    assert_eq!(policy.queue_delay_ms, Some(3));
+
+    let request = InferenceRequest::new(BinaryTensorPacket {
+        shape: vec![1, 2],
+        dtype: TensorDtype::Float32,
+        data: vec![0; 8],
+    });
+    let outputs = backend
+        .infer_batch(&[request.clone(), request])
+        .expect("batched classification should succeed");
+
+    assert_eq!(outputs.len(), 2);
+    assert_eq!(batch_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(single_calls.load(Ordering::Relaxed), 0);
+    for output in outputs {
+        approx(&bytes_to_f32(&output.data), &[0.25, 0.75]);
+    }
 }

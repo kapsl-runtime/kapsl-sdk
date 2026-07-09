@@ -17,8 +17,8 @@
 
 use async_trait::async_trait;
 use kapsl_engine_api::{
-    BinaryTensorPacket, Engine, EngineError, EngineMetrics, EngineModelInfo, EngineStream,
-    InferenceRequest, TensorDtype,
+    BatchingPolicy, BinaryTensorPacket, Engine, EngineError, EngineMetrics, EngineModelInfo,
+    EngineStream, InferenceRequest, TensorDtype,
 };
 use std::path::Path;
 
@@ -43,6 +43,37 @@ impl Engine for OnnxEmbedBackend {
     fn infer(&self, request: &InferenceRequest) -> Result<BinaryTensorPacket, EngineError> {
         let output = self.inner.infer(request)?;
         embed_from_output(&output, request, self.normalize)
+    }
+
+    fn infer_batch(
+        &self,
+        requests: &[InferenceRequest],
+    ) -> Result<Vec<BinaryTensorPacket>, EngineError> {
+        let outputs = self.inner.infer_batch(requests)?;
+        if outputs.len() != requests.len() {
+            return Err(EngineError::backend(format!(
+                "embedding batch result length mismatch: expected {}, got {}",
+                requests.len(),
+                outputs.len()
+            )));
+        }
+        outputs
+            .into_iter()
+            .zip(requests.iter())
+            .map(|(output, request)| embed_from_output(&output, request, self.normalize))
+            .collect()
+    }
+
+    fn max_batch(&self) -> usize {
+        self.inner.max_batch()
+    }
+
+    fn self_batches(&self) -> bool {
+        self.inner.self_batches()
+    }
+
+    fn batching_policy(&self) -> BatchingPolicy {
+        self.inner.batching_policy()
     }
 
     fn infer_stream(&self, request: &InferenceRequest) -> EngineStream {
@@ -121,7 +152,13 @@ fn embed_from_output(
 
 /// Masked mean over the sequence axis. `mask` is `batch * seq` of 0/1 weights;
 /// padding tokens (weight 0) are excluded. Returns `batch * dim`.
-fn masked_mean_pool(hidden: &[f32], batch: usize, seq: usize, dim: usize, mask: &[f32]) -> Vec<f32> {
+fn masked_mean_pool(
+    hidden: &[f32],
+    batch: usize,
+    seq: usize,
+    dim: usize,
+    mask: &[f32],
+) -> Vec<f32> {
     let mut out = vec![0f32; batch * dim];
     for b in 0..batch {
         let mut denom = 0f32;
