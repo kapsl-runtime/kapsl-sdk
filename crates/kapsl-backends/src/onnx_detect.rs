@@ -27,8 +27,8 @@
 
 use async_trait::async_trait;
 use kapsl_engine_api::{
-    BinaryTensorPacket, Engine, EngineError, EngineMetrics, EngineModelInfo, EngineStream,
-    InferenceRequest, TensorDtype,
+    BatchingPolicy, BinaryTensorPacket, Engine, EngineError, EngineMetrics, EngineModelInfo,
+    EngineStream, InferenceRequest, TensorDtype,
 };
 use serde::Deserialize;
 use std::path::Path;
@@ -97,9 +97,7 @@ impl DetectConfig {
 
     fn validate(&self) -> Result<(), EngineError> {
         if self.num_classes == 0 {
-            return Err(EngineError::backend(
-                "detect: num_classes must be non-zero",
-            ));
+            return Err(EngineError::backend("detect: num_classes must be non-zero"));
         }
         Ok(())
     }
@@ -138,6 +136,36 @@ impl Engine for OnnxDetectBackend {
     fn infer(&self, request: &InferenceRequest) -> Result<BinaryTensorPacket, EngineError> {
         let output = self.inner.infer(request)?;
         detect_from_output(&output, &self.cfg)
+    }
+
+    fn infer_batch(
+        &self,
+        requests: &[InferenceRequest],
+    ) -> Result<Vec<BinaryTensorPacket>, EngineError> {
+        let outputs = self.inner.infer_batch(requests)?;
+        if outputs.len() != requests.len() {
+            return Err(EngineError::backend(format!(
+                "detector batch result length mismatch: expected {}, got {}",
+                requests.len(),
+                outputs.len()
+            )));
+        }
+        outputs
+            .into_iter()
+            .map(|output| detect_from_output(&output, &self.cfg))
+            .collect()
+    }
+
+    fn max_batch(&self) -> usize {
+        self.inner.max_batch()
+    }
+
+    fn self_batches(&self) -> bool {
+        self.inner.self_batches()
+    }
+
+    fn batching_policy(&self) -> BatchingPolicy {
+        self.inner.batching_policy()
     }
 
     fn infer_stream(&self, request: &InferenceRequest) -> EngineStream {
@@ -277,7 +305,11 @@ fn non_max_suppression(
     iou_threshold: f32,
     class_agnostic: bool,
 ) -> Vec<Candidate> {
-    candidates.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    candidates.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     let mut kept: Vec<Candidate> = Vec::new();
     'outer: for cand in candidates {

@@ -15,7 +15,8 @@ use async_stream::stream;
 use async_trait::async_trait;
 use futures::stream::{self, Stream, StreamExt};
 use kapsl_engine_api::{
-    BinaryTensorPacket, Engine, EngineError, EngineMetrics, InferenceRequest, TensorDtype,
+    BatchingPolicy, BinaryTensorPacket, Engine, EngineError, EngineMetrics, InferenceRequest,
+    TensorDtype,
 };
 use serde_json::Value;
 use std::fs;
@@ -999,6 +1000,10 @@ impl Engine for LLMBackend {
             engine_health: self.engine_health_code(),
             ..EngineMetrics::default()
         }
+    }
+
+    fn batching_policy(&self) -> BatchingPolicy {
+        BatchingPolicy::continuous(1)
     }
 
     fn health_check(&self) -> Result<(), EngineError> {
