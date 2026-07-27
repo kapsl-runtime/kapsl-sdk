@@ -15,6 +15,7 @@ use crate::sequence::{
     FinishReason, SamplingParams, Sequence, SequenceGroup, SequenceGroupOutput, SequenceStatus,
 };
 use half::f16;
+use kapsl_core::{accelerator_provider_pack_installed, AcceleratorProviderPack};
 use kapsl_engine_api::EngineError;
 use kapsl_hal::kernel::KernelBackend;
 use ndarray::{Array2, Array4, ArrayD, IxDyn};
@@ -256,18 +257,27 @@ fn llm_provider_policy() -> String {
 
 fn llm_provider_available(provider: &str) -> bool {
     match provider.trim().to_ascii_lowercase().as_str() {
-        "tensorrt" => TensorRTExecutionProvider::default()
-            .is_available()
-            .unwrap_or(false),
-        "cuda" => CUDAExecutionProvider::default()
-            .is_available()
-            .unwrap_or(false),
+        "tensorrt" => {
+            accelerator_provider_pack_installed(AcceleratorProviderPack::TensorRt)
+                && TensorRTExecutionProvider::default()
+                    .is_available()
+                    .unwrap_or(false)
+        }
+        "cuda" => {
+            accelerator_provider_pack_installed(AcceleratorProviderPack::Cuda)
+                && CUDAExecutionProvider::default()
+                    .is_available()
+                    .unwrap_or(false)
+        }
         "coreml" | "metal" => CoreMLExecutionProvider::default()
             .is_available()
             .unwrap_or(false),
-        "rocm" => ROCmExecutionProvider::default()
-            .is_available()
-            .unwrap_or(false),
+        "rocm" => {
+            accelerator_provider_pack_installed(AcceleratorProviderPack::Rocm)
+                && ROCmExecutionProvider::default()
+                    .is_available()
+                    .unwrap_or(false)
+        }
         "directml" => directml_provider_available(),
         "openvino" => OpenVINOExecutionProvider::default()
             .is_available()

@@ -1,3 +1,6 @@
+use kapsl_core::{
+    accelerator_provider_pack_installed, AcceleratorProviderPack, ALLOW_UNMANAGED_PROVIDERS_ENV,
+};
 use kapsl_hal::device::{Device, DeviceBackend, DeviceInfo};
 use ort::execution_providers::ExecutionProvider as _;
 use ort::execution_providers::{CUDAExecutionProvider, TensorRTExecutionProvider};
@@ -38,6 +41,19 @@ pub(crate) fn resolve_onnx_accelerator_provider(
     device_info: &DeviceInfo,
     device_id: i32,
 ) -> Result<ProviderAcceptance, String> {
+    let pack = match provider {
+        OnnxAcceleratorProvider::Cuda => AcceleratorProviderPack::Cuda,
+        OnnxAcceleratorProvider::TensorRt => AcceleratorProviderPack::TensorRt,
+    };
+    if !accelerator_provider_pack_installed(pack) {
+        return Err(format!(
+            "{} provider pack is not installed. Install the Kapsl {} accelerator pack, or set {}=1 for an explicitly managed system installation",
+            provider.as_str(),
+            pack.display_name(),
+            ALLOW_UNMANAGED_PROVIDERS_ENV
+        ));
+    }
+
     let device = cuda_device(device_info, device_id).ok_or_else(|| {
         format!(
             "{} requires CUDA device {}, but no matching CUDA device was detected",
