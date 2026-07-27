@@ -1,7 +1,6 @@
+use crate::priority::{stamp_engine_priority, Priority};
 use crate::request::Request;
-use kapsl_engine_api::{
-    BatchingMode, EngineError, EngineHandle, InferenceRequest, RequestMetadata,
-};
+use kapsl_engine_api::{BatchingMode, EngineError, EngineHandle, InferenceRequest};
 use log::info;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -226,12 +225,8 @@ impl GpuExecutor {
     /// scheduler's queue choice is the authoritative priority (it already folds
     /// in SLA/size promotion), so this overwrites any raw hint the caller set.
     /// Uses the engine-api convention: 0 = latency-critical, 1 = throughput.
-    fn stamp_priority(req: &mut Request, latency_critical: bool) {
-        let priority = if latency_critical { 0 } else { 1 };
-        req.input
-            .metadata
-            .get_or_insert_with(RequestMetadata::default)
-            .priority = Some(priority);
+    fn stamp_priority(req: &mut Request, priority: Priority) {
+        stamp_engine_priority(&mut req.input, priority);
     }
 
     fn dispatch_single(engine: EngineHandle, req: Request, in_flight: Arc<AtomicUsize>) {
@@ -351,6 +346,7 @@ impl GpuExecutor {
         queue: &WorkQueue,
         first: Request,
         cap: usize,
+        queue_delay: Duration,
         interrupt: Option<&WorkQueue>,
     ) -> Vec<Request> {
         let mut batch = Vec::with_capacity(cap);
@@ -367,11 +363,9 @@ impl GpuExecutor {
         // Adaptive window: only pay latency to gather stragglers when the model
         // is already under concurrent load. Skipped entirely for isolated
         // requests so single-stream latency does not regress.
-        if batch.len() < cap
-            && !self.queue_delay.is_zero()
-            && self.in_flight.load(Ordering::Relaxed) > 0
+        if batch.len() < cap && !queue_delay.is_zero() && self.in_flight.load(Ordering::Relaxed) > 0
         {
-            let deadline = Instant::now() + self.queue_delay;
+            let deadline = Instant::now() + queue_delay;
             while batch.len() < cap {
                 if interrupt.is_some_and(|q| q.len() > 0) {
                     break;
@@ -411,6 +405,10 @@ impl GpuExecutor {
             1
         };
         let batch_capable = request_coalescing && batch_cap > 1;
+        let coalescing_delay = batching_policy
+            .queue_delay_ms
+            .map(Duration::from_millis)
+            .unwrap_or(self.queue_delay);
 
         loop {
             // Occupancy-driven admission (self-batching backends only): when the
@@ -432,7 +430,13 @@ impl GpuExecutor {
                 // Latency-critical first, then throughput; coalesce either queue.
                 if let Some(req) = self.high_priority_queue.pop_nowait() {
                     let batch = self
-                        .accumulate_batch(&self.high_priority_queue, req, batch_cap, None)
+                        .accumulate_batch(
+                            &self.high_priority_queue,
+                            req,
+                            batch_cap,
+                            coalescing_delay,
+                            None,
+                        )
                         .await;
                     Self::dispatch_batch(self.engine.clone(), batch, self.in_flight.clone());
                     continue;
@@ -443,6 +447,7 @@ impl GpuExecutor {
                             &self.low_priority_queue,
                             req,
                             batch_cap,
+                            coalescing_delay,
                             Some(&self.high_priority_queue),
                         )
                         .await;
@@ -455,7 +460,7 @@ impl GpuExecutor {
                     // Propagate the resolved priority only to backends whose
                     // batching policy says their internal queue understands it.
                     if continuous_batches && batching_policy.supports_priority {
-                        Self::stamp_priority(&mut req, true);
+                        Self::stamp_priority(&mut req, Priority::LatencyCritical);
                     }
                     Self::dispatch_single(engine, req, self.in_flight.clone());
                     continue;
@@ -475,7 +480,7 @@ impl GpuExecutor {
                         || self.queue_delay.is_zero()
                     {
                         if continuous_batches && batching_policy.supports_priority {
-                            Self::stamp_priority(&mut req, false);
+                            Self::stamp_priority(&mut req, Priority::Throughput);
                         }
                         Self::dispatch_single(engine, req, self.in_flight.clone());
                         continue;
