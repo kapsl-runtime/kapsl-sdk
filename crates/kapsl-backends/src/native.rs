@@ -29,8 +29,8 @@ mod inner {
     use rand::{Rng, SeedableRng};
 
     use kapsl_engine_api::{
-        BinaryTensorPacket, EngineError, EngineMetrics, EngineModelInfo, EngineStream,
-        InferenceRequest, RequestMetadata, TensorDtype,
+        BatchingPolicy, BinaryTensorPacket, EngineError, EngineMetrics, EngineModelInfo,
+        EngineStream, InferenceRequest, RequestMetadata, TensorDtype,
     };
     use kapsl_hal::gpu_arena::{GpuBlockPool, GpuPoolHandle};
     use kapsl_kernels::cuda_kernels::{
@@ -45,6 +45,10 @@ mod inner {
 
     /// Maximum sequences decoded simultaneously in one batched forward pass.
     const MAX_BATCH: usize = 32;
+
+    pub(super) fn native_batching_policy() -> BatchingPolicy {
+        BatchingPolicy::continuous(MAX_BATCH)
+    }
 
     // ── GPU weights ──────────────────────────────────────────────────────
 
@@ -1417,6 +1421,10 @@ mod inner {
                 batch_size: MAX_BATCH,
                 ..EngineMetrics::default()
             }
+        }
+
+        fn batching_policy(&self) -> BatchingPolicy {
+            native_batching_policy()
         }
 
         fn model_info(&self) -> Option<EngineModelInfo> {
