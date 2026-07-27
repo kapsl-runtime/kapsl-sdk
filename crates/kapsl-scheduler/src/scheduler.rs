@@ -529,8 +529,10 @@ impl crate::replica_pool::ReplicaScheduler for Scheduler {
         let engine = self.engines[engine_idx].clone();
 
         let batching_policy = engine.batching_policy();
-        if matches!(batching_policy.mode, BatchingMode::Continuous)
-            && batching_policy.supports_priority
+        if matches!(
+            batching_policy.mode,
+            BatchingMode::Continuous | BatchingMode::Delegated
+        ) && batching_policy.supports_priority
         {
             stamp_engine_priority(&mut request, priority);
         }

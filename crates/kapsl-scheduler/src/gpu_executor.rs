@@ -399,6 +399,8 @@ impl GpuExecutor {
         let request_coalescing = matches!(batching_policy.mode, BatchingMode::RequestCoalescing);
         let continuous_batches = matches!(batching_policy.mode, BatchingMode::Continuous);
         let delegated_batches = matches!(batching_policy.mode, BatchingMode::Delegated);
+        let forwards_priority =
+            (continuous_batches || delegated_batches) && batching_policy.supports_priority;
         let batch_cap = if request_coalescing {
             batching_policy.max_requests.min(self.max_micro_batch)
         } else {
@@ -458,8 +460,8 @@ impl GpuExecutor {
                 if let Some(mut req) = self.high_priority_queue.pop_nowait() {
                     let engine = self.engine.clone();
                     // Propagate the resolved priority only to backends whose
-                    // batching policy says their internal queue understands it.
-                    if continuous_batches && batching_policy.supports_priority {
+                    // batching policy says their downstream queue understands it.
+                    if forwards_priority {
                         Self::stamp_priority(&mut req, Priority::LatencyCritical);
                     }
                     Self::dispatch_single(engine, req, self.in_flight.clone());
@@ -479,7 +481,7 @@ impl GpuExecutor {
                         || self.max_micro_batch <= 1
                         || self.queue_delay.is_zero()
                     {
-                        if continuous_batches && batching_policy.supports_priority {
+                        if forwards_priority {
                             Self::stamp_priority(&mut req, Priority::Throughput);
                         }
                         Self::dispatch_single(engine, req, self.in_flight.clone());

@@ -220,6 +220,23 @@ impl Engine for GatedEngine {
 /// priority before handing work to an internal batcher.
 struct PriorityRecordingEngine {
     seen: Arc<std::sync::Mutex<Vec<Option<u8>>>>,
+    policy: BatchingPolicy,
+}
+
+impl PriorityRecordingEngine {
+    fn continuous(seen: Arc<std::sync::Mutex<Vec<Option<u8>>>>) -> Self {
+        Self {
+            seen,
+            policy: BatchingPolicy::continuous(8).with_priority_support(),
+        }
+    }
+
+    fn delegated(seen: Arc<std::sync::Mutex<Vec<Option<u8>>>>) -> Self {
+        Self {
+            seen,
+            policy: BatchingPolicy::delegated().with_priority_support(),
+        }
+    }
 }
 
 #[async_trait]
@@ -234,8 +251,19 @@ impl Engine for PriorityRecordingEngine {
         Ok(request.input.clone())
     }
 
+    fn infer_batch(
+        &self,
+        _requests: &[InferenceRequest],
+    ) -> Result<Vec<BinaryTensorPacket>, EngineError> {
+        panic!("priority-aware self/delegated backend must not be request-coalesced")
+    }
+
     fn self_batches(&self) -> bool {
         true
+    }
+
+    fn batching_policy(&self) -> BatchingPolicy {
+        self.policy
     }
 
     fn infer_stream(&self, request: &InferenceRequest) -> EngineStream {
@@ -670,7 +698,7 @@ async fn test_gpu_executor_stamps_queue_priority_for_self_batching_backend() {
     use std::time::Duration;
 
     let seen = Arc::new(std::sync::Mutex::new(Vec::<Option<u8>>::new()));
-    let engine: EngineHandle = Arc::new(PriorityRecordingEngine { seen: seen.clone() });
+    let engine: EngineHandle = Arc::new(PriorityRecordingEngine::continuous(seen.clone()));
 
     let high = WorkQueue::new(64);
     let low = WorkQueue::new(64);
@@ -712,9 +740,61 @@ async fn test_gpu_executor_stamps_queue_priority_for_self_batching_backend() {
 }
 
 #[tokio::test]
+async fn test_gpu_executor_forwards_priority_without_coalescing_delegated_backend() {
+    use crate::gpu_executor::{GpuExecutor, WorkQueue};
+    use std::time::Duration;
+
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<Option<u8>>::new()));
+    let engine: EngineHandle = Arc::new(PriorityRecordingEngine::delegated(seen.clone()));
+
+    let high = WorkQueue::new(64);
+    let low = WorkQueue::new(64);
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let executor = GpuExecutor::new(high.clone(), low.clone(), engine, 8, 2, in_flight);
+
+    let mut receivers = Vec::new();
+    let (high_tx, high_rx) = oneshot::channel();
+    high.push_block(Request {
+        input: make_inference_request(None),
+        response_tx: high_tx,
+    })
+    .await;
+    receivers.push(high_rx);
+
+    for _ in 0..4 {
+        let (response_tx, response_rx) = oneshot::channel();
+        low.push_block(Request {
+            input: make_inference_request(None),
+            response_tx,
+        })
+        .await;
+        receivers.push(response_rx);
+    }
+
+    tokio::spawn(executor.run());
+
+    for rx in receivers {
+        tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .expect("executor did not respond in time")
+            .expect("response channel dropped")
+            .expect("inference failed");
+    }
+
+    let mut recorded = seen.lock().unwrap().clone();
+    recorded.sort();
+    assert_eq!(
+        recorded,
+        vec![Some(0), Some(1), Some(1), Some(1), Some(1)],
+        "delegated requests must be dispatched singly with parent queue priority, got {:?}",
+        recorded
+    );
+}
+
+#[tokio::test]
 async fn test_scheduler_stream_stamps_priority_for_self_batching_backend() {
     let seen = Arc::new(std::sync::Mutex::new(Vec::<Option<u8>>::new()));
-    let engine: EngineHandle = Arc::new(PriorityRecordingEngine { seen: seen.clone() });
+    let engine: EngineHandle = Arc::new(PriorityRecordingEngine::continuous(seen.clone()));
     let scheduler = build_scheduler_for_queue_tests(vec![engine], 8, 0);
 
     let latency_stream = ReplicaScheduler::infer_stream(
@@ -744,6 +824,43 @@ async fn test_scheduler_stream_stamps_priority_for_self_batching_backend() {
         recorded,
         vec![Some(0), Some(1)],
         "streaming requests must be stamped with the resolved scheduler priority, got {:?}",
+        recorded
+    );
+}
+
+#[tokio::test]
+async fn test_scheduler_stream_stamps_priority_for_delegated_backend() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<Option<u8>>::new()));
+    let engine: EngineHandle = Arc::new(PriorityRecordingEngine::delegated(seen.clone()));
+    let scheduler = build_scheduler_for_queue_tests(vec![engine], 8, 0);
+
+    let latency_stream = ReplicaScheduler::infer_stream(
+        &scheduler,
+        make_inference_request(None),
+        Priority::LatencyCritical,
+        false,
+    )
+    .await
+    .expect("latency stream should be admitted");
+
+    let throughput_stream = ReplicaScheduler::infer_stream(
+        &scheduler,
+        make_inference_request(None),
+        Priority::Throughput,
+        false,
+    )
+    .await
+    .expect("throughput stream should be admitted");
+
+    drop(latency_stream);
+    drop(throughput_stream);
+
+    let mut recorded = seen.lock().unwrap().clone();
+    recorded.sort();
+    assert_eq!(
+        recorded,
+        vec![Some(0), Some(1)],
+        "delegated streams must carry the resolved scheduler priority, got {:?}",
         recorded
     );
 }

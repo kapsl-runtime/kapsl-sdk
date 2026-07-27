@@ -504,7 +504,9 @@ pub struct RequestMetadata {
     pub force_cpu: Option<bool>,
     #[serde(default)]
     pub model_version: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    // Keep this field present for sequence-based formats such as bincode.
+    // Omitting it shifts every following field and breaks request decoding.
+    #[serde(default)]
     pub auth_token: Option<String>,
 
     // === Optional LLM overrides ===
@@ -1053,5 +1055,27 @@ mod tests {
         assert_eq!(continuous.mode, BatchingMode::Continuous);
         assert_eq!(continuous.max_requests, 1);
         assert!(continuous.supports_priority);
+    }
+
+    #[test]
+    fn inference_request_bincode_preserves_metadata_without_auth_token() {
+        let mut metadata = RequestMetadata::default();
+        metadata.priority = Some(0);
+        metadata.max_new_tokens = Some(32);
+        let request = InferenceRequest::new(BinaryTensorPacket {
+            shape: vec![1],
+            dtype: TensorDtype::Float32,
+            data: 1.0f32.to_ne_bytes().to_vec(),
+        })
+        .with_metadata(metadata);
+
+        let encoded = bincode::serialize(&request).expect("request should serialize");
+        let decoded: InferenceRequest =
+            bincode::deserialize(&encoded).expect("request should deserialize");
+        let decoded_metadata = decoded.metadata.expect("metadata should round-trip");
+
+        assert_eq!(decoded_metadata.priority, Some(0));
+        assert_eq!(decoded_metadata.max_new_tokens, Some(32));
+        assert_eq!(decoded_metadata.auth_token, None);
     }
 }
