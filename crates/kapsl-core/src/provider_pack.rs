@@ -1,3 +1,4 @@
+use serde::Deserialize;
 use std::env;
 use std::path::{Path, PathBuf};
 
@@ -9,6 +10,12 @@ pub enum AcceleratorProviderPack {
     Cuda,
     TensorRt,
     Rocm,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProviderPackManifest {
+    provider: String,
+    files: Vec<String>,
 }
 
 impl AcceleratorProviderPack {
@@ -115,7 +122,34 @@ fn directory_has_provider_manifest(directory: &Path, provider: AcceleratorProvid
             return false;
         }
         let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
-        name.starts_with(provider.manifest_prefix()) && name.ends_with(".json")
+        name.starts_with(provider.manifest_prefix())
+            && name.ends_with(".json")
+            && provider_manifest_is_complete(&path, directory, provider)
+    })
+}
+
+fn provider_manifest_is_complete(
+    manifest_path: &Path,
+    directory: &Path,
+    provider: AcceleratorProviderPack,
+) -> bool {
+    let Ok(bytes) = std::fs::read(manifest_path) else {
+        return false;
+    };
+    let Ok(manifest) = serde_json::from_slice::<ProviderPackManifest>(&bytes) else {
+        return false;
+    };
+    if !manifest
+        .provider
+        .eq_ignore_ascii_case(provider.directory_prefix())
+        || manifest.files.is_empty()
+    {
+        return false;
+    }
+
+    manifest.files.iter().all(|name| {
+        let relative = Path::new(name);
+        relative.components().count() == 1 && directory.join(relative).is_file()
     })
 }
 
@@ -147,9 +181,14 @@ mod tests {
 
         std::fs::write(
             temp.path().join("kapsl-provider-cuda12.json"),
-            br#"{"provider":"cuda"}"#,
+            br#"{"provider":"cuda","files":["onnxruntime_providers_cuda.dll"]}"#,
         )
         .expect("write CUDA marker");
+        std::fs::write(
+            temp.path().join("onnxruntime_providers_cuda.dll"),
+            b"provider",
+        )
+        .expect("write CUDA provider");
 
         assert!(accelerator_provider_pack_installed_in(
             AcceleratorProviderPack::Cuda,
@@ -164,9 +203,14 @@ mod tests {
         std::fs::create_dir(&cuda_dir).expect("create CUDA provider directory");
         std::fs::write(
             cuda_dir.join("kapsl-provider-cuda12.json"),
-            br#"{"provider":"cuda"}"#,
+            br#"{"provider":"cuda","files":["libonnxruntime_providers_cuda.so"]}"#,
         )
         .expect("write CUDA marker");
+        std::fs::write(
+            cuda_dir.join("libonnxruntime_providers_cuda.so"),
+            b"provider",
+        )
+        .expect("write CUDA provider");
 
         assert!(accelerator_provider_pack_installed_in(
             AcceleratorProviderPack::Cuda,
@@ -180,9 +224,14 @@ mod tests {
         let roots = vec![temp.path().to_path_buf()];
         std::fs::write(
             temp.path().join("kapsl-provider-tensorrt10.json"),
-            br#"{"provider":"tensorrt"}"#,
+            br#"{"provider":"tensorrt","files":["onnxruntime_providers_tensorrt.dll"]}"#,
         )
         .expect("write TensorRT marker");
+        std::fs::write(
+            temp.path().join("onnxruntime_providers_tensorrt.dll"),
+            b"provider",
+        )
+        .expect("write TensorRT provider");
 
         assert!(!accelerator_provider_pack_installed_in(
             AcceleratorProviderPack::TensorRt,
@@ -191,12 +240,40 @@ mod tests {
 
         std::fs::write(
             temp.path().join("kapsl-provider-cuda12.json"),
-            br#"{"provider":"cuda"}"#,
+            br#"{"provider":"cuda","files":["onnxruntime_providers_cuda.dll"]}"#,
         )
         .expect("write CUDA marker");
+        std::fs::write(
+            temp.path().join("onnxruntime_providers_cuda.dll"),
+            b"provider",
+        )
+        .expect("write CUDA provider");
 
         assert!(accelerator_provider_pack_installed_in(
             AcceleratorProviderPack::TensorRt,
+            &roots
+        ));
+    }
+
+    #[test]
+    fn incomplete_or_invalid_manifests_are_rejected() {
+        let temp = tempfile::tempdir().expect("temp provider root");
+        let marker = temp.path().join("kapsl-provider-cuda12.json");
+        let roots = vec![temp.path().to_path_buf()];
+
+        std::fs::write(&marker, b"not-json").expect("write invalid marker");
+        assert!(!accelerator_provider_pack_installed_in(
+            AcceleratorProviderPack::Cuda,
+            &roots
+        ));
+
+        std::fs::write(
+            &marker,
+            br#"{"provider":"cuda","files":["missing-provider.dll"]}"#,
+        )
+        .expect("write incomplete marker");
+        assert!(!accelerator_provider_pack_installed_in(
+            AcceleratorProviderPack::Cuda,
             &roots
         ));
     }
