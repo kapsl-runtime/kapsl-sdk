@@ -495,14 +495,21 @@ mod inner {
         ) -> Result<(), EngineError> {
             unsafe {
                 blas.gemm(
-                    cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_T,
-                    cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
-                    out_dim, batch, in_dim,
-                    &f16::from_f32(1.0),
-                    weight, lda,
-                    input,  ldb,
-                    &f16::from_f32(0.0),
-                    out,    ldc,
+                    cudarc::cublas::GemmConfig {
+                        transa: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_T,
+                        transb: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
+                        m: out_dim,
+                        n: batch,
+                        k: in_dim,
+                        alpha: f16::from_f32(1.0),
+                        lda,
+                        ldb,
+                        beta: f16::from_f32(0.0),
+                        ldc,
+                    },
+                    weight,
+                    input,
+                    out,
                 )
                 .map_err(|e| EngineError::backend(format!("{label} gemm: {e}")))
             }
@@ -835,7 +842,7 @@ mod inner {
 
             // Final norm + LM head.
             launch_rms_norm(&self.device, &mut RmsNormParams {
-                out: &mut self.batch.norm, input: &self.batch.hidden,
+                out: &mut self.batch.norm, input: self.batch.hidden.slice(..),
                 weight: &self.weights.norm,
                 rows: b as u32, dim: h as u32, eps,
             }).map_err(e)?;
