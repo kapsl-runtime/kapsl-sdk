@@ -4,8 +4,8 @@ use crate::request::Request;
 use crate::scheduler::QueueOverflowPolicy;
 use async_trait::async_trait;
 use kapsl_engine_api::{
-    BinaryTensorPacket, Engine, EngineError, EngineMetrics, EngineStream, InferenceRequest,
-    TensorDtype,
+    BatchingPolicy, BinaryTensorPacket, Engine, EngineError, EngineMetrics, EngineStream,
+    InferenceRequest, TensorDtype,
 };
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
@@ -53,6 +53,7 @@ struct BatchRecordingEngine {
     calls: Arc<std::sync::Mutex<Vec<usize>>>,
     max_batch: usize,
     self_batches: bool,
+    policy_queue_delay_ms: Option<u64>,
 }
 
 impl BatchRecordingEngine {
@@ -61,6 +62,20 @@ impl BatchRecordingEngine {
             calls,
             max_batch,
             self_batches: false,
+            policy_queue_delay_ms: None,
+        }
+    }
+
+    fn new_with_policy_delay(
+        calls: Arc<std::sync::Mutex<Vec<usize>>>,
+        max_batch: usize,
+        queue_delay_ms: u64,
+    ) -> Self {
+        Self {
+            calls,
+            max_batch,
+            self_batches: false,
+            policy_queue_delay_ms: Some(queue_delay_ms),
         }
     }
 
@@ -71,6 +86,7 @@ impl BatchRecordingEngine {
             calls,
             max_batch,
             self_batches: true,
+            policy_queue_delay_ms: None,
         }
     }
 }
@@ -100,6 +116,14 @@ impl Engine for BatchRecordingEngine {
 
     fn self_batches(&self) -> bool {
         self.self_batches
+    }
+
+    fn batching_policy(&self) -> BatchingPolicy {
+        let policy = BatchingPolicy::from_legacy(self.max_batch, self.self_batches);
+        match self.policy_queue_delay_ms {
+            Some(queue_delay_ms) => policy.with_queue_delay_ms(queue_delay_ms),
+            None => policy,
+        }
     }
 
     fn infer_stream(&self, request: &InferenceRequest) -> EngineStream {
@@ -191,10 +215,28 @@ impl Engine for GatedEngine {
     }
 }
 
-/// Self-batching engine that records the `metadata.priority` seen on each infer
-/// call, so tests can assert the executor stamped the resolved queue priority.
+/// Self-batching engine that records the `metadata.priority` seen on infer and
+/// stream calls, so tests can assert schedulers stamp the resolved queue
+/// priority before handing work to an internal batcher.
 struct PriorityRecordingEngine {
     seen: Arc<std::sync::Mutex<Vec<Option<u8>>>>,
+    policy: BatchingPolicy,
+}
+
+impl PriorityRecordingEngine {
+    fn continuous(seen: Arc<std::sync::Mutex<Vec<Option<u8>>>>) -> Self {
+        Self {
+            seen,
+            policy: BatchingPolicy::continuous(8).with_priority_support(),
+        }
+    }
+
+    fn delegated(seen: Arc<std::sync::Mutex<Vec<Option<u8>>>>) -> Self {
+        Self {
+            seen,
+            policy: BatchingPolicy::delegated().with_priority_support(),
+        }
+    }
 }
 
 #[async_trait]
@@ -209,13 +251,55 @@ impl Engine for PriorityRecordingEngine {
         Ok(request.input.clone())
     }
 
+    fn infer_batch(
+        &self,
+        _requests: &[InferenceRequest],
+    ) -> Result<Vec<BinaryTensorPacket>, EngineError> {
+        panic!("priority-aware self/delegated backend must not be request-coalesced")
+    }
+
     fn self_batches(&self) -> bool {
         true
     }
 
+    fn batching_policy(&self) -> BatchingPolicy {
+        self.policy
+    }
+
     fn infer_stream(&self, request: &InferenceRequest) -> EngineStream {
+        let priority = request.metadata.as_ref().and_then(|m| m.priority);
+        self.seen.lock().unwrap().push(priority);
         let output = Ok(request.input.clone());
         Box::pin(futures::stream::once(async move { output }))
+    }
+
+    fn unload(&mut self) {}
+
+    fn metrics(&self) -> EngineMetrics {
+        EngineMetrics::default()
+    }
+
+    fn health_check(&self) -> Result<(), EngineError> {
+        Ok(())
+    }
+}
+
+struct PendingStreamEngine;
+
+#[async_trait]
+impl Engine for PendingStreamEngine {
+    async fn load(&mut self, _model_path: &std::path::Path) -> Result<(), EngineError> {
+        Ok(())
+    }
+
+    fn infer(&self, request: &InferenceRequest) -> Result<BinaryTensorPacket, EngineError> {
+        Ok(request.input.clone())
+    }
+
+    fn infer_stream(&self, _request: &InferenceRequest) -> EngineStream {
+        Box::pin(futures::stream::pending::<
+            Result<BinaryTensorPacket, EngineError>,
+        >())
     }
 
     fn unload(&mut self) {}
@@ -273,6 +357,8 @@ fn build_scheduler_for_queue_tests(
         _enable_fallback: false,
         cpu_active_count: Arc::new(AtomicUsize::new(cpu_active)),
         gpu_in_flight_count: Arc::new(AtomicUsize::new(0)),
+        gpu_stream_in_flight_count: Arc::new(AtomicUsize::new(0)),
+        gpu_stream_slots: Arc::new(tokio::sync::Semaphore::new(queue_size.max(1))),
         device_mesh: None,
         router: MeshRouter::new(None, 1),
         max_micro_batch: 1,
@@ -431,6 +517,58 @@ async fn test_gpu_executor_coalesces_capable_backend() {
 }
 
 #[tokio::test]
+async fn test_gpu_executor_uses_policy_queue_delay_for_request_coalescing_backend() {
+    use crate::gpu_executor::{GpuExecutor, WorkQueue};
+    use std::time::Duration;
+
+    let calls = Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+    let engine: EngineHandle = Arc::new(BatchRecordingEngine::new_with_policy_delay(
+        calls.clone(),
+        8,
+        60,
+    ));
+
+    let high = WorkQueue::new(64);
+    let low = WorkQueue::new(64);
+    // Simulate concurrent load so the adaptive coalescing window is allowed to
+    // wait for a near-term straggler.
+    let in_flight = Arc::new(AtomicUsize::new(1));
+    let executor = GpuExecutor::new(high.clone(), low.clone(), engine, 8, 0, in_flight);
+
+    let (tx1, rx1) = oneshot::channel();
+    high.push_block(Request {
+        input: make_inference_request(None),
+        response_tx: tx1,
+    })
+    .await;
+
+    tokio::spawn(executor.run());
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let (tx2, rx2) = oneshot::channel();
+    high.push_block(Request {
+        input: make_inference_request(None),
+        response_tx: tx2,
+    })
+    .await;
+
+    for rx in [rx1, rx2] {
+        tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .expect("executor did not respond in time")
+            .expect("response channel dropped")
+            .expect("inference failed");
+    }
+
+    let recorded = calls.lock().unwrap().clone();
+    assert!(
+        recorded.iter().any(|&n| n == 2),
+        "policy queue_delay_ms should allow the executor to coalesce the straggler, got {:?}",
+        recorded
+    );
+}
+
+#[tokio::test]
 async fn test_gpu_executor_never_coalesces_self_batching_backend() {
     use crate::gpu_executor::{GpuExecutor, WorkQueue};
     use std::time::Duration;
@@ -560,7 +698,7 @@ async fn test_gpu_executor_stamps_queue_priority_for_self_batching_backend() {
     use std::time::Duration;
 
     let seen = Arc::new(std::sync::Mutex::new(Vec::<Option<u8>>::new()));
-    let engine: EngineHandle = Arc::new(PriorityRecordingEngine { seen: seen.clone() });
+    let engine: EngineHandle = Arc::new(PriorityRecordingEngine::continuous(seen.clone()));
 
     let high = WorkQueue::new(64);
     let low = WorkQueue::new(64);
@@ -599,6 +737,176 @@ async fn test_gpu_executor_stamps_queue_priority_for_self_batching_backend() {
         "high-queue request must be stamped priority 0 and low-queue 1, got {:?}",
         recorded
     );
+}
+
+#[tokio::test]
+async fn test_gpu_executor_forwards_priority_without_coalescing_delegated_backend() {
+    use crate::gpu_executor::{GpuExecutor, WorkQueue};
+    use std::time::Duration;
+
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<Option<u8>>::new()));
+    let engine: EngineHandle = Arc::new(PriorityRecordingEngine::delegated(seen.clone()));
+
+    let high = WorkQueue::new(64);
+    let low = WorkQueue::new(64);
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let executor = GpuExecutor::new(high.clone(), low.clone(), engine, 8, 2, in_flight);
+
+    let mut receivers = Vec::new();
+    let (high_tx, high_rx) = oneshot::channel();
+    high.push_block(Request {
+        input: make_inference_request(None),
+        response_tx: high_tx,
+    })
+    .await;
+    receivers.push(high_rx);
+
+    for _ in 0..4 {
+        let (response_tx, response_rx) = oneshot::channel();
+        low.push_block(Request {
+            input: make_inference_request(None),
+            response_tx,
+        })
+        .await;
+        receivers.push(response_rx);
+    }
+
+    tokio::spawn(executor.run());
+
+    for rx in receivers {
+        tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .expect("executor did not respond in time")
+            .expect("response channel dropped")
+            .expect("inference failed");
+    }
+
+    let mut recorded = seen.lock().unwrap().clone();
+    recorded.sort();
+    assert_eq!(
+        recorded,
+        vec![Some(0), Some(1), Some(1), Some(1), Some(1)],
+        "delegated requests must be dispatched singly with parent queue priority, got {:?}",
+        recorded
+    );
+}
+
+#[tokio::test]
+async fn test_scheduler_stream_stamps_priority_for_self_batching_backend() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<Option<u8>>::new()));
+    let engine: EngineHandle = Arc::new(PriorityRecordingEngine::continuous(seen.clone()));
+    let scheduler = build_scheduler_for_queue_tests(vec![engine], 8, 0);
+
+    let latency_stream = ReplicaScheduler::infer_stream(
+        &scheduler,
+        make_inference_request(None),
+        Priority::LatencyCritical,
+        false,
+    )
+    .await
+    .expect("latency stream should be admitted");
+
+    let throughput_stream = ReplicaScheduler::infer_stream(
+        &scheduler,
+        make_inference_request(None),
+        Priority::Throughput,
+        false,
+    )
+    .await
+    .expect("throughput stream should be admitted");
+
+    drop(latency_stream);
+    drop(throughput_stream);
+
+    let mut recorded = seen.lock().unwrap().clone();
+    recorded.sort();
+    assert_eq!(
+        recorded,
+        vec![Some(0), Some(1)],
+        "streaming requests must be stamped with the resolved scheduler priority, got {:?}",
+        recorded
+    );
+}
+
+#[tokio::test]
+async fn test_scheduler_stream_stamps_priority_for_delegated_backend() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<Option<u8>>::new()));
+    let engine: EngineHandle = Arc::new(PriorityRecordingEngine::delegated(seen.clone()));
+    let scheduler = build_scheduler_for_queue_tests(vec![engine], 8, 0);
+
+    let latency_stream = ReplicaScheduler::infer_stream(
+        &scheduler,
+        make_inference_request(None),
+        Priority::LatencyCritical,
+        false,
+    )
+    .await
+    .expect("latency stream should be admitted");
+
+    let throughput_stream = ReplicaScheduler::infer_stream(
+        &scheduler,
+        make_inference_request(None),
+        Priority::Throughput,
+        false,
+    )
+    .await
+    .expect("throughput stream should be admitted");
+
+    drop(latency_stream);
+    drop(throughput_stream);
+
+    let mut recorded = seen.lock().unwrap().clone();
+    recorded.sort();
+    assert_eq!(
+        recorded,
+        vec![Some(0), Some(1)],
+        "delegated streams must carry the resolved scheduler priority, got {:?}",
+        recorded
+    );
+}
+
+#[tokio::test]
+async fn test_scheduler_stream_admission_tracks_depth_and_releases_on_drop() {
+    let engine: EngineHandle = Arc::new(PendingStreamEngine);
+    let scheduler = build_scheduler_for_queue_tests(vec![engine], 1, 0)
+        .with_queue_overflow_policy(QueueOverflowPolicy::DropNewest);
+
+    let stream = ReplicaScheduler::infer_stream(
+        &scheduler,
+        make_inference_request(None),
+        Priority::Throughput,
+        false,
+    )
+    .await
+    .expect("first stream should be admitted");
+
+    assert_eq!(scheduler.get_queue_depth(), (0, 1));
+
+    let second = ReplicaScheduler::infer_stream(
+        &scheduler,
+        make_inference_request(None),
+        Priority::Throughput,
+        false,
+    )
+    .await;
+    let err = match second {
+        Ok(_) => panic!("second stream should be rejected while the only slot is held"),
+        Err(err) => err,
+    };
+    assert!(err.is_overloaded());
+
+    drop(stream);
+    assert_eq!(scheduler.get_queue_depth(), (0, 0));
+
+    let stream = ReplicaScheduler::infer_stream(
+        &scheduler,
+        make_inference_request(None),
+        Priority::Throughput,
+        false,
+    )
+    .await
+    .expect("released stream slot should admit the next stream");
+    drop(stream);
 }
 
 #[tokio::test]

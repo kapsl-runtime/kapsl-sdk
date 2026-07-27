@@ -29,8 +29,8 @@ mod vision_tests;
 
 use async_trait::async_trait;
 use kapsl_engine_api::{
-    BinaryTensorPacket, CancellationToken, Engine, EngineError, EngineMetrics, EngineModelInfo,
-    EngineStream, InferenceRequest,
+    BatchingPolicy, BinaryTensorPacket, CancellationToken, Engine, EngineError, EngineMetrics,
+    EngineModelInfo, EngineStream, InferenceRequest,
 };
 use std::path::Path;
 
@@ -134,7 +134,8 @@ impl Engine for PreprocessBackend {
             });
         }
         let transformed = self.transform(request)?;
-        self.inner.infer_with_cancellation(&transformed, cancellation)
+        self.inner
+            .infer_with_cancellation(&transformed, cancellation)
     }
 
     fn max_batch(&self) -> usize {
@@ -143,6 +144,10 @@ impl Engine for PreprocessBackend {
 
     fn self_batches(&self) -> bool {
         self.inner.self_batches()
+    }
+
+    fn batching_policy(&self) -> BatchingPolicy {
+        self.inner.batching_policy()
     }
 
     async fn warmup(&self) -> Result<(), EngineError> {

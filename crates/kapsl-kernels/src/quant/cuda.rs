@@ -189,7 +189,17 @@ extern "C" __global__ void q4_k_gemv(
             shared_mem_bytes: 0,
         };
         unsafe {
-            f.clone().launch(cfg, (p.out, p.w, p.x, p.m as i32, p.k as i32, p.b as i32))
+            f.clone().launch(
+                cfg,
+                (
+                    &mut *p.out,
+                    p.w,
+                    p.x,
+                    p.m as i32,
+                    p.k as i32,
+                    p.b as i32,
+                ),
+            )
                 .map_err(|e| format!("q8_0_gemv launch: {e}"))
         }
     }
@@ -206,7 +216,17 @@ extern "C" __global__ void q4_k_gemv(
             shared_mem_bytes: 0,
         };
         unsafe {
-            f.clone().launch(cfg, (p.out, p.w, p.x, p.m as i32, p.k as i32, p.b as i32))
+            f.clone().launch(
+                cfg,
+                (
+                    &mut *p.out,
+                    p.w,
+                    p.x,
+                    p.m as i32,
+                    p.k as i32,
+                    p.b as i32,
+                ),
+            )
                 .map_err(|e| format!("q4_k_gemv launch: {e}"))
         }
     }
