@@ -1,6 +1,8 @@
 //! Unit tests for the audio log-mel preprocessing stage.
 
-use super::audio::{AudioConfig, AudioLayout, AudioPreprocessor, LogKind, MelScale};
+use super::audio::{
+    AudioConfig, AudioLayout, AudioPreprocessor, FeatureNormalization, LogKind, MelScale,
+};
 use super::Preprocessor;
 use kapsl_engine_api::{BinaryTensorPacket, TensorDtype};
 
@@ -152,4 +154,130 @@ fn log10_compression_applied_to_silence() {
     let pre = AudioPreprocessor::new(cfg).unwrap();
     let out = pre.apply(&f32_packet(&vec![0.0; 16])).unwrap();
     assert!(out_f32(&out).iter().all(|&v| (v + 10.0).abs() < 1e-3));
+}
+
+#[test]
+fn per_feature_normalization_matches_nemo_formula() {
+    let samples: Vec<f32> = (0..512)
+        .map(|i| {
+            let x = i as f32;
+            (0.071 * x).sin() + 0.35 * (0.0009 * x * x).cos()
+        })
+        .collect();
+    let base = AudioConfig {
+        n_fft: 64,
+        hop_length: 16,
+        n_mels: 8,
+        center: false,
+        ..Default::default()
+    };
+
+    let raw = AudioPreprocessor::new(base.clone())
+        .unwrap()
+        .apply(&f32_packet(&samples))
+        .unwrap();
+    let normalized = AudioPreprocessor::new(AudioConfig {
+        normalize: FeatureNormalization::PerFeature,
+        ..base
+    })
+    .unwrap()
+    .apply(&f32_packet(&samples))
+    .unwrap();
+
+    assert_eq!(normalized.shape, raw.shape);
+    let n_frames = raw.shape[2] as usize;
+    let raw_values = out_f32(&raw);
+    let normalized_values = out_f32(&normalized);
+    for mel in 0..8 {
+        let row = &raw_values[mel * n_frames..(mel + 1) * n_frames];
+        let mean = row.iter().copied().sum::<f32>() / n_frames as f32;
+        let sample_variance = row
+            .iter()
+            .map(|&value| {
+                let centered = value - mean;
+                centered * centered
+            })
+            .sum::<f32>()
+            / (n_frames - 1) as f32;
+        let denominator = sample_variance.sqrt() + 1e-5;
+
+        for frame in 0..n_frames {
+            let expected = (row[frame] - mean) / denominator;
+            let actual = normalized_values[mel * n_frames + frame];
+            assert!(
+                (actual - expected).abs() < 1e-5,
+                "mel {mel}, frame {frame}: expected {expected}, got {actual}"
+            );
+        }
+    }
+}
+
+#[test]
+fn per_feature_normalization_handles_one_frame() {
+    let cfg = AudioConfig {
+        n_fft: 16,
+        hop_length: 8,
+        n_mels: 4,
+        center: false,
+        normalize: FeatureNormalization::PerFeature,
+        ..Default::default()
+    };
+    let pre = AudioPreprocessor::new(cfg).unwrap();
+    let out = pre.apply(&f32_packet(&sine(440.0, 16000, 16))).unwrap();
+
+    assert_eq!(out.shape, vec![1, 4, 1]);
+    assert!(out_f32(&out).iter().all(|&value| value == 0.0));
+}
+
+#[test]
+fn derives_feature_length_from_emitted_time_axis() {
+    let cfg = AudioConfig {
+        layout: AudioLayout::TimeMel,
+        length_input: Some("length".to_string()),
+        ..small_cfg()
+    };
+    let pre = AudioPreprocessor::new(cfg).unwrap();
+    let output = pre.apply(&f32_packet(&vec![0.0; 16])).unwrap();
+    let derived = pre.derived_inputs(&output).unwrap();
+
+    assert_eq!(output.shape, vec![1, 3, 4]);
+    assert_eq!(derived.len(), 1);
+    assert_eq!(derived[0].name, "length");
+    assert_eq!(derived[0].tensor.shape, vec![1]);
+    assert_eq!(derived[0].tensor.dtype, TensorDtype::Int64);
+    assert_eq!(
+        i64::from_le_bytes(derived[0].tensor.data.as_slice().try_into().unwrap()),
+        3
+    );
+}
+
+#[test]
+fn audio_config_accepts_nemo_normalize_type_alias() {
+    let cfg: AudioConfig = serde_yaml::from_str(
+        "normalize_type: per_feature\nlength_input: length\nlength_dtype: int32\n",
+    )
+    .unwrap();
+
+    assert_eq!(cfg.normalize, FeatureNormalization::PerFeature);
+    assert_eq!(cfg.length_input.as_deref(), Some("length"));
+    assert_eq!(cfg.length_dtype, TensorDtype::Int32);
+}
+
+#[test]
+fn invalid_normalization_and_length_settings_are_rejected() {
+    assert!(AudioPreprocessor::new(AudioConfig {
+        normalize_eps: 0.0,
+        ..Default::default()
+    })
+    .is_err());
+    assert!(AudioPreprocessor::new(AudioConfig {
+        length_input: Some(" ".to_string()),
+        ..Default::default()
+    })
+    .is_err());
+    assert!(AudioPreprocessor::new(AudioConfig {
+        length_dtype: TensorDtype::Float32,
+        ..Default::default()
+    })
+    .is_err());
 }
