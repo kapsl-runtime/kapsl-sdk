@@ -299,4 +299,56 @@ mod tests {
         let active_models = registry.list_by_status(ModelStatus::Active);
         assert_eq!(active_models.len(), 2);
     }
+
+    fn bare_model() -> ModelInfo {
+        ModelInfo::new(
+            7,
+            "resnet".to_string(),
+            "1.0.0".to_string(),
+            "onnx".to_string(),
+            "CPU".to_string(),
+            "all".to_string(),
+            "/path/to/model.onnx".to_string(),
+        )
+    }
+
+    #[test]
+    fn model_axes_carry_the_input_contract() {
+        let model = bare_model().with_model_axes(
+            Some("onnx".to_string()),
+            Some("opaque".to_string()),
+            Some("forward".to_string()),
+            Some("vision".to_string()),
+        );
+
+        // `framework` alone says "onnx" for an image classifier and an ASR
+        // model alike; `preprocess` is what tells them apart.
+        assert_eq!(model.framework, "onnx");
+        assert_eq!(model.preprocess.as_deref(), Some("vision"));
+        assert_eq!(model.model_type.as_deref(), Some("opaque"));
+        assert_eq!(model.task.as_deref(), Some("forward"));
+    }
+
+    // A model registered without a manifest must not invent axes, and the
+    // absent ones must stay off the wire so existing clients see the same JSON.
+    #[test]
+    fn absent_axes_are_omitted_from_json() {
+        let json = serde_json::to_value(bare_model()).expect("serialize");
+
+        assert!(json.get("format").is_none());
+        assert!(json.get("model_type").is_none());
+        assert!(json.get("task").is_none());
+        assert!(json.get("preprocess").is_none());
+        assert_eq!(json["framework"], "onnx");
+    }
+
+    // Older payloads predate the axes entirely; they must still deserialize.
+    #[test]
+    fn json_without_axes_still_deserializes() {
+        let json = serde_json::to_value(bare_model()).expect("serialize");
+        let parsed: ModelInfo = serde_json::from_value(json).expect("deserialize");
+
+        assert_eq!(parsed.id, 7);
+        assert!(parsed.preprocess.is_none());
+    }
 }

@@ -378,4 +378,34 @@ mod tests {
 
         clear_model_cache_env();
     }
+
+    fn manifest_with_metadata(metadata: &str) -> Manifest {
+        let mut manifest = default_manifest("model.onnx");
+        manifest.metadata = Some(serde_yaml::from_str(metadata).expect("parse metadata"));
+        manifest
+    }
+
+    #[test]
+    fn preprocess_kind_reads_the_front_end_a_package_asks_for() {
+        let vision = manifest_with_metadata("preprocess:\n  kind: vision\n  width: 224\n");
+        assert_eq!(vision.preprocess_kind().as_deref(), Some("vision"));
+
+        let audio = manifest_with_metadata("preprocess:\n  kind: audio\n  n_mels: 80\n");
+        assert_eq!(audio.preprocess_kind().as_deref(), Some("audio"));
+    }
+
+    // A package with no preprocessing takes tensors directly, and one with a
+    // malformed block must not be reported as having a front-end it lacks.
+    #[test]
+    fn preprocess_kind_is_absent_without_a_usable_block() {
+        assert_eq!(default_manifest("model.onnx").preprocess_kind(), None);
+        assert_eq!(
+            manifest_with_metadata("labels: [cat, dog]\n").preprocess_kind(),
+            None
+        );
+        assert_eq!(
+            manifest_with_metadata("preprocess:\n  width: 224\n").preprocess_kind(),
+            None
+        );
+    }
 }
