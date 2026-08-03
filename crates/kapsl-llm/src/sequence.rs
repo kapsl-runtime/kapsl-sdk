@@ -30,6 +30,12 @@ pub struct Sequence {
     pub generated_this_turn: usize,
     pub kv_cached_len: usize,
     pub rng_state: u64,
+    /// Text that has already been emitted by the incremental decoder.
+    ///
+    /// Keeping the stable decoded prefix is sufficient for byte-level BPE
+    /// tokenizers and avoids persisting the fragile index bookkeeping used by
+    /// `tokenizers::DecodeStream` 0.20.x.
+    pub decode_stream_prefix: String,
 }
 
 impl Sequence {
@@ -44,6 +50,7 @@ impl Sequence {
             generated_this_turn: 0,
             kv_cached_len: 0,
             rng_state: 0x4d595df4d0f33173,
+            decode_stream_prefix: String::new(),
         }
     }
 
@@ -59,6 +66,10 @@ impl Sequence {
 
     pub fn is_finished(&self) -> bool {
         matches!(self.status, SequenceStatus::Finished(_))
+    }
+
+    pub fn reset_decode_stream(&mut self) {
+        self.decode_stream_prefix.clear();
     }
 }
 
@@ -210,7 +221,8 @@ pub struct SamplingParams {
 #[derive(Debug, Clone)]
 pub struct SequenceGroupOutput {
     pub request_id: String,
-    pub text: String, // Incremental text
+    // Incremental text produced by the tokenizer's stateful decode stream.
+    pub text: String,
     pub finish_reason: Option<FinishReason>,
 }
 
