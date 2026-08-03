@@ -65,9 +65,36 @@ mod tests {
             "KAPSL_LITE_MODEL_CACHE_MAX_MIB",
             "KAPSL_LITE_MODEL_CACHE_RESERVED_FREE_BYTES",
             "KAPSL_LITE_MODEL_CACHE_RESERVED_FREE_MIB",
+            "KAPSL_DISCARD_PACKAGE_AFTER_LOAD",
+            "KAPSL_LITE_DISCARD_PACKAGE_AFTER_LOAD",
         ] {
             std::env::remove_var(key);
         }
+    }
+
+    /// Builds a package at a caller-chosen path so a test can watch what
+    /// happens to the file itself.
+    fn build_package_at(package_path: &Path, model_bytes: Vec<u8>) {
+        let manifest = default_manifest("model.onnx");
+        let manifest_bytes = serde_json::to_vec(&manifest).expect("serialize manifest");
+        let tar_file = File::create(package_path).expect("create tar.gz");
+        let encoder = GzEncoder::new(tar_file, Compression::default());
+        let mut builder = Builder::new(encoder);
+
+        for (path, data) in [
+            ("metadata.json", manifest_bytes),
+            ("model.onnx", model_bytes),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_path(path).expect("set path");
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append(&header, data.as_slice()).expect("append");
+        }
+
+        let encoder = builder.into_inner().expect("finish tar builder");
+        encoder.finish().expect("finish gzip");
     }
 
     #[test]
@@ -217,6 +244,108 @@ mod tests {
         assert!(
             !first_cached_path.exists(),
             "oldest cache entry should be evicted to satisfy max size"
+        );
+
+        clear_model_cache_env();
+    }
+
+    // Caching the model must not spend its bytes a second time. The container
+    // case is the one that hurts: a writable layer is often RAM, so a copy of
+    // the weights is charged against the same budget as the weights.
+    #[cfg(unix)]
+    #[test]
+    fn test_cached_model_is_hard_linked_to_the_extracted_file() {
+        use std::os::unix::fs::MetadataExt;
+
+        let _guard = env_lock().lock().expect("acquire env lock");
+        clear_model_cache_env();
+
+        let package_dir = tempfile::tempdir().expect("create package dir");
+        let package_path = package_dir.path().join("model.aimod");
+        build_package_at(&package_path, vec![3u8; 4096]);
+
+        let loader = PackageLoader::load(&package_path).expect("load package");
+        let cached = loader.get_model_path();
+        let cached_meta = std::fs::metadata(&cached).expect("stat cached model");
+
+        assert_eq!(
+            cached_meta.nlink(),
+            2,
+            "cached model should share an inode with the extracted file, not duplicate it"
+        );
+
+        let extracted_meta =
+            std::fs::metadata(loader.extracted_path.join("model.onnx")).expect("stat extracted");
+        assert_eq!(
+            (cached_meta.dev(), cached_meta.ino()),
+            (extracted_meta.dev(), extracted_meta.ino()),
+            "cached model should be the same inode as the extracted file"
+        );
+    }
+
+    // The link is only sound if the bytes outlive the temp directory that
+    // supplied them, which is deleted as soon as the loader is dropped.
+    #[test]
+    fn test_cached_model_outlives_the_extracted_package() {
+        let _guard = env_lock().lock().expect("acquire env lock");
+        clear_model_cache_env();
+
+        let package_dir = tempfile::tempdir().expect("create package dir");
+        let package_path = package_dir.path().join("model.aimod");
+        build_package_at(&package_path, vec![5u8; 2048]);
+
+        let loader = PackageLoader::load(&package_path).expect("load package");
+        let cached = loader.get_model_path();
+        let extracted = loader.extracted_path.clone();
+        drop(loader);
+
+        assert!(
+            !extracted.exists(),
+            "the package temp directory should be cleaned up on drop"
+        );
+        assert_eq!(
+            std::fs::read(&cached).expect("read cached model"),
+            vec![5u8; 2048],
+            "cached model should still be readable once the extract is gone"
+        );
+    }
+
+    // Deleting the caller's own file is never the default: for anyone running
+    // `kapsl run --model ./my-model.aimod` the package is theirs to keep.
+    #[test]
+    fn test_package_is_kept_after_load_by_default() {
+        let _guard = env_lock().lock().expect("acquire env lock");
+        clear_model_cache_env();
+
+        let package_dir = tempfile::tempdir().expect("create package dir");
+        let package_path = package_dir.path().join("model.aimod");
+        build_package_at(&package_path, vec![1u8; 512]);
+
+        let _loader = PackageLoader::load(&package_path).expect("load package");
+
+        assert!(package_path.exists(), "package should be left alone");
+    }
+
+    // A runtime that pulled the package solely to load it, onto a filesystem
+    // that is RAM, can say so.
+    #[test]
+    fn test_package_is_discarded_after_load_when_enabled() {
+        let _guard = env_lock().lock().expect("acquire env lock");
+        clear_model_cache_env();
+        std::env::set_var("KAPSL_DISCARD_PACKAGE_AFTER_LOAD", "1");
+
+        let package_dir = tempfile::tempdir().expect("create package dir");
+        let package_path = package_dir.path().join("model.aimod");
+        build_package_at(&package_path, vec![7u8; 1024]);
+
+        let loader = PackageLoader::load(&package_path).expect("load package");
+        let cached = loader.get_model_path();
+
+        assert!(!package_path.exists(), "package should be discarded");
+        assert_eq!(
+            std::fs::read(&cached).expect("read cached model"),
+            vec![7u8; 1024],
+            "discarding the package must not disturb the cached model"
         );
 
         clear_model_cache_env();
