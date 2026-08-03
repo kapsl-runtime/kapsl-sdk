@@ -29,10 +29,14 @@
 //!     log: log10           # `none` | `ln` | `log10`
 //!     power: 2.0           # 1.0 magnitude, 2.0 power
 //!     center: true         # reflect-pad n_fft/2 each side (librosa default)
+//!     normalize: per_feature # `none` (default) or mean/std over time per mel bin
+//!     normalize_eps: 1.0e-5  # added to each feature standard deviation
 //!     layout: mel_time     # [n_mels, n_frames]; or `time_mel`
+//!     length_input: length # optional derived [1] frame-count model input
+//!     length_dtype: int64  # `int64` (default) or `int32`
 //! ```
 
-use kapsl_engine_api::{BinaryTensorPacket, EngineError, TensorDtype};
+use kapsl_engine_api::{BinaryTensorPacket, EngineError, NamedTensor, TensorDtype};
 use rustfft::{num_complex::Complex, Fft, FftPlanner};
 use serde::Deserialize;
 use std::sync::Arc;
@@ -105,6 +109,22 @@ impl Default for AudioLayout {
     }
 }
 
+/// Normalization applied to the completed mel spectrogram.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeatureNormalization {
+    /// Leave features on their original scale.
+    None,
+    /// Normalize every mel bin independently over the time axis.
+    PerFeature,
+}
+
+impl Default for FeatureNormalization {
+    fn default() -> Self {
+        FeatureNormalization::None
+    }
+}
+
 fn default_sample_rate() -> u32 {
     16000
 }
@@ -125,6 +145,13 @@ fn default_center() -> bool {
 }
 fn default_log_eps() -> f32 {
     1e-10
+}
+fn default_normalize_eps() -> f32 {
+    // Matches NeMo's CONSTANT used by normalize_batch.
+    1e-5
+}
+fn default_length_dtype() -> TensorDtype {
+    TensorDtype::Int64
 }
 
 /// Parsed `metadata.preprocess` block for an audio model.
@@ -158,6 +185,20 @@ pub struct AudioConfig {
     /// Floor added before a log to avoid `log(0)`.
     #[serde(default = "default_log_eps")]
     pub log_eps: f32,
+    /// Feature normalization after log compression. `normalize_type` is
+    /// accepted as an alias for model metadata that uses NeMo's field name.
+    #[serde(default, alias = "normalize_type")]
+    pub normalize: FeatureNormalization,
+    /// Value added to each standard deviation during normalization.
+    #[serde(default = "default_normalize_eps")]
+    pub normalize_eps: f32,
+    /// Optional named model input that receives the emitted feature-frame
+    /// count as a one-element tensor.
+    #[serde(default)]
+    pub length_input: Option<String>,
+    /// Integer dtype for `length_input`.
+    #[serde(default = "default_length_dtype")]
+    pub length_dtype: TensorDtype,
 }
 
 impl Default for AudioConfig {
@@ -176,6 +217,10 @@ impl Default for AudioConfig {
             center: default_center(),
             layout: AudioLayout::default(),
             log_eps: default_log_eps(),
+            normalize: FeatureNormalization::default(),
+            normalize_eps: default_normalize_eps(),
+            length_input: None,
+            length_dtype: default_length_dtype(),
         }
     }
 }
@@ -190,6 +235,25 @@ impl AudioConfig {
         if self.sample_rate == 0 {
             return Err(EngineError::backend(
                 "audio preprocess: sample_rate must be non-zero",
+            ));
+        }
+        if !self.normalize_eps.is_finite() || self.normalize_eps <= 0.0 {
+            return Err(EngineError::backend(
+                "audio preprocess: normalize_eps must be finite and greater than zero",
+            ));
+        }
+        if self
+            .length_input
+            .as_ref()
+            .is_some_and(|name| name.trim().is_empty())
+        {
+            return Err(EngineError::backend(
+                "audio preprocess: length_input must not be empty",
+            ));
+        }
+        if !matches!(self.length_dtype, TensorDtype::Int32 | TensorDtype::Int64) {
+            return Err(EngineError::backend(
+                "audio preprocess: length_dtype must be int32 or int64",
             ));
         }
         Ok(())
@@ -315,6 +379,47 @@ impl AudioPreprocessor {
         }
     }
 
+    /// NeMo-compatible per-feature normalization: for each mel bin, subtract
+    /// its mean over time and divide by the bias-corrected sample standard
+    /// deviation plus epsilon.
+    fn normalize(&self, mels: &mut [f32], n_frames: usize) {
+        if self.cfg.normalize != FeatureNormalization::PerFeature || n_frames == 0 {
+            return;
+        }
+
+        for row in mels.chunks_exact_mut(n_frames) {
+            let mean = row.iter().copied().sum::<f32>() / n_frames as f32;
+            let variance = if n_frames > 1 {
+                row.iter()
+                    .map(|&value| {
+                        let centered = value - mean;
+                        centered * centered
+                    })
+                    .sum::<f32>()
+                    / (n_frames - 1) as f32
+            } else {
+                0.0
+            };
+            let denominator = variance.sqrt() + self.cfg.normalize_eps;
+            for value in row {
+                *value = (*value - mean) / denominator;
+            }
+        }
+    }
+
+    fn frame_count(&self, output: &BinaryTensorPacket) -> Result<i64, EngineError> {
+        let time_axis = match self.cfg.layout {
+            AudioLayout::MelTime => 2,
+            AudioLayout::TimeMel => 1,
+        };
+        output.shape.get(time_axis).copied().ok_or_else(|| {
+            EngineError::backend(format!(
+                "audio preprocess: cannot derive length from output shape {:?}",
+                output.shape
+            ))
+        })
+    }
+
     /// Reflect-pad `n_fft/2` samples on each side (librosa `center=True`).
     fn maybe_center(&self, samples: &[f32]) -> Vec<f32> {
         if !self.cfg.center {
@@ -413,6 +518,8 @@ impl Preprocessor for AudioPreprocessor {
             }
         }
 
+        self.normalize(&mut mels, n_frames);
+
         // Emit in the requested layout.
         let (shape, data) = match self.cfg.layout {
             AudioLayout::MelTime => {
@@ -436,5 +543,29 @@ impl Preprocessor for AudioPreprocessor {
 
     fn name(&self) -> &'static str {
         "audio"
+    }
+
+    fn derived_inputs(&self, output: &BinaryTensorPacket) -> Result<Vec<NamedTensor>, EngineError> {
+        let Some(name) = self.cfg.length_input.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let n_frames = self.frame_count(output)?;
+        let data = match self.cfg.length_dtype {
+            TensorDtype::Int64 => n_frames.to_le_bytes().to_vec(),
+            TensorDtype::Int32 => i32::try_from(n_frames)
+                .map_err(|_| {
+                    EngineError::backend(format!(
+                        "audio preprocess: frame count {n_frames} does not fit int32"
+                    ))
+                })?
+                .to_le_bytes()
+                .to_vec(),
+            _ => unreachable!("length dtype validated during construction"),
+        };
+        let tensor = BinaryTensorPacket::new(vec![1], self.cfg.length_dtype, data)?;
+        Ok(vec![NamedTensor {
+            name: name.clone(),
+            tensor,
+        }])
     }
 }

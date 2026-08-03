@@ -12,10 +12,10 @@
 //!
 //! [`PreprocessBackend`] wraps an inner [`Engine`] together with a
 //! [`Preprocessor`]. On each request it transforms `request.input` (typically a
-//! `Uint8` packet of raw encoded file bytes) into the tensor the model expects,
-//! then delegates to the inner engine unchanged. Everything else — batching
-//! capability, metrics, model info, hot-swap — passes straight through, so a
-//! preprocessed ONNX classifier still composes with
+//! `Uint8` packet of raw encoded file bytes) into the tensor the model expects
+//! and may add named inputs derived from that tensor, then delegates to the
+//! inner engine. Everything else — batching capability, metrics, model info,
+//! hot-swap — passes straight through, so a preprocessed ONNX classifier still composes with
 //! [`crate::factory::maybe_wrap_onnx_postprocess`]: the pipeline becomes
 //! `preprocess -> onnx forward -> postprocess`.
 
@@ -25,12 +25,14 @@ pub mod vision;
 #[cfg(test)]
 mod audio_tests;
 #[cfg(test)]
+mod preprocess_tests;
+#[cfg(test)]
 mod vision_tests;
 
 use async_trait::async_trait;
 use kapsl_engine_api::{
     BatchingPolicy, BinaryTensorPacket, CancellationToken, Engine, EngineError, EngineMetrics,
-    EngineModelInfo, EngineStream, InferenceRequest,
+    EngineModelInfo, EngineStream, InferenceRequest, NamedTensor,
 };
 use std::path::Path;
 
@@ -47,6 +49,20 @@ pub trait Preprocessor: Send + Sync {
     /// the client sent (e.g. a `Uint8` 1-D packet of encoded image bytes); the
     /// returned packet must match the model's expected dtype, shape, and layout.
     fn apply(&self, input: &BinaryTensorPacket) -> Result<BinaryTensorPacket, EngineError>;
+
+    /// Derive named model inputs from the tensor returned by [`Self::apply`].
+    ///
+    /// Most preprocessors only replace the primary input. Audio front-ends can
+    /// additionally use this hook to emit the feature-frame count expected by
+    /// multi-input acoustic models, without making clients duplicate framing
+    /// arithmetic. A derived tensor takes precedence over a client-supplied
+    /// tensor with the same name.
+    fn derived_inputs(
+        &self,
+        _output: &BinaryTensorPacket,
+    ) -> Result<Vec<NamedTensor>, EngineError> {
+        Ok(Vec::new())
+    }
 
     /// Stable label for logs/diagnostics.
     fn name(&self) -> &'static str;
@@ -65,12 +81,23 @@ impl PreprocessBackend {
     }
 
     /// Build a request identical to `request` but with its input replaced by the
-    /// preprocessed tensor. Additional inputs, session id, metadata, and the
-    /// cancellation token are preserved.
+    /// preprocessed tensor. Additional inputs are preserved unless a
+    /// preprocessor derives a fresh tensor with the same name; session id,
+    /// metadata, and the cancellation token are always preserved.
     fn transform(&self, request: &InferenceRequest) -> Result<InferenceRequest, EngineError> {
         let input = self.pre.apply(&request.input)?;
+        let derived_inputs = self.pre.derived_inputs(&input)?;
         let mut transformed = request.clone();
         transformed.input = input;
+        for derived in derived_inputs {
+            // The manifest owns derived inputs. Remove any stale value a legacy
+            // client supplied, then append the value computed from the actual
+            // emitted tensor.
+            transformed
+                .additional_inputs
+                .retain(|candidate| candidate.name != derived.name);
+            transformed.additional_inputs.push(derived);
+        }
         Ok(transformed)
     }
 }

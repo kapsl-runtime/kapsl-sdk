@@ -247,6 +247,17 @@ impl<E: Engine> MonitoringMiddleware<E> {
     pub fn registry(&self) -> &std::sync::Arc<prometheus::Registry> {
         &self.metrics.registry
     }
+
+    /// Record scheduler dispatch cardinality, not the tensor's leading
+    /// dimension. Before preprocessing, that dimension can be an encoded image
+    /// byte count or a PCM sample count rather than a model batch axis.
+    fn observe_dispatch_size(&self, request_count: usize) {
+        debug_assert!(request_count > 0);
+        self.metrics
+            .batch_size_hist
+            .with_label_values(&[self.model_id.as_str()])
+            .observe(request_count as f64);
+    }
 }
 
 #[async_trait]
@@ -263,10 +274,7 @@ impl<E: Engine> Engine for MonitoringMiddleware<E> {
             .inc();
         self.auto_tune.on_request_start();
 
-        self.metrics
-            .batch_size_hist
-            .with_label_values(&[self.model_id.as_str()])
-            .observe(request.input.shape[0] as f64);
+        self.observe_dispatch_size(1);
 
         let start = Instant::now();
         let result = self.inner.infer(request);
@@ -315,16 +323,13 @@ impl<E: Engine> Engine for MonitoringMiddleware<E> {
         }
 
         let model_id = self.model_id.as_str();
-        for request in requests {
+        self.observe_dispatch_size(requests.len());
+        for _ in requests {
             self.metrics
                 .active_inferences
                 .with_label_values(&[model_id])
                 .inc();
             self.auto_tune.on_request_start();
-            self.metrics
-                .batch_size_hist
-                .with_label_values(&[model_id])
-                .observe(request.input.shape.first().copied().unwrap_or(0) as f64);
         }
 
         let start = Instant::now();
@@ -374,10 +379,7 @@ impl<E: Engine> Engine for MonitoringMiddleware<E> {
             .with_label_values(&[self.model_id.as_str()])
             .inc();
         self.auto_tune.on_request_start();
-        self.metrics
-            .batch_size_hist
-            .with_label_values(&[self.model_id.as_str()])
-            .observe(request.input.shape[0] as f64);
+        self.observe_dispatch_size(1);
 
         let start = Instant::now();
         let inner = self.inner.infer_stream(request);
@@ -433,10 +435,28 @@ impl<E: Engine> Engine for MonitoringMiddleware<E> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
     use kapsl_engine_api::EngineError;
     use kapsl_engine_api::TensorDtype;
+    use prometheus::{Encoder, TextEncoder};
 
     struct MockEngine;
+
+    fn raw_media_request(payload_len: i64) -> InferenceRequest {
+        InferenceRequest::new(BinaryTensorPacket {
+            shape: vec![payload_len],
+            dtype: TensorDtype::Uint8,
+            data: vec![0],
+        })
+    }
+
+    fn metrics_text(registry: &prometheus::Registry) -> String {
+        let mut output = Vec::new();
+        TextEncoder::new()
+            .encode(&registry.gather(), &mut output)
+            .expect("encode metrics");
+        String::from_utf8(output).expect("metrics are UTF-8")
+    }
 
     #[async_trait]
     impl Engine for MockEngine {
@@ -496,6 +516,60 @@ mod tests {
         let result = middleware.infer(&request);
 
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn single_raw_media_request_records_dispatch_size_one() {
+        let registry = std::sync::Arc::new(prometheus::Registry::new());
+        let middleware = MonitoringMiddleware::new(
+            MockEngine,
+            "vision".to_string(),
+            "v1".to_string(),
+            &registry,
+        );
+
+        middleware.infer(&raw_media_request(173_131)).unwrap();
+
+        let metrics = metrics_text(&registry);
+        assert!(metrics.contains(r#"kapsl_batch_size_bucket{model="vision",le="1"} 1"#));
+        assert!(metrics.contains(r#"kapsl_batch_size_sum{model="vision"} 1"#));
+        assert!(metrics.contains(r#"kapsl_batch_size_count{model="vision"} 1"#));
+    }
+
+    #[test]
+    fn infer_batch_records_one_observation_for_request_group() {
+        let registry = std::sync::Arc::new(prometheus::Registry::new());
+        let middleware =
+            MonitoringMiddleware::new(MockEngine, "audio".to_string(), "v1".to_string(), &registry);
+        let requests = (0..4)
+            .map(|_| raw_media_request(264_000))
+            .collect::<Vec<_>>();
+
+        middleware.infer_batch(&requests).unwrap();
+
+        let metrics = metrics_text(&registry);
+        assert!(metrics.contains(r#"kapsl_batch_size_bucket{model="audio",le="4"} 1"#));
+        assert!(metrics.contains(r#"kapsl_batch_size_sum{model="audio"} 4"#));
+        assert!(metrics.contains(r#"kapsl_batch_size_count{model="audio"} 1"#));
+    }
+
+    #[tokio::test]
+    async fn streaming_raw_media_request_records_dispatch_size_one() {
+        let registry = std::sync::Arc::new(prometheus::Registry::new());
+        let middleware = MonitoringMiddleware::new(
+            MockEngine,
+            "streaming-audio".to_string(),
+            "v1".to_string(),
+            &registry,
+        );
+
+        let mut stream = middleware.infer_stream(&raw_media_request(264_000));
+        while stream.next().await.is_some() {}
+
+        let metrics = metrics_text(&registry);
+        assert!(metrics.contains(r#"kapsl_batch_size_bucket{model="streaming-audio",le="1"} 1"#));
+        assert!(metrics.contains(r#"kapsl_batch_size_sum{model="streaming-audio"} 1"#));
+        assert!(metrics.contains(r#"kapsl_batch_size_count{model="streaming-audio"} 1"#));
     }
 }
 
