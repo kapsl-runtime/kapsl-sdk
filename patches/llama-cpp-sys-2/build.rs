@@ -975,6 +975,20 @@ fn main() {
             // culibos is required when statically linking cudart_static
             println!("cargo:rustc-link-lib=static=culibos");
         }
+
+        // ggml's CMake turns NCCL on by default (`GGML_CUDA_NCCL`) and, when it
+        // finds the library, compiles the multi-GPU allreduce path and links it
+        // with `target_link_libraries(ggml-cuda PRIVATE NCCL::NCCL)`. That is a
+        // CMake-side interface: for a *static* ggml-cuda it never reaches the
+        // link line Cargo builds, so the NCCL symbols end up undefined and the
+        // final binary fails to link with errors like:
+        //
+        //     rust-lld: error: undefined symbol: ncclAllReduce
+        //     >>> referenced by ggml_backend_cuda_comm_allreduce_tensor
+        //
+        // Emit the link ourselves, but only when CMake actually enabled NCCL —
+        // otherwise the code was never compiled and there is nothing to link.
+        link_nccl_if_enabled(&build_dir);
     }
 
     if cfg!(feature = "rocm") && !build_shared_libs {
@@ -1154,4 +1168,67 @@ fn main() {
             }
         }
     }
+}
+
+/// Emit link directives for NCCL when ggml's CMake build actually enabled it.
+///
+/// `find_package(NCCL)` caches the resolved path in `NCCL_LIBRARY`, so
+/// CMakeCache.txt is the authoritative answer to "was the NCCL code path
+/// compiled in?" — more reliable than probing the system for a library that
+/// ggml may not have used. When NCCL was not found, ggml prints a warning and
+/// compiles without `GGML_USE_NCCL`, so there is nothing to link and this is a
+/// no-op.
+fn link_nccl_if_enabled(build_dir: &Path) {
+    let cmake_cache = build_dir.join("build").join("CMakeCache.txt");
+    let Ok(cache) = std::fs::read_to_string(&cmake_cache) else {
+        debug_log!(
+            "NCCL: no CMakeCache.txt at {}, skipping NCCL link",
+            cmake_cache.display()
+        );
+        return;
+    };
+
+    let nccl_library = cache.lines().find_map(|line| {
+        line.strip_prefix("NCCL_LIBRARY:")
+            .and_then(|rest| rest.split_once('='))
+            .map(|(_, value)| value.trim())
+    });
+
+    let Some(nccl_library) = nccl_library else {
+        debug_log!("NCCL: NCCL_LIBRARY absent from cache, NCCL not in use");
+        return;
+    };
+    if nccl_library.is_empty() || nccl_library.ends_with("-NOTFOUND") {
+        debug_log!("NCCL: NCCL_LIBRARY={nccl_library}, NCCL not in use");
+        return;
+    }
+
+    let nccl_path = Path::new(nccl_library);
+
+    // Derive the link name from the file rather than hardcoding "nccl", so a
+    // static build (libnccl_static.a) links the right target.
+    let Some(file_name) = nccl_path.file_name().and_then(|name| name.to_str()) else {
+        debug_log!("NCCL: could not read file name from {nccl_library}");
+        return;
+    };
+    let stem = file_name.strip_prefix("lib").unwrap_or(file_name);
+    let link_name = match stem.find(".so").or_else(|| stem.find(".a")) {
+        Some(cut) => &stem[..cut],
+        None => stem,
+    };
+    if link_name.is_empty() {
+        debug_log!("NCCL: could not derive a link name from {file_name}");
+        return;
+    }
+
+    if let Some(parent) = nccl_path.parent() {
+        println!("cargo:rustc-link-search=native={}", parent.display());
+    }
+    let kind = if file_name.ends_with(".a") {
+        "static"
+    } else {
+        "dylib"
+    };
+    println!("cargo:rustc-link-lib={kind}={link_name}");
+    debug_log!("NCCL: linking {kind}={link_name} from {nccl_library}");
 }
