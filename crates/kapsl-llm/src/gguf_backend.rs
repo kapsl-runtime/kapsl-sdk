@@ -447,12 +447,17 @@ impl GgufWindowedKvConfig {
 /// attention, so `n_swa + n_ubatch` positions must stay live simultaneously
 /// (the same bound llama.cpp's native iSWA cache uses for its SWA buffer).
 /// The `+ 1` covers block-boundary straddle at both ends.
+///
+/// Only the shared-KV pool sizes rings, so outside that feature this is
+/// compiled solely for its unit tests.
+#[cfg(any(feature = "gguf-cuda-shared-kv", test))]
 fn swa_window_blocks(n_swa: usize, n_ubatch: usize, block_size: usize) -> usize {
     (n_swa + n_ubatch).div_ceil(block_size.max(1)) + 1
 }
 
 /// Physical blocks a layer needs to cover `logical` logical blocks: capped at
 /// the ring size on windowed layers, uncapped on full-attention layers.
+#[cfg(any(feature = "gguf-cuda-shared-kv", test))]
 fn windowed_layer_capacity(logical: usize, layer_window: Option<usize>) -> usize {
     match layer_window {
         Some(window_blocks) => logical.min(window_blocks),
@@ -668,6 +673,7 @@ fn gguf_shared_kv_disable_reason(model: &LlamaModel) -> Option<String> {
 /// the same structure. Cohere2 (and other SWA families) are excluded — cohere2's
 /// NoPE global-attention layers degenerate on the paged path, and the rest are
 /// not yet eval-checked. Extend this as more families are verified.
+#[cfg(any(feature = "gguf-cuda-shared-kv", test))]
 fn swa_shared_kv_arch_verified(arch: &str) -> bool {
     matches!(arch, "gemma2" | "gemma3" | "gemma3n" | "gemma4")
 }
@@ -682,6 +688,7 @@ fn swa_shared_kv_arch_verified(arch: &str) -> bool {
 /// gated by `KAPSL_GGUF_ENABLE_SWA_SHARED_KV`); `has_key`/`pos_int` look up
 /// architecture-scoped GGUF metadata (already prefixed with `<arch>.` by the
 /// caller) — presence, and positive-integer value, respectively.
+#[cfg(any(feature = "gguf-cuda-shared-kv", test))]
 fn classify_shared_kv_support(
     arch: &str,
     n_swa: u32,

@@ -49,18 +49,6 @@ static std::string random_string(size_t length = 32) {
     return result;
 }
 
-static bool ends_with(const std::string & value, const std::string & suffix) {
-    return value.size() >= suffix.size()
-        && value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
-}
-
-static bool detect_thinking_forced_open(const common_chat_params & params) {
-    return params.supports_thinking
-        && !params.thinking_start_tag.empty()
-        && !params.thinking_end_tag.empty()
-        && ends_with(params.generation_prompt, params.thinking_start_tag);
-}
-
 static void init_chat_msg(struct llama_rs_chat_msg_oaicompat * out_msg) {
     if (!out_msg) {
         return;
