@@ -18,7 +18,7 @@ half = "2.0"
 rand = { version = "0.8", features = ["small_rng"] }
 thiserror = "1.0"
 log = "0.4"
-lru = "0.12"
+lru = "0.16"
 tokio = { version = "1", features = ["sync", "rt", "macros"] }
 futures = "0.3"
 ndarray = "0.17"
