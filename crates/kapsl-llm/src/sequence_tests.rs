@@ -17,6 +17,10 @@ mod tests {
         assert_eq!(seq.get_len(), 4);
         assert!((seq.cumulative_logprob + 0.75).abs() < f32::EPSILON);
 
+        seq.decode_stream_prefix = "decoded".to_string();
+        seq.reset_decode_stream();
+        assert!(seq.decode_stream_prefix.is_empty());
+
         seq.status = SequenceStatus::Finished(FinishReason::Stop);
         assert!(seq.is_finished());
     }
