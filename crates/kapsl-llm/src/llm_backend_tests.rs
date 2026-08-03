@@ -119,6 +119,33 @@ mod tests {
     }
 
     #[test]
+    fn load_model_runtime_config_suppresses_added_special_tokens() {
+        let root = make_temp_dir("cfg_added_special_tokens");
+        let model_path = root.join("model.onnx");
+        fs::write(&model_path, "").expect("model file");
+        fs::write(
+            root.join("generation_config.json"),
+            json!({ "eos_token_id": 10 }).to_string(),
+        )
+        .expect("generation config");
+        fs::write(
+            root.join("tokenizer.json"),
+            json!({
+                "added_tokens": [
+                    { "id": 10, "content": "<eos>", "special": true },
+                    { "id": 11, "content": "<role>", "special": true },
+                    { "id": 12, "content": "ordinary", "special": false }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("tokenizer");
+
+        let runtime = load_model_runtime_config(&model_path);
+        assert_eq!(runtime.sampling.stop_token_ids, vec![10, 11]);
+    }
+
+    #[test]
     fn load_model_runtime_config_reads_manifest_chat_template_for_onnx() {
         let root = make_temp_dir("manifest_template");
         let model_path = root.join("model.onnx");
@@ -214,7 +241,7 @@ mod tests {
             .response_tx
             .send(SequenceGroupOutput {
                 request_id: seq_group.request_id.clone(),
-                text: "lo".to_string(),
+                text: "Hello".to_string(),
                 finish_reason: Some(FinishReason::Stop),
             })
             .await
