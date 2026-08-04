@@ -7,7 +7,8 @@ type GlobalSchedulerMutex = parking_lot::Mutex<GlobalKvScheduler>;
 use crate::llm_metrics::LLMMetrics;
 use crate::model_paths::{find_model_asset, find_model_root};
 use crate::prompt_adapter::{
-    chat_template_from_explicit_name, chat_template_from_model_identifiers, ChatPromptTemplate,
+    chat_template_from_explicit_name, chat_template_from_model_identifiers,
+    chat_template_from_template_source, ChatPromptTemplate,
 };
 use crate::scheduler::SchedulerConfig;
 use crate::sequence::{SamplingParams, SequenceGroup};
@@ -158,6 +159,7 @@ fn load_model_runtime_config(model_path: &Path) -> ModelRuntimeConfig {
 
     let mut cfg_json: Option<Value> = None;
     let manifest_llm_json = read_manifest_llm_metadata(model_path);
+    let manifest_model_identifiers = read_manifest_model_identifiers(model_path);
     if let Some(gen_path) = find_model_asset(model_path, "generation_config.json") {
         if let Some(gen) = read_json(&gen_path) {
             if let Some(temp) = gen.get("temperature").and_then(|v| v.as_f64()) {
@@ -232,6 +234,12 @@ fn load_model_runtime_config(model_path: &Path) -> ModelRuntimeConfig {
 
     let tokenizer_path = find_model_asset(model_path, "tokenizer.json");
     let tokenizer_json = tokenizer_path.as_ref().and_then(|p| read_json(p));
+    let tokenizer_config_json = find_model_asset(model_path, "tokenizer_config.json")
+        .as_ref()
+        .and_then(|p| read_json(p));
+    let embedded_chat_template = tokenizer_config_json
+        .as_ref()
+        .and_then(tokenizer_config_chat_template);
 
     if config.sampling.stop_token_ids.is_empty() {
         if let Some(cfg) = cfg_json.as_ref() {
@@ -360,9 +368,16 @@ fn load_model_runtime_config(model_path: &Path) -> ModelRuntimeConfig {
                 suffix: format!("{}{}", assistant_tag, think_suffix),
             });
         }
+    } else if let Some(template) =
+        embedded_chat_template.and_then(chat_template_from_template_source)
+    {
+        config.prompt_template = Some(template);
     } else {
-        config.prompt_template =
-            prompt_template_from_manifest_or_config(manifest_llm_json.as_ref(), cfg_json.as_ref());
+        config.prompt_template = prompt_template_from_manifest_or_config(
+            manifest_llm_json.as_ref(),
+            cfg_json.as_ref(),
+            &manifest_model_identifiers,
+        );
     }
 
     config
@@ -373,13 +388,32 @@ fn read_manifest_llm_metadata(model_path: &Path) -> Option<Value> {
     read_json(&meta_path).and_then(|meta| meta.get("metadata").and_then(|m| m.get("llm")).cloned())
 }
 
+fn read_manifest_model_identifiers(model_path: &Path) -> Vec<String> {
+    let meta_path = find_model_root(model_path).join("metadata.json");
+    let Some(meta) = read_json(&meta_path) else {
+        return Vec::new();
+    };
+    ["project_name", "model_type"]
+        .into_iter()
+        .filter_map(|key| json_string_field(&meta, key).map(str::to_string))
+        .collect()
+}
+
 fn json_string_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     value.get(key).and_then(|v| v.as_str()).map(str::trim)
+}
+
+fn tokenizer_config_chat_template(config: &Value) -> Option<&str> {
+    let template = config.get("chat_template")?;
+    template
+        .as_str()
+        .or_else(|| template.get("default").and_then(Value::as_str))
 }
 
 fn prompt_template_from_manifest_or_config(
     llm_meta: Option<&Value>,
     cfg_json: Option<&Value>,
+    manifest_identifiers: &[String],
 ) -> Option<ChatPromptTemplate> {
     if let Some(llm) = llm_meta {
         for key in ["chat_template", "prompt_template", "model_family"] {
@@ -391,8 +425,11 @@ fn prompt_template_from_manifest_or_config(
         }
     }
 
-    let mut identifiers = Vec::new();
+    let mut identifiers = manifest_identifiers.to_vec();
     if let Some(cfg) = cfg_json {
+        if let Some(name_or_path) = json_string_field(cfg, "_name_or_path") {
+            identifiers.push(name_or_path.to_string());
+        }
         if let Some(model_type) = json_string_field(cfg, "model_type") {
             identifiers.push(model_type.to_string());
         }
