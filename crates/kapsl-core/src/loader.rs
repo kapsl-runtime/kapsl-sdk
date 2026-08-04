@@ -104,6 +104,24 @@ pub struct Manifest {
     pub cron_jobs: Vec<CronJobDef>,
 }
 
+impl Manifest {
+    /// The input front-end this package asks for, from
+    /// `metadata.preprocess.kind` (`vision`, `audio`). `None` when the package
+    /// declares no preprocessing, which means the model takes tensors directly.
+    ///
+    /// Only the kind is surfaced, not the rest of the block: the geometry and
+    /// normalization belong to the server-side preprocessor, and a client that
+    /// read them would be re-implementing it.
+    pub fn preprocess_kind(&self) -> Option<String> {
+        self.metadata
+            .as_ref()?
+            .get("preprocess")?
+            .get("kind")?
+            .as_str()
+            .map(str::to_string)
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum LoaderError {
     #[error("IO error: {0}")]
