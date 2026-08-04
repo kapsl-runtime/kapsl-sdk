@@ -15,7 +15,8 @@ use async_stream::stream;
 use async_trait::async_trait;
 use futures::stream::{self, Stream, StreamExt};
 use kapsl_engine_api::{
-    BinaryTensorPacket, Engine, EngineError, EngineMetrics, InferenceRequest, TensorDtype,
+    BatchingPolicy, BinaryTensorPacket, Engine, EngineError, EngineMetrics, InferenceRequest,
+    TensorDtype,
 };
 use serde_json::Value;
 use std::fs;
@@ -262,6 +263,27 @@ fn load_model_runtime_config(model_path: &Path) -> ModelRuntimeConfig {
 
             if !stop_ids.is_empty() {
                 config.sampling.stop_token_ids = stop_ids;
+            }
+        }
+    }
+
+    // Added special tokens are not user-visible when the tokenizer decodes
+    // with skip_special_tokens=true. Treat them like the configured EOS ids so
+    // min_tokens suppresses them instead of counting an invisible token toward
+    // the requested output floor.
+    if let Some(tokenizer) = tokenizer_json.as_ref() {
+        if let Some(added_tokens) = tokenizer.get("added_tokens").and_then(|v| v.as_array()) {
+            for entry in added_tokens {
+                if entry.get("special").and_then(|v| v.as_bool()) != Some(true) {
+                    continue;
+                }
+                let Some(id) = entry.get("id").and_then(|v| v.as_u64()) else {
+                    continue;
+                };
+                let id = id as u32;
+                if !config.sampling.stop_token_ids.contains(&id) {
+                    config.sampling.stop_token_ids.push(id);
+                }
             }
         }
     }
@@ -999,6 +1021,10 @@ impl Engine for LLMBackend {
             engine_health: self.engine_health_code(),
             ..EngineMetrics::default()
         }
+    }
+
+    fn batching_policy(&self) -> BatchingPolicy {
+        BatchingPolicy::continuous(1)
     }
 
     fn health_check(&self) -> Result<(), EngineError> {

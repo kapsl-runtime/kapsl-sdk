@@ -2,8 +2,8 @@ use crate::prompt_adapter::{chat_template_from_model_identifiers, prompt_is_expl
 use async_stream::stream;
 use async_trait::async_trait;
 use kapsl_engine_api::{
-    BinaryTensorPacket, Engine, EngineError, EngineMetrics, EngineModelInfo, EngineStream,
-    InferenceRequest, TensorDtype,
+    BatchingPolicy, BinaryTensorPacket, Engine, EngineError, EngineMetrics, EngineModelInfo,
+    EngineStream, InferenceRequest, TensorDtype,
 };
 use std::collections::VecDeque;
 use std::num::NonZeroU32;
@@ -4283,6 +4283,15 @@ impl Engine for GgufBackend {
     /// `max_batch()` at the default 1).
     fn self_batches(&self) -> bool {
         true
+    }
+
+    fn batching_policy(&self) -> BatchingPolicy {
+        let max_requests = self
+            .inner
+            .as_ref()
+            .map(|inner| inner.max_concurrent)
+            .unwrap_or_else(max_concurrent);
+        BatchingPolicy::continuous(max_requests).with_priority_support()
     }
 
     fn health_check(&self) -> Result<(), EngineError> {

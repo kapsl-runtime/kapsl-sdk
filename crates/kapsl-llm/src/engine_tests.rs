@@ -3,7 +3,7 @@ mod tests {
     use super::super::{
         build_kv_array_f16, build_kv_array_f32_from_f16, empty_kv_shape, infer_kv_layout,
         normalize_metadata_safe_load_setting, parse_safe_load_env_setting, parse_safe_load_setting,
-        KvLayout, SafeLoadSetting,
+        KvLayout, LLMEngine, SafeLoadSetting, SamplingParams,
     };
     use half::f16;
     use serde_json::json;
@@ -132,5 +132,50 @@ mod tests {
 
         let shape = empty_kv_shape(None, KvLayout::HeadDimFirst, 3, 7);
         assert_eq!(shape, vec![1, 3, 7, 1]);
+    }
+
+    fn sampling_params(temperature: f32) -> SamplingParams {
+        SamplingParams {
+            max_tokens: 8,
+            min_tokens: 2,
+            temperature,
+            top_p: 1.0,
+            top_k: 1,
+            stop_token_ids: vec![0],
+            repetition_penalty: 1.0,
+            seed: Some(42),
+        }
+    }
+
+    #[test]
+    fn greedy_sampling_suppresses_stop_token_below_minimum() {
+        let logits = [10.0, 9.0, 8.0];
+        let params = sampling_params(0.0);
+        let mut rng = 42;
+
+        assert_eq!(
+            LLMEngine::sample_next_token(&logits, &params, 0, &mut rng),
+            1
+        );
+        assert_eq!(
+            LLMEngine::sample_next_token(&logits, &params, 2, &mut rng),
+            0
+        );
+    }
+
+    #[test]
+    fn probabilistic_sampling_suppresses_stop_token_below_minimum() {
+        let logits = [10.0, 9.0, 8.0];
+        let params = sampling_params(1.0);
+        let mut rng = 42;
+
+        assert_eq!(
+            LLMEngine::sample_next_token(&logits, &params, 0, &mut rng),
+            1
+        );
+        assert_eq!(
+            LLMEngine::sample_next_token(&logits, &params, 2, &mut rng),
+            0
+        );
     }
 }

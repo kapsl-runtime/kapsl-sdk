@@ -15,6 +15,7 @@ use crate::sequence::{
     FinishReason, SamplingParams, Sequence, SequenceGroup, SequenceGroupOutput, SequenceStatus,
 };
 use half::f16;
+use kapsl_core::{accelerator_provider_pack_installed, AcceleratorProviderPack};
 use kapsl_engine_api::EngineError;
 use kapsl_hal::kernel::KernelBackend;
 use ndarray::{Array2, Array4, ArrayD, IxDyn};
@@ -256,18 +257,27 @@ fn llm_provider_policy() -> String {
 
 fn llm_provider_available(provider: &str) -> bool {
     match provider.trim().to_ascii_lowercase().as_str() {
-        "tensorrt" => TensorRTExecutionProvider::default()
-            .is_available()
-            .unwrap_or(false),
-        "cuda" => CUDAExecutionProvider::default()
-            .is_available()
-            .unwrap_or(false),
+        "tensorrt" => {
+            accelerator_provider_pack_installed(AcceleratorProviderPack::TensorRt)
+                && TensorRTExecutionProvider::default()
+                    .is_available()
+                    .unwrap_or(false)
+        }
+        "cuda" => {
+            accelerator_provider_pack_installed(AcceleratorProviderPack::Cuda)
+                && CUDAExecutionProvider::default()
+                    .is_available()
+                    .unwrap_or(false)
+        }
         "coreml" | "metal" => CoreMLExecutionProvider::default()
             .is_available()
             .unwrap_or(false),
-        "rocm" => ROCmExecutionProvider::default()
-            .is_available()
-            .unwrap_or(false),
+        "rocm" => {
+            accelerator_provider_pack_installed(AcceleratorProviderPack::Rocm)
+                && ROCmExecutionProvider::default()
+                    .is_available()
+                    .unwrap_or(false)
+        }
         "directml" => directml_provider_available(),
         "openvino" => OpenVINOExecutionProvider::default()
             .is_available()
@@ -289,21 +299,56 @@ fn directml_provider_available() -> bool {
     false
 }
 
-fn fastest_llm_provider() -> &'static str {
-    if llm_provider_available("tensorrt") {
-        "tensorrt"
-    } else if llm_provider_available("cuda") {
+fn fastest_llm_auto_provider() -> &'static str {
+    fastest_llm_auto_provider_from_available(
+        llm_provider_available("cuda"),
+        llm_provider_available("coreml"),
+        llm_provider_available("rocm"),
+        llm_provider_available("directml"),
+        llm_provider_available("openvino"),
+    )
+}
+
+fn fastest_llm_auto_provider_from_available(
+    cuda: bool,
+    coreml: bool,
+    rocm: bool,
+    directml: bool,
+    openvino: bool,
+) -> &'static str {
+    if cuda {
         "cuda"
-    } else if llm_provider_available("coreml") {
+    } else if coreml {
         "coreml"
-    } else if llm_provider_available("rocm") {
+    } else if rocm {
         "rocm"
-    } else if llm_provider_available("directml") {
+    } else if directml {
         "directml"
-    } else if llm_provider_available("openvino") {
+    } else if openvino {
         "openvino"
     } else {
         "cpu"
+    }
+}
+
+#[cfg(test)]
+mod provider_selection_tests {
+    use super::fastest_llm_auto_provider_from_available;
+
+    #[test]
+    fn auto_provider_prefers_cuda_without_considering_tensorrt() {
+        assert_eq!(
+            fastest_llm_auto_provider_from_available(true, true, true, true, true),
+            "cuda"
+        );
+    }
+
+    #[test]
+    fn auto_provider_falls_back_to_cpu_when_no_accelerator_is_available() {
+        assert_eq!(
+            fastest_llm_auto_provider_from_available(false, false, false, false, false),
+            "cpu"
+        );
     }
 }
 
@@ -1551,7 +1596,7 @@ impl LLMEngine {
                 .map(|provider| provider.trim().eq_ignore_ascii_case("cpu"))
                 .unwrap_or(true);
             if provider_is_cpu_or_missing {
-                let fastest = fastest_llm_provider().to_string();
+                let fastest = fastest_llm_auto_provider().to_string();
                 if fastest != "cpu" {
                     log::info!(
                         "LLM auto-selecting fastest provider `{}` (set KAPSL_PROVIDER_POLICY=manifest to keep package provider)",
@@ -2654,6 +2699,7 @@ impl LLMEngine {
                         let mut seq = existing_seq_arc.lock().unwrap();
                         seq.output_token_ids.extend(token_ids.clone());
                         seq.generated_this_turn = 0;
+                        seq.reset_decode_stream();
                         seq.status = SequenceStatus::Waiting;
                         (seq.sequence_id, seq.get_len())
                     };
@@ -2721,6 +2767,7 @@ impl LLMEngine {
                     seq.prompt_token_ids = token_ids.clone();
                     seq.output_token_ids.clear();
                     seq.generated_this_turn = 0;
+                    seq.reset_decode_stream();
                     seq.kv_cached_len = 0;
                     seq.rng_state = rng_state;
                     seq.status = SequenceStatus::Waiting;
@@ -2731,6 +2778,7 @@ impl LLMEngine {
                         let mut seq = req_seq_arc.lock().unwrap();
                         seq.generated_this_turn = 0;
                         seq.output_token_ids.clear();
+                        seq.reset_decode_stream();
                     }
                     self.sessions
                         .insert(session_key.clone(), req_seq_arc.clone());
@@ -3464,7 +3512,7 @@ impl LLMEngine {
                 )
             };
 
-            let (token_ids_for_penalty, mut rng_state) = {
+            let (token_ids_for_penalty, generated_this_turn, mut rng_state) = {
                 let seq = item.seq_arc.lock().unwrap();
                 let token_ids = (sampling_params.repetition_penalty > 1.0).then(|| {
                     seq.prompt_token_ids
@@ -3473,7 +3521,7 @@ impl LLMEngine {
                         .copied()
                         .collect::<Vec<u32>>()
                 });
-                (token_ids, seq.rng_state)
+                (token_ids, seq.generated_this_turn, seq.rng_state)
             };
             // Only clone into workspace when repetition penalty is active; otherwise
             // sample directly from logits_data to avoid a ~600 KB/vocab copy per step.
@@ -3493,9 +3541,19 @@ impl LLMEngine {
                         };
                     }
                 }
-                Self::sample_next_token(&self.logits_workspace, &sampling_params, &mut rng_state)
+                Self::sample_next_token(
+                    &self.logits_workspace,
+                    &sampling_params,
+                    generated_this_turn,
+                    &mut rng_state,
+                )
             } else {
-                Self::sample_next_token(&logits_data[start..end], &sampling_params, &mut rng_state)
+                Self::sample_next_token(
+                    &logits_data[start..end],
+                    &sampling_params,
+                    generated_this_turn,
+                    &mut rng_state,
+                )
             };
             let mut finish_reason = None;
             let (old_len, old_status, new_len, new_status, text) = {
@@ -3514,12 +3572,8 @@ impl LLMEngine {
                     seq.status = SequenceStatus::Finished(FinishReason::Length);
                     finish_reason = Some(FinishReason::Length);
                 }
-                let text = self
-                    .tokenizer
-                    .as_ref()
-                    .unwrap()
-                    .decode(&[next], true)
-                    .unwrap_or_default();
+                let text =
+                    Self::decode_next_token(self.tokenizer.as_ref().unwrap(), &mut seq, next);
                 (old_len, old_status, seq.get_len(), seq.status, text)
             };
 
@@ -4190,7 +4244,7 @@ impl LLMEngine {
                 )
             };
 
-            let (token_ids_for_penalty, mut rng_state) = {
+            let (token_ids_for_penalty, generated_this_turn, mut rng_state) = {
                 let seq = item.seq_arc.lock().unwrap();
                 let token_ids = (sampling_params.repetition_penalty > 1.0).then(|| {
                     seq.prompt_token_ids
@@ -4199,7 +4253,7 @@ impl LLMEngine {
                         .copied()
                         .collect::<Vec<u32>>()
                 });
-                (token_ids, seq.rng_state)
+                (token_ids, seq.generated_this_turn, seq.rng_state)
             };
             let next = if let Some(token_ids) = token_ids_for_penalty {
                 let penalty = sampling_params.repetition_penalty;
@@ -4217,9 +4271,19 @@ impl LLMEngine {
                         };
                     }
                 }
-                Self::sample_next_token(&self.logits_workspace, &sampling_params, &mut rng_state)
+                Self::sample_next_token(
+                    &self.logits_workspace,
+                    &sampling_params,
+                    generated_this_turn,
+                    &mut rng_state,
+                )
             } else {
-                Self::sample_next_token(&logits_data[start..end], &sampling_params, &mut rng_state)
+                Self::sample_next_token(
+                    &logits_data[start..end],
+                    &sampling_params,
+                    generated_this_turn,
+                    &mut rng_state,
+                )
             };
             let mut finish_reason = None;
             let (old_len, old_status, new_len, new_status, text) = {
@@ -4238,12 +4302,8 @@ impl LLMEngine {
                     seq.status = SequenceStatus::Finished(FinishReason::Length);
                     finish_reason = Some(FinishReason::Length);
                 }
-                let text = self
-                    .tokenizer
-                    .as_ref()
-                    .unwrap()
-                    .decode(&[next], true)
-                    .unwrap_or_default();
+                let text =
+                    Self::decode_next_token(self.tokenizer.as_ref().unwrap(), &mut seq, next);
                 (old_len, old_status, seq.get_len(), seq.status, text)
             };
 
@@ -5196,7 +5256,7 @@ impl LLMEngine {
                     logits_data.to_vec()
                 };
                 drop(outputs);
-                let (token_ids_for_penalty, mut rng_state) = {
+                let (token_ids_for_penalty, generated_this_turn, mut rng_state) = {
                     let seq = seq_arc.lock().unwrap();
                     let token_ids = (sampling_params.repetition_penalty > 1.0).then(|| {
                         seq.prompt_token_ids
@@ -5205,7 +5265,7 @@ impl LLMEngine {
                             .copied()
                             .collect::<Vec<u32>>()
                     });
-                    (token_ids, seq.rng_state)
+                    (token_ids, seq.generated_this_turn, seq.rng_state)
                 };
                 if let Some(token_ids) = token_ids_for_penalty {
                     let penalty = sampling_params.repetition_penalty;
@@ -5221,7 +5281,12 @@ impl LLMEngine {
                         }
                     }
                 }
-                let next = Self::sample_next_token(&logits_slice, &sampling_params, &mut rng_state);
+                let next = Self::sample_next_token(
+                    &logits_slice,
+                    &sampling_params,
+                    generated_this_turn,
+                    &mut rng_state,
+                );
 
                 {
                     let mut finish_reason = None;
@@ -5246,12 +5311,11 @@ impl LLMEngine {
                             finish_reason = Some(FinishReason::Length);
                         }
 
-                        let text = self
-                            .tokenizer
-                            .as_ref()
-                            .unwrap()
-                            .decode(&[next], true)
-                            .unwrap_or_default();
+                        let text = Self::decode_next_token(
+                            self.tokenizer.as_ref().unwrap(),
+                            &mut seq,
+                            next,
+                        );
                         (old_len, old_status, seq.get_len(), seq.status, text)
                     };
 
@@ -6146,7 +6210,7 @@ impl LLMEngine {
                     logits_data.to_vec()
                 };
                 drop(outputs);
-                let (token_ids_for_penalty, mut rng_state) = {
+                let (token_ids_for_penalty, generated_this_turn, mut rng_state) = {
                     let seq = seq_arc.lock().unwrap();
                     let token_ids = (sampling_params.repetition_penalty > 1.0).then(|| {
                         seq.prompt_token_ids
@@ -6155,7 +6219,7 @@ impl LLMEngine {
                             .copied()
                             .collect::<Vec<u32>>()
                     });
-                    (token_ids, seq.rng_state)
+                    (token_ids, seq.generated_this_turn, seq.rng_state)
                 };
                 if let Some(token_ids) = token_ids_for_penalty {
                     let penalty = sampling_params.repetition_penalty;
@@ -6171,7 +6235,12 @@ impl LLMEngine {
                         }
                     }
                 }
-                let next = Self::sample_next_token(&logits_slice, &sampling_params, &mut rng_state);
+                let next = Self::sample_next_token(
+                    &logits_slice,
+                    &sampling_params,
+                    generated_this_turn,
+                    &mut rng_state,
+                );
 
                 {
                     let mut finish_reason = None;
@@ -6196,12 +6265,11 @@ impl LLMEngine {
                             finish_reason = Some(FinishReason::Length);
                         }
 
-                        let text = self
-                            .tokenizer
-                            .as_ref()
-                            .unwrap()
-                            .decode(&[next], true)
-                            .unwrap_or_default();
+                        let text = Self::decode_next_token(
+                            self.tokenizer.as_ref().unwrap(),
+                            &mut seq,
+                            next,
+                        );
                         (old_len, old_status, seq.get_len(), seq.status, text)
                     };
 
@@ -6239,6 +6307,40 @@ impl LLMEngine {
         hash
     }
 
+    fn decode_next_token(tokenizer: &Tokenizer, seq: &mut Sequence, token_id: u32) -> String {
+        let decoded = match tokenizer.decode(&seq.output_token_ids, true) {
+            Ok(decoded) => decoded,
+            Err(err) => {
+                log::warn!("Incremental tokenizer decode failed: {}", err);
+                return String::new();
+            }
+        };
+
+        // Byte-level BPE can end a partial decode with the replacement
+        // character while a multi-byte UTF-8 character is still incomplete.
+        // Do not expose that unstable suffix: the next token will complete it
+        // and the cumulative decode will then extend the last stable prefix.
+        if decoded.ends_with('\u{fffd}') && !seq.is_finished() {
+            return String::new();
+        }
+
+        if let Some(delta) = decoded.strip_prefix(&seq.decode_stream_prefix) {
+            let delta = delta.to_string();
+            seq.decode_stream_prefix = decoded;
+            delta
+        } else {
+            // A decoder must never make already-streamed bytes retractable.
+            // Returning no new bytes is safer than duplicating the cumulative
+            // output; the final benchmark correctness gate will also surface
+            // any tokenizer whose decoder is not prefix-stable.
+            log::warn!(
+                "Incremental tokenizer decode rewrote an emitted prefix after token {}",
+                token_id
+            );
+            String::new()
+        }
+    }
+
     fn splitmix64(x: u64) -> u64 {
         let mut z = x.wrapping_add(0x9e3779b97f4a7c15);
         z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
@@ -6252,16 +6354,31 @@ impl LLMEngine {
         (val as f32) / (u32::MAX as f32)
     }
 
-    fn sample_next_token(logits: &[f32], params: &SamplingParams, rng_state: &mut u64) -> u32 {
+    fn sample_next_token(
+        logits: &[f32],
+        params: &SamplingParams,
+        generated_tokens: usize,
+        rng_state: &mut u64,
+    ) -> u32 {
         if logits.is_empty() {
             return 0;
         }
+
+        // Hugging Face-style min_new_tokens is a floor on decoded content,
+        // not a count that includes EOS/stop tokens. Suppress every configured
+        // stop token while selecting the next token below that floor so an EOS
+        // at the final allowed step cannot produce one fewer visible token.
+        let suppress_stop_tokens = generated_tokens < params.min_tokens;
+        let token_allowed = |index: usize| {
+            !suppress_stop_tokens || !params.stop_token_ids.contains(&(index as u32))
+        };
 
         let temperature = params.temperature;
         if temperature <= 0.0 {
             return logits
                 .iter()
                 .enumerate()
+                .filter(|(index, _)| token_allowed(*index))
                 .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
                 .map(|(i, _)| i as u32)
                 .unwrap_or(0);
@@ -6278,6 +6395,9 @@ impl LLMEngine {
 
         let mut top: Vec<(usize, f32)> = Vec::with_capacity(top_k);
         for (idx, &logit) in logits.iter().enumerate() {
+            if !token_allowed(idx) {
+                continue;
+            }
             let scaled = logit / temperature;
             if top.len() < top_k {
                 top.push((idx, scaled));

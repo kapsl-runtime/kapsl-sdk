@@ -13,7 +13,9 @@
 #[cfg(all(feature = "native", test))]
 mod native_hotswap {
     use std::path::Path;
-    use kapsl_engine_api::{BinaryTensorPacket, Engine, InferenceRequest, TensorDtype};
+    use kapsl_engine_api::{
+        BatchingMode, BinaryTensorPacket, Engine, InferenceRequest, TensorDtype,
+    };
 
     fn model_a() -> Option<String> { std::env::var("KAPSL_TEST_MODEL_A").ok() }
     fn model_b() -> Option<String> { std::env::var("KAPSL_TEST_MODEL_B").ok() }
@@ -38,6 +40,15 @@ mod native_hotswap {
 
     fn new_backend() -> super::super::inner::NativeBackend {
         super::super::inner::NativeBackend::new(0).expect("CUDA device 0")
+    }
+
+    #[test]
+    fn native_backend_advertises_internal_continuous_batching() {
+        let policy = super::super::inner::native_batching_policy();
+        assert_eq!(policy.mode, BatchingMode::Continuous);
+        assert_eq!(policy.max_requests, 32);
+        assert_eq!(policy.queue_delay_ms, None);
+        assert!(!policy.supports_priority);
     }
 
     // ── stage() / is_staged() / swap() lifecycle ──────────────────────────

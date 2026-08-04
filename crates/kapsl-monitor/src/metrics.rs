@@ -79,7 +79,8 @@ impl KapslMetrics {
         .unwrap();
 
         let batch_size_hist = HistogramVec::new(
-            HistogramOpts::new("kapsl_batch_size", "Observed batch sizes"),
+            HistogramOpts::new("kapsl_batch_size", "Number of requests per engine dispatch")
+                .buckets(vec![1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0]),
             &["model"],
         )
         .unwrap();

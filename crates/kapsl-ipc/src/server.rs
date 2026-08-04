@@ -48,6 +48,18 @@ fn check_auth(request: &InferenceRequest, expected: Option<&str>) -> Option<Stri
     }
 }
 
+fn request_priority(request: &InferenceRequest, default: Priority) -> Priority {
+    match request
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.priority)
+    {
+        Some(0) => Priority::LatencyCritical,
+        Some(_) => Priority::Throughput,
+        None => default,
+    }
+}
+
 fn decode_inference_request(payload: &[u8]) -> Result<InferenceRequest, String> {
     match bincode::deserialize::<InferenceRequest>(payload) {
         Ok(request) => Ok(request),
@@ -280,9 +292,8 @@ where
                 };
 
                 // Execute streaming inference
-                let stream_result = scheduler
-                    .infer_stream(request, Priority::LatencyCritical, false)
-                    .await;
+                let priority = request_priority(&request, Priority::LatencyCritical);
+                let stream_result = scheduler.infer_stream(request, priority, false).await;
 
                 use futures::StreamExt;
                 match stream_result {
@@ -404,9 +415,10 @@ where
                         continue;
                     }
 
-                    // Process
-                    // Default to Throughput priority and allow GPU (force_cpu = false)
-                    let result = scheduler.infer(&request, Priority::Throughput, false).await;
+                    // Process. Direct IPC clients default to throughput; delegated
+                    // engines carry the parent scheduler's resolved priority.
+                    let priority = request_priority(&request, Priority::Throughput);
+                    let result = scheduler.infer(&request, priority, false).await;
 
                     match result {
                         Ok(output) => {
@@ -672,5 +684,155 @@ where
                     .await?;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::Stream;
+    use kapsl_engine_api::{EngineError, EngineMetrics, RequestMetadata, TensorDtype};
+    use std::pin::Pin;
+    use std::sync::Mutex;
+    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt, DuplexStream};
+
+    struct PriorityRecordingScheduler {
+        seen: Arc<Mutex<Vec<Priority>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ReplicaScheduler for PriorityRecordingScheduler {
+        fn get_queue_depth(&self) -> (usize, usize) {
+            (0, 0)
+        }
+
+        fn is_healthy(&self) -> bool {
+            true
+        }
+
+        fn get_metrics(&self) -> EngineMetrics {
+            EngineMetrics::default()
+        }
+
+        async fn infer(
+            &self,
+            request: &InferenceRequest,
+            priority: Priority,
+            _force_cpu: bool,
+        ) -> Result<BinaryTensorPacket, EngineError> {
+            self.seen.lock().unwrap().push(priority);
+            Ok(request.input.clone())
+        }
+
+        async fn infer_stream(
+            &self,
+            request: InferenceRequest,
+            priority: Priority,
+            _force_cpu: bool,
+        ) -> Result<
+            Pin<Box<dyn Stream<Item = Result<BinaryTensorPacket, EngineError>> + Send>>,
+            EngineError,
+        > {
+            self.seen.lock().unwrap().push(priority);
+            Ok(Box::pin(futures::stream::once(
+                async move { Ok(request.input) },
+            )))
+        }
+    }
+
+    fn request_with_priority(priority: u8) -> InferenceRequest {
+        let mut metadata = RequestMetadata::default();
+        metadata.priority = Some(priority);
+        InferenceRequest::new(BinaryTensorPacket {
+            shape: vec![1],
+            dtype: TensorDtype::Float32,
+            data: 1.0f32.to_ne_bytes().to_vec(),
+        })
+        .with_metadata(metadata)
+    }
+
+    async fn write_request(
+        client: &mut DuplexStream,
+        model_id: u32,
+        op_code: u32,
+        request: &InferenceRequest,
+    ) {
+        let payload = bincode::serialize(request).expect("request serialization");
+        client
+            .write_all(&model_id.to_le_bytes())
+            .await
+            .expect("write model id");
+        client
+            .write_all(&op_code.to_le_bytes())
+            .await
+            .expect("write op code");
+        client
+            .write_all(&(payload.len() as u32).to_le_bytes())
+            .await
+            .expect("write payload size");
+        client.write_all(&payload).await.expect("write payload");
+    }
+
+    async fn read_response(client: &mut DuplexStream) -> (u32, Vec<u8>) {
+        let mut header = [0u8; 8];
+        client
+            .read_exact(&mut header)
+            .await
+            .expect("read response header");
+        let status = u32::from_le_bytes(header[0..4].try_into().unwrap());
+        let payload_size = u32::from_le_bytes(header[4..8].try_into().unwrap());
+        let mut payload = vec![0u8; payload_size as usize];
+        client
+            .read_exact(&mut payload)
+            .await
+            .expect("read response payload");
+        (status, payload)
+    }
+
+    fn lookup_for(scheduler: Arc<dyn ReplicaScheduler + Send + Sync>) -> SchedulerLookup {
+        Arc::new(move |model_id| (model_id == 7).then(|| scheduler.clone()))
+    }
+
+    #[tokio::test]
+    async fn infer_uses_priority_stamped_by_delegating_scheduler() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let scheduler: Arc<dyn ReplicaScheduler + Send + Sync> =
+            Arc::new(PriorityRecordingScheduler { seen: seen.clone() });
+        let (mut client, server) = duplex(4096);
+        let task = tokio::spawn(handle_connection(server, lookup_for(scheduler), None, None));
+
+        write_request(&mut client, 7, OP_INFER, &request_with_priority(0)).await;
+        let (status, payload) = read_response(&mut client).await;
+        assert_eq!(status, STATUS_OK);
+        bincode::deserialize::<BinaryTensorPacket>(&payload).expect("response packet");
+
+        drop(client);
+        task.await
+            .expect("server task")
+            .expect("connection handler");
+        assert_eq!(*seen.lock().unwrap(), vec![Priority::LatencyCritical]);
+    }
+
+    #[tokio::test]
+    async fn stream_uses_priority_stamped_by_delegating_scheduler() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let scheduler: Arc<dyn ReplicaScheduler + Send + Sync> =
+            Arc::new(PriorityRecordingScheduler { seen: seen.clone() });
+        let (mut client, server) = duplex(4096);
+        let task = tokio::spawn(handle_connection(server, lookup_for(scheduler), None, None));
+
+        write_request(&mut client, 7, OP_INFER_STREAM, &request_with_priority(1)).await;
+        let (status, payload) = read_response(&mut client).await;
+        assert_eq!(status, STATUS_STREAM_CHUNK);
+        bincode::deserialize::<BinaryTensorPacket>(&payload).expect("stream packet");
+        let (status, payload) = read_response(&mut client).await;
+        assert_eq!(status, STATUS_STREAM_END);
+        assert!(payload.is_empty());
+
+        drop(client);
+        task.await
+            .expect("server task")
+            .expect("connection handler");
+        assert_eq!(*seen.lock().unwrap(), vec![Priority::Throughput]);
     }
 }

@@ -1,12 +1,16 @@
 use crate::gpu_executor::{GpuExecutor, WorkQueue};
 use crate::mesh_routing::{MeshRouter, MeshRouterStats};
-use crate::priority::Priority;
+use crate::priority::{stamp_engine_priority, Priority};
 use crate::request::Request;
+use futures::Stream;
 use kapsl_engine_api::{
-    BinaryTensorPacket, EngineError, EngineHandle, EngineModelInfo, InferenceRequest,
+    BatchingMode, BinaryTensorPacket, EngineError, EngineHandle, EngineModelInfo, EngineStream,
+    InferenceRequest,
 };
-use std::sync::atomic::AtomicUsize;
-use tokio::sync::oneshot;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll};
+use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 
 use kapsl_hal::device_mesh::DeviceMesh;
 use std::sync::Arc;
@@ -28,6 +32,42 @@ impl QueueOverflowPolicy {
     }
 }
 
+struct StreamAdmissionGuard {
+    counter: Arc<AtomicUsize>,
+    _permit: Option<OwnedSemaphorePermit>,
+}
+
+impl StreamAdmissionGuard {
+    fn new(counter: Arc<AtomicUsize>, permit: Option<OwnedSemaphorePermit>) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self {
+            counter,
+            _permit: permit,
+        }
+    }
+}
+
+impl Drop for StreamAdmissionGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+struct TrackedEngineStream {
+    inner: EngineStream,
+    _guard: StreamAdmissionGuard,
+}
+
+impl Unpin for TrackedEngineStream {}
+
+impl Stream for TrackedEngineStream {
+    type Item = Result<BinaryTensorPacket, EngineError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.inner.as_mut().poll_next(cx)
+    }
+}
+
 /// Main scheduler that coordinates CPU and GPU execution
 pub struct Scheduler {
     engines: Vec<EngineHandle>,
@@ -40,6 +80,10 @@ pub struct Scheduler {
     cpu_active_count: Arc<std::sync::atomic::AtomicUsize>,
     // Track in-flight GPU work (requests already dequeued from the channels, but not finished).
     gpu_in_flight_count: Arc<AtomicUsize>,
+    // Track active GPU streams, which bypass the one-shot executor queue but
+    // still need admission/backpressure accounting.
+    gpu_stream_in_flight_count: Arc<AtomicUsize>,
+    gpu_stream_slots: Arc<Semaphore>,
     // Device mesh for distributed inference
     device_mesh: Option<Arc<DeviceMesh>>,
     // Mesh router for topology-aware routing
@@ -72,6 +116,7 @@ impl Scheduler {
         let mut gpu_high_priority_queues = Vec::with_capacity(total_workers);
         let mut gpu_low_priority_queues = Vec::with_capacity(total_workers);
         let gpu_in_flight_count = Arc::new(AtomicUsize::new(0));
+        let gpu_stream_slots = Arc::new(Semaphore::new(total_workers.max(1) * queue_size.max(1)));
 
         for engine in &engines {
             for _ in 0..workers_per_device {
@@ -106,6 +151,8 @@ impl Scheduler {
             _enable_fallback: enable_fallback,
             cpu_active_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             gpu_in_flight_count,
+            gpu_stream_in_flight_count: Arc::new(AtomicUsize::new(0)),
+            gpu_stream_slots,
             device_mesh,
             router,
             max_micro_batch,
@@ -135,6 +182,39 @@ impl Scheduler {
         tp_group_hint: Option<usize>,
     ) -> usize {
         self.router.route(session_id, tp_group_hint)
+    }
+
+    async fn acquire_gpu_stream_permit(&self) -> Result<OwnedSemaphorePermit, EngineError> {
+        match self.queue_overflow_policy {
+            QueueOverflowPolicy::Block => self
+                .gpu_stream_slots
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| EngineError::overloaded("GPU stream slots closed".to_string())),
+            QueueOverflowPolicy::DropNewest => {
+                self.gpu_stream_slots
+                    .clone()
+                    .try_acquire_owned()
+                    .map_err(|_| {
+                        EngineError::overloaded(format!(
+                            "GPU stream slots full (policy={})",
+                            self.queue_overflow_policy.as_str()
+                        ))
+                    })
+            }
+            QueueOverflowPolicy::DropOldest => {
+                self.gpu_stream_slots
+                    .clone()
+                    .try_acquire_owned()
+                    .map_err(|_| {
+                        EngineError::overloaded(
+                            "GPU stream slots full (policy=drop_oldest; active streams cannot be evicted)"
+                                .to_string(),
+                        )
+                    })
+            }
+        }
     }
 
     /// Get mesh routing statistics
@@ -278,6 +358,9 @@ impl Scheduler {
         gpu_total += self
             .gpu_in_flight_count
             .load(std::sync::atomic::Ordering::Relaxed);
+        gpu_total += self
+            .gpu_stream_in_flight_count
+            .load(std::sync::atomic::Ordering::Relaxed);
         (cpu_depth, gpu_total)
     }
 
@@ -415,8 +498,8 @@ impl crate::replica_pool::ReplicaScheduler for Scheduler {
 
     async fn infer_stream(
         &self,
-        request: InferenceRequest,
-        _priority: Priority,
+        mut request: InferenceRequest,
+        priority: Priority,
         force_cpu: bool,
     ) -> Result<
         std::pin::Pin<
@@ -424,6 +507,14 @@ impl crate::replica_pool::ReplicaScheduler for Scheduler {
         >,
         EngineError,
     > {
+        if request
+            .cancellation
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
+        {
+            return Err(EngineError::cancelled("Request cancelled"));
+        }
+
         if !self.is_healthy() {
             return Err(EngineError::overloaded("Scheduler overloaded".to_string()));
         }
@@ -437,8 +528,29 @@ impl crate::replica_pool::ReplicaScheduler for Scheduler {
         let engine_idx = worker_idx % self.engines.len();
         let engine = self.engines[engine_idx].clone();
 
+        let batching_policy = engine.batching_policy();
+        if matches!(
+            batching_policy.mode,
+            BatchingMode::Continuous | BatchingMode::Delegated
+        ) && batching_policy.supports_priority
+        {
+            stamp_engine_priority(&mut request, priority);
+        }
+
+        let (counter, permit) = if force_cpu {
+            (self.cpu_active_count.clone(), None)
+        } else {
+            (
+                self.gpu_stream_in_flight_count.clone(),
+                Some(self.acquire_gpu_stream_permit().await?),
+            )
+        };
+        let guard = StreamAdmissionGuard::new(counter, permit);
         let stream = engine.infer_stream(&request);
-        Ok(stream)
+        Ok(Box::pin(TrackedEngineStream {
+            inner: stream,
+            _guard: guard,
+        }))
     }
 }
 

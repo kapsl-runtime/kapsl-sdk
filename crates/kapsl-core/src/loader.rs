@@ -104,6 +104,24 @@ pub struct Manifest {
     pub cron_jobs: Vec<CronJobDef>,
 }
 
+impl Manifest {
+    /// The input front-end this package asks for, from
+    /// `metadata.preprocess.kind` (`vision`, `audio`). `None` when the package
+    /// declares no preprocessing, which means the model takes tensors directly.
+    ///
+    /// Only the kind is surfaced, not the rest of the block: the geometry and
+    /// normalization belong to the server-side preprocessor, and a client that
+    /// read them would be re-implementing it.
+    pub fn preprocess_kind(&self) -> Option<String> {
+        self.metadata
+            .as_ref()?
+            .get("preprocess")?
+            .get("kind")?
+            .as_str()
+            .map(str::to_string)
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum LoaderError {
     #[error("IO error: {0}")]
@@ -150,11 +168,15 @@ impl PackageLoader {
         let temp_dir = create_package_temp_dir(package_path)?;
         let extracted_path = temp_dir.path().to_path_buf();
 
-        let file = File::open(package_path)?;
-        let tar = GzDecoder::new(file);
-        let mut archive = Archive::new(tar);
-
-        archive.unpack(&extracted_path)?;
+        // Scoped so the archive's handle on the package is closed before
+        // anything downstream touches the file — Windows refuses to delete an
+        // open one, which is what discard_package_after_load would ask for.
+        {
+            let file = File::open(package_path)?;
+            let tar = GzDecoder::new(file);
+            let mut archive = Archive::new(tar);
+            archive.unpack(&extracted_path)?;
+        }
 
         log::info!("Extracted package to: {}", extracted_path.display());
         for entry in fs::read_dir(&extracted_path)? {
@@ -189,6 +211,23 @@ impl PackageLoader {
         }
         let persisted_model_path =
             persist_model_file(package_path, &manifest.model_file, &model_path)?;
+
+        // Only once the cache holds the model, and never before: the cached
+        // copy is linked from the extracted temp directory rather than from the
+        // archive, so this cannot take the bytes back out from under it.
+        if discard_package_after_load() {
+            match fs::remove_file(package_path) {
+                Ok(()) => log::info!(
+                    "Discarded package after load: {}",
+                    package_path.display()
+                ),
+                Err(error) => log::warn!(
+                    "Failed to discard package {}: {}",
+                    package_path.display(),
+                    error
+                ),
+            }
+        }
 
         Ok(Self {
             _temp_dir: temp_dir,
@@ -453,7 +492,11 @@ fn persist_model_assets(
     )?;
 
     for asset in assets {
-        copy_if_needed(&asset.source_path, asset.source_size, &cache_dir.join(asset.target_name))?;
+        link_or_copy_if_needed(
+            &asset.source_path,
+            asset.source_size,
+            &cache_dir.join(asset.target_name),
+        )?;
     }
 
     Ok(cache_dir.join(file_name))
@@ -506,6 +549,12 @@ fn collect_model_assets(
     Ok(assets)
 }
 
+/// Upper bound on what admitting these assets to the cache will cost.
+///
+/// It assumes every asset is copied. Where the hard link in
+/// `link_or_copy_if_needed` succeeds the real cost is nothing, so this can evict
+/// more than it had to — an over-estimate that only ever frees space, which is
+/// the harmless direction for a bound that guards against running out of it.
 fn estimate_required_copy_bytes(
     assets: &[ModelAsset],
     cache_dir: &Path,
@@ -533,15 +582,71 @@ fn should_copy_file(source_size: u64, target_path: &Path) -> Result<bool, Loader
     Ok(metadata.len() != source_size)
 }
 
-fn copy_if_needed(source_path: &Path, source_size: u64, target_path: &Path) -> Result<(), LoaderError> {
+/// Places an extracted asset in the cache, preferring a hard link.
+///
+/// The source is the copy inside the package's temp directory, which is deleted
+/// as soon as loading finishes, so the cache only needs the bytes to outlive it
+/// — and a second link to the same inode does that without spending them twice.
+/// It matters most where it is least visible: a container's writable layer is
+/// often RAM, so a copy of a multi-gigabyte model is charged against the same
+/// budget as the weights themselves.
+///
+/// Falling back to a copy is normal rather than exceptional. Hard links fail
+/// across filesystems (`EXDEV`), which is exactly what a configured
+/// `KAPSL_MODEL_CACHE_DIR` on another volume produces, and some filesystems
+/// refuse them outright.
+fn link_or_copy_if_needed(
+    source_path: &Path,
+    source_size: u64,
+    target_path: &Path,
+) -> Result<(), LoaderError> {
     if !should_copy_file(source_size, target_path)? {
         return Ok(());
     }
     if let Some(parent) = target_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::copy(source_path, target_path)?;
+    // A stale entry of the wrong size is what got us here, and hard_link will
+    // not overwrite.
+    match fs::remove_file(target_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(LoaderError::Io(error)),
+    }
+
+    if let Err(error) = fs::hard_link(source_path, target_path) {
+        log::debug!(
+            "Hard link {} -> {} failed ({}); copying instead",
+            source_path.display(),
+            target_path.display(),
+            error
+        );
+        fs::copy(source_path, target_path)?;
+    }
     Ok(())
+}
+
+/// Whether to delete the `.aimod` once its contents are safely in the cache.
+///
+/// Off by default: for anyone running `kapsl run --model ./my-model.aimod` the
+/// package is their file, not a disposable artifact. It is opt-in for callers
+/// that pulled the package solely to load it — a serverless runtime, say, whose
+/// filesystem is RAM and which re-pulls on every cold start anyway. There the
+/// package is pure overhead from the moment the cache is populated.
+fn discard_package_after_load() -> bool {
+    for key in [
+        "KAPSL_DISCARD_PACKAGE_AFTER_LOAD",
+        "KAPSL_LITE_DISCARD_PACKAGE_AFTER_LOAD",
+    ] {
+        let Ok(value) = std::env::var(key) else {
+            continue;
+        };
+        return matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        );
+    }
+    false
 }
 
 fn enforce_cache_policy<F>(

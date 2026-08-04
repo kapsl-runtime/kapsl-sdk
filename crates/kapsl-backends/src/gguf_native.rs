@@ -27,8 +27,8 @@ mod inner {
     use rand::{Rng, SeedableRng};
 
     use kapsl_engine_api::{
-        BinaryTensorPacket, Engine, EngineError, EngineMetrics, EngineModelInfo, EngineStream,
-        InferenceRequest, RequestMetadata, TensorDtype,
+        BatchingPolicy, BinaryTensorPacket, Engine, EngineError, EngineMetrics, EngineModelInfo,
+        EngineStream, InferenceRequest, RequestMetadata, TensorDtype,
     };
     use kapsl_hal::gpu_arena::{GpuBlockPool, GpuPoolHandle};
     use kapsl_loader::weights::DType;
@@ -1656,6 +1656,10 @@ mod inner {
                 kv_cache_packed_layers: 0,
                 ..EngineMetrics::new()
             }
+        }
+
+        fn batching_policy(&self) -> BatchingPolicy {
+            BatchingPolicy::continuous(self.batch_dec.active_count().max(1))
         }
 
         fn health_check(&self) -> Result<(), EngineError> {
