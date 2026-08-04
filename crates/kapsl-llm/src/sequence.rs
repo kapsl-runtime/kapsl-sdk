@@ -1,6 +1,7 @@
 use kapsl_engine_api::CancellationToken;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokenizers::Tokenizer;
 use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -30,12 +31,80 @@ pub struct Sequence {
     pub generated_this_turn: usize,
     pub kv_cached_len: usize,
     pub rng_state: u64,
-    /// Text that has already been emitted by the incremental decoder.
-    ///
-    /// Keeping the stable decoded prefix is sufficient for byte-level BPE
-    /// tokenizers and avoids persisting the fragile index bookkeeping used by
-    /// `tokenizers::DecodeStream` 0.20.x.
+    /// Text emitted during the current generation turn.
     pub decode_stream_prefix: String,
+    pub(crate) decode_stream: IncrementalDecodeState,
+}
+
+/// Owned state for Hugging Face tokenizers' incremental decoder.
+///
+/// `tokenizers::DecodeStream` borrows its tokenizer, which prevents storing it
+/// alongside a long-lived sequence. This owns the corrected bounded state used
+/// by newer tokenizers releases, so each decode only revisits the small unstable
+/// suffix instead of every token generated so far.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct IncrementalDecodeState {
+    ids: Vec<u32>,
+    prefix: String,
+    prefix_index: usize,
+    cumulative_fallback: bool,
+}
+
+impl IncrementalDecodeState {
+    pub(crate) fn step(
+        &mut self,
+        tokenizer: &Tokenizer,
+        token_id: u32,
+    ) -> tokenizers::Result<Option<String>> {
+        self.ids.push(token_id);
+        let decoded = tokenizer.decode(&self.ids, true)?;
+        let delta = if decoded.len() > self.prefix.len() && !decoded.ends_with('\u{fffd}') {
+            if !decoded.starts_with(&self.prefix) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "incremental tokenizer decode encountered an invalid prefix",
+                )
+                .into());
+            }
+
+            let delta = decoded[self.prefix.len()..].to_string();
+            let new_prefix_index =
+                self.ids
+                    .len()
+                    .checked_sub(self.prefix_index)
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "incremental tokenizer decode index became invalid",
+                        )
+                    })?;
+            self.ids = self.ids.drain(self.prefix_index..).collect();
+            self.prefix = tokenizer.decode(&self.ids, true)?;
+            self.prefix_index = new_prefix_index;
+            Some(delta)
+        } else {
+            None
+        };
+
+        Ok(delta)
+    }
+
+    pub(crate) fn enter_cumulative_fallback(&mut self) {
+        self.cumulative_fallback = true;
+    }
+
+    pub(crate) fn uses_cumulative_fallback(&self) -> bool {
+        self.cumulative_fallback
+    }
+
+    pub(crate) fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn buffered_token_count(&self) -> usize {
+        self.ids.len()
+    }
 }
 
 impl Sequence {
@@ -51,6 +120,7 @@ impl Sequence {
             kv_cached_len: 0,
             rng_state: 0x4d595df4d0f33173,
             decode_stream_prefix: String::new(),
+            decode_stream: IncrementalDecodeState::default(),
         }
     }
 
@@ -70,6 +140,7 @@ impl Sequence {
 
     pub fn reset_decode_stream(&mut self) {
         self.decode_stream_prefix.clear();
+        self.decode_stream.reset();
     }
 }
 

@@ -6308,36 +6308,60 @@ impl LLMEngine {
     }
 
     fn decode_next_token(tokenizer: &Tokenizer, seq: &mut Sequence, token_id: u32) -> String {
-        let decoded = match tokenizer.decode(&seq.output_token_ids, true) {
-            Ok(decoded) => decoded,
+        if seq.decode_stream.uses_cumulative_fallback() {
+            return Self::decode_cumulative_delta(tokenizer, seq, token_id);
+        }
+
+        let mut text = match seq.decode_stream.step(tokenizer, token_id) {
+            Ok(Some(delta)) => {
+                seq.decode_stream_prefix.push_str(&delta);
+                delta
+            }
+            Ok(None) => String::new(),
             Err(err) => {
                 log::warn!("Incremental tokenizer decode failed: {}", err);
+                seq.decode_stream.enter_cumulative_fallback();
+                return Self::decode_cumulative_delta(tokenizer, seq, token_id);
+            }
+        };
+
+        // The bounded stream intentionally withholds an incomplete byte-level
+        // token. Reconcile once at completion to flush any remaining suffix and
+        // provide a correctness check without cumulatively decoding every step.
+        if seq.is_finished() {
+            text.push_str(&Self::decode_cumulative_delta(tokenizer, seq, token_id));
+        }
+        text
+    }
+
+    fn decode_cumulative_delta(tokenizer: &Tokenizer, seq: &mut Sequence, token_id: u32) -> String {
+        let generated_start = seq
+            .output_token_ids
+            .len()
+            .saturating_sub(seq.generated_this_turn);
+        let decoded = match tokenizer.decode(&seq.output_token_ids[generated_start..], true) {
+            Ok(decoded) => decoded,
+            Err(err) => {
+                log::warn!("Cumulative tokenizer decode failed: {}", err);
                 return String::new();
             }
         };
 
-        // Byte-level BPE can end a partial decode with the replacement
-        // character while a multi-byte UTF-8 character is still incomplete.
-        // Do not expose that unstable suffix: the next token will complete it
-        // and the cumulative decode will then extend the last stable prefix.
-        if decoded.ends_with('\u{fffd}') && !seq.is_finished() {
-            return String::new();
-        }
-
-        if let Some(delta) = decoded.strip_prefix(&seq.decode_stream_prefix) {
-            let delta = delta.to_string();
-            seq.decode_stream_prefix = decoded;
-            delta
-        } else {
-            // A decoder must never make already-streamed bytes retractable.
-            // Returning no new bytes is safer than duplicating the cumulative
-            // output; the final benchmark correctness gate will also surface
-            // any tokenizer whose decoder is not prefix-stable.
-            log::warn!(
-                "Incremental tokenizer decode rewrote an emitted prefix after token {}",
-                token_id
-            );
-            String::new()
+        match decoded.strip_prefix(&seq.decode_stream_prefix) {
+            Some(delta) => {
+                let delta = delta.to_string();
+                seq.decode_stream_prefix = decoded;
+                delta
+            }
+            None => {
+                // A decoder must never make already-streamed bytes retractable.
+                // Returning no new bytes is safer than duplicating the output.
+                log::warn!(
+                    "Incremental tokenizer decode rewrote an emitted prefix after token {}",
+                    token_id
+                );
+                String::new()
+            }
         }
     }
 
@@ -6364,21 +6388,28 @@ impl LLMEngine {
             return 0;
         }
 
-        // Hugging Face-style min_new_tokens is a floor on decoded content,
-        // not a count that includes EOS/stop tokens. Suppress every configured
-        // stop token while selecting the next token below that floor so an EOS
-        // at the final allowed step cannot produce one fewer visible token.
-        let suppress_stop_tokens = generated_tokens < params.min_tokens;
-        let token_allowed = |index: usize| {
-            !suppress_stop_tokens || !params.stop_token_ids.contains(&(index as u32))
-        };
+        // Hugging Face-style min_new_tokens is a floor on decoded content. The
+        // optimistic path samples normally and only performs a filtered rescan
+        // when a stop token would actually enter the candidate set.
+        let suppress_stop_tokens =
+            generated_tokens < params.min_tokens && !params.stop_token_ids.is_empty();
 
         let temperature = params.temperature;
         if temperature <= 0.0 {
+            let next = logits
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .map(|(i, _)| i as u32)
+                .unwrap_or(0);
+            if !suppress_stop_tokens || !params.stop_token_ids.contains(&next) {
+                return next;
+            }
+
             return logits
                 .iter()
                 .enumerate()
-                .filter(|(index, _)| token_allowed(*index))
+                .filter(|(index, _)| !params.stop_token_ids.contains(&(*index as u32)))
                 .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
                 .map(|(i, _)| i as u32)
                 .unwrap_or(0);
@@ -6393,21 +6424,25 @@ impl LLMEngine {
             top_k = 1;
         }
 
-        let mut top: Vec<(usize, f32)> = Vec::with_capacity(top_k);
-        for (idx, &logit) in logits.iter().enumerate() {
-            if !token_allowed(idx) {
-                continue;
-            }
-            let scaled = logit / temperature;
-            if top.len() < top_k {
-                top.push((idx, scaled));
-                if top.len() == top_k {
-                    top.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-                }
-            } else if scaled > top[0].1 {
-                top[0] = (idx, scaled);
-                top.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-            }
+        // With an unbounded top-k every in-vocabulary stop token is guaranteed
+        // to enter the candidates, so filter during the first scan. For the
+        // usual small top-k, avoid per-logit stop membership checks unless a
+        // stop token actually reaches the candidate set.
+        let initial_suppression = (suppress_stop_tokens && top_k == logits.len())
+            .then_some(params.stop_token_ids.as_slice());
+        let mut top = Self::collect_top_candidates(logits, temperature, top_k, initial_suppression);
+        if initial_suppression.is_none()
+            && suppress_stop_tokens
+            && top
+                .iter()
+                .any(|(index, _)| params.stop_token_ids.contains(&(*index as u32)))
+        {
+            top = Self::collect_top_candidates(
+                logits,
+                temperature,
+                top_k,
+                Some(&params.stop_token_ids),
+            );
         }
 
         if top.is_empty() {
@@ -6457,6 +6492,31 @@ impl LLMEngine {
         }
 
         top[0].0 as u32
+    }
+
+    fn collect_top_candidates(
+        logits: &[f32],
+        temperature: f32,
+        top_k: usize,
+        suppressed_token_ids: Option<&[u32]>,
+    ) -> Vec<(usize, f32)> {
+        let mut top: Vec<(usize, f32)> = Vec::with_capacity(top_k);
+        for (idx, &logit) in logits.iter().enumerate() {
+            if suppressed_token_ids.is_some_and(|token_ids| token_ids.contains(&(idx as u32))) {
+                continue;
+            }
+            let scaled = logit / temperature;
+            if top.len() < top_k {
+                top.push((idx, scaled));
+                if top.len() == top_k {
+                    top.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+                }
+            } else if scaled > top[0].1 {
+                top[0] = (idx, scaled);
+                top.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+            }
+        }
+        top
     }
 }
 
