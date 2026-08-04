@@ -165,6 +165,59 @@ fn normalize_metadata_safe_load_setting(setting: SafeLoadSetting) -> SafeLoadSet
     }
 }
 
+fn tokenizer_add_bos_token(model_path: &Path) -> Option<bool> {
+    let path = find_model_asset(model_path, "tokenizer_config.json")?;
+    let file = std::fs::File::open(path).ok()?;
+    serde_json::from_reader::<_, serde_json::Value>(file)
+        .ok()?
+        .get("add_bos_token")?
+        .as_bool()
+}
+
+fn tokenizer_declared_bos_token_id(model_path: &Path, tokenizer: &Tokenizer) -> Option<u32> {
+    if let Some(path) = find_model_asset(model_path, "tokenizer_config.json") {
+        if let Ok(file) = std::fs::File::open(path) {
+            if let Ok(config) = serde_json::from_reader::<_, serde_json::Value>(file) {
+                let bos_token = config.get("bos_token").and_then(|value| {
+                    value
+                        .as_str()
+                        .or_else(|| value.get("content").and_then(serde_json::Value::as_str))
+                });
+                if let Some(id) = bos_token.and_then(|token| tokenizer.token_to_id(token)) {
+                    return Some(id);
+                }
+            }
+        }
+    }
+
+    let path = find_model_asset(model_path, "tokenizer.json")?;
+    let file = std::fs::File::open(path).ok()?;
+    let tokenizer_json = serde_json::from_reader::<_, serde_json::Value>(file).ok()?;
+    let single = tokenizer_json
+        .get("post_processor")?
+        .get("single")?
+        .as_array()?;
+    single.iter().find_map(|entry| {
+        let token = entry.get("SpecialToken")?.get("id")?.as_str()?;
+        let normalized = token.to_ascii_lowercase();
+        (normalized == "<s>" || normalized.contains("bos") || normalized.contains("begin"))
+            .then(|| tokenizer.token_to_id(token))
+            .flatten()
+    })
+}
+
+fn resolve_prepend_bos_token_id(
+    configured_bos_token_id: Option<u32>,
+    add_bos_token: Option<bool>,
+) -> Option<u32> {
+    match add_bos_token {
+        Some(false) => None,
+        // Preserve the existing config.json fallback for packages that predate
+        // tokenizer_config.json, while honoring models that explicitly enable BOS.
+        Some(true) | None => configured_bos_token_id,
+    }
+}
+
 fn env_var_alias(primary: &str, legacy: &str) -> Option<String> {
     std::env::var(primary)
         .or_else(|_| std::env::var(legacy))
@@ -988,8 +1041,8 @@ pub struct LLMEngine {
     kv_admission_hard_limit_bytes: Option<usize>,
     // Detected vocabulary size (optional). Populated at load() when available.
     vocab_size: Option<usize>,
-    // Detected BOS token id (optional).
-    bos_token_id: Option<u32>,
+    // BOS token id to prepend when enabled by the tokenizer policy (optional).
+    prepend_bos_token_id: Option<u32>,
     // Whether to use KV cache inputs/outputs. Some models export these but don't support non-zero past.
     use_kv_cache: bool,
     // Guard to avoid repeated in-loop recovery churn.
@@ -1168,7 +1221,7 @@ impl LLMEngine {
             kv_blocks_cap: None,
             kv_compression_bits_override: None,
             vocab_size: None,
-            bos_token_id: None,
+            prepend_bos_token_id: None,
             use_kv_cache: true,
             coreml_cpu_fallback_attempted: false,
             kv_workspace_key: Vec::new(),
@@ -1764,6 +1817,11 @@ impl LLMEngine {
             Tokenizer::from_file(&tokenizer_path)
                 .map_err(|e| EngineError::backend(e.to_string()))?,
         );
+        let tokenizer_adds_bos = tokenizer_add_bos_token(model_path);
+        let tokenizer_bos_token_id = self
+            .tokenizer
+            .as_ref()
+            .and_then(|tokenizer| tokenizer_declared_bos_token_id(model_path, tokenizer));
 
         // Build the ONNX session so we can inspect its declared inputs.
         let make_builder = |provider: Option<&str>,
@@ -2417,7 +2475,14 @@ impl LLMEngine {
             log::info!("Could not detect model vocab_size; vocab_size remains unset");
             self.vocab_size = None;
         }
-        self.bos_token_id = config_bos_token_id;
+        let declared_bos_token_id = config_bos_token_id.or(tokenizer_bos_token_id);
+        self.prepend_bos_token_id =
+            resolve_prepend_bos_token_id(declared_bos_token_id, tokenizer_adds_bos);
+        if config_bos_token_id.is_some() && tokenizer_adds_bos == Some(false) {
+            log::info!(
+                "Tokenizer explicitly disables BOS insertion; config.json bos_token_id will not be prepended"
+            );
+        }
 
         // Persist captured names & shapes and session.
         self.model_input_names = Arc::new(input_names_set);
@@ -2647,7 +2712,7 @@ impl LLMEngine {
                 let tokenizer = self.tokenizer.as_ref().unwrap();
                 let encoded = tokenizer.encode(prompt, false).unwrap();
                 let mut token_ids = encoded.get_ids().to_vec();
-                if let Some(bos_id) = self.bos_token_id {
+                if let Some(bos_id) = self.prepend_bos_token_id {
                     if existing_seq_arc.is_some() {
                         if token_ids.first().copied() == Some(bos_id) {
                             token_ids.remove(0);

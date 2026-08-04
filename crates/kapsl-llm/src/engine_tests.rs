@@ -3,11 +3,13 @@ mod tests {
     use super::super::{
         build_kv_array_f16, build_kv_array_f32_from_f16, empty_kv_shape, infer_kv_layout,
         normalize_metadata_safe_load_setting, parse_safe_load_env_setting, parse_safe_load_setting,
+        resolve_prepend_bos_token_id, tokenizer_add_bos_token, tokenizer_declared_bos_token_id,
         KvLayout, LLMEngine, SafeLoadSetting, SamplingParams,
     };
     use half::f16;
     use serde_json::json;
     use std::collections::HashMap;
+    use std::fs;
     use tokenizers::decoders::byte_fallback::ByteFallback;
     use tokenizers::decoders::metaspace::Metaspace;
     use tokenizers::models::bpe::BPE;
@@ -68,6 +70,78 @@ mod tests {
         assert_eq!(
             normalize_metadata_safe_load_setting(SafeLoadSetting::Auto),
             SafeLoadSetting::Auto
+        );
+    }
+
+    #[test]
+    fn bos_insertion_follows_tokenizer_policy_across_model_families() {
+        // Qwen and GPT-style tokenizers commonly expose a bos_token_id for
+        // generation semantics while explicitly disabling automatic insertion.
+        assert_eq!(
+            resolve_prepend_bos_token_id(Some(151_643), Some(false)),
+            None
+        );
+        assert_eq!(
+            resolve_prepend_bos_token_id(Some(50_256), Some(false)),
+            None
+        );
+
+        // Gemma/Llama-style tokenizers that opt in retain their configured BOS.
+        assert_eq!(resolve_prepend_bos_token_id(Some(2), Some(true)), Some(2));
+        assert_eq!(
+            resolve_prepend_bos_token_id(Some(128_000), Some(true)),
+            Some(128_000)
+        );
+
+        // Older DeepSeek and other packages without tokenizer_config.json keep
+        // the legacy config.json behavior instead of changing silently.
+        assert_eq!(
+            resolve_prepend_bos_token_id(Some(100_000), None),
+            Some(100_000)
+        );
+        assert_eq!(resolve_prepend_bos_token_id(None, Some(true)), None);
+    }
+
+    #[test]
+    fn tokenizer_bos_policy_is_read_from_the_model_assets() {
+        let root =
+            std::env::temp_dir().join(format!("kapsl_llm_bos_policy_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create model root");
+        let model_path = root.join("model.onnx");
+        fs::write(&model_path, "").expect("model file");
+        fs::write(
+            root.join("tokenizer_config.json"),
+            json!({ "add_bos_token": false }).to_string(),
+        )
+        .expect("tokenizer config");
+
+        assert_eq!(tokenizer_add_bos_token(&model_path), Some(false));
+    }
+
+    #[test]
+    fn legacy_tokenizer_post_processor_supplies_deepseek_bos() {
+        let root =
+            std::env::temp_dir().join(format!("kapsl_llm_deepseek_bos_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create model root");
+        let model_path = root.join("model.onnx");
+        fs::write(&model_path, "").expect("model file");
+        fs::write(
+            root.join("tokenizer.json"),
+            json!({
+                "post_processor": {
+                    "single": [{
+                        "SpecialToken": { "id": "<｜begin▁of▁sentence｜>" }
+                    }]
+                }
+            })
+            .to_string(),
+        )
+        .expect("tokenizer json");
+        let tokenizer = bpe_tokenizer(HashMap::from([("<｜begin▁of▁sentence｜>".to_string(), 0)]));
+
+        assert_eq!(
+            tokenizer_declared_bos_token_id(&model_path, &tokenizer),
+            Some(0)
         );
     }
 
