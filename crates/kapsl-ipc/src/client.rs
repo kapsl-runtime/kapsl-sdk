@@ -65,10 +65,6 @@ impl IpcClient {
 
 #[async_trait]
 impl TransportClient for IpcClient {
-    fn transport_type(&self) -> &'static str {
-        "ipc"
-    }
-
     async fn infer(
         &self,
         model_id: u32,

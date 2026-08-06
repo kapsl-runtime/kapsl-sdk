@@ -55,10 +55,6 @@ impl DType {
         }
     }
 
-    pub fn is_quantized(self) -> bool {
-        matches!(self, DType::Q8_0 | DType::Q4_K)
-    }
-
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "F32" => Some(DType::F32),
@@ -91,11 +87,6 @@ impl TensorData {
 
     pub fn numel(&self) -> usize {
         self.shape.iter().product()
-    }
-
-    /// Raw byte count accounting for quantized block layouts.
-    pub fn raw_byte_len(&self) -> usize {
-        self.dtype.raw_bytes_for_numel(self.numel())
     }
 
     /// View as f16 slice (panics if dtype is not F16).

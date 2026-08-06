@@ -275,23 +275,6 @@ impl PrefixBlockCache {
         freed
     }
 
-    /// Evict up to `n` zero-refcount block groups globally, oldest first.
-    pub fn evict_lru(&mut self, n: usize) -> Vec<(Arc<GpuBlockPool>, Vec<u32>)> {
-        let mut candidates: Vec<(BlockCacheKey, Instant)> = self.entries.iter()
-            .filter(|(_, e)| e.refcount == 0)
-            .map(|(k, e)| (k.clone(), e.last_used))
-            .collect();
-        candidates.sort_by_key(|(_, t)| *t);
-
-        let mut freed = Vec::new();
-        for (key, _) in candidates.into_iter().take(n) {
-            if let Some(entry) = self.entries.remove(&key) {
-                freed.push((entry.pool, entry.block_ids));
-            }
-        }
-        freed
-    }
-
     // ── Metrics ───────────────────────────────────────────────────────────────
 
     pub fn entry_count(&self) -> usize { self.entries.len() }

@@ -62,14 +62,6 @@ impl NcclComm {
         })
     }
 
-    /// Generate a unique NCCL ID
-    ///
-    /// This should be called on rank 0 and the resulting ID should be
-    /// broadcast to all other ranks before calling `new()`.
-    pub fn generate_id() -> Result<Id, String> {
-        Id::new().map_err(|e| format!("Failed to generate NCCL ID: {:?}", e))
-    }
-
     /// Convert our DType to NCCL type info
     fn dtype_size(dtype: DType) -> usize {
         match dtype {

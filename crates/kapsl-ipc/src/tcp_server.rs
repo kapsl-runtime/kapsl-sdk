@@ -38,11 +38,6 @@ impl TcpServer {
         }
     }
 
-    pub fn with_auth_token(mut self, token: impl Into<String>) -> Self {
-        self.auth_token = Some(Arc::from(token.into().as_str()));
-        self
-    }
-
     async fn run_internal(&self) -> std::io::Result<()> {
         let addr = format!("{}:{}", self.bind_addr, self.port);
         let listener = TcpListener::bind(&addr).await?;
@@ -83,7 +78,4 @@ impl TransportServer for TcpServer {
         Ok(())
     }
 
-    fn transport_type(&self) -> &'static str {
-        "tcp"
-    }
 }

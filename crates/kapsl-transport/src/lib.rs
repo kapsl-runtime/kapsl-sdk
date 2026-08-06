@@ -106,8 +106,6 @@ pub trait TransportServer: Send + Sync {
     /// Gracefully shutdown the server
     async fn shutdown(&self) -> Result<(), TransportError>;
 
-    /// Get the transport type name (for logging/debugging)
-    fn transport_type(&self) -> &'static str;
 }
 
 /// Client-side transport trait
@@ -133,8 +131,6 @@ pub trait TransportClient: Send + Sync {
         TransportError,
     >;
 
-    /// Get the transport type name (for logging/debugging)
-    fn transport_type(&self) -> &'static str;
 }
 
 #[cfg(test)]

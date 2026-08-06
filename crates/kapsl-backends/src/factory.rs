@@ -261,14 +261,6 @@ impl BackendFactory {
         Self::push_unique_provider(providers, "cpu");
     }
 
-    /// Create the best available backend based on manifest requirements and available hardware
-    pub fn create_best_backend(
-        manifest: &Manifest,
-        device_info: &DeviceInfo,
-    ) -> Result<Box<dyn Engine>, String> {
-        Self::create_best_backend_with_tuning(manifest, device_info, &OnnxRuntimeTuning::default())
-    }
-
     pub fn create_best_backend_with_tuning(
         manifest: &Manifest,
         device_info: &DeviceInfo,
@@ -389,22 +381,6 @@ impl BackendFactory {
             .unwrap_or(GraphOptimizationLevel::Level3);
         let inner = Self::build_onnx_backend(ExecutionProvider::CPU, opt_cpu, 0, tuning)?;
         finalize_onnx_pipeline(engine_kind, manifest, inner)
-    }
-
-    /// Create a backend for a specific device
-    pub fn create_backend_for_device(
-        manifest: &Manifest,
-        provider: &str,
-        device_id: usize,
-        device_info: &DeviceInfo,
-    ) -> Result<Box<dyn Engine>, String> {
-        Self::create_backend_for_device_with_tuning(
-            manifest,
-            provider,
-            device_id,
-            device_info,
-            &OnnxRuntimeTuning::default(),
-        )
     }
 
     pub fn create_backend_for_device_with_tuning(
@@ -670,23 +646,6 @@ impl BackendFactory {
         handle: Option<GpuPoolHandle>,
     ) -> Result<GgufBackend, String> {
         Ok(GgufBackend::new_cuda_shared_kv(device_id.max(0) as usize, handle))
-    }
-
-    /// Create a NativeBackend with an optional pre-shared pool handle.
-    ///
-    /// Returns the concrete (unboxed) backend so callers can call
-    /// `backend.pool_handle()` after `load()` to register the pool for sharing.
-    #[cfg(feature = "native")]
-    pub fn create_native(
-        device_id: i32,
-        handle: Option<GpuPoolHandle>,
-    ) -> Result<NativeBackend, String> {
-        let mut b = NativeBackend::new(device_id)
-            .map_err(|e| format!("NativeBackend init failed: {e}"))?;
-        if let Some(h) = handle {
-            b = b.with_pool_handle(h);
-        }
-        Ok(b)
     }
 
     /// Validate that hardware meets minimum requirements

@@ -54,16 +54,7 @@ pub trait MlpKernel: Send + Sync + Debug {
     ) -> Result<(), KernelError>;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KernelBackendType {
-    Cpu,
-    Cuda,
-    Rocm,
-}
-
 pub trait KernelBackend: Send + Sync + Debug {
-    fn backend_type(&self) -> KernelBackendType;
-
     fn attention(&self) -> Box<dyn AttentionKernel>;
     fn mlp(&self) -> Box<dyn MlpKernel>;
 }

@@ -241,11 +241,6 @@ impl DeviceInfo {
         probed
     }
 
-    /// Probe device information (not cached).
-    pub fn try_probe() -> Result<Self, DeviceProbeError> {
-        Self::try_probe_with_timeout(DEFAULT_PROBE_TIMEOUT)
-    }
-
     /// Probe device information with a timeout applied to external commands.
     pub fn try_probe_with_timeout(timeout: Duration) -> Result<Self, DeviceProbeError> {
         let cpu_cores = sys_info::cpu_num()?;

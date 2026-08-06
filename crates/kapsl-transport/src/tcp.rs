@@ -50,10 +50,6 @@ impl TcpClient {
 
 #[async_trait]
 impl TransportClient for TcpClient {
-    fn transport_type(&self) -> &'static str {
-        "tcp"
-    }
-
     async fn infer(
         &self,
         model_id: u32,

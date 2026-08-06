@@ -3023,13 +3023,6 @@ impl GgufBackend {
         }
     }
 
-    /// The KV-cache path this engine is using after `load()`. Returns
-    /// [`GgufKvPath::Unloaded`] before a model is loaded.
-    #[cfg(feature = "gguf-cuda-shared-kv")]
-    pub fn active_kv_path(&self) -> GgufKvPath {
-        GgufKvPath::from_u8(self.kv_path.load(std::sync::atomic::Ordering::Relaxed))
-    }
-
     #[cfg(feature = "gguf-cuda-shared-kv")]
     pub fn with_pool_handle(mut self, handle: GpuPoolHandle) -> Self {
         *self.pool_slot.lock().unwrap() = Some(handle);

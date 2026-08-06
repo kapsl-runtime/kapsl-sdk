@@ -68,16 +68,6 @@ impl EngineError {
         }
     }
 
-    pub fn backend_with_source(
-        message: impl Into<String>,
-        source: impl std::error::Error + Send + Sync + 'static,
-    ) -> Self {
-        EngineError::Backend {
-            message: message.into(),
-            source: Some(Box::new(source)),
-        }
-    }
-
     pub fn invalid_input(message: impl Into<String>) -> Self {
         EngineError::InvalidInput {
             message: message.into(),
@@ -401,15 +391,6 @@ impl BinaryTensorPacket {
         shape_elements(&self.shape)
     }
 
-    pub fn tensor_elements_cached(&self, cache: &mut Option<usize>) -> Result<usize, EngineError> {
-        if let Some(value) = *cache {
-            return Ok(value);
-        }
-        let value = self.tensor_elements()?;
-        *cache = Some(value);
-        Ok(value)
-    }
-
     pub fn validate(&self) -> Result<(), EngineError> {
         let elements = self.tensor_elements()?;
         let expected = elements
@@ -443,9 +424,6 @@ impl BinaryTensorPacket {
         }
     }
 
-    pub fn as_borrowed(&self) -> BinaryTensorPacketRef<'_> {
-        BinaryTensorPacketRef::from(self)
-    }
 }
 
 impl<'a> BinaryTensorPacketRef<'a> {
@@ -589,12 +567,6 @@ impl InferenceRequest {
         self
     }
 
-    pub fn with_request_id(mut self, request_id: impl Into<String>) -> Self {
-        let metadata = self.metadata.get_or_insert_with(RequestMetadata::default);
-        metadata.request_id = Some(request_id.into());
-        self
-    }
-
     pub fn add_input(&mut self, name: impl Into<String>, tensor: BinaryTensorPacket) {
         self.additional_inputs.push(NamedTensor {
             name: name.into(),
@@ -691,11 +663,6 @@ impl BatchingPolicy {
         self
     }
 
-    pub fn with_max_batched_tokens(mut self, max_batched_tokens: usize) -> Self {
-        self.max_batched_tokens = Some(max_batched_tokens);
-        self
-    }
-
     pub fn with_priority_support(mut self) -> Self {
         self.supports_priority = true;
         self
@@ -720,28 +687,12 @@ pub trait Engine: Send + Sync {
     /// Run a single inference request and return the output tensor.
     fn infer(&self, request: &InferenceRequest) -> Result<BinaryTensorPacket, EngineError>;
 
-    /// Run a single inference request asynchronously.
-    async fn infer_async(
-        &self,
-        request: &InferenceRequest,
-    ) -> Result<BinaryTensorPacket, EngineError> {
-        self.infer(request)
-    }
-
     /// Run a batch of inference requests.
     fn infer_batch(
         &self,
         requests: &[InferenceRequest],
     ) -> Result<Vec<BinaryTensorPacket>, EngineError> {
         requests.iter().map(|req| self.infer(req)).collect()
-    }
-
-    /// Run a batch of inference requests asynchronously.
-    async fn infer_batch_async(
-        &self,
-        requests: &[InferenceRequest],
-    ) -> Result<Vec<BinaryTensorPacket>, EngineError> {
-        self.infer_batch(requests)
     }
 
     /// Maximum number of independent requests this engine can coalesce into a
@@ -783,26 +734,6 @@ pub trait Engine: Send + Sync {
 
     /// Run a streaming inference request.
     fn infer_stream(&self, request: &InferenceRequest) -> EngineStream;
-
-    /// Run inference with cancellation support.
-    fn infer_with_cancellation(
-        &self,
-        request: &InferenceRequest,
-        cancellation: &CancellationToken,
-    ) -> Result<BinaryTensorPacket, EngineError> {
-        if cancellation.is_cancelled() {
-            return Err(EngineError::Cancelled {
-                message: "Request cancelled".to_string(),
-            });
-        }
-        let result = self.infer(request);
-        if cancellation.is_cancelled() {
-            return Err(EngineError::Cancelled {
-                message: "Request cancelled".to_string(),
-            });
-        }
-        result
-    }
 
     /// Warm up the model runtime before serving requests.
     async fn warmup(&self) -> Result<(), EngineError> {
@@ -862,25 +793,11 @@ impl Engine for Box<dyn Engine> {
         (**self).infer(request)
     }
 
-    async fn infer_async(
-        &self,
-        request: &InferenceRequest,
-    ) -> Result<BinaryTensorPacket, EngineError> {
-        (**self).infer_async(request).await
-    }
-
     fn infer_batch(
         &self,
         requests: &[InferenceRequest],
     ) -> Result<Vec<BinaryTensorPacket>, EngineError> {
         (**self).infer_batch(requests)
-    }
-
-    async fn infer_batch_async(
-        &self,
-        requests: &[InferenceRequest],
-    ) -> Result<Vec<BinaryTensorPacket>, EngineError> {
-        (**self).infer_batch_async(requests).await
     }
 
     fn max_batch(&self) -> usize {
@@ -897,14 +814,6 @@ impl Engine for Box<dyn Engine> {
 
     fn infer_stream(&self, request: &InferenceRequest) -> EngineStream {
         (**self).infer_stream(request)
-    }
-
-    fn infer_with_cancellation(
-        &self,
-        request: &InferenceRequest,
-        cancellation: &CancellationToken,
-    ) -> Result<BinaryTensorPacket, EngineError> {
-        (**self).infer_with_cancellation(request, cancellation)
     }
 
     async fn warmup(&self) -> Result<(), EngineError> {

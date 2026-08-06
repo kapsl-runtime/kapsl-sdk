@@ -460,10 +460,6 @@ impl OnnxBackend {
         Self::builder().build()
     }
 
-    pub fn new_cpu_with_optimization(opt_level: GraphOptimizationLevel) -> Self {
-        Self::builder().with_optimization_level(opt_level).build()
-    }
-
     pub fn new_cuda(device_id: i32) -> Result<Self, String> {
         Self::new_cuda_with_optimization(GraphOptimizationLevel::Level3, device_id)
     }
@@ -474,73 +470,6 @@ impl OnnxBackend {
     ) -> Result<Self, String> {
         Ok(Self::builder()
             .with_provider(ExecutionProvider::CUDA)
-            .with_optimization_level(opt_level)
-            .with_device_id(device_id)?
-            .build())
-    }
-
-    pub fn new_tensorrt(device_id: i32) -> Result<Self, String> {
-        Self::new_tensorrt_with_optimization(GraphOptimizationLevel::Level3, device_id)
-    }
-
-    pub fn new_tensorrt_with_optimization(
-        opt_level: GraphOptimizationLevel,
-        device_id: i32,
-    ) -> Result<Self, String> {
-        Ok(Self::builder()
-            .with_provider(ExecutionProvider::TensorRT)
-            .with_optimization_level(opt_level)
-            .with_device_id(device_id)?
-            .build())
-    }
-
-    pub fn new_directml(device_id: i32) -> Result<Self, String> {
-        Self::new_directml_with_optimization(GraphOptimizationLevel::Level3, device_id)
-    }
-
-    pub fn new_directml_with_optimization(
-        opt_level: GraphOptimizationLevel,
-        device_id: i32,
-    ) -> Result<Self, String> {
-        Ok(Self::builder()
-            .with_provider(ExecutionProvider::DirectML)
-            .with_optimization_level(opt_level)
-            .with_device_id(device_id)?
-            .build())
-    }
-
-    pub fn new_rocm(device_id: i32) -> Result<Self, String> {
-        Self::new_rocm_with_optimization(GraphOptimizationLevel::Level3, device_id)
-    }
-
-    pub fn new_rocm_with_optimization(
-        opt_level: GraphOptimizationLevel,
-        device_id: i32,
-    ) -> Result<Self, String> {
-        Ok(Self::builder()
-            .with_provider(ExecutionProvider::ROCm)
-            .with_optimization_level(opt_level)
-            .with_device_id(device_id)?
-            .build())
-    }
-
-    pub fn new_openvino_with_optimiation(
-        opt_level: GraphOptimizationLevel,
-        device_id: i32,
-    ) -> Result<Self, String> {
-        Ok(Self::builder()
-            .with_provider(ExecutionProvider::OpenVINO)
-            .with_optimization_level(opt_level)
-            .with_device_id(device_id)?
-            .build())
-    }
-
-    pub fn new_coreml_with_optimiation(
-        opt_level: GraphOptimizationLevel,
-        device_id: i32,
-    ) -> Result<Self, String> {
-        Ok(Self::builder()
-            .with_provider(ExecutionProvider::CoreML)
             .with_optimization_level(opt_level)
             .with_device_id(device_id)?
             .build())

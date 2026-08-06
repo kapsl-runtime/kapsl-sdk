@@ -473,10 +473,6 @@ impl BlockTable {
         self.len = 0;
     }
 
-    /// Upload to GPU as a CudaSlice for kernel consumption.
-    pub fn to_device(&self, device: &Arc<CudaDevice>) -> Result<CudaSlice<i32>, ArenaError> {
-        Ok(device.htod_sync_copy(&self.table[..self.len])?)
-    }
 }
 
 #[cfg(feature = "cuda")]

@@ -572,9 +572,6 @@ impl TransportServer for ShmServer {
         Ok(())
     }
 
-    fn transport_type(&self) -> &'static str {
-        "shared_memory"
-    }
 }
 
 /// Read tensor from shared memory
