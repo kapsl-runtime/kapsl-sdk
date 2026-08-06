@@ -15,6 +15,7 @@
 //! The result is L2-normalized by default (so cosine similarity == dot product,
 //! which is what vector stores expect); pass `normalize = false` to disable.
 
+use crate::tensor_util::{bytes_to_f32, dim_usize, f32_packet};
 use async_trait::async_trait;
 use kapsl_engine_api::{
     BatchingPolicy, BinaryTensorPacket, Engine, EngineError, EngineMetrics, EngineModelInfo,
@@ -211,16 +212,6 @@ fn extract_attention_mask(request: &InferenceRequest, batch: usize, seq: usize) 
     vec![1.0; expected]
 }
 
-fn dim_usize(d: i64) -> usize {
-    d.max(0) as usize
-}
-
-fn bytes_to_f32(data: &[u8]) -> Vec<f32> {
-    data.chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        .collect()
-}
-
 /// Interpret a tensor packet as f32 weights, accepting the integer/float dtypes
 /// an attention mask is commonly stored in.
 fn packet_to_f32(packet: &BinaryTensorPacket) -> Vec<f32> {
@@ -237,18 +228,6 @@ fn packet_to_f32(packet: &BinaryTensorPacket) -> Vec<f32> {
             .map(|b| i32::from_le_bytes(b.try_into().unwrap()) as f32)
             .collect(),
         _ => Vec::new(),
-    }
-}
-
-fn f32_packet(shape: Vec<i64>, values: Vec<f32>) -> BinaryTensorPacket {
-    let mut data = Vec::with_capacity(values.len() * 4);
-    for v in &values {
-        data.extend_from_slice(&v.to_le_bytes());
-    }
-    BinaryTensorPacket {
-        shape,
-        dtype: TensorDtype::Float32,
-        data,
     }
 }
 

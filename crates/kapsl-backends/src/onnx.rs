@@ -1,3 +1,4 @@
+use crate::env_util::read_env_flag;
 use async_trait::async_trait;
 use half::f16;
 use kapsl_engine_api::{
@@ -263,17 +264,6 @@ const ORT_BUCKET_DIM_GRANULARITY_ENV: &str = "KAPSL_ORT_BUCKET_DIM_GRANULARITY";
 const ORT_BUCKET_MAX_DIMS_ENV: &str = "KAPSL_ORT_BUCKET_MAX_DIMS";
 const MODEL_PEAK_CONCURRENCY_ENV: &str = "KAPSL_MODEL_PEAK_CONCURRENCY";
 const ORT_SESSION_BUCKETS_MAX: usize = 64;
-
-fn read_env_flag(name: &str, default: bool) -> bool {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => Some(true),
-            "0" | "false" | "no" | "off" => Some(false),
-            _ => None,
-        })
-        .unwrap_or(default)
-}
 
 fn read_env_usize(name: &str) -> Option<usize> {
     std::env::var(name)

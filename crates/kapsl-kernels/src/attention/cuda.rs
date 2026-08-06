@@ -9,21 +9,11 @@
 
 #[cfg(feature = "cuda")]
 mod inner {
+    use crate::nvrtc_util::cuda_compile_opts;
     use cudarc::driver::{CudaDevice, CudaFunction, CudaSlice, CudaView, LaunchAsync, LaunchConfig};
-    use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
+    use cudarc::nvrtc::compile_ptx_with_opts;
     use half::f16;
     use std::sync::{Arc, OnceLock};
-
-    fn cuda_compile_opts() -> CompileOptions {
-        let cuda_include = std::env::var("CUDA_PATH")
-            .or_else(|_| std::env::var("CUDA_HOME"))
-            .map(|p| format!("{p}/include"))
-            .unwrap_or_else(|_| "/usr/local/cuda/include".to_string());
-        CompileOptions {
-            include_paths: vec![cuda_include],
-            ..Default::default()
-        }
-    }
 
     /// Compiled PTX module, lazily initialised.
     struct KernelModule {
@@ -1030,21 +1020,11 @@ __global__ void batch_kv_write(
 
 #[cfg(feature = "cuda")]
 mod argmax_inner {
+    use crate::nvrtc_util::cuda_compile_opts;
     use cudarc::driver::{CudaDevice, CudaSlice, LaunchAsync, LaunchConfig};
-    use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
+    use cudarc::nvrtc::compile_ptx_with_opts;
     use half::f16;
     use std::sync::Arc;
-
-    fn cuda_compile_opts() -> CompileOptions {
-        let cuda_include = std::env::var("CUDA_PATH")
-            .or_else(|_| std::env::var("CUDA_HOME"))
-            .map(|p| format!("{p}/include"))
-            .unwrap_or_else(|_| "/usr/local/cuda/include".to_string());
-        CompileOptions {
-            include_paths: vec![cuda_include],
-            ..Default::default()
-        }
-    }
 
     /// Parallel argmax over a single row of f16 logits stored in GPU memory.
     ///
