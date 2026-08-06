@@ -4421,38 +4421,12 @@ impl LLMEngine {
             };
 
             for seq_arc in seqs {
-                let (input_tokens, seq_id, total_len, kv_cached_len) = {
-                    let seq = seq_arc.lock().unwrap();
-                    if seq.is_finished() {
-                        continue;
-                    }
-
-                    let total_len = seq.get_len();
-                    let kv_cached_len = seq.kv_cached_len;
-                    let input_tokens = if use_kv_cache {
-                        let prompt_len = seq.prompt_token_ids.len();
-                        let start = kv_cached_len;
-                        if start < prompt_len {
-                            let mut tokens = seq.prompt_token_ids[start..].to_vec();
-                            tokens.extend_from_slice(&seq.output_token_ids);
-                            tokens
-                        } else {
-                            let start_out = start.saturating_sub(prompt_len);
-                            seq.output_token_ids[start_out..].to_vec()
-                        }
-                    } else {
-                        let mut tokens = seq.prompt_token_ids.clone();
-                        tokens.extend(seq.output_token_ids.iter().copied());
-                        tokens
-                    };
-
-                    (input_tokens, seq.sequence_id, total_len, kv_cached_len)
-                };
-
-                let input_len = input_tokens.len();
-                if input_len == 0 {
+                let Some((input_tokens, seq_id, total_len, kv_cached_len)) =
+                    Self::decode_inputs_for_sequence(&seq_arc, use_kv_cache)
+                else {
                     continue;
-                }
+                };
+                let input_len = input_tokens.len();
 
                 let input_tokens_i64: Vec<i64> = input_tokens.iter().map(|&x| x as i64).collect();
                 let input_ids_i64 =
@@ -5208,133 +5182,16 @@ impl LLMEngine {
                 }
 
                 // === Sampling ===
-                let (logits_shape, logits_data) = {
-                    let logits = outputs
-                        .get("logits")
-                        .ok_or_else(|| EngineError::backend("Missing logits output".to_string()))?;
-                    extract_tensor_f32(logits, "logits")?
-                };
-                let mut vocab = logits_shape
-                    .last()
-                    .copied()
-                    .filter(|v| *v > 0)
-                    .map(|v| v as usize);
-                if vocab.is_none() {
-                    if let Some(vs) = self.vocab_size {
-                        if vs > 0 && logits_data.len() % vs == 0 {
-                            vocab = Some(vs);
-                        }
-                    }
-                }
-                let seq_len = if logits_shape.len() >= 2 {
-                    logits_shape
-                        .get(logits_shape.len() - 2)
-                        .copied()
-                        .filter(|v| *v > 0)
-                        .map(|v| v as usize)
-                } else {
-                    None
-                };
-                let (start, end) = if let Some(vocab) = vocab {
-                    let seq = seq_len.unwrap_or_else(|| logits_data.len() / vocab).max(1);
-                    let start = (seq - 1) * vocab;
-                    (start, start + vocab)
-                } else {
-                    (0, logits_data.len())
-                };
-                let (request_id, response_tx, sampling_params) = {
-                    let group = group_arc.lock().unwrap();
-                    (
-                        group.request_id.clone(),
-                        group.response_tx.clone(),
-                        group.sampling_params.clone(),
-                    )
-                };
-                let mut logits_slice = if end <= logits_data.len() {
-                    logits_data[start..end].to_vec()
-                } else {
-                    logits_data.to_vec()
-                };
-                drop(outputs);
-                let (token_ids_for_penalty, generated_this_turn, mut rng_state) = {
-                    let seq = seq_arc.lock().unwrap();
-                    let token_ids = (sampling_params.repetition_penalty > 1.0).then(|| {
-                        seq.prompt_token_ids
-                            .iter()
-                            .chain(seq.output_token_ids.iter())
-                            .copied()
-                            .collect::<Vec<u32>>()
-                    });
-                    (token_ids, seq.generated_this_turn, seq.rng_state)
-                };
-                if let Some(token_ids) = token_ids_for_penalty {
-                    let penalty = sampling_params.repetition_penalty;
-                    for token_id in token_ids {
-                        let idx = token_id as usize;
-                        if idx < logits_slice.len() {
-                            let val = logits_slice[idx];
-                            logits_slice[idx] = if val > 0.0 {
-                                val / penalty
-                            } else {
-                                val * penalty
-                            };
-                        }
-                    }
-                }
-                let next = Self::sample_next_token(
-                    &logits_slice,
-                    &sampling_params,
-                    generated_this_turn,
-                    &mut rng_state,
-                );
-
-                {
-                    let mut finish_reason = None;
-                    let (old_len, old_status, new_len, new_status, text) = {
-                        let mut seq = seq_arc.lock().unwrap();
-                        let old_len = seq.get_len();
-                        let old_status = seq.status;
-
-                        if use_kv_cache {
-                            seq.kv_cached_len = seq.kv_cached_len.saturating_add(input_len);
-                        }
-
-                        seq.rng_state = rng_state;
-                        seq.append_token_id(next, 0.0);
-                        if sampling_params.stop_token_ids.contains(&next)
-                            && seq.generated_this_turn >= sampling_params.min_tokens
-                        {
-                            seq.status = SequenceStatus::Finished(FinishReason::Stop);
-                            finish_reason = Some(FinishReason::Stop);
-                        } else if seq.generated_this_turn >= sampling_params.max_tokens {
-                            seq.status = SequenceStatus::Finished(FinishReason::Length);
-                            finish_reason = Some(FinishReason::Length);
-                        }
-
-                        let text = Self::decode_next_token(
-                            self.tokenizer.as_ref().unwrap(),
-                            &mut seq,
-                            next,
-                        );
-                        (old_len, old_status, seq.get_len(), seq.status, text)
-                    };
-
-                    if old_len != new_len || old_status != new_status {
-                        let mut group = group_arc.lock().unwrap();
-                        if old_len != new_len {
-                            group.update_seq_len(seq_id, new_len);
-                        }
-                        if old_status != new_status {
-                            group.update_seq_status(old_status, new_status);
-                        }
-                    }
-
-                    let _ = response_tx.try_send(SequenceGroupOutput {
-                        request_id,
-                        text,
-                        finish_reason,
-                    });
-                }
+                Self::sample_and_emit(
+                    outputs,
+                    self.vocab_size,
+                    self.tokenizer.as_ref().unwrap(),
+                    group_arc,
+                    &seq_arc,
+                    seq_id,
+                    use_kv_cache,
+                    input_len,
+                )?;
             }
         }
 
@@ -5362,38 +5219,12 @@ impl LLMEngine {
             };
 
             for seq_arc in seqs {
-                let (input_tokens, seq_id, total_len, kv_cached_len) = {
-                    let seq = seq_arc.lock().unwrap();
-                    if seq.is_finished() {
-                        continue;
-                    }
-
-                    let total_len = seq.get_len();
-                    let kv_cached_len = seq.kv_cached_len;
-                    let input_tokens = if use_kv_cache {
-                        let prompt_len = seq.prompt_token_ids.len();
-                        let start = kv_cached_len;
-                        if start < prompt_len {
-                            let mut tokens = seq.prompt_token_ids[start..].to_vec();
-                            tokens.extend_from_slice(&seq.output_token_ids);
-                            tokens
-                        } else {
-                            let start_out = start.saturating_sub(prompt_len);
-                            seq.output_token_ids[start_out..].to_vec()
-                        }
-                    } else {
-                        let mut tokens = seq.prompt_token_ids.clone();
-                        tokens.extend(seq.output_token_ids.iter().copied());
-                        tokens
-                    };
-
-                    (input_tokens, seq.sequence_id, total_len, kv_cached_len)
-                };
-
-                let input_len = input_tokens.len();
-                if input_len == 0 {
+                let Some((input_tokens, seq_id, total_len, kv_cached_len)) =
+                    Self::decode_inputs_for_sequence(&seq_arc, use_kv_cache)
+                else {
                     continue;
-                }
+                };
+                let input_len = input_tokens.len();
 
                 let input_tokens_i64: Vec<i64> = input_tokens.iter().map(|&x| x as i64).collect();
                 let input_ids_i64 =
@@ -6162,133 +5993,16 @@ impl LLMEngine {
                 }
 
                 // === Sampling ===
-                let (logits_shape, logits_data) = {
-                    let logits = outputs
-                        .get("logits")
-                        .ok_or_else(|| EngineError::backend("Missing logits output".to_string()))?;
-                    extract_tensor_f32(logits, "logits")?
-                };
-                let mut vocab = logits_shape
-                    .last()
-                    .copied()
-                    .filter(|v| *v > 0)
-                    .map(|v| v as usize);
-                if vocab.is_none() {
-                    if let Some(vs) = self.vocab_size {
-                        if vs > 0 && logits_data.len() % vs == 0 {
-                            vocab = Some(vs);
-                        }
-                    }
-                }
-                let seq_len = if logits_shape.len() >= 2 {
-                    logits_shape
-                        .get(logits_shape.len() - 2)
-                        .copied()
-                        .filter(|v| *v > 0)
-                        .map(|v| v as usize)
-                } else {
-                    None
-                };
-                let (start, end) = if let Some(vocab) = vocab {
-                    let seq = seq_len.unwrap_or_else(|| logits_data.len() / vocab).max(1);
-                    let start = (seq - 1) * vocab;
-                    (start, start + vocab)
-                } else {
-                    (0, logits_data.len())
-                };
-                let (request_id, response_tx, sampling_params) = {
-                    let group = group_arc.lock().unwrap();
-                    (
-                        group.request_id.clone(),
-                        group.response_tx.clone(),
-                        group.sampling_params.clone(),
-                    )
-                };
-                let mut logits_slice = if end <= logits_data.len() {
-                    logits_data[start..end].to_vec()
-                } else {
-                    logits_data.to_vec()
-                };
-                drop(outputs);
-                let (token_ids_for_penalty, generated_this_turn, mut rng_state) = {
-                    let seq = seq_arc.lock().unwrap();
-                    let token_ids = (sampling_params.repetition_penalty > 1.0).then(|| {
-                        seq.prompt_token_ids
-                            .iter()
-                            .chain(seq.output_token_ids.iter())
-                            .copied()
-                            .collect::<Vec<u32>>()
-                    });
-                    (token_ids, seq.generated_this_turn, seq.rng_state)
-                };
-                if let Some(token_ids) = token_ids_for_penalty {
-                    let penalty = sampling_params.repetition_penalty;
-                    for token_id in token_ids {
-                        let idx = token_id as usize;
-                        if idx < logits_slice.len() {
-                            let val = logits_slice[idx];
-                            logits_slice[idx] = if val > 0.0 {
-                                val / penalty
-                            } else {
-                                val * penalty
-                            };
-                        }
-                    }
-                }
-                let next = Self::sample_next_token(
-                    &logits_slice,
-                    &sampling_params,
-                    generated_this_turn,
-                    &mut rng_state,
-                );
-
-                {
-                    let mut finish_reason = None;
-                    let (old_len, old_status, new_len, new_status, text) = {
-                        let mut seq = seq_arc.lock().unwrap();
-                        let old_len = seq.get_len();
-                        let old_status = seq.status;
-
-                        if use_kv_cache {
-                            seq.kv_cached_len = seq.kv_cached_len.saturating_add(input_len);
-                        }
-
-                        seq.rng_state = rng_state;
-                        seq.append_token_id(next, 0.0);
-                        if sampling_params.stop_token_ids.contains(&next)
-                            && seq.generated_this_turn >= sampling_params.min_tokens
-                        {
-                            seq.status = SequenceStatus::Finished(FinishReason::Stop);
-                            finish_reason = Some(FinishReason::Stop);
-                        } else if seq.generated_this_turn >= sampling_params.max_tokens {
-                            seq.status = SequenceStatus::Finished(FinishReason::Length);
-                            finish_reason = Some(FinishReason::Length);
-                        }
-
-                        let text = Self::decode_next_token(
-                            self.tokenizer.as_ref().unwrap(),
-                            &mut seq,
-                            next,
-                        );
-                        (old_len, old_status, seq.get_len(), seq.status, text)
-                    };
-
-                    if old_len != new_len || old_status != new_status {
-                        let mut group = group_arc.lock().unwrap();
-                        if old_len != new_len {
-                            group.update_seq_len(seq_id, new_len);
-                        }
-                        if old_status != new_status {
-                            group.update_seq_status(old_status, new_status);
-                        }
-                    }
-
-                    let _ = response_tx.try_send(SequenceGroupOutput {
-                        request_id,
-                        text,
-                        finish_reason,
-                    });
-                }
+                Self::sample_and_emit(
+                    outputs,
+                    self.vocab_size,
+                    self.tokenizer.as_ref().unwrap(),
+                    group_arc,
+                    &seq_arc,
+                    seq_id,
+                    use_kv_cache,
+                    input_len,
+                )?;
             }
         }
 
@@ -6305,6 +6019,191 @@ impl LLMEngine {
             hash = hash.wrapping_mul(FNV_PRIME);
         }
         hash
+    }
+
+    /// Build the decode inputs for one sequence: the token slice to feed this
+    /// step (only the uncached suffix when the KV cache is live), plus its id and
+    /// lengths.
+    ///
+    /// Returns `None` when the caller should skip this sequence -- it has already
+    /// finished, or there is nothing left to feed. Shared by `execute_step` and
+    /// `execute_pipeline_step`.
+    fn decode_inputs_for_sequence(
+        seq_arc: &Arc<Mutex<Sequence>>,
+        use_kv_cache: bool,
+    ) -> Option<(Vec<u32>, u64, usize, usize)> {
+        let seq = seq_arc.lock().unwrap();
+        if seq.is_finished() {
+            return None;
+        }
+
+        let total_len = seq.get_len();
+        let kv_cached_len = seq.kv_cached_len;
+        let input_tokens = if use_kv_cache {
+            let prompt_len = seq.prompt_token_ids.len();
+            let start = kv_cached_len;
+            if start < prompt_len {
+                let mut tokens = seq.prompt_token_ids[start..].to_vec();
+                tokens.extend_from_slice(&seq.output_token_ids);
+                tokens
+            } else {
+                let start_out = start.saturating_sub(prompt_len);
+                seq.output_token_ids[start_out..].to_vec()
+            }
+        } else {
+            let mut tokens = seq.prompt_token_ids.clone();
+            tokens.extend(seq.output_token_ids.iter().copied());
+            tokens
+        };
+
+        if input_tokens.is_empty() {
+            return None;
+        }
+        Some((input_tokens, seq.sequence_id, total_len, kv_cached_len))
+    }
+
+    /// Sample the next token for one sequence from a completed forward pass and
+    /// publish it: slice the final-position logits, apply the repetition penalty,
+    /// sample, append to the sequence, and emit the incremental output.
+    ///
+    /// Shared verbatim by `execute_step` and `execute_pipeline_step`. Takes
+    /// `outputs` by value so the session outputs are released before the
+    /// tokenizer decode, exactly as the inlined copies did.
+    #[allow(clippy::too_many_arguments)]
+    fn sample_and_emit(
+        outputs: ort::session::SessionOutputs<'_>,
+        vocab_size: Option<usize>,
+        tokenizer: &Tokenizer,
+        group_arc: &Arc<Mutex<SequenceGroup>>,
+        seq_arc: &Arc<Mutex<Sequence>>,
+        seq_id: u64,
+        use_kv_cache: bool,
+        input_len: usize,
+    ) -> Result<(), EngineError> {
+        let (logits_shape, logits_data) = {
+            let logits = outputs
+                .get("logits")
+                .ok_or_else(|| EngineError::backend("Missing logits output".to_string()))?;
+            extract_tensor_f32(logits, "logits")?
+        };
+        let mut vocab = logits_shape
+            .last()
+            .copied()
+            .filter(|v| *v > 0)
+            .map(|v| v as usize);
+        if vocab.is_none() {
+            if let Some(vs) = vocab_size {
+                if vs > 0 && logits_data.len() % vs == 0 {
+                    vocab = Some(vs);
+                }
+            }
+        }
+        let seq_len = if logits_shape.len() >= 2 {
+            logits_shape
+                .get(logits_shape.len() - 2)
+                .copied()
+                .filter(|v| *v > 0)
+                .map(|v| v as usize)
+        } else {
+            None
+        };
+        let (start, end) = if let Some(vocab) = vocab {
+            let seq = seq_len.unwrap_or_else(|| logits_data.len() / vocab).max(1);
+            let start = (seq - 1) * vocab;
+            (start, start + vocab)
+        } else {
+            (0, logits_data.len())
+        };
+        let (request_id, response_tx, sampling_params) = {
+            let group = group_arc.lock().unwrap();
+            (
+                group.request_id.clone(),
+                group.response_tx.clone(),
+                group.sampling_params.clone(),
+            )
+        };
+        let mut logits_slice = if end <= logits_data.len() {
+            logits_data[start..end].to_vec()
+        } else {
+            logits_data.to_vec()
+        };
+        drop(outputs);
+        let (token_ids_for_penalty, generated_this_turn, mut rng_state) = {
+            let seq = seq_arc.lock().unwrap();
+            let token_ids = (sampling_params.repetition_penalty > 1.0).then(|| {
+                seq.prompt_token_ids
+                    .iter()
+                    .chain(seq.output_token_ids.iter())
+                    .copied()
+                    .collect::<Vec<u32>>()
+            });
+            (token_ids, seq.generated_this_turn, seq.rng_state)
+        };
+        if let Some(token_ids) = token_ids_for_penalty {
+            let penalty = sampling_params.repetition_penalty;
+            for token_id in token_ids {
+                let idx = token_id as usize;
+                if idx < logits_slice.len() {
+                    let val = logits_slice[idx];
+                    logits_slice[idx] = if val > 0.0 {
+                        val / penalty
+                    } else {
+                        val * penalty
+                    };
+                }
+            }
+        }
+        let next = Self::sample_next_token(
+            &logits_slice,
+            &sampling_params,
+            generated_this_turn,
+            &mut rng_state,
+        );
+
+        {
+            let mut finish_reason = None;
+            let (old_len, old_status, new_len, new_status, text) = {
+                let mut seq = seq_arc.lock().unwrap();
+                let old_len = seq.get_len();
+                let old_status = seq.status;
+
+                if use_kv_cache {
+                    seq.kv_cached_len = seq.kv_cached_len.saturating_add(input_len);
+                }
+
+                seq.rng_state = rng_state;
+                seq.append_token_id(next, 0.0);
+                if sampling_params.stop_token_ids.contains(&next)
+                    && seq.generated_this_turn >= sampling_params.min_tokens
+                {
+                    seq.status = SequenceStatus::Finished(FinishReason::Stop);
+                    finish_reason = Some(FinishReason::Stop);
+                } else if seq.generated_this_turn >= sampling_params.max_tokens {
+                    seq.status = SequenceStatus::Finished(FinishReason::Length);
+                    finish_reason = Some(FinishReason::Length);
+                }
+
+                let text = Self::decode_next_token(tokenizer, &mut seq, next);
+                (old_len, old_status, seq.get_len(), seq.status, text)
+            };
+
+            if old_len != new_len || old_status != new_status {
+                let mut group = group_arc.lock().unwrap();
+                if old_len != new_len {
+                    group.update_seq_len(seq_id, new_len);
+                }
+                if old_status != new_status {
+                    group.update_seq_status(old_status, new_status);
+                }
+            }
+
+            let _ = response_tx.try_send(SequenceGroupOutput {
+                request_id,
+                text,
+                finish_reason,
+            });
+        }
+        Ok(())
     }
 
     fn decode_next_token(tokenizer: &Tokenizer, seq: &mut Sequence, token_id: u32) -> String {
