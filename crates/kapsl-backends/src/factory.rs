@@ -639,15 +639,6 @@ impl BackendFactory {
         Ok(b)
     }
 
-    /// Create a llama.cpp CUDA backend backed by the Kapsl shared KV pool.
-    #[cfg(feature = "gguf-cuda-shared-kv")]
-    pub fn create_gguf_cuda_shared_kv(
-        device_id: i32,
-        handle: Option<GpuPoolHandle>,
-    ) -> Result<GgufBackend, String> {
-        Ok(GgufBackend::new_cuda_shared_kv(device_id.max(0) as usize, handle))
-    }
-
     /// Validate that hardware meets minimum requirements
     pub fn validate_requirements(
         requirements: &HardwareRequirements,

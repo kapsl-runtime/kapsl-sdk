@@ -218,25 +218,6 @@ impl MeshComm for MockComm {
         Ok(())
     }
 
-    fn reduce_scatter(
-        &self,
-        buf: &mut [u8],
-        out: &mut [u8],
-        op: ReduceOp,
-        group: &str,
-    ) -> Result<(), String> {
-        // First do all-reduce
-        self.all_reduce(buf, DType::Float32, op, group)?;
-
-        // Then scatter - each rank gets its chunk
-        let chunk_size = buf.len() / self.world_size;
-        let offset = self.rank * chunk_size;
-        let copy_len = chunk_size.min(out.len());
-        out[..copy_len].copy_from_slice(&buf[offset..offset + copy_len]);
-
-        Ok(())
-    }
-
     fn barrier(&self, _group: &str) -> Result<(), String> {
         // Increment barrier counter
         let mut state = self.state.write().map_err(|e| e.to_string())?;

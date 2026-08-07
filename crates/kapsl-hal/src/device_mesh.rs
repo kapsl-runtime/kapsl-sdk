@@ -406,15 +406,6 @@ pub trait MeshComm: std::fmt::Debug {
     /// Broadcast from root rank to all ranks in group
     fn broadcast(&self, buf: &mut [u8], root_rank: usize, group: &str) -> Result<(), String>;
 
-    /// Reduce-scatter: reduce and distribute results
-    fn reduce_scatter(
-        &self,
-        buf: &mut [u8],
-        out: &mut [u8],
-        op: ReduceOp,
-        group: &str,
-    ) -> Result<(), String>;
-
     /// Barrier synchronization
     fn barrier(&self, group: &str) -> Result<(), String>;
 
