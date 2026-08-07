@@ -472,7 +472,6 @@ impl BlockTable {
     pub fn clear(&mut self) {
         self.len = 0;
     }
-
 }
 
 #[cfg(feature = "cuda")]

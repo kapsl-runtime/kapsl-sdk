@@ -91,5 +91,4 @@ impl ModelConfig {
         self.num_key_value_heads
             .unwrap_or(self.num_attention_heads)
     }
-
 }

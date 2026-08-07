@@ -192,7 +192,6 @@ impl ShmManager {
         let header = self.header();
         header.notify_write_fd
     }
-
 }
 
 #[derive(Debug)]

@@ -382,7 +382,6 @@ impl ModelRegistry {
         }
         false
     }
-
 }
 
 impl Default for ModelRegistry {

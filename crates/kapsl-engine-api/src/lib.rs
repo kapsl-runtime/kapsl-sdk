@@ -423,7 +423,6 @@ impl BinaryTensorPacket {
             data: &self.data,
         }
     }
-
 }
 
 impl<'a> BinaryTensorPacketRef<'a> {

@@ -191,7 +191,6 @@ impl TransportServer for IpcServer {
         }
         Ok(())
     }
-
 }
 
 pub(crate) async fn handle_connection<T>(

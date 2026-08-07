@@ -571,7 +571,6 @@ impl TransportServer for ShmServer {
         // Shared memory will be cleaned up when the process exits
         Ok(())
     }
-
 }
 
 /// Read tensor from shared memory

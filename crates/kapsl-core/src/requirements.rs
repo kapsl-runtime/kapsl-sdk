@@ -111,7 +111,6 @@ impl HardwareRequirements {
             strategy: Some("round-robin".to_string()),
         }
     }
-
 }
 
 #[path = "requirements_tests.rs"]
