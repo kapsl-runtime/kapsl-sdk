@@ -94,6 +94,46 @@ pub struct KvView {
     pub length: usize,
 }
 
+/// Repack a layer view's keys into the `[1, heads, seq, head_dim]` layout the
+/// ONNX decode path expects, dropping the unused tail of each head's slot.
+///
+/// Storage-independent -- `DenseKvCache` and `PagedKvCache` carried
+/// byte-identical copies of this, so it lives outside both.
+fn pack_layer_view_as_onnx(
+    view: &KvView,
+    num_heads: usize,
+    head_dim: usize,
+) -> Option<Array4<f16>> {
+    let seq_len = view.length;
+
+    let stride = num_heads * head_dim;
+    if stride == 0 || view.key.len() % stride != 0 {
+        return None;
+    }
+    let max_seq_len = view.key.len() / stride;
+    if seq_len > max_seq_len {
+        return None;
+    }
+
+    let total = num_heads * seq_len * head_dim;
+    let mut packed = vec![f16::ZERO; total];
+    for h in 0..num_heads {
+        let head_offset = h * max_seq_len * head_dim;
+        let packed_offset = h * seq_len * head_dim;
+        for pos in 0..seq_len {
+            let src = head_offset + pos * head_dim;
+            let dst = packed_offset + pos * head_dim;
+            let src_end = src + head_dim;
+            let dst_end = dst + head_dim;
+            if src_end <= view.key.len() {
+                packed[dst..dst_end].copy_from_slice(&view.key[src..src_end]);
+            }
+        }
+    }
+
+    Array4::from_shape_vec((1, num_heads, seq_len, head_dim), packed).ok()
+}
+
 pub struct PackedKvView {
     pub key: Arc<[f16]>,
     pub value: Arc<[f16]>,
@@ -647,35 +687,9 @@ impl DenseKvCache {
     }
 
     pub fn get_layer_as_onnx(&mut self, sequence_id: u64, layer: usize) -> Option<Array4<f16>> {
+        let (num_heads, head_dim) = (self.num_heads, self.head_dim);
         let view = self.get_layer_view(sequence_id, layer)?;
-        let seq_len = view.length;
-
-        let stride = self.num_heads * self.head_dim;
-        if stride == 0 || view.key.len() % stride != 0 {
-            return None;
-        }
-        let max_seq_len = view.key.len() / stride;
-        if seq_len > max_seq_len {
-            return None;
-        }
-
-        let total = self.num_heads * seq_len * self.head_dim;
-        let mut packed = vec![f16::ZERO; total];
-        for h in 0..self.num_heads {
-            let head_offset = h * max_seq_len * self.head_dim;
-            let packed_offset = h * seq_len * self.head_dim;
-            for pos in 0..seq_len {
-                let src = head_offset + pos * self.head_dim;
-                let dst = packed_offset + pos * self.head_dim;
-                let src_end = src + self.head_dim;
-                let dst_end = dst + self.head_dim;
-                if src_end <= view.key.len() {
-                    packed[dst..dst_end].copy_from_slice(&view.key[src..src_end]);
-                }
-            }
-        }
-
-        Array4::from_shape_vec((1, self.num_heads, seq_len, self.head_dim), packed).ok()
+        pack_layer_view_as_onnx(&view, num_heads, head_dim)
     }
 
     pub fn stats(&self) -> KvCacheStats {
@@ -1756,35 +1770,9 @@ impl PagedKvCache {
     }
 
     pub fn get_layer_as_onnx(&mut self, sequence_id: u64, layer: usize) -> Option<Array4<f16>> {
+        let (num_heads, head_dim) = (self.num_heads, self.head_dim);
         let view = self.get_layer_view(sequence_id, layer)?;
-        let seq_len = view.length;
-
-        let stride = self.num_heads * self.head_dim;
-        if stride == 0 || view.key.len() % stride != 0 {
-            return None;
-        }
-        let max_seq_len = view.key.len() / stride;
-        if seq_len > max_seq_len {
-            return None;
-        }
-
-        let total = self.num_heads * seq_len * self.head_dim;
-        let mut packed = vec![f16::ZERO; total];
-        for h in 0..self.num_heads {
-            let head_offset = h * max_seq_len * self.head_dim;
-            let packed_offset = h * seq_len * self.head_dim;
-            for pos in 0..seq_len {
-                let src = head_offset + pos * self.head_dim;
-                let dst = packed_offset + pos * self.head_dim;
-                let src_end = src + self.head_dim;
-                let dst_end = dst + self.head_dim;
-                if src_end <= view.key.len() {
-                    packed[dst..dst_end].copy_from_slice(&view.key[src..src_end]);
-                }
-            }
-        }
-
-        Array4::from_shape_vec((1, self.num_heads, seq_len, self.head_dim), packed).ok()
+        pack_layer_view_as_onnx(&view, num_heads, head_dim)
     }
 
     pub fn stats(&self) -> KvCacheStats {
