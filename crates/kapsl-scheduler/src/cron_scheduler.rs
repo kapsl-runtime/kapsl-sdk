@@ -402,10 +402,9 @@ impl CronScheduler {
 mod tests {
     use super::*;
     use crate::scheduler::Scheduler;
+    use crate::test_support::make_request;
     use async_trait::async_trait;
-    use kapsl_engine_api::{
-        BinaryTensorPacket, Engine, EngineError, InferenceRequest, TensorDtype,
-    };
+    use kapsl_engine_api::{BinaryTensorPacket, Engine, EngineError, InferenceRequest};
     use std::sync::{Arc, Mutex as StdMutex};
 
     struct EchoEngine;
@@ -439,20 +438,6 @@ mod tests {
     fn make_scheduler() -> Scheduler {
         let engine: Arc<dyn Engine> = Arc::new(EchoEngine);
         Scheduler::new(vec![engine], 2, 1, 1000, true, 1, 0, None)
-    }
-
-    fn make_request() -> InferenceRequest {
-        InferenceRequest {
-            input: BinaryTensorPacket {
-                shape: vec![1, 1],
-                dtype: TensorDtype::Float32,
-                data: vec![0, 0, 0, 0],
-            },
-            additional_inputs: Vec::new(),
-            session_id: None,
-            metadata: None,
-            cancellation: None,
-        }
     }
 
     #[tokio::test]
