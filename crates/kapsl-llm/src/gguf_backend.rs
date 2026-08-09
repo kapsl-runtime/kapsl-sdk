@@ -24,7 +24,7 @@ use kapsl_hal::cpu_block_store::CpuBlockStore;
 #[cfg(feature = "gguf-cuda-shared-kv")]
 use kapsl_hal::cross_device_scheduler::CrossDevicePoolScheduler;
 #[cfg(feature = "gguf-cuda-shared-kv")]
-use kapsl_hal::gpu_arena::{GpuBlockPool, GpuPoolHandle};
+use kapsl_hal::gpu_arena::{GpuBlockPool, GpuDevicePool, GpuPoolHandle, PoolOwner};
 #[cfg(feature = "gguf-cuda-shared-kv")]
 use kapsl_hal::prefix_cache::PrefixBlockCache;
 #[cfg(feature = "gguf")]
@@ -2980,6 +2980,9 @@ pub struct GgufBackend {
     device_id: usize,
     #[cfg(feature = "gguf-cuda-shared-kv")]
     pool_slot: Arc<Mutex<Option<GpuPoolHandle>>>,
+    /// Runtime-owned backing pool. Geometry is not known until `load()`.
+    #[cfg(feature = "gguf-cuda-shared-kv")]
+    device_pool: Option<(Arc<GpuDevicePool>, PoolOwner)>,
     /// Active KV path, set during `load()`. Read lock-free via `active_kv_path`.
     #[cfg(feature = "gguf-cuda-shared-kv")]
     kv_path: Arc<std::sync::atomic::AtomicU8>,
@@ -3003,6 +3006,8 @@ impl GgufBackend {
             #[cfg(feature = "gguf-cuda-shared-kv")]
             pool_slot: Arc::new(Mutex::new(None)),
             #[cfg(feature = "gguf-cuda-shared-kv")]
+            device_pool: None,
+            #[cfg(feature = "gguf-cuda-shared-kv")]
             kv_path: Arc::new(std::sync::atomic::AtomicU8::new(
                 GgufKvPath::Unloaded.as_u8(),
             )),
@@ -3017,10 +3022,24 @@ impl GgufBackend {
             metrics: Arc::new(Mutex::new(EngineMetrics::new())),
             device_id,
             pool_slot: Arc::new(Mutex::new(handle)),
+            device_pool: None,
             kv_path: Arc::new(std::sync::atomic::AtomicU8::new(
                 GgufKvPath::Unloaded.as_u8(),
             )),
         }
+    }
+
+    /// Construct the shared-KV backend as a client of a runtime-owned device
+    /// pool. The model-specific KV view is created after geometry is read.
+    #[cfg(feature = "gguf-cuda-shared-kv")]
+    pub fn new_cuda_device_pool(
+        device_id: usize,
+        device_pool: Arc<GpuDevicePool>,
+        model_id: u32,
+    ) -> Self {
+        let mut backend = Self::new_cuda_shared_kv(device_id, None);
+        backend.device_pool = Some((device_pool, PoolOwner::GgufKv { model_id }));
+        backend
     }
 
     #[cfg(feature = "gguf-cuda-shared-kv")]
@@ -4017,16 +4036,37 @@ impl Engine for GgufBackend {
             // uniform full allocation.
             let windowed = gguf_windowed_kv_config(&weights.model, config, block_size);
             // Auto-select the least-loaded registered device when KAPSL_GGUF_AUTO_DEVICE=1.
-            let effective_device_id = gguf_select_device(self.device_id, n_head_kv, head_dim);
+            let effective_device_id = if self.device_pool.is_some() {
+                self.device_id
+            } else {
+                gguf_select_device(self.device_id, n_head_kv, head_dim)
+            };
             if effective_device_id != self.device_id {
                 log::info!(
                     "[gguf] auto-device: selected device {} over {} (more free {n_head_kv}h×{head_dim}d blocks)",
                     effective_device_id, self.device_id,
                 );
             }
+            let requested_blocks =
+                gguf_shared_kv_block_count(n_layers, config, block_size, windowed.as_ref());
             let handle = {
                 let mut slot = self.pool_slot.lock().unwrap();
-                if let Some(handle) = slot.as_ref() {
+                if let Some((device_pool, owner)) = self.device_pool.as_ref() {
+                    let pool = Arc::new(
+                        GpuBlockPool::from_device_pool(
+                            Arc::clone(device_pool),
+                            *owner,
+                            requested_blocks,
+                            block_size,
+                            n_head_kv,
+                            head_dim,
+                        )
+                        .map_err(|e| EngineError::backend(format!("shared KV view: {e}")))?,
+                    );
+                    let handle = GpuPoolHandle::private(pool);
+                    *slot = Some(handle.clone());
+                    handle
+                } else if let Some(handle) = slot.as_ref() {
                     if handle.pool.is_compatible(n_head_kv, head_dim) {
                         handle.clone()
                     } else {
@@ -4039,17 +4079,15 @@ impl Engine for GgufBackend {
                         );
                         let device = CudaDevice::new(effective_device_id)
                             .map_err(|e| EngineError::backend(format!("CUDA: {e}")))?;
-                        let num_blocks = gguf_shared_kv_block_count(
-                            n_layers,
-                            config,
-                            block_size,
-                            windowed.as_ref(),
-                        );
                         let pool = Arc::new(
-                            GpuBlockPool::new(device, num_blocks, block_size, n_head_kv, head_dim)
-                                .map_err(|e| {
-                                    EngineError::backend(format!("shared KV pool: {e}"))
-                                })?,
+                            GpuBlockPool::new(
+                                device,
+                                requested_blocks,
+                                block_size,
+                                n_head_kv,
+                                head_dim,
+                            )
+                            .map_err(|e| EngineError::backend(format!("shared KV pool: {e}")))?,
                         );
                         let handle = GpuPoolHandle::private(pool);
                         *slot = Some(handle.clone());
@@ -4058,11 +4096,15 @@ impl Engine for GgufBackend {
                 } else {
                     let device = CudaDevice::new(effective_device_id)
                         .map_err(|e| EngineError::backend(format!("CUDA: {e}")))?;
-                    let num_blocks =
-                        gguf_shared_kv_block_count(n_layers, config, block_size, windowed.as_ref());
                     let pool = Arc::new(
-                        GpuBlockPool::new(device, num_blocks, block_size, n_head_kv, head_dim)
-                            .map_err(|e| EngineError::backend(format!("shared KV pool: {e}")))?,
+                        GpuBlockPool::new(
+                            device,
+                            requested_blocks,
+                            block_size,
+                            n_head_kv,
+                            head_dim,
+                        )
+                        .map_err(|e| EngineError::backend(format!("shared KV pool: {e}")))?,
                     );
                     let handle = GpuPoolHandle::private(pool);
                     *slot = Some(handle.clone());

@@ -1,19 +1,19 @@
-//! ONNX Runtime CUDA allocator backed by the shared Kapsl `GpuBlockPool`.
+//! ONNX Runtime CUDA allocator backed by the runtime-owned `GpuDevicePool`.
 //!
 //! Registers a custom `OrtAllocator` on the global ORT environment so that
-//! CUDA execution-provider sessions draw device memory from the same block
-//! pool as the GGUF KV cache, giving multi-model deployments a single GPU
+//! CUDA execution-provider sessions draw device memory from the same device
+//! pool as GGUF KV views, giving multi-model deployments a single GPU
 //! memory budget instead of two independent arenas.
 //!
 //! # Flow
 //!
-//! 1. The runtime creates (or obtains, e.g. via `GgufBackend::pool_handle()`)
-//!    a `GpuPoolHandle` for a device and calls [`register_pool_allocator`].
+//! 1. The runtime creates a `GpuDevicePool` for a device and calls
+//!    [`register_pool_allocator`] before constructing backend sessions.
 //! 2. ORT sessions on that device opt in with the session config entry
 //!    `session.use_env_allocators = 1` ([`USE_ENV_ALLOCATORS_KEY`]);
 //!    `OnnxBackend` does this automatically when a pool is registered.
-//! 3. Each ORT device allocation is served as a contiguous run of pool
-//!    blocks; frees return the run to the pool.
+//! 3. Each ORT device allocation is served as an aligned byte extent; frees
+//!    return that exact allocation to the pool.
 //!
 //! The registered allocator is matched by ORT against the memory info
 //! (`"Cuda"`, device id, `OrtMemTypeDefault`), so CPU-side allocations and
@@ -24,7 +24,7 @@ use std::ffi::{c_void, CStr};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use kapsl_hal::gpu_arena::{GpuBlockPool, GpuPoolHandle};
+use kapsl_hal::gpu_arena::{GpuAllocation, GpuDevicePool, PoolOwner};
 use ort::memory::{AllocationDevice, AllocatorType, MemoryInfo, MemoryType};
 use ort::sys as ort_sys;
 use ort::AsPointer;
@@ -36,20 +36,13 @@ pub const USE_ENV_ALLOCATORS_KEY: &str = "session.use_env_allocators";
 /// CUDA device pointers handed to ORT must be at least 256-byte aligned.
 const CUDA_ALLOC_ALIGN: usize = 256;
 
-/// A live ORT allocation: a contiguous run of pool blocks.
-struct BlockRun {
-    first: u32,
-    count: usize,
-}
-
 struct AllocState {
-    pool: Arc<GpuBlockPool>,
+    pool: Arc<GpuDevicePool>,
     /// Kept alive for the allocator's lifetime; `Info` returns its pointer.
     mem_info: MemoryInfo,
-    bytes_per_block: usize,
     device_id: i32,
-    /// Device pointer → run, so `Free` can return blocks to the pool.
-    live: Mutex<HashMap<usize, BlockRun>>,
+    /// Device pointer → allocation, so `Free` returns the exact owned extent.
+    live: Mutex<HashMap<usize, GpuAllocation>>,
 }
 
 #[repr(C)]
@@ -69,17 +62,18 @@ unsafe extern "system" fn pool_alloc(
         if size == 0 {
             return std::ptr::null_mut();
         }
-        let blocks = size.div_ceil(state.bytes_per_block);
-        match state.pool.alloc_blocks_contiguous(blocks) {
-            Ok(first) => {
-                let ptr = state.pool.block_device_ptr(first) as usize;
-                state.live.lock().unwrap().insert(ptr, BlockRun { first, count: blocks });
+        match state.pool.alloc(PoolOwner::Onnx, size, CUDA_ALLOC_ALIGN) {
+            Ok(allocation) => {
+                let ptr = state.pool.allocation_ptr(&allocation) as usize;
+                state.live.lock().unwrap().insert(ptr, allocation);
                 ptr as *mut c_void
             }
             Err(e) => {
                 log::error!(
-                    "ORT pool allocator (device {}): failed to allocate {} bytes ({} blocks): {}",
-                    state.device_id, size, blocks, e
+                    "ORT pool allocator (device {}): failed to allocate {} bytes: {}",
+                    state.device_id,
+                    size,
+                    e
                 );
                 std::ptr::null_mut()
             }
@@ -94,11 +88,27 @@ unsafe extern "system" fn pool_free(this_: *mut ort_sys::OrtAllocator, p: *mut c
             return;
         }
         let state = unsafe { &(*(this_ as *const PoolOrtAllocator)).state };
-        match state.live.lock().unwrap().remove(&(p as usize)) {
-            Some(run) => state.pool.free_blocks_contiguous(run.first, run.count),
+        let allocation = { state.live.lock().unwrap().remove(&(p as usize)) };
+        match allocation {
+            Some(allocation) => {
+                if let Err(error) = state.pool.free(allocation.clone()) {
+                    state
+                        .live
+                        .lock()
+                        .unwrap()
+                        .insert(p as usize, allocation);
+                    log::error!(
+                        "ORT pool allocator (device {}): failed to free {:p}: {}",
+                        state.device_id,
+                        p,
+                        error
+                    );
+                }
+            }
             None => log::warn!(
                 "ORT pool allocator (device {}): free of unknown pointer {:p}",
-                state.device_id, p
+                state.device_id,
+                p
             ),
         }
     }));
@@ -121,7 +131,7 @@ unsafe extern "system" fn pool_reserve(
 }
 
 struct Registration {
-    handle: GpuPoolHandle,
+    pool: Arc<GpuDevicePool>,
     /// Pins the ORT environment the allocator was registered on, so it (and
     /// the leaked allocator vtable) outlive every session that may use it.
     _env: Arc<ort::environment::Environment>,
@@ -146,28 +156,19 @@ fn status_to_result(status: ort_sys::OrtStatusPtr) -> Result<(), String> {
     }
 }
 
-/// Register `handle`'s pool as the ORT device allocator for `device_id`.
+/// Register the runtime-owned pool as the ORT device allocator for `device_id`.
 ///
 /// Idempotent for the same pool; registering a *different* pool for a device
 /// that already has one is an error. After this call, `OnnxBackend` sessions
 /// on this device automatically allocate from the shared pool.
-pub fn register_pool_allocator(device_id: i32, handle: &GpuPoolHandle) -> Result<(), String> {
-    let pool = handle.pool.clone();
-    let bytes_per_block = pool.bytes_per_block();
-    if bytes_per_block == 0 || bytes_per_block % CUDA_ALLOC_ALIGN != 0 {
-        return Err(format!(
-            "pool block size ({bytes_per_block} bytes) is not a multiple of the required \
-             {CUDA_ALLOC_ALIGN}-byte CUDA alignment; cannot serve ORT allocations"
-        ));
-    }
-
+pub fn register_pool_allocator(device_id: i32, pool: &Arc<GpuDevicePool>) -> Result<(), String> {
     let mut reg = registry().lock().unwrap();
     if let Some(existing) = reg.get(&device_id) {
-        if Arc::ptr_eq(&existing.handle.pool, &pool) {
+        if Arc::ptr_eq(&existing.pool, pool) {
             return Ok(());
         }
         return Err(format!(
-            "a different GpuBlockPool is already registered with ORT for device {device_id}"
+            "a different GpuDevicePool is already registered with ORT for device {device_id}"
         ));
     }
 
@@ -190,9 +191,8 @@ pub fn register_pool_allocator(device_id: i32, handle: &GpuPoolHandle) -> Result
             Reserve: Some(pool_reserve),
         },
         state: AllocState {
-            pool: pool.clone(),
+            pool: Arc::clone(pool),
             mem_info,
-            bytes_per_block,
             device_id,
             live: Mutex::new(HashMap::new()),
         },
@@ -201,22 +201,19 @@ pub fn register_pool_allocator(device_id: i32, handle: &GpuPoolHandle) -> Result
     // registration entry pins the environment, so leak the allocator.
     let allocator: &'static mut PoolOrtAllocator = Box::leak(allocator);
 
-    let status = unsafe {
-        (ort::api().RegisterAllocator)(env.ptr().cast_mut(), &mut allocator.ort)
-    };
+    let status =
+        unsafe { (ort::api().RegisterAllocator)(env.ptr().cast_mut(), &mut allocator.ort) };
     status_to_result(status).map_err(|e| format!("ORT RegisterAllocator failed: {e}"))?;
 
     log::info!(
-        "Registered shared GPU pool with ORT for device {}: {} blocks × {} KiB ({} MiB)",
+        "Registered runtime GPU device pool with ORT for device {}: {} MiB",
         device_id,
-        pool.total_blocks(),
-        bytes_per_block / 1024,
         pool.capacity_bytes() / (1024 * 1024),
     );
     reg.insert(
         device_id,
         Registration {
-            handle: handle.clone(),
+            pool: Arc::clone(pool),
             _env: env,
         },
     );
@@ -226,14 +223,4 @@ pub fn register_pool_allocator(device_id: i32, handle: &GpuPoolHandle) -> Result
 /// Whether a shared pool allocator has been registered for `device_id`.
 pub fn is_registered(device_id: i32) -> bool {
     registry().lock().unwrap().contains_key(&device_id)
-}
-
-/// The pool handle registered for `device_id`, if any. Lets the factory hand
-/// the same pool to GGUF backends created after registration.
-pub fn registered_pool_handle(device_id: i32) -> Option<GpuPoolHandle> {
-    registry()
-        .lock()
-        .unwrap()
-        .get(&device_id)
-        .map(|r| r.handle.clone())
 }

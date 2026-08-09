@@ -32,7 +32,7 @@ mod inner {
         BatchingPolicy, BinaryTensorPacket, EngineError, EngineMetrics, EngineModelInfo,
         EngineStream, InferenceRequest, RequestMetadata, TensorDtype,
     };
-    use kapsl_hal::gpu_arena::{GpuBlockPool, GpuPoolHandle};
+    use kapsl_hal::gpu_arena::{GpuBlockPool, GpuDevicePool, GpuPoolHandle, PoolOwner};
     use kapsl_kernels::cuda_kernels::{
         launch_argmax, launch_batch_kv_write, launch_batch_rope, launch_fused_swiglu,
         launch_paged_attention, launch_prefill_attention, launch_residual_add, launch_rms_norm,
@@ -1191,6 +1191,8 @@ mod inner {
         state: Arc<Mutex<Option<BackendState>>>,
         /// Pool handle to inject before load(); also populated after load() for sharing.
         pool_slot: Arc<Mutex<Option<GpuPoolHandle>>>,
+        /// Runtime-owned storage used to create the geometry view during load.
+        device_pool: Option<(Arc<GpuDevicePool>, PoolOwner)>,
     }
 
     impl NativeBackend {
@@ -1201,6 +1203,7 @@ mod inner {
                 device_id,
                 state: Arc::new(Mutex::new(None)),
                 pool_slot: Arc::new(Mutex::new(None)),
+                device_pool: None,
             })
         }
 
@@ -1208,6 +1211,13 @@ mod inner {
         /// is incompatible with the model, load() will create a private pool instead.
         pub fn with_pool_handle(self, handle: GpuPoolHandle) -> Self {
             *self.pool_slot.lock().unwrap() = Some(handle);
+            self
+        }
+
+        /// Attach this backend to runtime-owned device storage. Model geometry
+        /// is applied later, after safetensors metadata has been loaded.
+        pub fn with_device_pool(mut self, pool: Arc<GpuDevicePool>, model_id: u32) -> Self {
+            self.device_pool = Some((pool, PoolOwner::NativeKv { model_id }));
             self
         }
 
@@ -1277,7 +1287,18 @@ mod inner {
             let pool_slot = Arc::clone(&self.pool_slot);
             let (block_pool, pool_cap): (Arc<GpuBlockPool>, Arc<AtomicUsize>) = {
                 let mut slot = pool_slot.lock().unwrap();
-                if let Some(ref handle) = *slot {
+                if let Some((device_pool, owner)) = self.device_pool.as_ref() {
+                    let bps = (config.max_position_embeddings + block_size - 1) / block_size;
+                    let requested_blocks = config.num_hidden_layers * MAX_BATCH * bps;
+                    let p = Arc::new(GpuBlockPool::from_device_pool(
+                        Arc::clone(device_pool), *owner, requested_blocks, block_size,
+                        config.num_kv_heads(), config.head_dim())
+                        .map_err(|e| EngineError::backend(format!("block pool view: {e}")))?);
+                    let h = GpuPoolHandle::private(p.clone());
+                    let cap = h.blocks_per_engine.clone();
+                    *slot = Some(h);
+                    (p, cap)
+                } else if let Some(ref handle) = *slot {
                     if handle.pool.is_compatible(config.num_kv_heads(), config.head_dim()) {
                         log::info!("[native] Attaching to shared GpuBlockPool ({} free, cap {})",
                             handle.pool.free_count(), handle.cap());

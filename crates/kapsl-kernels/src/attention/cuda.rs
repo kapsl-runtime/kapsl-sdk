@@ -10,7 +10,7 @@
 #[cfg(feature = "cuda")]
 mod inner {
     use crate::nvrtc_util::cuda_compile_opts;
-    use cudarc::driver::{CudaDevice, CudaFunction, CudaSlice, CudaView, LaunchAsync, LaunchConfig};
+    use cudarc::driver::{CudaDevice, CudaFunction, CudaSlice, CudaView, CudaViewMut, LaunchAsync, LaunchConfig};
     use cudarc::nvrtc::compile_ptx_with_opts;
     use half::f16;
     use std::sync::{Arc, OnceLock};
@@ -184,7 +184,7 @@ __global__ void paged_attention_v1(
         /// Query:   [batch, num_q_heads, head_dim], device f16.
         pub q: &'a CudaSlice<f16>,
         /// KV pool: [num_blocks, 2, num_kv_heads, block_size, head_dim], device f16.
-        pub kv_cache: &'a CudaSlice<f16>,
+        pub kv_cache: CudaView<'a, f16>,
         /// Block tables: [batch, max_blocks_per_seq], device i32.
         pub block_tables: &'a CudaSlice<i32>,
         /// Context lengths: [batch], device i32.
@@ -232,7 +232,7 @@ __global__ void paged_attention_v1(
                     (
                         &mut *params.out,
                         params.q,
-                        params.kv_cache,
+                        &params.kv_cache,
                         params.block_tables,
                         params.context_lens,
                         params.scale,
@@ -552,7 +552,7 @@ __global__ void write_kv_to_pool(
     static KV_WRITE_KERNEL: &str = "write_kv_to_pool";
 
     pub struct KvWriteParams<'a> {
-        pub kv_cache: &'a mut CudaSlice<f16>,
+        pub kv_cache: CudaViewMut<'a, f16>,
         pub k_vec: &'a CudaSlice<f16>,
         pub v_vec: &'a CudaSlice<f16>,
         pub physical_block: u32,
@@ -587,7 +587,7 @@ __global__ void write_kv_to_pool(
                 .launch(
                     cfg,
                     (
-                        &mut *params.kv_cache,
+                        &mut params.kv_cache,
                         params.k_vec,
                         params.v_vec,
                         params.physical_block as i32,
@@ -961,7 +961,7 @@ __global__ void batch_kv_write(
     static BATCH_KV_WRITE_KERNEL: &str = "batch_kv_write";
 
     pub struct BatchKvWriteParams<'a> {
-        pub kv_cache: &'a mut CudaSlice<f16>,
+        pub kv_cache: CudaViewMut<'a, f16>,
         pub k: &'a CudaSlice<f16>,
         pub v: &'a CudaSlice<f16>,
         pub physical_blocks: &'a CudaSlice<i32>,
@@ -1000,7 +1000,7 @@ __global__ void batch_kv_write(
                 .launch(
                     cfg,
                     (
-                        &mut *p.kv_cache,
+                        &mut p.kv_cache,
                         p.k,
                         p.v,
                         p.physical_blocks,

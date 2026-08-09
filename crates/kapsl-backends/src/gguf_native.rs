@@ -30,7 +30,7 @@ mod inner {
         BatchingPolicy, BinaryTensorPacket, Engine, EngineError, EngineMetrics, EngineModelInfo,
         EngineStream, InferenceRequest, RequestMetadata, TensorDtype,
     };
-    use kapsl_hal::gpu_arena::{GpuBlockPool, GpuPoolHandle};
+    use kapsl_hal::gpu_arena::{GpuBlockPool, GpuDevicePool, GpuPoolHandle, PoolOwner};
     use kapsl_loader::weights::DType;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use kapsl_kernels::cuda_quant_kernels::{launch_q4_k_gemv, launch_q8_0_gemv, QuantGemvParams};
@@ -1261,6 +1261,8 @@ mod inner {
         inner: Arc<Mutex<Option<BackendInner>>>,
         /// Pool handle to inject before load(); also populated after load() for sharing.
         pool_slot: Arc<Mutex<Option<GpuPoolHandle>>>,
+        /// Runtime-owned storage used to create the geometry view during load.
+        device_pool: Option<(Arc<GpuDevicePool>, PoolOwner)>,
         batch_dec: Arc<BatchDecodeCoordinator>,
     }
 
@@ -1274,6 +1276,7 @@ mod inner {
                 device_id,
                 inner,
                 pool_slot: Arc::new(Mutex::new(None)),
+                device_pool: None,
                 batch_dec,
             })
         }
@@ -1282,6 +1285,13 @@ mod inner {
         /// is incompatible with the model, load() will create a private pool instead.
         pub fn with_pool_handle(self, handle: GpuPoolHandle) -> Self {
             *self.pool_slot.lock().unwrap() = Some(handle);
+            self
+        }
+
+        /// Attach this backend to runtime-owned device storage. Model geometry
+        /// is applied after GGUF metadata has been loaded.
+        pub fn with_device_pool(mut self, pool: Arc<GpuDevicePool>, model_id: u32) -> Self {
+            self.device_pool = Some((pool, PoolOwner::GgufKv { model_id }));
             self
         }
 
@@ -1316,6 +1326,7 @@ mod inner {
             let device_id = self.device_id;
             let inner_arc = Arc::clone(&self.inner);
             let pool_slot = Arc::clone(&self.pool_slot);
+            let device_pool = self.device_pool.clone();
 
             tokio::task::spawn_blocking(move || {
                 // ── Load GGUF weights → dequantize to f16 ──────────────────
@@ -1349,7 +1360,17 @@ mod inner {
                 let block_size = 16usize;
                 let (block_pool, pool_cap): (Arc<GpuBlockPool>, Arc<AtomicUsize>) = {
                     let mut slot = pool_slot.lock().unwrap();
-                    if let Some(ref handle) = *slot {
+                    if let Some((device_pool, owner)) = device_pool.as_ref() {
+                        let requested_blocks = kv_pool_block_count(&config, block_size);
+                        let p = Arc::new(GpuBlockPool::from_device_pool(
+                            Arc::clone(device_pool), *owner, requested_blocks, block_size,
+                            config.num_kv_heads(), config.head_dim())
+                            .map_err(|e| EngineError::backend(format!("block pool view: {e}")))?);
+                        let h = GpuPoolHandle::private(p.clone());
+                        let cap = h.blocks_per_engine.clone();
+                        *slot = Some(h);
+                        (p, cap)
+                    } else if let Some(ref handle) = *slot {
                         if handle.pool.is_compatible(config.num_kv_heads(), config.head_dim()) {
                             log::info!("[gguf-native] Attaching to shared GpuBlockPool ({} free, cap {})",
                                 handle.pool.free_count(), handle.cap());
