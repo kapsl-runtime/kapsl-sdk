@@ -26,6 +26,18 @@ use ort::session::builder::GraphOptimizationLevel;
 #[cfg(any(feature = "gguf-native", feature = "native", feature = "gguf-cuda-shared-kv"))]
 use std::sync::Arc;
 
+fn use_registered_env_allocator(device_id: i32) -> bool {
+    #[cfg(feature = "onnx-cuda-pool")]
+    {
+        return crate::ort_pool_allocator::is_registered(device_id);
+    }
+    #[cfg(not(feature = "onnx-cuda-pool"))]
+    {
+        let _ = device_id;
+        false
+    }
+}
+
 pub struct BackendFactory;
 
 #[derive(Debug, Clone, Default)]
@@ -322,11 +334,18 @@ impl BackendFactory {
                         "✓ Using LLMBackend with manifest provider override: {}",
                         provider
                     );
-                    return Ok(Box::new(LLMBackend::with_device(provider, device_id)));
+                    return Ok(Box::new(
+                        LLMBackend::with_device(provider, device_id)
+                            .with_env_allocators(use_registered_env_allocator(device_id)),
+                    ));
                 }
             }
             log::info!("✓ Using LLMBackend with runtime fastest-provider selection");
-            return Ok(Box::new(LLMBackend::new()));
+            let device_id = requirements.device_id.unwrap_or(0);
+            return Ok(Box::new(
+                LLMBackend::new()
+                    .with_env_allocators(use_registered_env_allocator(device_id)),
+            ));
         }
 
         if !engine_kind.is_implemented() {
@@ -433,16 +452,19 @@ impl BackendFactory {
                     "✓ Using LLMBackend with manifest provider override: {}",
                     provider
                 );
-                return Ok(Box::new(LLMBackend::with_device(
-                    provider.to_string(),
-                    device_id as i32,
-                )));
+                return Ok(Box::new(
+                    LLMBackend::with_device(provider.to_string(), device_id as i32)
+                        .with_env_allocators(use_registered_env_allocator(device_id as i32)),
+                ));
             }
 
             log::info!(
                 "✓ Using LLMBackend with device pinning and runtime provider auto-selection"
             );
-            return Ok(Box::new(LLMBackend::with_device_id(device_id as i32)));
+            return Ok(Box::new(
+                LLMBackend::with_device_id(device_id as i32)
+                    .with_env_allocators(use_registered_env_allocator(device_id as i32)),
+            ));
         }
 
         if !engine_kind.is_implemented() {
