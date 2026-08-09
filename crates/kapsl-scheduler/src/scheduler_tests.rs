@@ -393,6 +393,27 @@ async fn test_get_worker_index_sticky_session() {
     assert!(first < scheduler.gpu_high_priority_queues.len());
 }
 
+#[tokio::test]
+async fn test_drop_scheduler_releases_executor_engine_handles() {
+    let engine = Arc::new(MockEngine::new(EngineMetrics::default()));
+    let engine_handle: EngineHandle = engine.clone();
+    let scheduler = Scheduler::new(vec![engine_handle], 1, 1, 8, false, 1, 0, None);
+
+    drop(scheduler);
+    for _ in 0..100 {
+        if Arc::strong_count(&engine) == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+
+    assert_eq!(
+        Arc::strong_count(&engine),
+        1,
+        "executor task retained its engine after scheduler teardown"
+    );
+}
+
 #[test]
 fn test_is_healthy_threshold() {
     let engine_handle: EngineHandle = Arc::new(MockEngine::new(EngineMetrics::default()));
