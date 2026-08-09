@@ -45,6 +45,8 @@ pub struct LLMBackend {
     provider_override: Option<String>,
     device_id_override: Option<i32>,
     device_ids_override: Option<Vec<i32>>,
+    /// Opt CUDA/TensorRT sessions into allocators registered on the ORT environment.
+    use_env_allocators: bool,
     /// Optional shared block pool.  When set, the engine draws from this pool
     /// instead of a private allocator, enabling unified KV memory across models.
     shared_pool: Option<SharedBlockAllocator>,
@@ -439,6 +441,7 @@ impl LLMBackend {
             provider_override: None,
             device_id_override: None,
             device_ids_override: None,
+            use_env_allocators: false,
             shared_pool: None,
             kv_blocks_cap: None,
             kv_compression_bits: None,
@@ -475,6 +478,14 @@ impl LLMBackend {
     /// Overrides the value in `metadata.json` and `KAPSL_LLM_KV_COMPRESSION_BITS`.
     pub fn with_kv_compression_bits(mut self, bits: u8) -> Self {
         self.kv_compression_bits = Some(bits);
+        self
+    }
+
+    /// Make CUDA/TensorRT sessions use allocators registered on the shared ORT
+    /// environment. The runtime enables this only after registering its stable
+    /// device pool.
+    pub fn with_env_allocators(mut self, enabled: bool) -> Self {
+        self.use_env_allocators = enabled;
         self
     }
 
@@ -632,6 +643,7 @@ impl Engine for LLMBackend {
         let provider_override = self.provider_override.clone();
         let device_id_override = self.device_id_override;
         let device_ids_override = self.device_ids_override.clone();
+        let use_env_allocators = self.use_env_allocators;
         let engine_block_size = hints.block_size;
         let engine_num_gpu_blocks = hints.num_gpu_blocks;
         let shared_pool = self.shared_pool.clone();
@@ -651,6 +663,7 @@ impl Engine for LLMBackend {
                 provider_override,
                 device_id_override,
                 device_ids_override,
+                use_env_allocators,
             );
             // If a shared pool was attached, replace the private allocator.
             let mut engine = if let Some(pool) = shared_pool {

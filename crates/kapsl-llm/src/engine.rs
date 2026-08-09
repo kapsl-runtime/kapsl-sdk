@@ -944,6 +944,7 @@ pub struct LLMEngine {
     provider_override: Option<String>,
     device_id_override: Option<i32>,
     device_ids_override: Option<Vec<i32>>,
+    use_env_allocators: bool,
     pipeline_stages: Option<Vec<PipelineStage>>,
 
     // KV cache (recreated when model geometry detected)
@@ -1118,6 +1119,7 @@ impl LLMEngine {
         provider_override: Option<String>,
         device_id_override: Option<i32>,
         device_ids_override: Option<Vec<i32>>,
+        use_env_allocators: bool,
     ) -> Self {
         let block_manager = BlockManager::new(num_gpu_blocks, block_size, 0);
         let scheduler = LLMScheduler::new(scheduler_config, block_manager);
@@ -1144,6 +1146,7 @@ impl LLMEngine {
             provider_override,
             device_id_override,
             device_ids_override,
+            use_env_allocators,
             pipeline_stages: None,
             kv_cache,
             kv_cache_config: KvCacheConfig::default(),
@@ -1774,6 +1777,11 @@ impl LLMEngine {
 
             if let Some(provider) = provider {
                 let p_lower = provider.to_lowercase();
+                if self.use_env_allocators && matches!(p_lower.as_str(), "cuda" | "tensorrt") {
+                    builder = builder
+                        .with_config_entry("session.use_env_allocators", "1")
+                        .map_err(|e| EngineError::backend(e.to_string()))?;
+                }
                 match p_lower.as_str() {
                     "coreml" | "metal" => {
                         if CoreMLExecutionProvider::default()
