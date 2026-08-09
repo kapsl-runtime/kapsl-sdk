@@ -1690,6 +1690,16 @@ struct GgufSharedKvPoolState {
     windowed_inner: Mutex<GgufWindowedReservation>,
 }
 
+#[cfg(feature = "gguf-cuda-shared-kv")]
+impl Drop for GgufSharedKvPool {
+    fn drop(&mut self) {
+        gguf_global_kv_scheduler()
+            .lock()
+            .unwrap()
+            .unregister_pool(self.state.device_id, &self.state.handle.pool);
+    }
+}
+
 /// Single-sequence reservation state for windowed (Phase 2) allocation.
 ///
 /// Unlike [`GgufSharedKvReservation`]'s flat `[layer * n_new + pos]` layout,

@@ -194,6 +194,21 @@ mod inner {
             self.device_pools.entry(device_id).or_default().push(pool);
         }
 
+        /// Unregister one geometry view without disturbing other models on the
+        /// same device. Pool identity is pointer-based because two views may
+        /// legitimately have identical geometry and capacity.
+        pub fn unregister_pool(&mut self, device_id: usize, pool: &Arc<GpuBlockPool>) {
+            let remove_device = if let Some(pools) = self.device_pools.get_mut(&device_id) {
+                pools.retain(|registered| !Arc::ptr_eq(registered, pool));
+                pools.is_empty()
+            } else {
+                false
+            };
+            if remove_device {
+                self.device_pools.remove(&device_id);
+            }
+        }
+
         /// Remove all pools for a device (e.g. on hot-unplug or shutdown).
         pub fn unregister_device(&mut self, device_id: usize) {
             self.device_pools.remove(&device_id);
@@ -579,6 +594,22 @@ mod inner {
             // CPU store was created for this geometry.
             let free = s.device_free_blocks(0, pool.num_kv_heads(), pool.head_dim());
             assert_eq!(free, pool.total_blocks());
+        }
+
+        #[test]
+        fn unregister_pool_removes_only_the_matching_view() {
+            let mut s = sched();
+            let first = small_pool();
+            let second = small_pool();
+            s.register_pool(0, first.clone());
+            s.register_pool(0, second.clone());
+
+            s.unregister_pool(0, &first);
+            assert_eq!(s.registered_devices(), vec![0]);
+            assert_eq!(s.device_free_blocks(0, second.num_kv_heads(), second.head_dim()), 8);
+
+            s.unregister_pool(0, &second);
+            assert!(s.registered_devices().is_empty());
         }
 
         #[test]
