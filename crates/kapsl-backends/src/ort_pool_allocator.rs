@@ -36,6 +36,16 @@ pub const USE_ENV_ALLOCATORS_KEY: &str = "session.use_env_allocators";
 /// CUDA device pointers handed to ORT must be at least 256-byte aligned.
 const CUDA_ALLOC_ALIGN: usize = 256;
 
+/// Highest `OrtAllocator` ABI represented by ort-sys 2.0.0-rc.11.
+///
+/// ORT API 23 added `GetStats` and `AllocOnStream` function pointers after
+/// `Reserve`. The rc.11 bindings advertise API 23 but their `OrtAllocator`
+/// definition ends at `Reserve`. Advertising 23 here makes ORT read the first
+/// words of `AllocState` as those callbacks, corrupting CUDA feed copies. ORT
+/// explicitly supports allocators built against older API layouts, so report
+/// API 22 until the bindings expose the API-23 tail fields.
+const ORT_ALLOCATOR_ABI_VERSION: u32 = 22;
+
 struct AllocState {
     pool: Arc<GpuDevicePool>,
     /// Kept alive for the allocator's lifetime; `Info` returns its pointer.
@@ -184,7 +194,7 @@ pub fn register_pool_allocator(device_id: i32, pool: &Arc<GpuDevicePool>) -> Res
 
     let allocator = Box::new(PoolOrtAllocator {
         ort: ort_sys::OrtAllocator {
-            version: ort_sys::ORT_API_VERSION,
+            version: ORT_ALLOCATOR_ABI_VERSION,
             Alloc: Some(pool_alloc),
             Free: Some(pool_free),
             Info: Some(pool_info),
