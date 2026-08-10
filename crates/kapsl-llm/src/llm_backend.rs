@@ -979,7 +979,13 @@ impl Engine for LLMBackend {
 
         let tx_guard = self.request_tx.read().unwrap();
         if let Some(tx) = tx_guard.as_ref() {
-            let tx = tx.clone();
+            // A returned stream can outlive the backend (and may remain stored
+            // even after it has yielded its final item).  Holding a strong
+            // sender in that stream would keep the engine's request channel
+            // open forever and prevent `unload` from observing task teardown.
+            // Upgrade only while enqueueing the request, then release the
+            // strong sender before awaiting response chunks.
+            let tx = tx.downgrade();
             drop(tx_guard);
 
             let stream = stream! {
@@ -999,6 +1005,10 @@ impl Engine for LLMBackend {
                 // Per-model backpressure: reject immediately when this model's
                 // queue is full rather than blocking (which would build latency
                 // and hold the admission reservation indefinitely).
+                let Some(tx) = tx.upgrade() else {
+                    yield Err(EngineError::ModelNotLoaded);
+                    return;
+                };
                 match tx.try_send(seq_group) {
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(_)) => {
@@ -1012,6 +1022,7 @@ impl Engine for LLMBackend {
                         return;
                     }
                 }
+                drop(tx);
 
                 let mut saw_finish = false;
                 loop {

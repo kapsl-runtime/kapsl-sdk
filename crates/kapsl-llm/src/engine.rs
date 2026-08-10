@@ -2821,13 +2821,23 @@ impl LLMEngine {
                 self.scheduler.add_sequence_group(req);
             }
 
+            // `try_recv` reports disconnection through its error, so the loop
+            // above alone cannot distinguish an idle open channel from one
+            // whose final sender was dropped by `LLMBackend::unload`.  Once all
+            // accepted work has drained, terminate the task so unload can wait
+            // for ORT/CUDA resource destruction without hanging forever.
+            let active_ids = self.scheduler.active_sequence_ids();
+            if self.request_rx.is_closed() && active_ids.is_empty() {
+                log::debug!("LLM request channel closed; stopping engine loop");
+                break;
+            }
+
             // While the breaker is open and cooling down, do no work this round.
             if circuit_blocking {
                 tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
                 continue;
             }
 
-            let active_ids = self.scheduler.active_sequence_ids();
             if self.use_kv_cache {
                 self.kv_cache.set_active_sequences(&active_ids);
             }

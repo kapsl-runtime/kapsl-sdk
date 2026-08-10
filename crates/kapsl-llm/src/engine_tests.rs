@@ -3,11 +3,14 @@ mod tests {
     use super::super::{
         build_kv_array_f16, build_kv_array_f32_from_f16, empty_kv_shape, infer_kv_layout,
         normalize_metadata_safe_load_setting, parse_safe_load_env_setting, parse_safe_load_setting,
-        KvLayout, LLMEngine, SafeLoadSetting, SamplingParams,
+        KvLayout, LLMEngine, LLMMetrics, SafeLoadSetting, SamplingParams, SchedulerConfig,
     };
     use half::f16;
     use serde_json::json;
     use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::sync::mpsc;
 
     #[test]
     fn parse_safe_load_setting_handles_bool_and_strings() {
@@ -177,5 +180,36 @@ mod tests {
             LLMEngine::sample_next_token(&logits, &params, 2, &mut rng),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn run_loop_stops_after_request_channel_closes() {
+        let (request_tx, request_rx) = mpsc::channel(1);
+        let mut engine = LLMEngine::new(
+            SchedulerConfig {
+                max_num_batched_tokens: 16,
+                max_num_seqs: 1,
+                max_paddings: 0,
+            },
+            16,
+            1,
+            request_rx,
+            Arc::new(Mutex::new(LLMMetrics::default())),
+            None,
+            None,
+            None,
+            false,
+        );
+
+        let mut task = tokio::spawn(async move { engine.run_loop().await });
+        drop(request_tx);
+
+        match tokio::time::timeout(Duration::from_secs(1), &mut task).await {
+            Ok(result) => result.expect("engine loop task panicked"),
+            Err(_) => {
+                task.abort();
+                panic!("engine loop did not stop after its final request sender was dropped");
+            }
+        }
     }
 }
