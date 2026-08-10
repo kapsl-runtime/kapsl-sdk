@@ -170,6 +170,84 @@ mod tests {
         );
     }
 
+    #[test]
+    fn load_model_runtime_config_uses_embedded_family_specific_chat_template() {
+        let root = make_temp_dir("embedded_qwen_template");
+        let model_path = root.join("model.onnx");
+        fs::write(&model_path, "").expect("model file");
+        fs::write(
+            root.join("config.json"),
+            json!({
+                "_name_or_path": "Qwen/Qwen2.5-1.5B-Instruct",
+                "model_type": "qwen2"
+            })
+            .to_string(),
+        )
+        .expect("config");
+        fs::write(
+            root.join("tokenizer_config.json"),
+            json!({
+                "add_bos_token": false,
+                "chat_template": "<|im_start|>system\\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\\n<|im_start|>user\\n{{ message.content }}<|im_end|>"
+            })
+            .to_string(),
+        )
+        .expect("tokenizer config");
+
+        let runtime = load_model_runtime_config(&model_path);
+        assert_eq!(runtime.prompt_template, Some(ChatPromptTemplate::Qwen));
+        assert_eq!(
+            runtime
+                .prompt_template
+                .as_ref()
+                .map(|template| template.render("what is your name?")),
+            Some(
+                "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n\
+                 <|im_start|>user\nwhat is your name?<|im_end|>\n<|im_start|>assistant\n"
+                    .to_string()
+            )
+        );
+
+        fs::write(
+            root.join("tokenizer_config.json"),
+            json!({
+                "chat_template": {
+                    "default": "<|im_start|>{{ message.role }}\\n{{ message.content }}<|im_end|>"
+                }
+            })
+            .to_string(),
+        )
+        .expect("generic tokenizer config");
+        let runtime = load_model_runtime_config(&model_path);
+        assert_eq!(runtime.prompt_template, Some(ChatPromptTemplate::ChatMl));
+    }
+
+    #[test]
+    fn load_model_runtime_config_uses_manifest_identity_for_legacy_deepseek_package() {
+        let root = make_temp_dir("legacy_deepseek_template");
+        let model_path = root.join("model.onnx");
+        fs::write(&model_path, "").expect("model file");
+        fs::write(
+            root.join("metadata.json"),
+            json!({
+                "project_name": "deepseek",
+                "framework": "llm",
+                "metadata": { "llm": {} }
+            })
+            .to_string(),
+        )
+        .expect("metadata");
+
+        let runtime = load_model_runtime_config(&model_path);
+        assert_eq!(
+            runtime
+                .prompt_template
+                .as_ref()
+                .map(|template| template.render("hello")),
+            Some("<｜User｜>hello<｜Assistant｜><think>\n".to_string())
+        );
+    }
+
     #[tokio::test]
     async fn infer_stream_handles_cumulative_and_incremental_outputs() {
         let backend = LLMBackend::new();

@@ -61,26 +61,6 @@ fn parse_header(mmap: &Mmap) -> Result<HashMap<String, TensorHeader>, LoadError>
     Ok(headers)
 }
 
-/// Extract a named tensor's bytes and metadata from the mmap.
-fn extract_tensor(
-    name: &str,
-    headers: &HashMap<String, TensorHeader>,
-    mmap: &Mmap,
-    data_base: usize,
-) -> Result<TensorData, WeightError> {
-    let h = headers
-        .get(name)
-        .ok_or_else(|| WeightError::Missing(name.to_string()))?;
-
-    let dtype = DType::from_str(&h.dtype)
-        .ok_or_else(|| WeightError::UnsupportedDtype(h.dtype.clone(), name.to_string()))?;
-
-    let [start, end] = h.data_offsets;
-    let bytes = mmap[data_base + start..data_base + end].to_vec();
-
-    Ok(TensorData::new(bytes, dtype, h.shape.clone()))
-}
-
 // ── Public API ───────────────────────────────────────────────────────────────
 
 /// Load all safetensors shards from a model directory into CPU memory.

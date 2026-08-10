@@ -165,6 +165,59 @@ fn normalize_metadata_safe_load_setting(setting: SafeLoadSetting) -> SafeLoadSet
     }
 }
 
+fn tokenizer_add_bos_token(model_path: &Path) -> Option<bool> {
+    let path = find_model_asset(model_path, "tokenizer_config.json")?;
+    let file = std::fs::File::open(path).ok()?;
+    serde_json::from_reader::<_, serde_json::Value>(file)
+        .ok()?
+        .get("add_bos_token")?
+        .as_bool()
+}
+
+fn tokenizer_declared_bos_token_id(model_path: &Path, tokenizer: &Tokenizer) -> Option<u32> {
+    if let Some(path) = find_model_asset(model_path, "tokenizer_config.json") {
+        if let Ok(file) = std::fs::File::open(path) {
+            if let Ok(config) = serde_json::from_reader::<_, serde_json::Value>(file) {
+                let bos_token = config.get("bos_token").and_then(|value| {
+                    value
+                        .as_str()
+                        .or_else(|| value.get("content").and_then(serde_json::Value::as_str))
+                });
+                if let Some(id) = bos_token.and_then(|token| tokenizer.token_to_id(token)) {
+                    return Some(id);
+                }
+            }
+        }
+    }
+
+    let path = find_model_asset(model_path, "tokenizer.json")?;
+    let file = std::fs::File::open(path).ok()?;
+    let tokenizer_json = serde_json::from_reader::<_, serde_json::Value>(file).ok()?;
+    let single = tokenizer_json
+        .get("post_processor")?
+        .get("single")?
+        .as_array()?;
+    single.iter().find_map(|entry| {
+        let token = entry.get("SpecialToken")?.get("id")?.as_str()?;
+        let normalized = token.to_ascii_lowercase();
+        (normalized == "<s>" || normalized.contains("bos") || normalized.contains("begin"))
+            .then(|| tokenizer.token_to_id(token))
+            .flatten()
+    })
+}
+
+fn resolve_prepend_bos_token_id(
+    configured_bos_token_id: Option<u32>,
+    add_bos_token: Option<bool>,
+) -> Option<u32> {
+    match add_bos_token {
+        Some(false) => None,
+        // Preserve the existing config.json fallback for packages that predate
+        // tokenizer_config.json, while honoring models that explicitly enable BOS.
+        Some(true) | None => configured_bos_token_id,
+    }
+}
+
 fn env_var_alias(primary: &str, legacy: &str) -> Option<String> {
     std::env::var(primary)
         .or_else(|_| std::env::var(legacy))
@@ -989,8 +1042,8 @@ pub struct LLMEngine {
     kv_admission_hard_limit_bytes: Option<usize>,
     // Detected vocabulary size (optional). Populated at load() when available.
     vocab_size: Option<usize>,
-    // Detected BOS token id (optional).
-    bos_token_id: Option<u32>,
+    // BOS token id to prepend when enabled by the tokenizer policy (optional).
+    prepend_bos_token_id: Option<u32>,
     // Whether to use KV cache inputs/outputs. Some models export these but don't support non-zero past.
     use_kv_cache: bool,
     // Guard to avoid repeated in-loop recovery churn.
@@ -1171,7 +1224,7 @@ impl LLMEngine {
             kv_blocks_cap: None,
             kv_compression_bits_override: None,
             vocab_size: None,
-            bos_token_id: None,
+            prepend_bos_token_id: None,
             use_kv_cache: true,
             coreml_cpu_fallback_attempted: false,
             kv_workspace_key: Vec::new(),
@@ -1767,6 +1820,11 @@ impl LLMEngine {
             Tokenizer::from_file(&tokenizer_path)
                 .map_err(|e| EngineError::backend(e.to_string()))?,
         );
+        let tokenizer_adds_bos = tokenizer_add_bos_token(model_path);
+        let tokenizer_bos_token_id = self
+            .tokenizer
+            .as_ref()
+            .and_then(|tokenizer| tokenizer_declared_bos_token_id(model_path, tokenizer));
 
         // Build the ONNX session so we can inspect its declared inputs.
         let make_builder = |provider: Option<&str>,
@@ -2425,7 +2483,14 @@ impl LLMEngine {
             log::info!("Could not detect model vocab_size; vocab_size remains unset");
             self.vocab_size = None;
         }
-        self.bos_token_id = config_bos_token_id;
+        let declared_bos_token_id = config_bos_token_id.or(tokenizer_bos_token_id);
+        self.prepend_bos_token_id =
+            resolve_prepend_bos_token_id(declared_bos_token_id, tokenizer_adds_bos);
+        if config_bos_token_id.is_some() && tokenizer_adds_bos == Some(false) {
+            log::info!(
+                "Tokenizer explicitly disables BOS insertion; config.json bos_token_id will not be prepended"
+            );
+        }
 
         // Persist captured names & shapes and session.
         self.model_input_names = Arc::new(input_names_set);
@@ -2655,7 +2720,7 @@ impl LLMEngine {
                 let tokenizer = self.tokenizer.as_ref().unwrap();
                 let encoded = tokenizer.encode(prompt, false).unwrap();
                 let mut token_ids = encoded.get_ids().to_vec();
-                if let Some(bos_id) = self.bos_token_id {
+                if let Some(bos_id) = self.prepend_bos_token_id {
                     if existing_seq_arc.is_some() {
                         if token_ids.first().copied() == Some(bos_id) {
                             token_ids.remove(0);
@@ -6225,36 +6290,60 @@ impl LLMEngine {
     }
 
     fn decode_next_token(tokenizer: &Tokenizer, seq: &mut Sequence, token_id: u32) -> String {
-        let decoded = match tokenizer.decode(&seq.output_token_ids, true) {
-            Ok(decoded) => decoded,
+        if seq.decode_stream.uses_cumulative_fallback() {
+            return Self::decode_cumulative_delta(tokenizer, seq, token_id);
+        }
+
+        let mut text = match seq.decode_stream.step(tokenizer, token_id) {
+            Ok(Some(delta)) => {
+                seq.decode_stream_prefix.push_str(&delta);
+                delta
+            }
+            Ok(None) => String::new(),
             Err(err) => {
                 log::warn!("Incremental tokenizer decode failed: {}", err);
+                seq.decode_stream.enter_cumulative_fallback();
+                return Self::decode_cumulative_delta(tokenizer, seq, token_id);
+            }
+        };
+
+        // The bounded stream intentionally withholds an incomplete byte-level
+        // token. Reconcile once at completion to flush any remaining suffix and
+        // provide a correctness check without cumulatively decoding every step.
+        if seq.is_finished() {
+            text.push_str(&Self::decode_cumulative_delta(tokenizer, seq, token_id));
+        }
+        text
+    }
+
+    fn decode_cumulative_delta(tokenizer: &Tokenizer, seq: &mut Sequence, token_id: u32) -> String {
+        let generated_start = seq
+            .output_token_ids
+            .len()
+            .saturating_sub(seq.generated_this_turn);
+        let decoded = match tokenizer.decode(&seq.output_token_ids[generated_start..], true) {
+            Ok(decoded) => decoded,
+            Err(err) => {
+                log::warn!("Cumulative tokenizer decode failed: {}", err);
                 return String::new();
             }
         };
 
-        // Byte-level BPE can end a partial decode with the replacement
-        // character while a multi-byte UTF-8 character is still incomplete.
-        // Do not expose that unstable suffix: the next token will complete it
-        // and the cumulative decode will then extend the last stable prefix.
-        if decoded.ends_with('\u{fffd}') && !seq.is_finished() {
-            return String::new();
-        }
-
-        if let Some(delta) = decoded.strip_prefix(&seq.decode_stream_prefix) {
-            let delta = delta.to_string();
-            seq.decode_stream_prefix = decoded;
-            delta
-        } else {
-            // A decoder must never make already-streamed bytes retractable.
-            // Returning no new bytes is safer than duplicating the cumulative
-            // output; the final benchmark correctness gate will also surface
-            // any tokenizer whose decoder is not prefix-stable.
-            log::warn!(
-                "Incremental tokenizer decode rewrote an emitted prefix after token {}",
-                token_id
-            );
-            String::new()
+        match decoded.strip_prefix(&seq.decode_stream_prefix) {
+            Some(delta) => {
+                let delta = delta.to_string();
+                seq.decode_stream_prefix = decoded;
+                delta
+            }
+            None => {
+                // A decoder must never make already-streamed bytes retractable.
+                // Returning no new bytes is safer than duplicating the output.
+                log::warn!(
+                    "Incremental tokenizer decode rewrote an emitted prefix after token {}",
+                    token_id
+                );
+                String::new()
+            }
         }
     }
 
@@ -6281,21 +6370,28 @@ impl LLMEngine {
             return 0;
         }
 
-        // Hugging Face-style min_new_tokens is a floor on decoded content,
-        // not a count that includes EOS/stop tokens. Suppress every configured
-        // stop token while selecting the next token below that floor so an EOS
-        // at the final allowed step cannot produce one fewer visible token.
-        let suppress_stop_tokens = generated_tokens < params.min_tokens;
-        let token_allowed = |index: usize| {
-            !suppress_stop_tokens || !params.stop_token_ids.contains(&(index as u32))
-        };
+        // Hugging Face-style min_new_tokens is a floor on decoded content. The
+        // optimistic path samples normally and only performs a filtered rescan
+        // when a stop token would actually enter the candidate set.
+        let suppress_stop_tokens =
+            generated_tokens < params.min_tokens && !params.stop_token_ids.is_empty();
 
         let temperature = params.temperature;
         if temperature <= 0.0 {
+            let next = logits
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .map(|(i, _)| i as u32)
+                .unwrap_or(0);
+            if !suppress_stop_tokens || !params.stop_token_ids.contains(&next) {
+                return next;
+            }
+
             return logits
                 .iter()
                 .enumerate()
-                .filter(|(index, _)| token_allowed(*index))
+                .filter(|(index, _)| !params.stop_token_ids.contains(&(*index as u32)))
                 .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
                 .map(|(i, _)| i as u32)
                 .unwrap_or(0);
@@ -6310,21 +6406,25 @@ impl LLMEngine {
             top_k = 1;
         }
 
-        let mut top: Vec<(usize, f32)> = Vec::with_capacity(top_k);
-        for (idx, &logit) in logits.iter().enumerate() {
-            if !token_allowed(idx) {
-                continue;
-            }
-            let scaled = logit / temperature;
-            if top.len() < top_k {
-                top.push((idx, scaled));
-                if top.len() == top_k {
-                    top.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-                }
-            } else if scaled > top[0].1 {
-                top[0] = (idx, scaled);
-                top.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-            }
+        // With an unbounded top-k every in-vocabulary stop token is guaranteed
+        // to enter the candidates, so filter during the first scan. For the
+        // usual small top-k, avoid per-logit stop membership checks unless a
+        // stop token actually reaches the candidate set.
+        let initial_suppression = (suppress_stop_tokens && top_k == logits.len())
+            .then_some(params.stop_token_ids.as_slice());
+        let mut top = Self::collect_top_candidates(logits, temperature, top_k, initial_suppression);
+        if initial_suppression.is_none()
+            && suppress_stop_tokens
+            && top
+                .iter()
+                .any(|(index, _)| params.stop_token_ids.contains(&(*index as u32)))
+        {
+            top = Self::collect_top_candidates(
+                logits,
+                temperature,
+                top_k,
+                Some(&params.stop_token_ids),
+            );
         }
 
         if top.is_empty() {
@@ -6374,6 +6474,31 @@ impl LLMEngine {
         }
 
         top[0].0 as u32
+    }
+
+    fn collect_top_candidates(
+        logits: &[f32],
+        temperature: f32,
+        top_k: usize,
+        suppressed_token_ids: Option<&[u32]>,
+    ) -> Vec<(usize, f32)> {
+        let mut top: Vec<(usize, f32)> = Vec::with_capacity(top_k);
+        for (idx, &logit) in logits.iter().enumerate() {
+            if suppressed_token_ids.is_some_and(|token_ids| token_ids.contains(&(idx as u32))) {
+                continue;
+            }
+            let scaled = logit / temperature;
+            if top.len() < top_k {
+                top.push((idx, scaled));
+                if top.len() == top_k {
+                    top.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+                }
+            } else if scaled > top[0].1 {
+                top[0] = (idx, scaled);
+                top.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+            }
+        }
+        top
     }
 }
 

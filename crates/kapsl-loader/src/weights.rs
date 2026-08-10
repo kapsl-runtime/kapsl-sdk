@@ -22,6 +22,11 @@ pub enum WeightError {
 }
 
 /// Element type of a tensor.
+///
+/// Quantized variants keep GGML's own spelling (`Q8_0`, `Q4_K`) so the names
+/// match the GGUF type table and the kernels that consume them, rather than
+/// Rust's camel case.
+#[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DType {
     F32,

@@ -59,6 +59,12 @@ impl GgufValueType {
     }
 }
 
+/// One metadata value, mirroring the GGUF spec's value-type table.
+///
+/// Every variant has to exist for the reader to consume its bytes and advance
+/// to the next key, so the payloads of variants no accessor currently reads
+/// (the narrow ints and `Bool`) are deliberately kept rather than elided.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 enum GgufValue {
     U8(u8), I8(i8), U16(u16), I16(i16), U32(u32), I32(i32),

@@ -45,6 +45,27 @@ pub struct ModelInfo {
     pub replica_id: u32,
     /// Base model ID this is a replica of (same as id for primary)
     pub base_model_id: u32,
+
+    /// Model file format (`onnx`, `gguf`, `safetensors`) from the manifest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    /// Model capability class (`causal-lm`, `embedding`, `seq-classifier`,
+    /// `seq2seq`, `opaque`) from the manifest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_type: Option<String>,
+    /// Serving operation (`generate`, `embed`, `classify`, `rerank`, `forward`)
+    /// from the manifest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    /// Input front-end the package asks for (`vision`, `audio`), read from the
+    /// manifest's `metadata.preprocess.kind`.
+    ///
+    /// This is the one axis a caller cannot guess: `framework` says `onnx` for
+    /// an image classifier and an ASR model alike, but the first wants encoded
+    /// image bytes and the second wants a PCM waveform. Clients that build a
+    /// request form — the console playground above all — key off this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preprocess: Option<String>,
 }
 
 impl ModelInfo {
@@ -73,7 +94,31 @@ impl ModelInfo {
             status: ModelStatus::Active,
             replica_id: 0,     // Default to 0 for primary instance
             base_model_id: id, // Primary instance uses its own ID as base
+            format: None,
+            model_type: None,
+            task: None,
+            preprocess: None,
         }
+    }
+
+    /// Attach the manifest's input contract (`format` / `model_type` / `task` /
+    /// `metadata.preprocess.kind`).
+    ///
+    /// Separate from [`Self::new`] so the axes stay optional: a registry entry
+    /// built without a manifest — a test double, a legacy caller — is still
+    /// valid, it just reports nothing about its input shape.
+    pub fn with_model_axes(
+        mut self,
+        format: Option<String>,
+        model_type: Option<String>,
+        task: Option<String>,
+        preprocess: Option<String>,
+    ) -> Self {
+        self.format = format;
+        self.model_type = model_type;
+        self.task = task;
+        self.preprocess = preprocess;
+        self
     }
 
     /// Create a new replica of an existing model
@@ -104,6 +149,10 @@ impl ModelInfo {
             status: ModelStatus::Active,
             replica_id,
             base_model_id,
+            format: None,
+            model_type: None,
+            task: None,
+            preprocess: None,
         }
     }
 }
