@@ -7,8 +7,8 @@
 # feature defaults to gguf-cuda-shared-kv.  Supported values:
 #   gguf-cuda-shared-kv   llama.cpp fork + Kapsl shared KV pool (default)
 #   gguf-cuda             llama.cpp with static CUDA KV
-#   gguf-native           Kapsl CUDA kernels only
-#   native                alias for gguf-native
+#   gguf-native           GGUF with Kapsl's native CUDA kernels
+#   native                safetensors with Kapsl's native CUDA kernels
 #   cuda                  alias for gguf-cuda
 #
 # Override any path via env var before calling, e.g.:
