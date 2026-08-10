@@ -2,8 +2,8 @@ use crate::env_util::read_env_flag;
 use async_trait::async_trait;
 use half::f16;
 use kapsl_engine_api::{
-    BinaryTensorPacket, Engine, EngineError, EngineMetrics, EngineModelInfo, InferenceRequest,
-    TensorDtype,
+    BinaryTensorPacket, Engine, EngineError, EngineMetrics, EngineModelInfo,
+    ExternalDeviceMemoryReport, InferenceRequest, TensorDtype,
 };
 use ndarray::ArrayD;
 use ort::execution_providers::ExecutionProvider as OrtExecutionProvider;
@@ -46,6 +46,7 @@ pub struct ModelMetadata {
 /// can coalesce into one stacked `session.run` (see [`OnnxBackend::max_batch`]).
 /// The scheduler's micro-batcher caps its accumulation to this value.
 const ONNX_MAX_MICRO_BATCH: usize = 32;
+static NEXT_ONNX_EXTERNAL_ALLOCATION_ID: AtomicU64 = AtomicU64::new(1);
 
 pub struct OnnxBackend {
     session: Arc<RwLock<Option<Arc<SessionPool>>>>,
@@ -63,6 +64,7 @@ pub struct OnnxBackend {
     metrics: Arc<RwLock<EngineMetrics>>,
     metadata: Arc<RwLock<Option<ModelMetadata>>>,
     warmed_up: Arc<AtomicBool>,
+    external_allocation_id: String,
 }
 
 #[derive(Default)]
@@ -430,6 +432,11 @@ impl OnnxBackendBuilder {
             metrics: Arc::new(RwLock::new(EngineMetrics::default())),
             metadata: Arc::new(RwLock::new(None)),
             warmed_up: Arc::new(AtomicBool::new(false)),
+            external_allocation_id: format!(
+                "onnx-session:{}:{}",
+                self.device_id,
+                NEXT_ONNX_EXTERNAL_ALLOCATION_ID.fetch_add(1, Ordering::Relaxed)
+            ),
         }
     }
 }
@@ -477,6 +484,23 @@ impl OnnxBackend {
 
     fn session_pool_size(&self) -> usize {
         self.peak_concurrency_hint.unwrap_or(1).max(1) as usize
+    }
+
+    fn uses_external_cuda_memory(&self) -> bool {
+        if !matches!(
+            self.provider,
+            ExecutionProvider::CUDA | ExecutionProvider::TensorRT
+        ) {
+            return false;
+        }
+        #[cfg(feature = "onnx-cuda-pool")]
+        {
+            !crate::ort_pool_allocator::is_registered(self.device_id)
+        }
+        #[cfg(not(feature = "onnx-cuda-pool"))]
+        {
+            true
+        }
     }
 
     fn create_session_pool(&self, session: Session) -> Arc<SessionPool> {
@@ -1536,6 +1560,26 @@ where
 
 #[async_trait]
 impl Engine for OnnxBackend {
+    fn planned_external_device_memory(
+        &self,
+        model_path: &Path,
+    ) -> Result<ExternalDeviceMemoryReport, EngineError> {
+        if !self.uses_external_cuda_memory() {
+            return Ok(ExternalDeviceMemoryReport::default());
+        }
+        let model_bytes = std::fs::metadata(model_path)
+            .map_err(|source| EngineError::ModelLoadError {
+                path: model_path.display().to_string(),
+                source: Box::new(source),
+            })?
+            .len() as usize;
+        Ok(ExternalDeviceMemoryReport::single(
+            self.external_allocation_id.clone(),
+            self.device_id as usize,
+            model_bytes.saturating_mul(self.session_pool_size()),
+        ))
+    }
+
     // TODO: Extract session creation to a helper method to reduce duplication
     // TODO: Add better error messages with execution provider fallback information
     // TODO: Add capability checking before attempting to use hardware accelerators

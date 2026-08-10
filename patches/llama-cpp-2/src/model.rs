@@ -643,6 +643,37 @@ impl LlamaModel {
         unsafe { llama_cpp_sys_2::llama_model_size(self.model.as_ptr()) }
     }
 
+    /// Returns exact model-buffer bytes by backend device name.
+    pub fn device_memory(&self) -> Vec<(String, u64)> {
+        let count = unsafe {
+            llama_cpp_sys_2::llama_model_device_memory_count(self.model.as_ptr())
+        }
+        .max(0);
+        (0..count)
+            .filter_map(|device_index| {
+                let name = unsafe {
+                    llama_cpp_sys_2::llama_model_device_name(
+                        self.model.as_ptr(),
+                        device_index,
+                    )
+                };
+                if name.is_null() {
+                    return None;
+                }
+                let name = unsafe { std::ffi::CStr::from_ptr(name) }
+                    .to_string_lossy()
+                    .into_owned();
+                let bytes = unsafe {
+                    llama_cpp_sys_2::llama_model_device_memory(
+                        self.model.as_ptr(),
+                        device_index,
+                    )
+                };
+                Some((name, bytes))
+            })
+            .collect()
+    }
+
     /// Returns the number of parameters in the model.
     pub fn n_params(&self) -> u64 {
         unsafe { llama_cpp_sys_2::llama_model_n_params(self.model.as_ptr()) }

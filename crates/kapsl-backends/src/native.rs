@@ -20,7 +20,7 @@ mod inner {
     use std::collections::{HashMap, HashSet};
     use std::path::Path;
     use std::sync::{Arc, Mutex};
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
     use async_trait::async_trait;
     use cudarc::cublas::{CudaBlas, Gemm};
@@ -30,7 +30,7 @@ mod inner {
 
     use kapsl_engine_api::{
         BatchingPolicy, BinaryTensorPacket, EngineError, EngineMetrics, EngineModelInfo,
-        EngineStream, InferenceRequest, RequestMetadata, TensorDtype,
+        EngineStream, ExternalDeviceMemoryReport, InferenceRequest, RequestMetadata, TensorDtype,
     };
     use kapsl_hal::gpu_arena::{GpuBlockPool, GpuDevicePool, GpuPoolHandle, PoolOwner};
     use kapsl_kernels::cuda_kernels::{
@@ -69,6 +69,56 @@ mod inner {
         layers: Vec<GpuLayerWeights>,
         norm: CudaSlice<f16>,
         lm_head: CudaSlice<f16>,
+    }
+
+    impl GpuLayerWeights {
+        fn byte_len(&self) -> usize {
+            [
+                self.input_layernorm.len(),
+                self.q_proj.len(),
+                self.k_proj.len(),
+                self.v_proj.len(),
+                self.o_proj.len(),
+                self.post_attention_layernorm.len(),
+                self.gate_proj.len(),
+                self.up_proj.len(),
+                self.down_proj.len(),
+            ]
+            .into_iter()
+            .sum::<usize>()
+                * std::mem::size_of::<f16>()
+        }
+    }
+
+    impl GpuModelWeights {
+        fn byte_len(&self) -> usize {
+            (self.embed_tokens.len() + self.norm.len() + self.lm_head.len())
+                * std::mem::size_of::<f16>()
+                + self.layers.iter().map(GpuLayerWeights::byte_len).sum::<usize>()
+        }
+    }
+
+    fn planned_weight_bytes(model_path: &Path) -> Result<usize, EngineError> {
+        let dir = if model_path.is_dir() {
+            model_path
+        } else {
+            model_path.parent().unwrap_or(model_path)
+        };
+        let mut bytes = 0usize;
+        for entry in std::fs::read_dir(dir)
+            .map_err(|e| EngineError::backend(format!("read model directory: {e}")))?
+        {
+            let entry = entry.map_err(|e| EngineError::backend(format!("read model entry: {e}")))?;
+            if entry.path().extension().and_then(|value| value.to_str()) == Some("safetensors") {
+                bytes = bytes.saturating_add(
+                    entry
+                        .metadata()
+                        .map_err(|e| EngineError::backend(format!("stat safetensors shard: {e}")))?
+                        .len() as usize,
+                );
+            }
+        }
+        Ok(bytes)
     }
 
     fn upload_tensor(device: &Arc<CudaDevice>, t: &TensorData) -> Result<CudaSlice<f16>, EngineError> {
@@ -284,6 +334,7 @@ mod inner {
         blas: Arc<CudaBlas>,
         config: ModelConfig,
         weights: GpuModelWeights,
+        external_weight_bytes: Arc<AtomicUsize>,
         block_pool: Arc<GpuBlockPool>,
         /// Shared cap; other backends on the same device may lower this via an atomic store.
         pool_cap: Arc<AtomicUsize>,
@@ -386,6 +437,8 @@ mod inner {
 
             log::info!("NativeBackend: activating staged weights (PCIe transfer only)…");
             let new_weights = upload_staged(&self.device, &staged)?;
+            self.external_weight_bytes
+                .store(new_weights.byte_len(), Ordering::Release);
             self.weights = new_weights;
             self.config = staged.config;
 
@@ -1188,6 +1241,8 @@ mod inner {
 
     pub struct NativeBackend {
         device_id: i32,
+        external_allocation_id: String,
+        external_weight_bytes: Arc<AtomicUsize>,
         state: Arc<Mutex<Option<BackendState>>>,
         /// Pool handle to inject before load(); also populated after load() for sharing.
         pool_slot: Arc<Mutex<Option<GpuPoolHandle>>>,
@@ -1197,10 +1252,16 @@ mod inner {
 
     impl NativeBackend {
         pub fn new(device_id: i32) -> Result<Self, EngineError> {
+            static NEXT_ALLOCATION_ID: AtomicU64 = AtomicU64::new(1);
             CudaDevice::new(device_id as usize)
                 .map_err(|e| EngineError::backend(format!("CUDA device {device_id}: {e}")))?;
             Ok(Self {
                 device_id,
+                external_allocation_id: format!(
+                    "native:{device_id}:{}",
+                    NEXT_ALLOCATION_ID.fetch_add(1, Ordering::Relaxed)
+                ),
+                external_weight_bytes: Arc::new(AtomicUsize::new(0)),
                 state: Arc::new(Mutex::new(None)),
                 pool_slot: Arc::new(Mutex::new(None)),
                 device_pool: None,
@@ -1259,6 +1320,17 @@ mod inner {
 
     #[async_trait]
     impl kapsl_engine_api::Engine for NativeBackend {
+        fn planned_external_device_memory(
+            &self,
+            model_path: &Path,
+        ) -> Result<ExternalDeviceMemoryReport, EngineError> {
+            Ok(ExternalDeviceMemoryReport::single(
+                self.external_allocation_id.clone(),
+                self.device_id as usize,
+                planned_weight_bytes(model_path)?,
+            ))
+        }
+
         async fn load(&mut self, model_path: &Path) -> Result<(), EngineError> {
             let dir = if model_path.is_dir() {
                 model_path.to_path_buf()
@@ -1281,6 +1353,7 @@ mod inner {
                 .map_err(|e| EngineError::backend(format!("cuBLAS: {e}")))?);
 
             let weights = upload_weights(&device, &cpu)?;
+            let weight_bytes = weights.byte_len();
             drop(cpu);
 
             let block_size = 16usize;
@@ -1344,7 +1417,9 @@ mod inner {
             let batch   = BatchDecodeScratch::new(&device, MAX_BATCH, h, nq * hd, nkv * hd, inter, vocab)?;
 
             let inner = BackendInner {
-                device: device.clone(), blas, weights, block_pool, pool_cap,
+                device: device.clone(), blas, weights,
+                external_weight_bytes: Arc::clone(&self.external_weight_bytes),
+                block_pool, pool_cap,
                 allocated_blocks: 0, config,
                 norm_buf:   alloc1(h)?,
                 logits_buf: alloc1(vocab)?,
@@ -1366,8 +1441,22 @@ mod inner {
                 thread: Some(handle),
                 is_staged: Arc::new(AtomicBool::new(false)),
             });
+            self.external_weight_bytes.store(weight_bytes, Ordering::Release);
             log::info!("NativeBackend: scheduler started (MAX_BATCH={})", MAX_BATCH);
             Ok(())
+        }
+
+        fn actual_external_device_memory(&self) -> ExternalDeviceMemoryReport {
+            let bytes = self.external_weight_bytes.load(Ordering::Acquire);
+            if bytes == 0 {
+                ExternalDeviceMemoryReport::default()
+            } else {
+                ExternalDeviceMemoryReport::single(
+                    self.external_allocation_id.clone(),
+                    self.device_id as usize,
+                    bytes,
+                )
+            }
         }
 
         fn infer(&self, req: &InferenceRequest) -> Result<BinaryTensorPacket, EngineError> {
@@ -1439,6 +1528,7 @@ mod inner {
                     let _ = t.join();
                 }
             }
+            self.external_weight_bytes.store(0, Ordering::Release);
             log::info!("NativeBackend: unloaded");
         }
 

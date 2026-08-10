@@ -310,8 +310,9 @@ impl BackendFactory {
         // GGUF: fallback to llama.cpp-backed GgufBackend.
         #[cfg(not(any(feature = "gguf-native", feature = "gguf-cuda-shared-kv")))]
         if engine_kind.is_gguf() {
+            let device_id = manifest.hardware_requirements.device_id.unwrap_or(0);
             log::info!("✓ Using GgufBackend (llama.cpp)");
-            return Ok(Box::new(GgufBackend::new()));
+            return Ok(Box::new(GgufBackend::new_on_device(device_id as usize)));
         }
 
         // Native CUDA: safetensors models use custom kernel backend.
@@ -442,7 +443,7 @@ impl BackendFactory {
         #[cfg(not(any(feature = "gguf-native", feature = "gguf-cuda-shared-kv")))]
         if engine_kind.is_gguf() {
             log::info!("✓ Using GgufBackend (llama.cpp)");
-            return Ok(Box::new(GgufBackend::new()));
+            return Ok(Box::new(GgufBackend::new_on_device(device_id)));
         }
 
         // ONNX generative path (LLMBackend): autoregressive decode over an ONNX graph.

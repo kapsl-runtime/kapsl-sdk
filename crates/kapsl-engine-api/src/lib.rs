@@ -592,6 +592,50 @@ pub struct EngineModelInfo {
     pub peak_concurrency: Option<u32>,
 }
 
+/// A backend allocation that lives outside the runtime-owned device pool.
+///
+/// `allocation_id` identifies the physical allocation, rather than an engine
+/// instance. Backends that share immutable weights between replicas must return
+/// the same ID so the runtime charges those bytes once and reference-counts the
+/// owners.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalDeviceMemory {
+    pub allocation_id: String,
+    pub device_id: usize,
+    pub bytes: usize,
+}
+
+/// Planned or actual backend-owned device memory outside the shared pool.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalDeviceMemoryReport {
+    #[serde(default)]
+    pub allocations: Vec<ExternalDeviceMemory>,
+}
+
+impl ExternalDeviceMemoryReport {
+    pub fn single(
+        allocation_id: impl Into<String>,
+        device_id: usize,
+        bytes: usize,
+    ) -> Self {
+        Self {
+            allocations: vec![ExternalDeviceMemory {
+                allocation_id: allocation_id.into(),
+                device_id,
+                bytes,
+            }],
+        }
+    }
+
+    pub fn bytes_for_device(&self, device_id: usize) -> usize {
+        self.allocations
+            .iter()
+            .filter(|allocation| allocation.device_id == device_id)
+            .map(|allocation| allocation.bytes)
+            .sum()
+    }
+}
+
 pub type EngineStream = Pin<Box<dyn Stream<Item = Result<BinaryTensorPacket, EngineError>> + Send>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -680,8 +724,27 @@ impl BatchingPolicy {
 
 #[async_trait]
 pub trait Engine: Send + Sync {
+    /// Report external device allocations expected during `load`.
+    ///
+    /// The default is empty for CPU backends and legacy implementations. The
+    /// runtime still observes CUDA free-memory deltas as a conservative fallback.
+    fn planned_external_device_memory(
+        &self,
+        _model_path: &std::path::Path,
+    ) -> Result<ExternalDeviceMemoryReport, EngineError> {
+        Ok(ExternalDeviceMemoryReport::default())
+    }
+
     /// Load model weights and prepare runtime state.
     async fn load(&mut self, model_path: &std::path::Path) -> Result<(), EngineError>;
+
+    /// Report the external device allocations currently held by this backend.
+    ///
+    /// Backends should return an empty report after `unload` has synchronously
+    /// released those allocations.
+    fn actual_external_device_memory(&self) -> ExternalDeviceMemoryReport {
+        ExternalDeviceMemoryReport::default()
+    }
 
     /// Run a single inference request and return the output tensor.
     fn infer(&self, request: &InferenceRequest) -> Result<BinaryTensorPacket, EngineError>;
@@ -784,8 +847,19 @@ pub trait Engine: Send + Sync {
 
 #[async_trait]
 impl Engine for Box<dyn Engine> {
+    fn planned_external_device_memory(
+        &self,
+        model_path: &std::path::Path,
+    ) -> Result<ExternalDeviceMemoryReport, EngineError> {
+        (**self).planned_external_device_memory(model_path)
+    }
+
     async fn load(&mut self, model_path: &std::path::Path) -> Result<(), EngineError> {
         (**self).load(model_path).await
+    }
+
+    fn actual_external_device_memory(&self) -> ExternalDeviceMemoryReport {
+        (**self).actual_external_device_memory()
     }
 
     fn infer(&self, request: &InferenceRequest) -> Result<BinaryTensorPacket, EngineError> {

@@ -130,8 +130,19 @@ impl OnnxDetectBackend {
 
 #[async_trait]
 impl Engine for OnnxDetectBackend {
+    fn planned_external_device_memory(
+        &self,
+        model_path: &Path,
+    ) -> Result<kapsl_engine_api::ExternalDeviceMemoryReport, EngineError> {
+        self.inner.planned_external_device_memory(model_path)
+    }
+
     async fn load(&mut self, model_path: &Path) -> Result<(), EngineError> {
         self.inner.load(model_path).await
+    }
+
+    fn actual_external_device_memory(&self) -> kapsl_engine_api::ExternalDeviceMemoryReport {
+        self.inner.actual_external_device_memory()
     }
 
     fn infer(&self, request: &InferenceRequest) -> Result<BinaryTensorPacket, EngineError> {
