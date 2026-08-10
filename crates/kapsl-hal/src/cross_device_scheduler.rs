@@ -68,7 +68,7 @@ mod inner {
 
     use crate::cpu_block_store::{CpuBlockStore, CpuStoreError};
     use crate::gpu_arena::{ArenaError, GpuBlockPool};
-    use crate::prefix_cache::{CachedBlockRef, PrefixBlockCache};
+    use crate::prefix_cache::PrefixBlockCache;
 
     // ── Error ─────────────────────────────────────────────────────────────────
 
@@ -434,6 +434,12 @@ mod inner {
             if total == 0 { 0.0 } else { used as f32 / total as f32 }
         }
 
+        /// Configured utilisation threshold for callers that coordinate
+        /// proactive eviction with external pressure monitoring.
+        pub fn eviction_threshold(&self) -> f32 {
+            self.evict_threshold
+        }
+
         /// Total free blocks on a device for the given KV geometry.
         pub fn device_free_blocks(&self, device_id: usize, kv_heads: usize, head_dim: usize) -> usize {
             self.device_pools.get(&device_id)
@@ -491,6 +497,10 @@ mod inner {
             Ok(None)
         }
 
+        // Session construction mirrors the public reservation result plus KV
+        // ownership metadata; keeping those values explicit avoids a second
+        // transient allocation on the admission path.
+        #[allow(clippy::too_many_arguments)]
         fn record_session(
             &mut self,
             session_id: u64,
@@ -549,7 +559,7 @@ mod inner {
             let mut candidates: Vec<(u64, Instant)> = self.sessions.iter()
                 .filter(|(_, s)| {
                     s.tier == KvTier::Gpu { device_id } &&
-                    s.pool.as_ref().map_or(false, |p| p.is_compatible(kv_heads, head_dim))
+                    s.pool.as_ref().is_some_and(|p| p.is_compatible(kv_heads, head_dim))
                 })
                 .map(|(&id, s)| (id, s.last_active))
                 .collect();

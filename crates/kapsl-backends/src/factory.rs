@@ -29,7 +29,7 @@ use std::sync::Arc;
 fn use_registered_env_allocator(device_id: i32) -> bool {
     #[cfg(feature = "onnx-cuda-pool")]
     {
-        return crate::ort_pool_allocator::is_registered(device_id);
+        crate::ort_pool_allocator::is_registered(device_id)
     }
     #[cfg(not(feature = "onnx-cuda-pool"))]
     {

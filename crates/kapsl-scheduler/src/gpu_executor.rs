@@ -75,6 +75,9 @@ impl WorkQueue {
         self.inner.capacity
     }
 
+    // Returning ownership lets callers retry or report the exact request
+    // without a heap allocation on the scheduler hot path.
+    #[allow(clippy::result_large_err)]
     pub(crate) fn try_push_drop_newest(&self, request: Request) -> Result<(), Request> {
         if self.is_closed() {
             return Err(request);

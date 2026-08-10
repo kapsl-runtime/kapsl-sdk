@@ -263,7 +263,8 @@ where
     fn select_least_loaded(&self, replicas: &[PooledReplica<T>]) -> usize {
         let memory_aware = Self::memory_routing_enabled(replicas);
         let mut best_idx = 0;
-        let mut best_key: Option<(u8, usize, Reverse<usize>, Reverse<usize>, usize)> = None;
+        type RoutingKey = (u8, usize, Reverse<usize>, Reverse<usize>, usize);
+        let mut best_key: Option<RoutingKey> = None;
 
         for (idx, replica) in replicas.iter().enumerate() {
             if !replica.scheduler.is_healthy() {

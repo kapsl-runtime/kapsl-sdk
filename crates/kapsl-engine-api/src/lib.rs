@@ -1041,9 +1041,11 @@ mod tests {
 
     #[test]
     fn inference_request_bincode_preserves_metadata_without_auth_token() {
-        let mut metadata = RequestMetadata::default();
-        metadata.priority = Some(0);
-        metadata.max_new_tokens = Some(32);
+        let metadata = RequestMetadata {
+            priority: Some(0),
+            max_new_tokens: Some(32),
+            ..RequestMetadata::default()
+        };
         let request = InferenceRequest::new(BinaryTensorPacket {
             shape: vec![1],
             dtype: TensorDtype::Float32,

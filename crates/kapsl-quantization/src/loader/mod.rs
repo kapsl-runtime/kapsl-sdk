@@ -43,7 +43,7 @@ pub(crate) fn load_quantized_safetensors(
     for entry in entries {
         let entry = entry?;
         let path = entry.path();
-        if !path.extension().is_some_and(|ext| ext == "safetensors") {
+        if path.extension().is_none_or(|ext| ext != "safetensors") {
             continue;
         }
 

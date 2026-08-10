@@ -174,9 +174,10 @@ fn cuda_device_summary(device: &Device) -> String {
     )
 }
 
-fn smoke_cache() -> &'static Mutex<HashMap<(OnnxAcceleratorProvider, i32), Result<(), String>>> {
-    static CACHE: OnceLock<Mutex<HashMap<(OnnxAcceleratorProvider, i32), Result<(), String>>>> =
-        OnceLock::new();
+type ProviderSmokeCache = Mutex<HashMap<(OnnxAcceleratorProvider, i32), Result<(), String>>>;
+
+fn smoke_cache() -> &'static ProviderSmokeCache {
+    static CACHE: OnceLock<ProviderSmokeCache> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 

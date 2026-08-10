@@ -107,7 +107,7 @@ fn pack_layer_view_as_onnx(
     let seq_len = view.length;
 
     let stride = num_heads * head_dim;
-    if stride == 0 || view.key.len() % stride != 0 {
+    if stride == 0 || !view.key.len().is_multiple_of(stride) {
         return None;
     }
     let max_seq_len = view.key.len() / stride;
@@ -1809,7 +1809,7 @@ impl PagedKvCache {
 }
 
 enum KvCacheInner {
-    Dense(DenseKvCache),
+    Dense(Box<DenseKvCache>),
     Paged(Box<PagedKvCache>),
 }
 
@@ -1821,12 +1821,12 @@ pub struct KvCache {
 impl KvCache {
     pub fn new(num_layers: usize, num_heads: usize, max_seq_len: usize, head_dim: usize) -> Self {
         Self {
-            inner: KvCacheInner::Dense(DenseKvCache::new(
+            inner: KvCacheInner::Dense(Box::new(DenseKvCache::new(
                 num_layers,
                 num_heads,
                 max_seq_len,
                 head_dim,
-            )),
+            ))),
             mode: KvCacheMode::Dense,
         }
     }
@@ -1840,14 +1840,14 @@ impl KvCache {
     ) -> Self {
         match config.mode {
             KvCacheMode::Dense => Self {
-                inner: KvCacheInner::Dense(DenseKvCache::new_with_config(
+                inner: KvCacheInner::Dense(Box::new(DenseKvCache::new_with_config(
                     num_layers,
                     num_heads,
                     max_seq_len,
                     head_dim,
                     config.dense_free_list_cap,
                     config.initial_seq_len,
-                )),
+                ))),
                 mode: KvCacheMode::Dense,
             },
             KvCacheMode::Paged => Self {

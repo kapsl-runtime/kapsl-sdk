@@ -152,7 +152,7 @@ mod tests {
         let encoder = GzEncoder::new(tar_file, Compression::default());
         let mut builder = Builder::new(encoder);
 
-        for (path, data) in vec![
+        for (path, data) in [
             ("metadata.json", manifest_bytes),
             ("model.onnx", vec![7u8; 1024]),
             ("model.onnx_data", vec![9u8; 256]),
@@ -212,7 +212,7 @@ mod tests {
                 cron_jobs: Vec::new(),
             };
             let manifest_bytes = serde_json::to_vec(&manifest).expect("serialize manifest");
-            for (path, data) in vec![
+            for (path, data) in [
                 ("metadata.json", manifest_bytes),
                 ("model.onnx", vec![byte; 1024]),
             ] {

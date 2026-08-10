@@ -349,7 +349,7 @@ fn build_scheduler_for_queue_tests(
 
     use crate::mesh_routing::MeshRouter;
 
-    let scheduler = Scheduler {
+    Scheduler {
         engines: engines.clone(),
         cpu_pool,
         gpu_high_priority_queues: vec![high_queue],
@@ -363,9 +363,7 @@ fn build_scheduler_for_queue_tests(
         router: MeshRouter::new(None, 1),
         max_micro_batch: 1,
         queue_overflow_policy: QueueOverflowPolicy::Block,
-    };
-
-    scheduler
+    }
 }
 
 #[tokio::test]
@@ -583,7 +581,7 @@ async fn test_gpu_executor_uses_policy_queue_delay_for_request_coalescing_backen
 
     let recorded = calls.lock().unwrap().clone();
     assert!(
-        recorded.iter().any(|&n| n == 2),
+        recorded.contains(&2),
         "policy queue_delay_ms should allow the executor to coalesce the straggler, got {:?}",
         recorded
     );

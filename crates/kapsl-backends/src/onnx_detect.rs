@@ -35,19 +35,14 @@ use serde::Deserialize;
 use std::path::Path;
 
 /// Encoding of the four box coordinates in the raw prediction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BoxFormat {
     /// `(cx, cy, w, h)` — center + size (YOLO default).
+    #[default]
     Xywh,
     /// `(x1, y1, x2, y2)` — corner coordinates.
     Xyxy,
-}
-
-impl Default for BoxFormat {
-    fn default() -> Self {
-        BoxFormat::Xywh
-    }
 }
 
 fn default_score_threshold() -> f32 {

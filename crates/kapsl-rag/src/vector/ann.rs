@@ -59,7 +59,7 @@ impl ScopeIndex {
     /// Insert or replace a chunk's embedding. Vectors of the wrong dimension
     /// are skipped, matching the brute-force path which skips them at query
     /// time.
-    pub fn upsert(&mut self, chunk_id: &str, embedding: &Vec<f32>) {
+    pub fn upsert(&mut self, chunk_id: &str, embedding: &[f32]) {
         if embedding.len() != self.dim {
             return;
         }

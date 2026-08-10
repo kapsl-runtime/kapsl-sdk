@@ -47,7 +47,10 @@ impl DType {
             DType::F32 => 4,
             DType::F16 | DType::BF16 => 2,
             DType::I8 | DType::U8 => 1,
-            DType::Q8_0 | DType::Q4_K => panic!("byte_size() not valid for quantized dtype {:?} — use raw_bytes_for_numel()", self),
+            DType::Q8_0 | DType::Q4_K => panic!(
+                "byte_size() not valid for quantized dtype {:?} — use raw_bytes_for_numel()",
+                self
+            ),
         }
     }
 
@@ -60,6 +63,9 @@ impl DType {
         }
     }
 
+    /// Parse a safetensors dtype spelling. This intentionally returns `Option`
+    /// because callers attach the tensor name to unsupported-dtype errors.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "F32" => Some(DType::F32),

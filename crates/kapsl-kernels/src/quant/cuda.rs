@@ -177,7 +177,7 @@ extern "C" __global__ void q4_k_gemv(
         load_functions(device);
         let f = Q8_0_FN.get().ok_or("q8_0_gemv not loaded")?;
         let cfg = LaunchConfig {
-            grid_dim:  ((p.m + ROWS - 1) / ROWS, p.b, 1),
+            grid_dim:  (p.m.div_ceil(ROWS), p.b, 1),
             block_dim: (32, ROWS, 1),
             shared_mem_bytes: 0,
         };
@@ -204,7 +204,7 @@ extern "C" __global__ void q4_k_gemv(
         load_functions(device);
         let f = Q4_K_FN.get().ok_or("q4_k_gemv not loaded")?;
         let cfg = LaunchConfig {
-            grid_dim:  ((p.m + ROWS - 1) / ROWS, p.b, 1),
+            grid_dim:  (p.m.div_ceil(ROWS), p.b, 1),
             block_dim: (32, ROWS, 1),
             shared_mem_bytes: 0,
         };

@@ -213,7 +213,7 @@ mod tests {
             "model 1 offset should be in its sub-pool"
         );
         assert!(
-            off2 >= 512 * 1024 && off2 < 1024 * 1024,
+            (512 * 1024..1024 * 1024).contains(&off2),
             "model 2 offset should be in its sub-pool"
         );
     }

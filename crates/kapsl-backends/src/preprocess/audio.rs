@@ -44,39 +44,29 @@ use std::sync::Arc;
 use super::Preprocessor;
 
 /// Mel warping curve used to space the filterbank centers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MelScale {
     /// `2595 * log10(1 + hz/700)`.
+    #[default]
     Htk,
     /// Linear below 1 kHz, log above (librosa/torchaudio default).
     Slaney,
 }
 
-impl Default for MelScale {
-    fn default() -> Self {
-        MelScale::Htk
-    }
-}
-
 /// Filter normalization.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MelNorm {
     /// Unit-height triangular filters.
+    #[default]
     None,
     /// Area-normalized (`2 / (right - left)`), as librosa `norm="slaney"`.
     Slaney,
 }
 
-impl Default for MelNorm {
-    fn default() -> Self {
-        MelNorm::None
-    }
-}
-
 /// Log compression applied to the mel energies.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LogKind {
     /// Leave mel energies linear.
@@ -84,45 +74,30 @@ pub enum LogKind {
     /// Natural log.
     Ln,
     /// Base-10 log.
+    #[default]
     Log10,
 }
 
-impl Default for LogKind {
-    fn default() -> Self {
-        LogKind::Log10
-    }
-}
-
 /// Layout of the emitted feature tensor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AudioLayout {
     /// `[1, n_mels, n_frames]`.
+    #[default]
     MelTime,
     /// `[1, n_frames, n_mels]`.
     TimeMel,
 }
 
-impl Default for AudioLayout {
-    fn default() -> Self {
-        AudioLayout::MelTime
-    }
-}
-
 /// Normalization applied to the completed mel spectrogram.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FeatureNormalization {
     /// Leave features on their original scale.
+    #[default]
     None,
     /// Normalize every mel bin independently over the time axis.
     PerFeature,
-}
-
-impl Default for FeatureNormalization {
-    fn default() -> Self {
-        FeatureNormalization::None
-    }
 }
 
 fn default_sample_rate() -> u32 {

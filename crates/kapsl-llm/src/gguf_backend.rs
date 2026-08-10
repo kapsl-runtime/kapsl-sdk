@@ -3204,6 +3204,10 @@ fn release_sequence_slot(
 }
 
 #[cfg(feature = "gguf")]
+// Sequence activation keeps the llama context and all per-request state
+// together; splitting these arguments would only move them into a transient
+// parameter bag at this internal boundary.
+#[allow(clippy::too_many_arguments)]
 fn finish_or_activate_prefilled_sequence(
     metrics: &Arc<Mutex<EngineMetrics>>,
     ctx: &mut llama_cpp_2::context::LlamaContext,
@@ -4065,7 +4069,7 @@ impl Engine for GgufBackend {
             let arc = Arc::new(GgufWeights {
                 backend: backend_for_load,
                 model: Arc::new(model),
-                n_ctx_train: n_ctx_train as u32,
+                n_ctx_train,
                 allocation_id: gguf_allocation_id(&model_path_key),
             });
             gguf_weights_cache()

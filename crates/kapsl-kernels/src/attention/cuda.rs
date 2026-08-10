@@ -10,15 +10,10 @@
 #[cfg(feature = "cuda")]
 mod inner {
     use crate::nvrtc_util::cuda_compile_opts;
-    use cudarc::driver::{CudaDevice, CudaFunction, CudaSlice, CudaView, CudaViewMut, LaunchAsync, LaunchConfig};
+    use cudarc::driver::{CudaDevice, CudaSlice, CudaView, CudaViewMut, LaunchAsync, LaunchConfig};
     use cudarc::nvrtc::compile_ptx_with_opts;
     use half::f16;
-    use std::sync::{Arc, OnceLock};
-
-    /// Compiled PTX module, lazily initialised.
-    struct KernelModule {
-        device: Arc<CudaDevice>,
-    }
+    use std::sync::Arc;
 
     static MODULE_NAME: &str = "kapsl_paged_attn";
     static KERNEL_NAME: &str = "paged_attention_v1";
@@ -217,7 +212,7 @@ __global__ void paged_attention_v1(
         // We conservatively allocate for the maximum context length across the batch.
         // The host should pass a reasonable upper bound via max_blocks_per_seq * block_size.
         let max_ctx = params.max_blocks_per_seq * params.block_size;
-        let shared_bytes = ((params.head_dim + max_ctx + 1024) * 4) as u32;
+        let shared_bytes = (params.head_dim + max_ctx + 1024) * 4;
 
         let cfg = LaunchConfig {
             grid_dim: (params.batch_size, params.num_q_heads, 1),
@@ -385,7 +380,7 @@ __global__ void fused_swiglu(
             .ok_or("swiglu not found")?;
 
         let threads = 256u32;
-        let blocks = (n + threads - 1) / threads;
+        let blocks = n.div_ceil(threads);
         let cfg = LaunchConfig {
             grid_dim: (blocks, 1, 1),
             block_dim: (threads, 1, 1),
@@ -646,7 +641,7 @@ __global__ void residual_add(
             .ok_or("residual_add not found")?;
 
         let threads = 256u32;
-        let blocks = (n + threads - 1) / threads;
+        let blocks = n.div_ceil(threads);
         let cfg = LaunchConfig {
             grid_dim: (blocks, 1, 1),
             block_dim: (threads, 1, 1),
@@ -887,8 +882,7 @@ __global__ void prefill_attention(
             .ok_or("prefill_attention not found")?;
 
         let threads = 256u32;
-        let shared =
-            ((p.head_dim + p.seq_len + 1024) * 4) as u32;
+        let shared = (p.head_dim + p.seq_len + 1024) * 4;
         let cfg = LaunchConfig {
             grid_dim: (p.seq_len, p.num_q_heads, 1),
             block_dim: (threads, 1, 1),

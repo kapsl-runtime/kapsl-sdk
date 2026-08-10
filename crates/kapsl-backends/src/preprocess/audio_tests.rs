@@ -40,7 +40,7 @@ fn small_cfg() -> AudioConfig {
 fn frame_count_and_shape_no_center() {
     let pre = AudioPreprocessor::new(small_cfg()).unwrap();
     // 16 samples, n_fft 8, hop 4 -> 1 + (16-8)/4 = 3 frames.
-    let out = pre.apply(&f32_packet(&vec![0.0; 16])).unwrap();
+    let out = pre.apply(&f32_packet(&[0.0; 16])).unwrap();
     assert_eq!(out.shape, vec![1, 4, 3]);
 }
 
@@ -50,14 +50,14 @@ fn center_padding_adds_frames() {
     cfg.center = true;
     let pre = AudioPreprocessor::new(cfg).unwrap();
     // pad 4 each side -> signal 24 -> 1 + (24-8)/4 = 5 frames.
-    let out = pre.apply(&f32_packet(&vec![0.1; 16])).unwrap();
+    let out = pre.apply(&f32_packet(&[0.1; 16])).unwrap();
     assert_eq!(out.shape, vec![1, 4, 5]);
 }
 
 #[test]
 fn silence_is_zero_energy_without_log() {
     let pre = AudioPreprocessor::new(small_cfg()).unwrap();
-    let out = pre.apply(&f32_packet(&vec![0.0; 32])).unwrap();
+    let out = pre.apply(&f32_packet(&[0.0; 32])).unwrap();
     assert!(out_f32(&out).iter().all(|&v| v.abs() < 1e-9));
 }
 
@@ -66,7 +66,7 @@ fn time_mel_layout_transposes_shape() {
     let mut cfg = small_cfg();
     cfg.layout = AudioLayout::TimeMel;
     let pre = AudioPreprocessor::new(cfg).unwrap();
-    let out = pre.apply(&f32_packet(&vec![0.0; 16])).unwrap();
+    let out = pre.apply(&f32_packet(&[0.0; 16])).unwrap();
     // [1, n_frames, n_mels] = [1, 3, 4]
     assert_eq!(out.shape, vec![1, 3, 4]);
 }
@@ -152,7 +152,7 @@ fn log10_compression_applied_to_silence() {
     let mut cfg = small_cfg();
     cfg.log = LogKind::Log10;
     let pre = AudioPreprocessor::new(cfg).unwrap();
-    let out = pre.apply(&f32_packet(&vec![0.0; 16])).unwrap();
+    let out = pre.apply(&f32_packet(&[0.0; 16])).unwrap();
     assert!(out_f32(&out).iter().all(|&v| (v + 10.0).abs() < 1e-3));
 }
 
@@ -237,7 +237,7 @@ fn derives_feature_length_from_emitted_time_axis() {
         ..small_cfg()
     };
     let pre = AudioPreprocessor::new(cfg).unwrap();
-    let output = pre.apply(&f32_packet(&vec![0.0; 16])).unwrap();
+    let output = pre.apply(&f32_packet(&[0.0; 16])).unwrap();
     let derived = pre.derived_inputs(&output).unwrap();
 
     assert_eq!(output.shape, vec![1, 3, 4]);

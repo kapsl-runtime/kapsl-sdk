@@ -3197,7 +3197,7 @@ impl LLMEngine {
         // The attention mask must cover past + present positions: prepend a 0 to mask out the dummy.
         let mask_len = 1 + input_len;
         let mask_data: Vec<i64> = (0..batch_size)
-            .flat_map(|_| std::iter::once(0i64).chain(std::iter::repeat(1i64).take(input_len)))
+            .flat_map(|_| std::iter::once(0i64).chain(std::iter::repeat_n(1i64, input_len)))
             .collect();
         let mask_i64 = Array2::from_shape_vec((batch_size, mask_len), mask_data).unwrap();
         let pos_ids_flat: Vec<i64> = (0..batch_size).flat_map(|_| 0..input_len as i64).collect();
@@ -3254,7 +3254,7 @@ impl LLMEngine {
                 TensorElementType::Int32 => {
                     let data: Vec<i32> = (0..batch_size)
                         .flat_map(|_| {
-                            std::iter::once(0i32).chain(std::iter::repeat(1i32).take(input_len))
+                            std::iter::once(0i32).chain(std::iter::repeat_n(1i32, input_len))
                         })
                         .collect();
                     Value::from_array(Array2::from_shape_vec((batch_size, mask_len), data).unwrap())
@@ -3264,7 +3264,7 @@ impl LLMEngine {
                 TensorElementType::Bool => {
                     let data: Vec<bool> = (0..batch_size)
                         .flat_map(|_| {
-                            std::iter::once(false).chain(std::iter::repeat(true).take(input_len))
+                            std::iter::once(false).chain(std::iter::repeat_n(true, input_len))
                         })
                         .collect();
                     Value::from_array(Array2::from_shape_vec((batch_size, mask_len), data).unwrap())
@@ -3274,7 +3274,7 @@ impl LLMEngine {
                 TensorElementType::Float32 => {
                     let data: Vec<f32> = (0..batch_size)
                         .flat_map(|_| {
-                            std::iter::once(0.0f32).chain(std::iter::repeat(1.0f32).take(input_len))
+                            std::iter::once(0.0f32).chain(std::iter::repeat_n(1.0f32, input_len))
                         })
                         .collect();
                     Value::from_array(Array2::from_shape_vec((batch_size, mask_len), data).unwrap())
@@ -6169,11 +6169,7 @@ impl LLMEngine {
                 .ok_or_else(|| EngineError::backend("Missing logits output".to_string()))?;
             extract_tensor_f32(logits, "logits")?
         };
-        let mut vocab = logits_shape
-            .last()
-            .copied()
-            .filter(|v| *v > 0)
-            .map(|v| v as usize);
+        let mut vocab = logits_shape.last().copied().filter(|v| *v > 0);
         if vocab.is_none() {
             if let Some(vs) = vocab_size {
                 if vs > 0 && logits_data.len() % vs == 0 {
@@ -6186,7 +6182,6 @@ impl LLMEngine {
                 .get(logits_shape.len() - 2)
                 .copied()
                 .filter(|v| *v > 0)
-                .map(|v| v as usize)
         } else {
             None
         };

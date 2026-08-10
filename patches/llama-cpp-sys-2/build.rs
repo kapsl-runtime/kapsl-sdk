@@ -517,6 +517,9 @@ fn main() {
         .include(llama_src.join("ggml/include"))
         .include(llama_src.join("vendor"))
         .flag_if_supported("-std=c++17")
+        // Vendored Jinja headers contain translation-unit-local diagnostic
+        // helpers that are not referenced by every wrapper source.
+        .flag_if_supported("-Wno-unused-function")
         .pic(true);
 
     if matches!(target_os, TargetOs::Windows(WindowsVariant::Msvc)) {

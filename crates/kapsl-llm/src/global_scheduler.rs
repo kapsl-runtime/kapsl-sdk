@@ -638,8 +638,8 @@ mod global_scheduler_tests {
             .unwrap()
             .max_tokens;
         // Allow ±1 for integer rounding.
-        assert!(b0 >= 249 && b0 <= 251, "b0={b0}");
-        assert!(b1 >= 749 && b1 <= 751, "b1={b1}");
+        assert!((249..=251).contains(&b0), "b0={b0}");
+        assert!((749..=751).contains(&b1), "b1={b1}");
         assert_eq!(b0 + b1, 1000);
     }
 

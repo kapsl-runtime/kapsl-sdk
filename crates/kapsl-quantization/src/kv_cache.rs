@@ -41,7 +41,7 @@ pub struct KvCacheConfig {
 impl KvCacheConfig {
     /// Create a new config, returning an error if `bits` or `head_dim` are invalid.
     pub fn new(bits: u8, head_dim: usize, num_layers: usize) -> Result<Self> {
-        if !matches!(bits, 2 | 3 | 4) {
+        if !matches!(bits, 2..=4) {
             return Err(anyhow!("bits must be 2, 3, or 4; got {bits}"));
         }
         if head_dim == 0 || !head_dim.is_power_of_two() {

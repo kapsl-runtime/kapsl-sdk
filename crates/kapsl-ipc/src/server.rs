@@ -729,8 +729,10 @@ mod tests {
     }
 
     fn request_with_priority(priority: u8) -> InferenceRequest {
-        let mut metadata = RequestMetadata::default();
-        metadata.priority = Some(priority);
+        let metadata = RequestMetadata {
+            priority: Some(priority),
+            ..RequestMetadata::default()
+        };
         InferenceRequest::new(BinaryTensorPacket {
             shape: vec![1],
             dtype: TensorDtype::Float32,

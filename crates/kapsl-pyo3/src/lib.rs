@@ -30,6 +30,8 @@ const DEFAULT_TCP_PORT: u16 = 9096;
 trait ReadWriteConnection: Read + Write + Send {}
 impl<T: Read + Write + Send> ReadWriteConnection for T {}
 type ClientConnection = Box<dyn ReadWriteConnection>;
+type RawTensorInput = (Vec<i64>, String, Vec<u8>);
+type AdditionalInputMap = HashMap<String, RawTensorInput>;
 
 enum TransportProtocol {
     Socket,
@@ -157,7 +159,7 @@ impl ConnectionTarget {
                 }
                 return Ok(Self::UnixSocket(path.to_string()));
             }
-            return Ok(Self::UnixSocket(endpoint.to_string()));
+            Ok(Self::UnixSocket(endpoint.to_string()))
         }
 
         #[cfg(windows)]
@@ -177,7 +179,7 @@ impl ConnectionTarget {
                 return Ok(Self::NamedPipe(Self::normalize_pipe_path(pipe_path)));
             }
 
-            return Ok(Self::NamedPipe(endpoint.to_string()));
+            Ok(Self::NamedPipe(endpoint.to_string()))
         }
     }
 
@@ -189,7 +191,7 @@ impl ConnectionTarget {
         socket_path: Option<&str>,
         pipe_name: Option<&str>,
     ) -> Result<Self, ClientError> {
-        fn normalize_opt<'a>(value: Option<&'a str>) -> Option<&'a str> {
+        fn normalize_opt(value: Option<&str>) -> Option<&str> {
             value.and_then(|raw| {
                 let trimmed = raw.trim();
                 if trimmed.is_empty() {
@@ -372,9 +374,7 @@ impl KapslClient {
         }
     }
 
-    fn parse_additional_inputs(
-        raw: HashMap<String, (Vec<i64>, String, Vec<u8>)>,
-    ) -> Result<Vec<NamedTensor>, ClientError> {
+    fn parse_additional_inputs(raw: AdditionalInputMap) -> Result<Vec<NamedTensor>, ClientError> {
         raw.into_iter()
             .map(|(name, (shape, dtype_str, data))| {
                 let dtype = TensorDtype::from_str(&dtype_str)
@@ -391,36 +391,10 @@ impl KapslClient {
         &self,
         stream: &mut dyn ReadWriteConnection,
         model_id: u32,
-        shape: &[i64],
-        dtype: &str,
-        data: &[u8],
-        additional_inputs: Vec<NamedTensor>,
-        session_id: Option<String>,
+        request: &InferenceRequest,
     ) -> Result<BinaryTensorPacket, ClientError> {
-        let dtype =
-            TensorDtype::from_str(dtype).map_err(|e| ClientError::InvalidDtype(e.to_string()))?;
-        let input = BinaryTensorPacket {
-            shape: shape.to_vec(),
-            dtype,
-            data: data.to_vec(),
-        };
-
-        let metadata = self.api_token.as_ref().map(|token| {
-            let mut m = kapsl_engine_api::RequestMetadata::default();
-            m.auth_token = Some(token.clone());
-            m
-        });
-
-        let request = InferenceRequest {
-            input,
-            additional_inputs,
-            session_id,
-            metadata,
-            cancellation: None,
-        };
-
         let input_bytes =
-            bincode::serialize(&request).map_err(|e| ClientError::Serialization(e.to_string()))?;
+            bincode::serialize(request).map_err(|e| ClientError::Serialization(e.to_string()))?;
 
         let header = RequestHeader {
             model_id,
@@ -475,23 +449,28 @@ impl KapslClient {
         extra: Vec<NamedTensor>,
         session_id: Option<String>,
     ) -> PyResult<BinaryTensorPacket> {
+        let dtype =
+            TensorDtype::from_str(dtype).map_err(|e| ClientError::InvalidDtype(e.to_string()))?;
+        let request = InferenceRequest {
+            input: BinaryTensorPacket {
+                shape: shape.to_vec(),
+                dtype,
+                data: data.to_vec(),
+            },
+            additional_inputs: extra,
+            session_id,
+            metadata: self.request_metadata(),
+            cancellation: None,
+        };
         let mut stream = self.checkout_connection().map_err(PyErr::from)?;
-        match self.infer_impl(
-            &mut stream,
-            model_id,
-            shape,
-            dtype,
-            data,
-            extra.clone(),
-            session_id.clone(),
-        ) {
+        match self.infer_impl(&mut stream, model_id, &request) {
             Ok(output) => {
                 self.return_connection(stream);
                 Ok(output)
             }
             Err(ClientError::Io(_)) => {
                 let mut fresh = self.connect_stream().map_err(PyErr::from)?;
-                match self.infer_impl(&mut fresh, model_id, shape, dtype, data, extra, session_id) {
+                match self.infer_impl(&mut fresh, model_id, &request) {
                     Ok(output) => {
                         self.return_connection(fresh);
                         Ok(output)
@@ -504,6 +483,15 @@ impl KapslClient {
                 Err(err.into())
             }
         }
+    }
+
+    fn request_metadata(&self) -> Option<kapsl_engine_api::RequestMetadata> {
+        self.api_token
+            .as_ref()
+            .map(|token| kapsl_engine_api::RequestMetadata {
+                auth_token: Some(token.clone()),
+                ..kapsl_engine_api::RequestMetadata::default()
+            })
     }
 }
 
@@ -522,6 +510,8 @@ impl KapslClient {
         max_pool_size = DEFAULT_MAX_POOL_SIZE,
         api_token = None
     ))]
+    // This mirrors the stable keyword-based Python constructor.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         endpoint: Option<String>,
         protocol: Option<String>,
@@ -564,7 +554,7 @@ impl KapslClient {
         shape: Vec<i64>,
         dtype: String,
         data: Vec<u8>,
-        additional_inputs: Option<HashMap<String, (Vec<i64>, String, Vec<u8>)>>,
+        additional_inputs: Option<AdditionalInputMap>,
         session_id: Option<String>,
     ) -> PyResult<Vec<u8>> {
         let extra = Self::parse_additional_inputs(additional_inputs.unwrap_or_default())
@@ -583,7 +573,7 @@ impl KapslClient {
         shape: Vec<i64>,
         dtype: String,
         data: Vec<u8>,
-        additional_inputs: Option<HashMap<String, (Vec<i64>, String, Vec<u8>)>>,
+        additional_inputs: Option<AdditionalInputMap>,
         session_id: Option<String>,
     ) -> PyResult<(Vec<u8>, Vec<i64>, String)> {
         let extra = Self::parse_additional_inputs(additional_inputs.unwrap_or_default())
@@ -599,7 +589,7 @@ impl KapslClient {
         shape: Vec<i64>,
         dtype: String,
         data: Vec<u8>,
-        additional_inputs: Option<HashMap<String, (Vec<i64>, String, Vec<u8>)>>,
+        additional_inputs: Option<AdditionalInputMap>,
         session_id: Option<String>,
     ) -> PyResult<StreamIterator> {
         let extra = Self::parse_additional_inputs(additional_inputs.unwrap_or_default())
@@ -610,11 +600,7 @@ impl KapslClient {
         let dtype = TensorDtype::from_str(&dtype)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
         let input = BinaryTensorPacket { shape, dtype, data };
-        let metadata = self.api_token.as_ref().map(|token| {
-            let mut m = kapsl_engine_api::RequestMetadata::default();
-            m.auth_token = Some(token.clone());
-            m
-        });
+        let metadata = self.request_metadata();
         let request = InferenceRequest {
             input,
             additional_inputs: extra,
