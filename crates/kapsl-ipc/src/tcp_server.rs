@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use kapsl_scheduler::ReplicaScheduler;
 use kapsl_transport::{TransportError, TransportServer};
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
@@ -38,9 +39,20 @@ impl TcpServer {
         }
     }
 
+    /// Require an inference metadata token for every request handled by this
+    /// server. A non-loopback listener is rejected unless this is configured.
+    pub fn with_auth_token(mut self, auth_token: impl Into<String>) -> Self {
+        let auth_token = auth_token.into();
+        if !auth_token.is_empty() {
+            self.auth_token = Some(Arc::from(auth_token));
+        }
+        self
+    }
+
     async fn run_internal(&self) -> std::io::Result<()> {
         let addr = format!("{}:{}", self.bind_addr, self.port);
         let listener = TcpListener::bind(&addr).await?;
+        validate_tcp_exposure(listener.local_addr()?.ip(), self.auth_token.is_some())?;
         let scheduler_lookup = self.scheduler_lookup.clone();
         let auth_token = self.auth_token.clone();
 
@@ -67,6 +79,19 @@ impl TcpServer {
     }
 }
 
+fn validate_tcp_exposure(bind_ip: IpAddr, authenticated: bool) -> std::io::Result<()> {
+    if bind_ip.is_loopback() || authenticated {
+        return Ok(());
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!(
+            "refusing unauthenticated TCP inference listener on non-loopback address {bind_ip}; configure a native-transport authentication token or bind to loopback"
+        ),
+    ))
+}
+
 #[async_trait]
 impl TransportServer for TcpServer {
     async fn run(&self) -> Result<(), TransportError> {
@@ -76,5 +101,23 @@ impl TransportServer for TcpServer {
     async fn shutdown(&self) -> Result<(), TransportError> {
         // TCP listeners don't need explicit cleanup
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_tcp_exposure;
+
+    #[test]
+    fn unauthenticated_tcp_is_limited_to_loopback() {
+        assert!(validate_tcp_exposure("127.0.0.1".parse().unwrap(), false).is_ok());
+        assert!(validate_tcp_exposure("::1".parse().unwrap(), false).is_ok());
+        assert!(validate_tcp_exposure("0.0.0.0".parse().unwrap(), false).is_err());
+        assert!(validate_tcp_exposure("192.0.2.10".parse().unwrap(), false).is_err());
+    }
+
+    #[test]
+    fn authenticated_tcp_may_bind_non_loopback() {
+        assert!(validate_tcp_exposure("0.0.0.0".parse().unwrap(), true).is_ok());
     }
 }
