@@ -31,8 +31,8 @@ mod vision_tests;
 
 use async_trait::async_trait;
 use kapsl_engine_api::{
-    BatchingPolicy, BinaryTensorPacket, CancellationToken, Engine, EngineError, EngineMetrics,
-    EngineModelInfo, EngineStream, InferenceRequest, NamedTensor,
+    BatchingPolicy, BinaryTensorPacket, Engine, EngineError, EngineMetrics, EngineModelInfo,
+    EngineStream, InferenceRequest, NamedTensor,
 };
 use std::path::Path;
 
@@ -104,21 +104,24 @@ impl PreprocessBackend {
 
 #[async_trait]
 impl Engine for PreprocessBackend {
+    fn planned_external_device_memory(
+        &self,
+        model_path: &Path,
+    ) -> Result<kapsl_engine_api::ExternalDeviceMemoryReport, EngineError> {
+        self.inner.planned_external_device_memory(model_path)
+    }
+
     async fn load(&mut self, model_path: &Path) -> Result<(), EngineError> {
         self.inner.load(model_path).await
+    }
+
+    fn actual_external_device_memory(&self) -> kapsl_engine_api::ExternalDeviceMemoryReport {
+        self.inner.actual_external_device_memory()
     }
 
     fn infer(&self, request: &InferenceRequest) -> Result<BinaryTensorPacket, EngineError> {
         let transformed = self.transform(request)?;
         self.inner.infer(&transformed)
-    }
-
-    async fn infer_async(
-        &self,
-        request: &InferenceRequest,
-    ) -> Result<BinaryTensorPacket, EngineError> {
-        let transformed = self.transform(request)?;
-        self.inner.infer_async(&transformed).await
     }
 
     fn infer_batch(
@@ -132,37 +135,11 @@ impl Engine for PreprocessBackend {
         self.inner.infer_batch(&transformed)
     }
 
-    async fn infer_batch_async(
-        &self,
-        requests: &[InferenceRequest],
-    ) -> Result<Vec<BinaryTensorPacket>, EngineError> {
-        let transformed = requests
-            .iter()
-            .map(|r| self.transform(r))
-            .collect::<Result<Vec<_>, _>>()?;
-        self.inner.infer_batch_async(&transformed).await
-    }
-
     fn infer_stream(&self, request: &InferenceRequest) -> EngineStream {
         match self.transform(request) {
             Ok(transformed) => self.inner.infer_stream(&transformed),
             Err(e) => Box::pin(futures::stream::once(async move { Err(e) })),
         }
-    }
-
-    fn infer_with_cancellation(
-        &self,
-        request: &InferenceRequest,
-        cancellation: &CancellationToken,
-    ) -> Result<BinaryTensorPacket, EngineError> {
-        if cancellation.is_cancelled() {
-            return Err(EngineError::Cancelled {
-                message: "Request cancelled".to_string(),
-            });
-        }
-        let transformed = self.transform(request)?;
-        self.inner
-            .infer_with_cancellation(&transformed, cancellation)
     }
 
     fn max_batch(&self) -> usize {

@@ -3,7 +3,7 @@ use async_stream::stream;
 use async_trait::async_trait;
 use kapsl_engine_api::{
     BatchingPolicy, BinaryTensorPacket, Engine, EngineError, EngineMetrics, EngineModelInfo,
-    EngineStream, InferenceRequest, TensorDtype,
+    EngineStream, ExternalDeviceMemory, ExternalDeviceMemoryReport, InferenceRequest, TensorDtype,
 };
 use std::collections::VecDeque;
 use std::num::NonZeroU32;
@@ -24,7 +24,7 @@ use kapsl_hal::cpu_block_store::CpuBlockStore;
 #[cfg(feature = "gguf-cuda-shared-kv")]
 use kapsl_hal::cross_device_scheduler::CrossDevicePoolScheduler;
 #[cfg(feature = "gguf-cuda-shared-kv")]
-use kapsl_hal::gpu_arena::{GpuBlockPool, GpuPoolHandle};
+use kapsl_hal::gpu_arena::{GpuBlockPool, GpuDevicePool, GpuPoolHandle, PoolOwner};
 #[cfg(feature = "gguf-cuda-shared-kv")]
 use kapsl_hal::prefix_cache::PrefixBlockCache;
 #[cfg(feature = "gguf")]
@@ -117,15 +117,36 @@ fn n_ctx_per_seq() -> u32 {
 }
 
 #[cfg(feature = "gguf")]
-fn gguf_model_params() -> LlamaModelParams {
-    let params = LlamaModelParams::default();
-    match std::env::var(GGUF_N_GPU_LAYERS_ENV)
+fn gguf_model_params(device_id: usize) -> Result<LlamaModelParams, EngineError> {
+    let mut params = LlamaModelParams::default();
+    params = match std::env::var(GGUF_N_GPU_LAYERS_ENV)
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
     {
         Some(n_gpu_layers) => params.with_n_gpu_layers(n_gpu_layers),
         None => params,
+    };
+    #[cfg(feature = "gguf-cuda")]
+    {
+        let selected = llama_cpp_2::list_llama_ggml_backend_devices()
+            .into_iter()
+            .filter(|device| {
+                device.device_type == llama_cpp_2::LlamaBackendDeviceType::Gpu
+                    && device.backend.eq_ignore_ascii_case("cuda")
+            })
+            .nth(device_id)
+            .ok_or_else(|| {
+                EngineError::backend(format!(
+                    "llama.cpp CUDA device {device_id} is not available"
+                ))
+            })?;
+        params = params
+            .with_devices(&[selected.index])
+            .map_err(|error| EngineError::backend(format!("select llama.cpp device: {error}")))?;
     }
+    #[cfg(not(feature = "gguf-cuda"))]
+    let _ = device_id;
+    Ok(params)
 }
 
 #[cfg(feature = "gguf")]
@@ -523,6 +544,7 @@ struct GgufWeights {
     backend: Arc<LlamaBackend>,
     model: Arc<LlamaModel>,
     n_ctx_train: u32,
+    allocation_id: String,
 }
 
 #[cfg(feature = "gguf")]
@@ -535,6 +557,16 @@ fn gguf_weights_cache() -> &'static std::sync::Mutex<
     std::collections::HashMap<std::path::PathBuf, std::sync::Weak<GgufWeights>>,
 > {
     GGUF_WEIGHTS_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(feature = "gguf")]
+fn gguf_model_key(model_path: &Path) -> std::path::PathBuf {
+    std::fs::canonicalize(model_path).unwrap_or_else(|_| model_path.to_path_buf())
+}
+
+#[cfg(feature = "gguf")]
+fn gguf_allocation_id(model_path: &Path) -> String {
+    format!("llama-gguf:{}", gguf_model_key(model_path).display())
 }
 
 // Global LlamaBackend singleton — llama.cpp allows only one backend per process.
@@ -1695,6 +1727,16 @@ struct GgufSharedKvPoolState {
     /// `windowed` is set. Per-layer block ownership: full layers hold one
     /// block per logical position, SWA layers hold at most the ring.
     windowed_inner: Mutex<GgufWindowedReservation>,
+}
+
+#[cfg(feature = "gguf-cuda-shared-kv")]
+impl Drop for GgufSharedKvPool {
+    fn drop(&mut self) {
+        gguf_global_kv_scheduler()
+            .lock()
+            .unwrap()
+            .unregister_pool(self.state.device_id, &self.state.handle.pool);
+    }
 }
 
 /// Single-sequence reservation state for windowed (Phase 2) allocation.
@@ -2983,10 +3025,12 @@ pub struct GgufBackend {
     #[cfg(feature = "gguf")]
     inner: Option<GgufInner>,
     metrics: Arc<Mutex<EngineMetrics>>,
-    #[cfg(feature = "gguf-cuda-shared-kv")]
     device_id: usize,
     #[cfg(feature = "gguf-cuda-shared-kv")]
     pool_slot: Arc<Mutex<Option<GpuPoolHandle>>>,
+    /// Runtime-owned backing pool. Geometry is not known until `load()`.
+    #[cfg(feature = "gguf-cuda-shared-kv")]
+    device_pool: Option<(Arc<GpuDevicePool>, PoolOwner)>,
     /// Active KV path, set during `load()`. Read lock-free via `active_kv_path`.
     #[cfg(feature = "gguf-cuda-shared-kv")]
     kv_path: Arc<std::sync::atomic::AtomicU8>,
@@ -2996,6 +3040,7 @@ pub struct GgufBackend {
 struct GgufInner {
     weights: Arc<GgufWeights>,
     request_tx: std_mpsc::Sender<GgufRequest>,
+    scheduler_thread: Option<std::thread::JoinHandle<()>>,
     max_concurrent: usize,
 }
 
@@ -3005,14 +3050,22 @@ impl GgufBackend {
             #[cfg(feature = "gguf")]
             inner: None,
             metrics: Arc::new(Mutex::new(EngineMetrics::new())),
-            #[cfg(feature = "gguf-cuda-shared-kv")]
             device_id: 0,
             #[cfg(feature = "gguf-cuda-shared-kv")]
             pool_slot: Arc::new(Mutex::new(None)),
             #[cfg(feature = "gguf-cuda-shared-kv")]
+            device_pool: None,
+            #[cfg(feature = "gguf-cuda-shared-kv")]
             kv_path: Arc::new(std::sync::atomic::AtomicU8::new(
                 GgufKvPath::Unloaded.as_u8(),
             )),
+        }
+    }
+
+    pub fn new_on_device(device_id: usize) -> Self {
+        Self {
+            device_id,
+            ..Self::new()
         }
     }
 
@@ -3024,17 +3077,24 @@ impl GgufBackend {
             metrics: Arc::new(Mutex::new(EngineMetrics::new())),
             device_id,
             pool_slot: Arc::new(Mutex::new(handle)),
+            device_pool: None,
             kv_path: Arc::new(std::sync::atomic::AtomicU8::new(
                 GgufKvPath::Unloaded.as_u8(),
             )),
         }
     }
 
-    /// The KV-cache path this engine is using after `load()`. Returns
-    /// [`GgufKvPath::Unloaded`] before a model is loaded.
+    /// Construct the shared-KV backend as a client of a runtime-owned device
+    /// pool. The model-specific KV view is created after geometry is read.
     #[cfg(feature = "gguf-cuda-shared-kv")]
-    pub fn active_kv_path(&self) -> GgufKvPath {
-        GgufKvPath::from_u8(self.kv_path.load(std::sync::atomic::Ordering::Relaxed))
+    pub fn new_cuda_device_pool(
+        device_id: usize,
+        device_pool: Arc<GpuDevicePool>,
+        model_id: u32,
+    ) -> Self {
+        let mut backend = Self::new_cuda_shared_kv(device_id, None);
+        backend.device_pool = Some((device_pool, PoolOwner::GgufKv { model_id }));
+        backend
     }
 
     #[cfg(feature = "gguf-cuda-shared-kv")]
@@ -3957,8 +4017,22 @@ fn run_scheduler(
 #[cfg(feature = "gguf")]
 #[async_trait]
 impl Engine for GgufBackend {
+    fn planned_external_device_memory(
+        &self,
+        model_path: &Path,
+    ) -> Result<ExternalDeviceMemoryReport, EngineError> {
+        let bytes = std::fs::metadata(model_path)
+            .map_err(|e| EngineError::backend(format!("stat GGUF model: {e}")))?
+            .len() as usize;
+        Ok(ExternalDeviceMemoryReport::single(
+            gguf_allocation_id(model_path),
+            self.device_id,
+            bytes,
+        ))
+    }
+
     async fn load(&mut self, model_path: &Path) -> Result<(), EngineError> {
-        let model_path_key = model_path.to_path_buf();
+        let model_path_key = gguf_model_key(model_path);
 
         let cached = gguf_weights_cache()
             .lock()
@@ -3974,10 +4048,11 @@ impl Engine for GgufBackend {
             shared
         } else {
             let model_path_load = model_path_key.clone();
+            let device_id = self.device_id;
             let backend_for_load = global_gguf_backend()?;
             let backend_for_closure = Arc::clone(&backend_for_load);
             let (model, n_ctx_train) = tokio::task::spawn_blocking(move || {
-                let params = gguf_model_params();
+                let params = gguf_model_params(device_id)?;
                 let model =
                     LlamaModel::load_from_file(&backend_for_closure, &model_path_load, &params)
                         .map_err(|e| EngineError::backend(format!("GGUF load failed: {e}")))?;
@@ -3991,6 +4066,7 @@ impl Engine for GgufBackend {
                 backend: backend_for_load,
                 model: Arc::new(model),
                 n_ctx_train: n_ctx_train as u32,
+                allocation_id: gguf_allocation_id(&model_path_key),
             });
             gguf_weights_cache()
                 .lock()
@@ -4031,16 +4107,37 @@ impl Engine for GgufBackend {
             // uniform full allocation.
             let windowed = gguf_windowed_kv_config(&weights.model, config, block_size);
             // Auto-select the least-loaded registered device when KAPSL_GGUF_AUTO_DEVICE=1.
-            let effective_device_id = gguf_select_device(self.device_id, n_head_kv, head_dim);
+            let effective_device_id = if self.device_pool.is_some() {
+                self.device_id
+            } else {
+                gguf_select_device(self.device_id, n_head_kv, head_dim)
+            };
             if effective_device_id != self.device_id {
                 log::info!(
                     "[gguf] auto-device: selected device {} over {} (more free {n_head_kv}h×{head_dim}d blocks)",
                     effective_device_id, self.device_id,
                 );
             }
+            let requested_blocks =
+                gguf_shared_kv_block_count(n_layers, config, block_size, windowed.as_ref());
             let handle = {
                 let mut slot = self.pool_slot.lock().unwrap();
-                if let Some(handle) = slot.as_ref() {
+                if let Some((device_pool, owner)) = self.device_pool.as_ref() {
+                    let pool = Arc::new(
+                        GpuBlockPool::from_device_pool(
+                            Arc::clone(device_pool),
+                            *owner,
+                            requested_blocks,
+                            block_size,
+                            n_head_kv,
+                            head_dim,
+                        )
+                        .map_err(|e| EngineError::backend(format!("shared KV view: {e}")))?,
+                    );
+                    let handle = GpuPoolHandle::private(pool);
+                    *slot = Some(handle.clone());
+                    handle
+                } else if let Some(handle) = slot.as_ref() {
                     if handle.pool.is_compatible(n_head_kv, head_dim) {
                         handle.clone()
                     } else {
@@ -4053,17 +4150,15 @@ impl Engine for GgufBackend {
                         );
                         let device = CudaDevice::new(effective_device_id)
                             .map_err(|e| EngineError::backend(format!("CUDA: {e}")))?;
-                        let num_blocks = gguf_shared_kv_block_count(
-                            n_layers,
-                            config,
-                            block_size,
-                            windowed.as_ref(),
-                        );
                         let pool = Arc::new(
-                            GpuBlockPool::new(device, num_blocks, block_size, n_head_kv, head_dim)
-                                .map_err(|e| {
-                                    EngineError::backend(format!("shared KV pool: {e}"))
-                                })?,
+                            GpuBlockPool::new(
+                                device,
+                                requested_blocks,
+                                block_size,
+                                n_head_kv,
+                                head_dim,
+                            )
+                            .map_err(|e| EngineError::backend(format!("shared KV pool: {e}")))?,
                         );
                         let handle = GpuPoolHandle::private(pool);
                         *slot = Some(handle.clone());
@@ -4072,11 +4167,15 @@ impl Engine for GgufBackend {
                 } else {
                     let device = CudaDevice::new(effective_device_id)
                         .map_err(|e| EngineError::backend(format!("CUDA: {e}")))?;
-                    let num_blocks =
-                        gguf_shared_kv_block_count(n_layers, config, block_size, windowed.as_ref());
                     let pool = Arc::new(
-                        GpuBlockPool::new(device, num_blocks, block_size, n_head_kv, head_dim)
-                            .map_err(|e| EngineError::backend(format!("shared KV pool: {e}")))?,
+                        GpuBlockPool::new(
+                            device,
+                            requested_blocks,
+                            block_size,
+                            n_head_kv,
+                            head_dim,
+                        )
+                        .map_err(|e| EngineError::backend(format!("shared KV pool: {e}")))?,
                     );
                     let handle = GpuPoolHandle::private(pool);
                     *slot = Some(handle.clone());
@@ -4144,7 +4243,7 @@ impl Engine for GgufBackend {
         let model_clone = Arc::clone(&weights.model);
         let backend_clone = Arc::clone(&weights.backend);
         let metrics = Arc::clone(&self.metrics);
-        std::thread::spawn(move || {
+        let scheduler_thread = std::thread::spawn(move || {
             run_scheduler(
                 model_clone,
                 backend_clone,
@@ -4165,9 +4264,39 @@ impl Engine for GgufBackend {
         self.inner = Some(GgufInner {
             weights,
             request_tx: tx,
+            scheduler_thread: Some(scheduler_thread),
             max_concurrent: config.max_concurrent,
         });
         Ok(())
+    }
+
+    fn actual_external_device_memory(&self) -> ExternalDeviceMemoryReport {
+        let Some(inner) = self.inner.as_ref() else {
+            return ExternalDeviceMemoryReport::default();
+        };
+        let fallback_device = self.device_id;
+        let allocations = inner
+            .weights
+            .model
+            .device_memory()
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, (name, bytes))| {
+                if bytes == 0 {
+                    return None;
+                }
+                let device_id = name
+                    .strip_prefix("CUDA")
+                    .and_then(|suffix| suffix.parse::<usize>().ok())
+                    .unwrap_or(fallback_device + index);
+                Some(ExternalDeviceMemory {
+                    allocation_id: inner.weights.allocation_id.clone(),
+                    device_id,
+                    bytes: bytes as usize,
+                })
+            })
+            .collect();
+        ExternalDeviceMemoryReport { allocations }
     }
 
     fn infer(&self, request: &InferenceRequest) -> Result<BinaryTensorPacket, EngineError> {
@@ -4272,7 +4401,21 @@ impl Engine for GgufBackend {
     }
 
     fn unload(&mut self) {
-        self.inner = None; // drops request_tx → scheduler thread exits
+        if let Some(inner) = self.inner.take() {
+            let GgufInner {
+                weights,
+                request_tx,
+                mut scheduler_thread,
+                ..
+            } = inner;
+            drop(request_tx);
+            if let Some(thread) = scheduler_thread.take() {
+                if thread.join().is_err() {
+                    log::warn!("[gguf] Scheduler thread panicked during unload");
+                }
+            }
+            drop(weights);
+        }
         if let Ok(mut metrics) = self.metrics.lock() {
             *metrics = EngineMetrics::new();
         }

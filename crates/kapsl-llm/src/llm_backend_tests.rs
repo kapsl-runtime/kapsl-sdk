@@ -292,6 +292,11 @@ mod tests {
         });
 
         let seq_group = rx.recv().await.expect("seq_group");
+        *backend.request_tx.write().unwrap() = None;
+        assert!(
+            rx.is_closed(),
+            "an active response stream must release its request sender after enqueue"
+        );
         let queued_prompt = seq_group
             .sequences
             .get(&0)
@@ -327,5 +332,33 @@ mod tests {
 
         let chunks = handle.await.expect("join stream task");
         assert_eq!(chunks, vec!["Hel".to_string(), "lo".to_string()]);
+    }
+
+    #[test]
+    fn unpolled_inference_stream_does_not_keep_request_channel_open() {
+        let backend = LLMBackend::new();
+        let (tx, rx) = mpsc::channel(1);
+        *backend.request_tx.write().unwrap() = Some(tx);
+
+        let request = InferenceRequest {
+            input: BinaryTensorPacket {
+                shape: vec![1, 2],
+                dtype: TensorDtype::Utf8,
+                data: b"Hi".to_vec(),
+            },
+            additional_inputs: Vec::new(),
+            session_id: None,
+            metadata: None,
+            cancellation: None,
+        };
+
+        let stream = backend.infer_stream(&request);
+        *backend.request_tx.write().unwrap() = None;
+
+        assert!(
+            rx.is_closed(),
+            "an unpolled response stream must not keep the engine request channel open"
+        );
+        drop(stream);
     }
 }

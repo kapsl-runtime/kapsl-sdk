@@ -9,6 +9,7 @@
 //! Models that already apply softmax in-graph set
 //! `metadata.classify.apply_softmax = false` to pass the output through.
 
+use crate::tensor_util::{bytes_to_f32, dim_usize, f32_packet};
 use async_trait::async_trait;
 use kapsl_engine_api::{
     BatchingPolicy, BinaryTensorPacket, Engine, EngineError, EngineMetrics, EngineModelInfo,
@@ -33,8 +34,19 @@ impl OnnxClassifyBackend {
 
 #[async_trait]
 impl Engine for OnnxClassifyBackend {
+    fn planned_external_device_memory(
+        &self,
+        model_path: &Path,
+    ) -> Result<kapsl_engine_api::ExternalDeviceMemoryReport, EngineError> {
+        self.inner.planned_external_device_memory(model_path)
+    }
+
     async fn load(&mut self, model_path: &Path) -> Result<(), EngineError> {
         self.inner.load(model_path).await
+    }
+
+    fn actual_external_device_memory(&self) -> kapsl_engine_api::ExternalDeviceMemoryReport {
+        self.inner.actual_external_device_memory()
     }
 
     fn infer(&self, request: &InferenceRequest) -> Result<BinaryTensorPacket, EngineError> {
@@ -142,28 +154,6 @@ fn softmax_rows(v: &mut [f32], rows: usize, classes: usize) {
         for x in row.iter_mut() {
             *x /= sum;
         }
-    }
-}
-
-fn dim_usize(d: i64) -> usize {
-    d.max(0) as usize
-}
-
-fn bytes_to_f32(data: &[u8]) -> Vec<f32> {
-    data.chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        .collect()
-}
-
-fn f32_packet(shape: Vec<i64>, values: Vec<f32>) -> BinaryTensorPacket {
-    let mut data = Vec::with_capacity(values.len() * 4);
-    for v in &values {
-        data.extend_from_slice(&v.to_le_bytes());
-    }
-    BinaryTensorPacket {
-        shape,
-        dtype: TensorDtype::Float32,
-        data,
     }
 }
 

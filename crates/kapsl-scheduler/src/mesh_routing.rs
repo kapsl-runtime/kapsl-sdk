@@ -151,22 +151,6 @@ impl MeshRouter {
         0
     }
 
-    /// Get the TP group index for a given worker
-    pub fn get_tp_group(&self, worker_idx: usize) -> Option<usize> {
-        let mesh = self.mesh.as_ref()?;
-        let tp_degree = match &mesh.topology {
-            MeshTopology::TensorParallel { degree, .. } => *degree,
-            MeshTopology::Mixed { tp, .. } => *tp,
-            _ => return None,
-        };
-
-        if tp_degree <= 1 {
-            return None;
-        }
-
-        Some(worker_idx / tp_degree)
-    }
-
     /// Get all worker indices in a TP group
     pub fn get_tp_group_workers(&self, tp_group: usize) -> Vec<usize> {
         let mesh = match &self.mesh {

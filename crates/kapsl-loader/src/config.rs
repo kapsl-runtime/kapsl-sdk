@@ -91,29 +91,4 @@ impl ModelConfig {
         self.num_key_value_heads
             .unwrap_or(self.num_attention_heads)
     }
-
-    /// GQA group size: how many query heads share one KV head.
-    pub fn gqa_groups(&self) -> usize {
-        self.num_attention_heads / self.num_kv_heads()
-    }
-
-    /// Detected architecture family.
-    pub fn arch_family(&self) -> ArchFamily {
-        for arch in &self.architectures {
-            let lower = arch.to_ascii_lowercase();
-            if lower.contains("llama") {
-                return ArchFamily::LLaMA;
-            }
-            if lower.contains("mistral") {
-                return ArchFamily::Mistral;
-            }
-            if lower.contains("phi") {
-                return ArchFamily::Phi;
-            }
-            if lower.contains("qwen") {
-                return ArchFamily::Qwen;
-            }
-        }
-        ArchFamily::Unknown(self.architectures.first().cloned().unwrap_or_default())
-    }
 }

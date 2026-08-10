@@ -139,17 +139,6 @@ impl DeviceMesh {
         }
     }
 
-    /// Create a new device mesh with a mock communication backend for testing
-    pub fn new_with_mock_comm(devices: Vec<Device>, rank: usize) -> Self {
-        use crate::mock_comm::MockComm;
-
-        let world_size = devices.len();
-        let mut mesh = Self::new(devices);
-        mesh.rank = rank;
-        mesh.comm = Some(Arc::new(MockComm::new(rank, world_size)));
-        mesh
-    }
-
     /// Create a new device mesh with NCCL communication backend for real GPU communication
     ///
     /// # Arguments
@@ -283,16 +272,6 @@ impl DeviceMesh {
         self.devices.get(rank).cloned()
     }
 
-    /// Get the local device for this process
-    pub fn local_device(&self) -> Option<Arc<Device>> {
-        self.get_device(self.rank)
-    }
-
-    /// Get all devices (returns Arc to avoid cloning the entire Vec)
-    pub fn all_devices(&self) -> Arc<Vec<Arc<Device>>> {
-        self.devices.clone()
-    }
-
     /// Get devices for a specific backend type (memory efficient)
     pub fn devices_by_backend(&self, backend: crate::device::DeviceBackend) -> Vec<Arc<Device>> {
         self.devices
@@ -300,20 +279,6 @@ impl DeviceMesh {
             .filter(|d| std::mem::discriminant(&d.backend) == std::mem::discriminant(&backend))
             .cloned()
             .collect()
-    }
-
-    /// Get devices in a specific process group
-    pub fn devices_in_group(&self, group_name: &str) -> Result<Vec<Arc<Device>>, String> {
-        let group = self
-            .groups
-            .get(group_name)
-            .ok_or_else(|| format!("Group '{}' not found", group_name))?;
-
-        Ok(group
-            .ranks
-            .iter()
-            .filter_map(|&rank| self.get_device(rank))
-            .collect())
     }
 
     /// Add a custom process group
@@ -346,11 +311,6 @@ impl DeviceMesh {
     /// Get a process group by name
     pub fn get_group(&self, name: &str) -> Option<&ProcessGroup> {
         self.groups.get(name)
-    }
-
-    /// List all group names
-    pub fn group_names(&self) -> Vec<String> {
-        self.groups.keys().cloned().collect()
     }
 
     /// Check if this rank is in a specific group
@@ -445,15 +405,6 @@ pub trait MeshComm: std::fmt::Debug {
 
     /// Broadcast from root rank to all ranks in group
     fn broadcast(&self, buf: &mut [u8], root_rank: usize, group: &str) -> Result<(), String>;
-
-    /// Reduce-scatter: reduce and distribute results
-    fn reduce_scatter(
-        &self,
-        buf: &mut [u8],
-        out: &mut [u8],
-        op: ReduceOp,
-        group: &str,
-    ) -> Result<(), String>;
 
     /// Barrier synchronization
     fn barrier(&self, group: &str) -> Result<(), String>;

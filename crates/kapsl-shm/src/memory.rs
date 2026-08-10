@@ -192,18 +192,6 @@ impl ShmManager {
         let header = self.header();
         header.notify_write_fd
     }
-
-    #[cfg(windows)]
-    pub fn notify_read_handle(&self) -> HANDLE {
-        let header = self.header();
-        header.notify_read_fd as HANDLE
-    }
-
-    #[cfg(windows)]
-    pub fn notify_write_handle(&self) -> HANDLE {
-        let header = self.header();
-        header.notify_write_fd as HANDLE
-    }
 }
 
 #[derive(Debug)]

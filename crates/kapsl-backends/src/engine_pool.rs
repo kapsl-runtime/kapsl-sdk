@@ -112,12 +112,6 @@ impl EnginePool {
         *guard = Some(Arc::new(cb));
     }
 
-    /// Clear any previously set eviction callback.
-    pub async fn clear_eviction_callback(&self) {
-        let mut guard = self.eviction_callback.lock().await;
-        *guard = None;
-    }
-
     pub fn start_health_check_task(&self) -> tokio::task::JoinHandle<()> {
         let pool = self.clone(); // Clone the Arc references
         let interval = self.config.health_check_interval;

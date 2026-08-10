@@ -62,14 +62,6 @@ impl NcclComm {
         })
     }
 
-    /// Generate a unique NCCL ID
-    ///
-    /// This should be called on rank 0 and the resulting ID should be
-    /// broadcast to all other ranks before calling `new()`.
-    pub fn generate_id() -> Result<Id, String> {
-        Id::new().map_err(|e| format!("Failed to generate NCCL ID: {:?}", e))
-    }
-
     /// Convert our DType to NCCL type info
     fn dtype_size(dtype: DType) -> usize {
         match dtype {
@@ -231,34 +223,6 @@ impl MeshComm for NcclComm {
             .synchronize()
             .map_err(|e| format!("Sync failed: {:?}", e))?;
         self.device_to_host(&device_buf, buf)?;
-
-        Ok(())
-    }
-
-    fn reduce_scatter(
-        &self,
-        buf: &mut [u8],
-        out: &mut [u8],
-        op: ReduceOp,
-        _group: &str,
-    ) -> Result<(), String> {
-        let device_in = self.host_to_device(buf)?;
-        let mut device_out = self.host_to_device(out)?;
-        let out_count = out.len() / 4; // Assuming f32
-
-        unsafe {
-            let send_ptr = *device_in.device_ptr() as *const f32;
-            let recv_ptr = *device_out.device_ptr_mut() as *mut f32;
-
-            self.comm
-                .reduce_scatter(send_ptr, recv_ptr, out_count, Self::to_nccl_op(op))
-                .map_err(|e| format!("NCCL reduce_scatter failed: {:?}", e))?;
-        }
-
-        self.device
-            .synchronize()
-            .map_err(|e| format!("Sync failed: {:?}", e))?;
-        self.device_to_host(&device_out, out)?;
 
         Ok(())
     }

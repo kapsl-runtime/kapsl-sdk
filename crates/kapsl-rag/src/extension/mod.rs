@@ -148,31 +148,6 @@ impl ExtensionManager {
         Ok(config.map(strip_wasi_block))
     }
 
-    pub fn list_configs(
-        &self,
-        workspace_id: &str,
-    ) -> Result<HashMap<String, ConnectorConfig>, ExtensionError> {
-        let mut configs = HashMap::new();
-        let dir = self.config_root.join(workspace_id);
-        if !dir.exists() {
-            return Ok(configs);
-        }
-        for entry in fs::read_dir(&dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("json") {
-                continue;
-            }
-            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                let data = fs::read_to_string(&path)?;
-                let config = serde_json::from_str(&data)
-                    .map_err(|e| ExtensionError::InvalidManifest(e.to_string()))?;
-                configs.insert(stem.to_string(), config);
-            }
-        }
-        Ok(configs)
-    }
-
     pub fn get_workspace_wasi_permissions(
         &self,
         workspace_id: &str,

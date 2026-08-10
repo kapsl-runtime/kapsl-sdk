@@ -145,25 +145,6 @@ where
         self.replicas.read().len()
     }
 
-    /// Get statistics about a specific replica
-    pub fn get_replica_stats(&self, replica_id: u32) -> Option<ReplicaStats> {
-        let replicas = self.replicas.read();
-        replicas
-            .iter()
-            .find(|r| r.replica_id == replica_id)
-            .map(|r| ReplicaStats {
-                replica_id: r.replica_id,
-                requests_total: r.requests_total.load(Ordering::Relaxed) as u64,
-                queue_depth: r.scheduler.get_queue_depth(),
-                healthy: r.scheduler.is_healthy(),
-            })
-    }
-
-    /// Get the total number of replicas in the pool
-    pub fn get_replica_count(&self) -> usize {
-        self.replicas.read().len()
-    }
-
     /// Get the number of healthy replicas in the pool
     pub fn get_healthy_replica_count(&self) -> usize {
         self.replicas

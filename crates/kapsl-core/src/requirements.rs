@@ -111,19 +111,6 @@ impl HardwareRequirements {
             strategy: Some("round-robin".to_string()),
         }
     }
-
-    pub fn requested_gpu_memory_mb(&self) -> Option<u64> {
-        self.gpu_memory_reservation_mb
-            .or(self.gpu_memory_limit_mb)
-            .or(self.min_vram_mb)
-    }
-
-    pub fn requested_isolation_mode(&self) -> &str {
-        self.isolation_mode
-            .as_deref()
-            .unwrap_or("best_effort")
-            .trim()
-    }
 }
 
 #[path = "requirements_tests.rs"]

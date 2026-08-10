@@ -40,42 +40,14 @@ impl<T: cudarc::driver::DeviceRepr> GpuTensor<T> {
 
 #[cfg(feature = "cuda")]
 impl<T: cudarc::driver::DeviceRepr + Clone> GpuTensor<T> {
-    /// Upload host data to a new GPU tensor.
-    pub fn from_host(
-        device: &Arc<CudaDevice>,
-        host: &[T],
-        shape: &[usize],
-    ) -> Result<Self, cudarc::driver::DriverError> {
-        let data = device.htod_sync_copy(host)?;
-        Ok(Self {
-            data,
-            shape: shape.to_vec(),
-        })
-    }
 }
 
 #[cfg(feature = "cuda")]
 impl GpuTensor<half::f16> {
-    /// Upload from raw f16 bytes (little-endian, 2 bytes per element).
-    pub fn from_f16_bytes(
-        device: &Arc<CudaDevice>,
-        bytes: &[u8],
-        shape: &[usize],
-    ) -> Result<Self, cudarc::driver::DriverError> {
-        let numel: usize = shape.iter().product();
-        assert_eq!(bytes.len(), numel * 2);
-        let f16_slice: &[half::f16] =
-            unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const half::f16, numel) };
-        Self::from_host(device, f16_slice, shape)
-    }
 }
 
 #[cfg(feature = "cuda")]
 impl<T: cudarc::driver::DeviceRepr + Default + Clone> GpuTensor<T> {
-    /// Download tensor to host.
-    pub fn to_host(&self, device: &Arc<CudaDevice>) -> Result<Vec<T>, cudarc::driver::DriverError> {
-        device.dtoh_sync_copy(&self.data)
-    }
 }
 
 #[cfg(feature = "cuda")]

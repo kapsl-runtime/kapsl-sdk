@@ -68,16 +68,6 @@ impl EngineError {
         }
     }
 
-    pub fn backend_with_source(
-        message: impl Into<String>,
-        source: impl std::error::Error + Send + Sync + 'static,
-    ) -> Self {
-        EngineError::Backend {
-            message: message.into(),
-            source: Some(Box::new(source)),
-        }
-    }
-
     pub fn invalid_input(message: impl Into<String>) -> Self {
         EngineError::InvalidInput {
             message: message.into(),
@@ -401,15 +391,6 @@ impl BinaryTensorPacket {
         shape_elements(&self.shape)
     }
 
-    pub fn tensor_elements_cached(&self, cache: &mut Option<usize>) -> Result<usize, EngineError> {
-        if let Some(value) = *cache {
-            return Ok(value);
-        }
-        let value = self.tensor_elements()?;
-        *cache = Some(value);
-        Ok(value)
-    }
-
     pub fn validate(&self) -> Result<(), EngineError> {
         let elements = self.tensor_elements()?;
         let expected = elements
@@ -441,10 +422,6 @@ impl BinaryTensorPacket {
             dtype: self.dtype,
             data: &self.data,
         }
-    }
-
-    pub fn as_borrowed(&self) -> BinaryTensorPacketRef<'_> {
-        BinaryTensorPacketRef::from(self)
     }
 }
 
@@ -589,12 +566,6 @@ impl InferenceRequest {
         self
     }
 
-    pub fn with_request_id(mut self, request_id: impl Into<String>) -> Self {
-        let metadata = self.metadata.get_or_insert_with(RequestMetadata::default);
-        metadata.request_id = Some(request_id.into());
-        self
-    }
-
     pub fn add_input(&mut self, name: impl Into<String>, tensor: BinaryTensorPacket) {
         self.additional_inputs.push(NamedTensor {
             name: name.into(),
@@ -619,6 +590,50 @@ pub struct EngineModelInfo {
     pub model_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peak_concurrency: Option<u32>,
+}
+
+/// A backend allocation that lives outside the runtime-owned device pool.
+///
+/// `allocation_id` identifies the physical allocation, rather than an engine
+/// instance. Backends that share immutable weights between replicas must return
+/// the same ID so the runtime charges those bytes once and reference-counts the
+/// owners.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalDeviceMemory {
+    pub allocation_id: String,
+    pub device_id: usize,
+    pub bytes: usize,
+}
+
+/// Planned or actual backend-owned device memory outside the shared pool.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalDeviceMemoryReport {
+    #[serde(default)]
+    pub allocations: Vec<ExternalDeviceMemory>,
+}
+
+impl ExternalDeviceMemoryReport {
+    pub fn single(
+        allocation_id: impl Into<String>,
+        device_id: usize,
+        bytes: usize,
+    ) -> Self {
+        Self {
+            allocations: vec![ExternalDeviceMemory {
+                allocation_id: allocation_id.into(),
+                device_id,
+                bytes,
+            }],
+        }
+    }
+
+    pub fn bytes_for_device(&self, device_id: usize) -> usize {
+        self.allocations
+            .iter()
+            .filter(|allocation| allocation.device_id == device_id)
+            .map(|allocation| allocation.bytes)
+            .sum()
+    }
 }
 
 pub type EngineStream = Pin<Box<dyn Stream<Item = Result<BinaryTensorPacket, EngineError>> + Send>>;
@@ -691,11 +706,6 @@ impl BatchingPolicy {
         self
     }
 
-    pub fn with_max_batched_tokens(mut self, max_batched_tokens: usize) -> Self {
-        self.max_batched_tokens = Some(max_batched_tokens);
-        self
-    }
-
     pub fn with_priority_support(mut self) -> Self {
         self.supports_priority = true;
         self
@@ -714,19 +724,30 @@ impl BatchingPolicy {
 
 #[async_trait]
 pub trait Engine: Send + Sync {
+    /// Report external device allocations expected during `load`.
+    ///
+    /// The default is empty for CPU backends and legacy implementations. The
+    /// runtime still observes CUDA free-memory deltas as a conservative fallback.
+    fn planned_external_device_memory(
+        &self,
+        _model_path: &std::path::Path,
+    ) -> Result<ExternalDeviceMemoryReport, EngineError> {
+        Ok(ExternalDeviceMemoryReport::default())
+    }
+
     /// Load model weights and prepare runtime state.
     async fn load(&mut self, model_path: &std::path::Path) -> Result<(), EngineError>;
 
+    /// Report the external device allocations currently held by this backend.
+    ///
+    /// Backends should return an empty report after `unload` has synchronously
+    /// released those allocations.
+    fn actual_external_device_memory(&self) -> ExternalDeviceMemoryReport {
+        ExternalDeviceMemoryReport::default()
+    }
+
     /// Run a single inference request and return the output tensor.
     fn infer(&self, request: &InferenceRequest) -> Result<BinaryTensorPacket, EngineError>;
-
-    /// Run a single inference request asynchronously.
-    async fn infer_async(
-        &self,
-        request: &InferenceRequest,
-    ) -> Result<BinaryTensorPacket, EngineError> {
-        self.infer(request)
-    }
 
     /// Run a batch of inference requests.
     fn infer_batch(
@@ -734,14 +755,6 @@ pub trait Engine: Send + Sync {
         requests: &[InferenceRequest],
     ) -> Result<Vec<BinaryTensorPacket>, EngineError> {
         requests.iter().map(|req| self.infer(req)).collect()
-    }
-
-    /// Run a batch of inference requests asynchronously.
-    async fn infer_batch_async(
-        &self,
-        requests: &[InferenceRequest],
-    ) -> Result<Vec<BinaryTensorPacket>, EngineError> {
-        self.infer_batch(requests)
     }
 
     /// Maximum number of independent requests this engine can coalesce into a
@@ -783,26 +796,6 @@ pub trait Engine: Send + Sync {
 
     /// Run a streaming inference request.
     fn infer_stream(&self, request: &InferenceRequest) -> EngineStream;
-
-    /// Run inference with cancellation support.
-    fn infer_with_cancellation(
-        &self,
-        request: &InferenceRequest,
-        cancellation: &CancellationToken,
-    ) -> Result<BinaryTensorPacket, EngineError> {
-        if cancellation.is_cancelled() {
-            return Err(EngineError::Cancelled {
-                message: "Request cancelled".to_string(),
-            });
-        }
-        let result = self.infer(request);
-        if cancellation.is_cancelled() {
-            return Err(EngineError::Cancelled {
-                message: "Request cancelled".to_string(),
-            });
-        }
-        result
-    }
 
     /// Warm up the model runtime before serving requests.
     async fn warmup(&self) -> Result<(), EngineError> {
@@ -854,19 +847,23 @@ pub trait Engine: Send + Sync {
 
 #[async_trait]
 impl Engine for Box<dyn Engine> {
+    fn planned_external_device_memory(
+        &self,
+        model_path: &std::path::Path,
+    ) -> Result<ExternalDeviceMemoryReport, EngineError> {
+        (**self).planned_external_device_memory(model_path)
+    }
+
     async fn load(&mut self, model_path: &std::path::Path) -> Result<(), EngineError> {
         (**self).load(model_path).await
     }
 
-    fn infer(&self, request: &InferenceRequest) -> Result<BinaryTensorPacket, EngineError> {
-        (**self).infer(request)
+    fn actual_external_device_memory(&self) -> ExternalDeviceMemoryReport {
+        (**self).actual_external_device_memory()
     }
 
-    async fn infer_async(
-        &self,
-        request: &InferenceRequest,
-    ) -> Result<BinaryTensorPacket, EngineError> {
-        (**self).infer_async(request).await
+    fn infer(&self, request: &InferenceRequest) -> Result<BinaryTensorPacket, EngineError> {
+        (**self).infer(request)
     }
 
     fn infer_batch(
@@ -874,13 +871,6 @@ impl Engine for Box<dyn Engine> {
         requests: &[InferenceRequest],
     ) -> Result<Vec<BinaryTensorPacket>, EngineError> {
         (**self).infer_batch(requests)
-    }
-
-    async fn infer_batch_async(
-        &self,
-        requests: &[InferenceRequest],
-    ) -> Result<Vec<BinaryTensorPacket>, EngineError> {
-        (**self).infer_batch_async(requests).await
     }
 
     fn max_batch(&self) -> usize {
@@ -897,14 +887,6 @@ impl Engine for Box<dyn Engine> {
 
     fn infer_stream(&self, request: &InferenceRequest) -> EngineStream {
         (**self).infer_stream(request)
-    }
-
-    fn infer_with_cancellation(
-        &self,
-        request: &InferenceRequest,
-        cancellation: &CancellationToken,
-    ) -> Result<BinaryTensorPacket, EngineError> {
-        (**self).infer_with_cancellation(request, cancellation)
     }
 
     async fn warmup(&self) -> Result<(), EngineError> {

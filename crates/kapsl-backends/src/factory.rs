@@ -9,6 +9,8 @@ use kapsl_core::EngineKind;
 use kapsl_core::HardwareRequirements;
 use kapsl_engine_api::Engine;
 #[cfg(any(feature = "gguf-native", feature = "native", feature = "gguf-cuda-shared-kv"))]
+use kapsl_hal::gpu_arena::GpuDevicePool;
+#[cfg(any(feature = "gguf-native", feature = "gguf-cuda-shared-kv"))]
 use kapsl_hal::gpu_arena::GpuPoolHandle;
 use kapsl_hal::device::DeviceInfo;
 use kapsl_llm::llm_backend::LLMBackend;
@@ -21,6 +23,20 @@ use ort::execution_providers::{
     ROCmExecutionProvider, TensorRTExecutionProvider,
 };
 use ort::session::builder::GraphOptimizationLevel;
+#[cfg(any(feature = "gguf-native", feature = "native", feature = "gguf-cuda-shared-kv"))]
+use std::sync::Arc;
+
+fn use_registered_env_allocator(device_id: i32) -> bool {
+    #[cfg(feature = "onnx-cuda-pool")]
+    {
+        return crate::ort_pool_allocator::is_registered(device_id);
+    }
+    #[cfg(not(feature = "onnx-cuda-pool"))]
+    {
+        let _ = device_id;
+        false
+    }
+}
 
 pub struct BackendFactory;
 
@@ -261,14 +277,6 @@ impl BackendFactory {
         Self::push_unique_provider(providers, "cpu");
     }
 
-    /// Create the best available backend based on manifest requirements and available hardware
-    pub fn create_best_backend(
-        manifest: &Manifest,
-        device_info: &DeviceInfo,
-    ) -> Result<Box<dyn Engine>, String> {
-        Self::create_best_backend_with_tuning(manifest, device_info, &OnnxRuntimeTuning::default())
-    }
-
     pub fn create_best_backend_with_tuning(
         manifest: &Manifest,
         device_info: &DeviceInfo,
@@ -289,25 +297,22 @@ impl BackendFactory {
         #[cfg(all(feature = "gguf-cuda-shared-kv", not(feature = "gguf-native")))]
         if engine_kind.is_gguf() {
             let device_id = manifest.hardware_requirements.device_id.unwrap_or(0);
-            // Reuse the device pool registered with ORT (if any) so GGUF KV
-            // and ONNX sessions draw from the same memory budget.
-            let pool = crate::ort_pool_allocator::registered_pool_handle(device_id as i32);
             log::info!(
-                "✓ Using GgufBackend (llama.cpp CUDA + Kapsl shared KV{}), device {}",
-                if pool.is_some() { ", pool shared with ONNX" } else { "" },
+                "✓ Using GgufBackend (llama.cpp CUDA + Kapsl KV), device {}",
                 device_id
             );
             return Ok(Box::new(GgufBackend::new_cuda_shared_kv(
                 device_id as usize,
-                pool,
+                None,
             )));
         }
 
         // GGUF: fallback to llama.cpp-backed GgufBackend.
         #[cfg(not(any(feature = "gguf-native", feature = "gguf-cuda-shared-kv")))]
         if engine_kind.is_gguf() {
+            let device_id = manifest.hardware_requirements.device_id.unwrap_or(0);
             log::info!("✓ Using GgufBackend (llama.cpp)");
-            return Ok(Box::new(GgufBackend::new()));
+            return Ok(Box::new(GgufBackend::new_on_device(device_id as usize)));
         }
 
         // Native CUDA: safetensors models use custom kernel backend.
@@ -330,11 +335,18 @@ impl BackendFactory {
                         "✓ Using LLMBackend with manifest provider override: {}",
                         provider
                     );
-                    return Ok(Box::new(LLMBackend::with_device(provider, device_id)));
+                    return Ok(Box::new(
+                        LLMBackend::with_device(provider, device_id)
+                            .with_env_allocators(use_registered_env_allocator(device_id)),
+                    ));
                 }
             }
             log::info!("✓ Using LLMBackend with runtime fastest-provider selection");
-            return Ok(Box::new(LLMBackend::new()));
+            let device_id = requirements.device_id.unwrap_or(0);
+            return Ok(Box::new(
+                LLMBackend::new()
+                    .with_env_allocators(use_registered_env_allocator(device_id)),
+            ));
         }
 
         if !engine_kind.is_implemented() {
@@ -391,22 +403,6 @@ impl BackendFactory {
         finalize_onnx_pipeline(engine_kind, manifest, inner)
     }
 
-    /// Create a backend for a specific device
-    pub fn create_backend_for_device(
-        manifest: &Manifest,
-        provider: &str,
-        device_id: usize,
-        device_info: &DeviceInfo,
-    ) -> Result<Box<dyn Engine>, String> {
-        Self::create_backend_for_device_with_tuning(
-            manifest,
-            provider,
-            device_id,
-            device_info,
-            &OnnxRuntimeTuning::default(),
-        )
-    }
-
     pub fn create_backend_for_device_with_tuning(
         manifest: &Manifest,
         provider: &str,
@@ -447,7 +443,7 @@ impl BackendFactory {
         #[cfg(not(any(feature = "gguf-native", feature = "gguf-cuda-shared-kv")))]
         if engine_kind.is_gguf() {
             log::info!("✓ Using GgufBackend (llama.cpp)");
-            return Ok(Box::new(GgufBackend::new()));
+            return Ok(Box::new(GgufBackend::new_on_device(device_id)));
         }
 
         // ONNX generative path (LLMBackend): autoregressive decode over an ONNX graph.
@@ -457,16 +453,19 @@ impl BackendFactory {
                     "✓ Using LLMBackend with manifest provider override: {}",
                     provider
                 );
-                return Ok(Box::new(LLMBackend::with_device(
-                    provider.to_string(),
-                    device_id as i32,
-                )));
+                return Ok(Box::new(
+                    LLMBackend::with_device(provider.to_string(), device_id as i32)
+                        .with_env_allocators(use_registered_env_allocator(device_id as i32)),
+                ));
             }
 
             log::info!(
                 "✓ Using LLMBackend with device pinning and runtime provider auto-selection"
             );
-            return Ok(Box::new(LLMBackend::with_device_id(device_id as i32)));
+            return Ok(Box::new(
+                LLMBackend::with_device_id(device_id as i32)
+                    .with_env_allocators(use_registered_env_allocator(device_id as i32)),
+            ));
         }
 
         if !engine_kind.is_implemented() {
@@ -663,30 +662,53 @@ impl BackendFactory {
         Ok(b)
     }
 
-    /// Create a llama.cpp CUDA backend backed by the Kapsl shared KV pool.
+    /// Create a GGUF native backend as a client of runtime-owned device memory.
+    #[cfg(feature = "gguf-native")]
+    pub fn create_gguf_native_device_pool(
+        device_id: i32,
+        pool: Arc<GpuDevicePool>,
+        model_id: u32,
+    ) -> Result<GgufNativeBackend, String> {
+        GgufNativeBackend::new(device_id)
+            .map(|backend| backend.with_device_pool(pool, model_id))
+            .map_err(|e| format!("GgufNativeBackend init failed: {e}"))
+    }
+
+    /// Create the llama.cpp GGUF path over runtime-owned device memory. The
+    /// model-specific view is deferred until model geometry is known.
+    #[cfg(feature = "gguf-cuda-shared-kv")]
+    pub fn create_gguf_cuda_device_pool(
+        device_id: i32,
+        pool: Arc<GpuDevicePool>,
+        model_id: u32,
+    ) -> Result<GgufBackend, String> {
+        Ok(GgufBackend::new_cuda_device_pool(
+            device_id as usize,
+            pool,
+            model_id,
+        ))
+    }
+
+    /// Legacy geometry-specific injection retained for callers migrating to
+    /// `create_gguf_cuda_device_pool`.
     #[cfg(feature = "gguf-cuda-shared-kv")]
     pub fn create_gguf_cuda_shared_kv(
         device_id: i32,
         handle: Option<GpuPoolHandle>,
     ) -> Result<GgufBackend, String> {
-        Ok(GgufBackend::new_cuda_shared_kv(device_id.max(0) as usize, handle))
+        Ok(GgufBackend::new_cuda_shared_kv(device_id as usize, handle))
     }
 
-    /// Create a NativeBackend with an optional pre-shared pool handle.
-    ///
-    /// Returns the concrete (unboxed) backend so callers can call
-    /// `backend.pool_handle()` after `load()` to register the pool for sharing.
+    /// Create the native safetensors backend over runtime-owned device memory.
     #[cfg(feature = "native")]
-    pub fn create_native(
+    pub fn create_native_device_pool(
         device_id: i32,
-        handle: Option<GpuPoolHandle>,
+        pool: Arc<GpuDevicePool>,
+        model_id: u32,
     ) -> Result<NativeBackend, String> {
-        let mut b = NativeBackend::new(device_id)
-            .map_err(|e| format!("NativeBackend init failed: {e}"))?;
-        if let Some(h) = handle {
-            b = b.with_pool_handle(h);
-        }
-        Ok(b)
+        NativeBackend::new(device_id)
+            .map(|backend| backend.with_device_pool(pool, model_id))
+            .map_err(|e| format!("NativeBackend init failed: {e}"))
     }
 
     /// Validate that hardware meets minimum requirements

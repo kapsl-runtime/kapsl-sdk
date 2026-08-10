@@ -16,13 +16,13 @@ use async_stream::stream;
 use async_trait::async_trait;
 use futures::stream::{self, Stream, StreamExt};
 use kapsl_engine_api::{
-    BatchingPolicy, BinaryTensorPacket, Engine, EngineError, EngineMetrics, InferenceRequest,
-    TensorDtype,
+    BatchingPolicy, BinaryTensorPacket, Engine, EngineError, EngineMetrics, ExternalDeviceMemory,
+    ExternalDeviceMemoryReport, InferenceRequest, TensorDtype,
 };
 use serde_json::Value;
 use std::fs;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use tokio::runtime::Runtime;
 use tokio::runtime::RuntimeFlavor;
@@ -38,14 +38,19 @@ fn shared_runtime() -> &'static Runtime {
     })
 }
 
+static NEXT_LLM_EXTERNAL_ALLOCATION_ID: AtomicU64 = AtomicU64::new(1);
+
 /// LLM Backend that bridges the Engine trait to the asynchronous LLMEngine loop
 pub struct LLMBackend {
     request_tx: RwLock<Option<mpsc::Sender<SequenceGroup>>>,
+    engine_done_rx: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
     metrics: Arc<Mutex<LLMMetrics>>,
     model_config: Arc<Mutex<ModelRuntimeConfig>>,
     provider_override: Option<String>,
     device_id_override: Option<i32>,
     device_ids_override: Option<Vec<i32>>,
+    /// Opt CUDA/TensorRT sessions into allocators registered on the ORT environment.
+    use_env_allocators: bool,
     /// Optional shared block pool.  When set, the engine draws from this pool
     /// instead of a private allocator, enabling unified KV memory across models.
     shared_pool: Option<SharedBlockAllocator>,
@@ -70,6 +75,7 @@ pub struct LLMBackend {
     /// Optional callback invoked with this backend's `engine_id` when its engine
     /// task ends (drops), so the runtime can fully deregister the dead engine.
     on_engine_death: Option<Arc<dyn Fn(u32) + Send + Sync>>,
+    external_allocation_id: String,
 }
 
 #[derive(Clone)]
@@ -468,6 +474,7 @@ impl LLMBackend {
     pub fn new() -> Self {
         Self {
             request_tx: RwLock::new(None),
+            engine_done_rx: Mutex::new(None),
             metrics: Arc::new(Mutex::new(LLMMetrics::default())),
             model_config: Arc::new(Mutex::new(ModelRuntimeConfig {
                 prompt_template: None,
@@ -476,6 +483,7 @@ impl LLMBackend {
             provider_override: None,
             device_id_override: None,
             device_ids_override: None,
+            use_env_allocators: false,
             shared_pool: None,
             kv_blocks_cap: None,
             kv_compression_bits: None,
@@ -483,6 +491,10 @@ impl LLMBackend {
             engine_id: 0,
             live_kv_cap: None,
             on_engine_death: None,
+            external_allocation_id: format!(
+                "llm-ort:{}",
+                NEXT_LLM_EXTERNAL_ALLOCATION_ID.fetch_add(1, Ordering::Relaxed)
+            ),
         }
     }
 
@@ -512,6 +524,14 @@ impl LLMBackend {
     /// Overrides the value in `metadata.json` and `KAPSL_LLM_KV_COMPRESSION_BITS`.
     pub fn with_kv_compression_bits(mut self, bits: u8) -> Self {
         self.kv_compression_bits = Some(bits);
+        self
+    }
+
+    /// Make CUDA/TensorRT sessions use allocators registered on the shared ORT
+    /// environment. The runtime enables this only after registering its stable
+    /// device pool.
+    pub fn with_env_allocators(mut self, enabled: bool) -> Self {
+        self.use_env_allocators = enabled;
         self
     }
 
@@ -594,6 +614,54 @@ impl Default for LLMBackend {
 
 #[async_trait]
 impl Engine for LLMBackend {
+    fn planned_external_device_memory(
+        &self,
+        model_path: &Path,
+    ) -> Result<ExternalDeviceMemoryReport, EngineError> {
+        if self.use_env_allocators {
+            return Ok(ExternalDeviceMemoryReport::default());
+        }
+        let uses_cuda = self
+            .provider_override
+            .as_deref()
+            .map(|provider| {
+                provider.eq_ignore_ascii_case("cuda") || provider.eq_ignore_ascii_case("tensorrt")
+            })
+            .unwrap_or_else(|| {
+                self.device_id_override.is_some() || self.device_ids_override.is_some()
+            });
+        if !uses_cuda {
+            return Ok(ExternalDeviceMemoryReport::default());
+        }
+
+        let model_bytes = fs::metadata(model_path)
+            .map_err(|source| EngineError::ModelLoadError {
+                path: model_path.display().to_string(),
+                source: Box::new(source),
+            })?
+            .len() as usize;
+        let mut device_ids = self
+            .device_ids_override
+            .clone()
+            .or_else(|| self.device_id_override.map(|device_id| vec![device_id]))
+            .unwrap_or_else(|| vec![0]);
+        device_ids.retain(|device_id| *device_id >= 0);
+        device_ids.sort_unstable();
+        device_ids.dedup();
+        let per_device_bytes = model_bytes.saturating_add(device_ids.len().saturating_sub(1))
+            / device_ids.len().max(1);
+        Ok(ExternalDeviceMemoryReport {
+            allocations: device_ids
+                .into_iter()
+                .map(|device_id| ExternalDeviceMemory {
+                    allocation_id: self.external_allocation_id.clone(),
+                    device_id: device_id as usize,
+                    bytes: per_device_bytes,
+                })
+                .collect(),
+        })
+    }
+
     async fn load(&mut self, model_path: &Path) -> Result<(), EngineError> {
         log::info!("Starting LLMEngine for model: {}", model_path.display());
 
@@ -605,6 +673,8 @@ impl Engine for LLMBackend {
 
         let (request_tx, request_rx) = mpsc::channel(100);
         let (load_tx, load_rx) = oneshot::channel::<Result<(), EngineError>>();
+        let (engine_done_tx, engine_done_rx) = std::sync::mpsc::channel::<()>();
+        *self.engine_done_rx.lock().unwrap() = Some(engine_done_rx);
 
         // Read per-model tuning hints from metadata.json before constructing LLMEngine.
         // This ensures BlockManager and SchedulerConfig are sized for the actual model
@@ -669,6 +739,7 @@ impl Engine for LLMBackend {
         let provider_override = self.provider_override.clone();
         let device_id_override = self.device_id_override;
         let device_ids_override = self.device_ids_override.clone();
+        let use_env_allocators = self.use_env_allocators;
         let engine_block_size = hints.block_size;
         let engine_num_gpu_blocks = hints.num_gpu_blocks;
         let shared_pool = self.shared_pool.clone();
@@ -678,7 +749,7 @@ impl Engine for LLMBackend {
         let engine_id_for_engine = self.engine_id;
         let on_engine_death = self.on_engine_death.clone();
         let live_kv_cap_for_engine = self.live_kv_cap.clone();
-        tokio::spawn(async move {
+        shared_runtime().spawn(async move {
             let engine = LLMEngine::new(
                 config,
                 engine_block_size,
@@ -688,6 +759,7 @@ impl Engine for LLMBackend {
                 provider_override,
                 device_id_override,
                 device_ids_override,
+                use_env_allocators,
             );
             // If a shared pool was attached, replace the private allocator.
             let mut engine = if let Some(pool) = shared_pool {
@@ -734,6 +806,10 @@ impl Engine for LLMBackend {
             if engine.is_loaded() {
                 engine.run_loop().await;
             }
+            // Destroy ORT sessions and CUDA allocations before acknowledging
+            // teardown to the runtime-owned device-memory lease.
+            drop(engine);
+            let _ = engine_done_tx.send(());
         });
 
         // Await the oneshot receiver instead of blocking the current runtime
@@ -940,7 +1016,13 @@ impl Engine for LLMBackend {
 
         let tx_guard = self.request_tx.read().unwrap();
         if let Some(tx) = tx_guard.as_ref() {
-            let tx = tx.clone();
+            // A returned stream can outlive the backend (and may remain stored
+            // even after it has yielded its final item).  Holding a strong
+            // sender in that stream would keep the engine's request channel
+            // open forever and prevent `unload` from observing task teardown.
+            // Upgrade only while enqueueing the request, then release the
+            // strong sender before awaiting response chunks.
+            let tx = tx.downgrade();
             drop(tx_guard);
 
             let stream = stream! {
@@ -960,6 +1042,10 @@ impl Engine for LLMBackend {
                 // Per-model backpressure: reject immediately when this model's
                 // queue is full rather than blocking (which would build latency
                 // and hold the admission reservation indefinitely).
+                let Some(tx) = tx.upgrade() else {
+                    yield Err(EngineError::ModelNotLoaded);
+                    return;
+                };
                 match tx.try_send(seq_group) {
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(_)) => {
@@ -973,6 +1059,7 @@ impl Engine for LLMBackend {
                         return;
                     }
                 }
+                drop(tx);
 
                 let mut saw_finish = false;
                 loop {
@@ -1034,8 +1121,13 @@ impl Engine for LLMBackend {
     }
 
     fn unload(&mut self) {
-        let mut tx_guard = self.request_tx.write().unwrap();
-        *tx_guard = None;
+        *self.request_tx.write().unwrap() = None;
+        if let Some(done) = self.engine_done_rx.lock().unwrap().take() {
+            // The runtime's device-memory lease cannot be released until the
+            // engine task has dropped its ORT sessions and CUDA allocations.
+            // A disconnected channel also confirms task teardown after panic.
+            let _ = done.recv();
+        }
     }
 
     fn metrics(&self) -> EngineMetrics {

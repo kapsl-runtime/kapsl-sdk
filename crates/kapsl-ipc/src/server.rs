@@ -110,14 +110,6 @@ impl IpcServer {
         }
     }
 
-    /// Require every inference request to carry this token in
-    /// `request.metadata.auth_token`. Requests without the token
-    /// or with a wrong token receive `STATUS_ERR: Unauthorized`.
-    pub fn with_auth_token(mut self, token: impl Into<String>) -> Self {
-        self.auth_token = Some(Arc::from(token.into().as_str()));
-        self
-    }
-
     async fn run_internal(&self) -> std::io::Result<()> {
         let scheduler_lookup = self.scheduler_lookup.clone();
         let auth_token = self.auth_token.clone();
@@ -198,10 +190,6 @@ impl TransportServer for IpcServer {
             }
         }
         Ok(())
-    }
-
-    fn transport_type(&self) -> &'static str {
-        "socket"
     }
 }
 

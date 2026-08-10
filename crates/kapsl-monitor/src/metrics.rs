@@ -39,6 +39,12 @@ pub struct KapslMetrics {
     pub onnx_session_pool_idle: IntGaugeVec,
     pub onnx_session_pool_waits_total: IntGaugeVec,
     pub onnx_session_pool_wait_seconds_total: GaugeVec,
+    // Runtime-owned per-device memory authority metrics.
+    pub device_memory_budget_bytes: IntGaugeVec,
+    pub device_memory_pooled_bytes: IntGaugeVec,
+    pub device_memory_planned_external_bytes: IntGaugeVec,
+    pub device_memory_external_bytes: IntGaugeVec,
+    pub device_memory_available_bytes: IntGaugeVec,
     /// Most recent time-to-first-token (milliseconds) per model. Surfaced on the
     /// runtime `/api/models` so control-plane autoscalers can scale on TTFT SLOs.
     pub model_ttft_ms: GaugeVec,
@@ -287,6 +293,46 @@ impl KapslMetrics {
             &["model"],
         )
         .unwrap();
+        let device_memory_budget_bytes = IntGaugeVec::new(
+            Opts::new(
+                "kapsl_device_memory_budget_bytes",
+                "Runtime admission budget per CUDA device",
+            ),
+            &["device"],
+        )
+        .unwrap();
+        let device_memory_pooled_bytes = IntGaugeVec::new(
+            Opts::new(
+                "kapsl_device_memory_pooled_bytes",
+                "Bytes owned by the runtime CUDA pool per device",
+            ),
+            &["device"],
+        )
+        .unwrap();
+        let device_memory_planned_external_bytes = IntGaugeVec::new(
+            Opts::new(
+                "kapsl_device_memory_planned_external_bytes",
+                "External CUDA bytes currently reserved for in-progress loads",
+            ),
+            &["device"],
+        )
+        .unwrap();
+        let device_memory_external_bytes = IntGaugeVec::new(
+            Opts::new(
+                "kapsl_device_memory_external_bytes",
+                "Backend and library CUDA bytes charged outside the runtime pool",
+            ),
+            &["device"],
+        )
+        .unwrap();
+        let device_memory_available_bytes = IntGaugeVec::new(
+            Opts::new(
+                "kapsl_device_memory_available_bytes",
+                "Uncommitted runtime admission budget per CUDA device",
+            ),
+            &["device"],
+        )
+        .unwrap();
 
         registry
             .register(Box::new(inference_latency.clone()))
@@ -381,6 +427,21 @@ impl KapslMetrics {
         registry
             .register(Box::new(onnx_session_pool_wait_seconds_total.clone()))
             .expect("Failed to register onnx_session_pool_wait_seconds_total");
+        registry
+            .register(Box::new(device_memory_budget_bytes.clone()))
+            .expect("Failed to register device_memory_budget_bytes");
+        registry
+            .register(Box::new(device_memory_pooled_bytes.clone()))
+            .expect("Failed to register device_memory_pooled_bytes");
+        registry
+            .register(Box::new(device_memory_planned_external_bytes.clone()))
+            .expect("Failed to register device_memory_planned_external_bytes");
+        registry
+            .register(Box::new(device_memory_external_bytes.clone()))
+            .expect("Failed to register device_memory_external_bytes");
+        registry
+            .register(Box::new(device_memory_available_bytes.clone()))
+            .expect("Failed to register device_memory_available_bytes");
 
         Self {
             registry: registry.clone(),
@@ -414,6 +475,11 @@ impl KapslMetrics {
             onnx_session_pool_idle,
             onnx_session_pool_waits_total,
             onnx_session_pool_wait_seconds_total,
+            device_memory_budget_bytes,
+            device_memory_pooled_bytes,
+            device_memory_planned_external_bytes,
+            device_memory_external_bytes,
+            device_memory_available_bytes,
             model_ttft_ms,
         }
     }

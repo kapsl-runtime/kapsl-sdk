@@ -1,15 +1,11 @@
 use crate::attention::CpuAttention;
 use crate::mlp::CpuMlp;
-use kapsl_hal::kernel::{AttentionKernel, KernelBackend, KernelBackendType, MlpKernel};
+use kapsl_hal::kernel::{AttentionKernel, KernelBackend, MlpKernel};
 
 #[derive(Debug)]
 pub struct CpuBackend;
 
 impl KernelBackend for CpuBackend {
-    fn backend_type(&self) -> KernelBackendType {
-        KernelBackendType::Cpu
-    }
-
     fn attention(&self) -> Box<dyn AttentionKernel> {
         Box::new(CpuAttention)
     }

@@ -94,6 +94,46 @@ pub struct KvView {
     pub length: usize,
 }
 
+/// Repack a layer view's keys into the `[1, heads, seq, head_dim]` layout the
+/// ONNX decode path expects, dropping the unused tail of each head's slot.
+///
+/// Storage-independent -- `DenseKvCache` and `PagedKvCache` carried
+/// byte-identical copies of this, so it lives outside both.
+fn pack_layer_view_as_onnx(
+    view: &KvView,
+    num_heads: usize,
+    head_dim: usize,
+) -> Option<Array4<f16>> {
+    let seq_len = view.length;
+
+    let stride = num_heads * head_dim;
+    if stride == 0 || view.key.len() % stride != 0 {
+        return None;
+    }
+    let max_seq_len = view.key.len() / stride;
+    if seq_len > max_seq_len {
+        return None;
+    }
+
+    let total = num_heads * seq_len * head_dim;
+    let mut packed = vec![f16::ZERO; total];
+    for h in 0..num_heads {
+        let head_offset = h * max_seq_len * head_dim;
+        let packed_offset = h * seq_len * head_dim;
+        for pos in 0..seq_len {
+            let src = head_offset + pos * head_dim;
+            let dst = packed_offset + pos * head_dim;
+            let src_end = src + head_dim;
+            let dst_end = dst + head_dim;
+            if src_end <= view.key.len() {
+                packed[dst..dst_end].copy_from_slice(&view.key[src..src_end]);
+            }
+        }
+    }
+
+    Array4::from_shape_vec((1, num_heads, seq_len, head_dim), packed).ok()
+}
+
 pub struct PackedKvView {
     pub key: Arc<[f16]>,
     pub value: Arc<[f16]>,
@@ -290,23 +330,6 @@ pub struct DenseKvCache {
 impl DenseKvCache {
     pub fn new(num_layers: usize, num_heads: usize, max_seq_len: usize, head_dim: usize) -> Self {
         Self::new_with_config(num_layers, num_heads, max_seq_len, head_dim, 32, 256)
-    }
-
-    pub fn new_with_free_list_cap(
-        num_layers: usize,
-        num_heads: usize,
-        max_seq_len: usize,
-        head_dim: usize,
-        free_list_cap: usize,
-    ) -> Self {
-        Self::new_with_config(
-            num_layers,
-            num_heads,
-            max_seq_len,
-            head_dim,
-            free_list_cap,
-            256,
-        )
     }
 
     pub fn new_with_config(
@@ -600,22 +623,6 @@ impl DenseKvCache {
         }
     }
 
-    pub fn overwrite_layer(
-        &mut self,
-        sequence_id: u64,
-        layer_index: usize,
-        key: &KvTensor,
-        value: &KvTensor,
-        length: usize,
-    ) {
-        let seq = self.sequences.get_mut(&sequence_id).unwrap();
-        let layer = &mut seq.layers[layer_index];
-
-        layer.key.data.copy_from_slice(&key.data);
-        layer.value.data.copy_from_slice(&value.data);
-        seq.current_len = length;
-    }
-
     pub fn remove_sequence(&mut self, sequence_id: u64) {
         self.tq_quantizers.remove(&sequence_id);
         if let Some(seq) = self.sequences.remove(&sequence_id) {
@@ -680,35 +687,9 @@ impl DenseKvCache {
     }
 
     pub fn get_layer_as_onnx(&mut self, sequence_id: u64, layer: usize) -> Option<Array4<f16>> {
+        let (num_heads, head_dim) = (self.num_heads, self.head_dim);
         let view = self.get_layer_view(sequence_id, layer)?;
-        let seq_len = view.length;
-
-        let stride = self.num_heads * self.head_dim;
-        if stride == 0 || view.key.len() % stride != 0 {
-            return None;
-        }
-        let max_seq_len = view.key.len() / stride;
-        if seq_len > max_seq_len {
-            return None;
-        }
-
-        let total = self.num_heads * seq_len * self.head_dim;
-        let mut packed = vec![f16::ZERO; total];
-        for h in 0..self.num_heads {
-            let head_offset = h * max_seq_len * self.head_dim;
-            let packed_offset = h * seq_len * self.head_dim;
-            for pos in 0..seq_len {
-                let src = head_offset + pos * self.head_dim;
-                let dst = packed_offset + pos * self.head_dim;
-                let src_end = src + self.head_dim;
-                let dst_end = dst + self.head_dim;
-                if src_end <= view.key.len() {
-                    packed[dst..dst_end].copy_from_slice(&view.key[src..src_end]);
-                }
-            }
-        }
-
-        Array4::from_shape_vec((1, self.num_heads, seq_len, self.head_dim), packed).ok()
+        pack_layer_view_as_onnx(&view, num_heads, head_dim)
     }
 
     pub fn stats(&self) -> KvCacheStats {
@@ -1760,74 +1741,6 @@ impl PagedKvCache {
         seq.current_len += delta;
     }
 
-    pub fn overwrite_layer(
-        &mut self,
-        sequence_id: u64,
-        layer_index: usize,
-        key: &KvTensor,
-        value: &KvTensor,
-        length: usize,
-    ) {
-        let expected_len = self.num_heads * length * self.head_dim;
-        if key.data.len() < expected_len || value.data.len() < expected_len {
-            return;
-        }
-        let old_blocks = {
-            let seq = self.sequences.get_mut(&sequence_id).unwrap();
-            let old = std::mem::take(&mut seq.blocks);
-            seq.current_len = 0;
-            old
-        };
-        for block in old_blocks {
-            self.free_block(block);
-        }
-
-        let block_size = self.block_size;
-        let blocks_needed = length.div_ceil(block_size);
-        let new_blocks = match self.allocate_blocks(blocks_needed, Some(sequence_id)) {
-            Ok(blocks) => blocks,
-            Err(_) => return,
-        };
-
-        let block_stride = self.block_stride();
-        let layer_stride = self.layer_stride();
-        let head_stride = self.head_stride();
-        let head_dim = self.head_dim;
-        let num_heads = self.num_heads;
-
-        // Lazily grow storage to cover the highest new block id before mutably
-        // borrowing seq (borrow checker constraint).
-        if let Some(&max_block_id) = new_blocks.iter().max() {
-            let needed_storage = (max_block_id + 1) * block_stride;
-            if self.key_storage.len() < needed_storage {
-                self.key_storage.resize(needed_storage, f16::ZERO);
-                self.value_storage.resize(needed_storage, f16::ZERO);
-            }
-        }
-
-        let seq = self.sequences.get_mut(&sequence_id).unwrap();
-        seq.blocks = new_blocks.into();
-        seq.packed_layers[layer_index] = None;
-
-        for h in 0..num_heads {
-            for pos in 0..length {
-                let logical_block = pos / block_size;
-                let token_in_block = pos % block_size;
-                let block = *seq.blocks.get(logical_block).unwrap();
-                let src = h * key.max_seq_len * head_dim + pos * head_dim;
-                let dst = block * block_stride
-                    + layer_index * layer_stride
-                    + h * head_stride
-                    + token_in_block * head_dim;
-                let src_end = src + head_dim;
-                let dst_end = dst + head_dim;
-                self.key_storage[dst..dst_end].copy_from_slice(&key.data[src..src_end]);
-                self.value_storage[dst..dst_end].copy_from_slice(&value.data[src..src_end]);
-            }
-        }
-        seq.current_len = length;
-    }
-
     pub fn remove_sequence(&mut self, sequence_id: u64) {
         if let Some(seq) = self.sequences.remove(&sequence_id) {
             // free_block clears each block's radix registration when its last
@@ -1857,35 +1770,9 @@ impl PagedKvCache {
     }
 
     pub fn get_layer_as_onnx(&mut self, sequence_id: u64, layer: usize) -> Option<Array4<f16>> {
+        let (num_heads, head_dim) = (self.num_heads, self.head_dim);
         let view = self.get_layer_view(sequence_id, layer)?;
-        let seq_len = view.length;
-
-        let stride = self.num_heads * self.head_dim;
-        if stride == 0 || view.key.len() % stride != 0 {
-            return None;
-        }
-        let max_seq_len = view.key.len() / stride;
-        if seq_len > max_seq_len {
-            return None;
-        }
-
-        let total = self.num_heads * seq_len * self.head_dim;
-        let mut packed = vec![f16::ZERO; total];
-        for h in 0..self.num_heads {
-            let head_offset = h * max_seq_len * self.head_dim;
-            let packed_offset = h * seq_len * self.head_dim;
-            for pos in 0..seq_len {
-                let src = head_offset + pos * self.head_dim;
-                let dst = packed_offset + pos * self.head_dim;
-                let src_end = src + self.head_dim;
-                let dst_end = dst + self.head_dim;
-                if src_end <= view.key.len() {
-                    packed[dst..dst_end].copy_from_slice(&view.key[src..src_end]);
-                }
-            }
-        }
-
-        Array4::from_shape_vec((1, self.num_heads, seq_len, self.head_dim), packed).ok()
+        pack_layer_view_as_onnx(&view, num_heads, head_dim)
     }
 
     pub fn stats(&self) -> KvCacheStats {
@@ -2019,20 +1906,6 @@ impl KvCache {
         0
     }
 
-    /// Attempt to restore an offloaded sequence from CPU memory back to GPU.
-    ///
-    /// Returns `true` if the sequence was successfully restored. The next call
-    /// to `allocate_sequence` for the same ID will see it as already present.
-    /// No-op in dense mode.
-    pub fn restore_offloaded_sequence(&mut self, sequence_id: u64) -> bool {
-        if let KvCacheInner::Paged(cache) = &mut self.inner {
-            return cache
-                .restore_offloaded_sequence_inner(sequence_id)
-                .is_some();
-        }
-        false
-    }
-
     pub fn rollback_sequence(&mut self, sequence_id: u64, length: usize) {
         match &mut self.inner {
             KvCacheInner::Dense(cache) => cache.rollback_sequence(sequence_id, length),
@@ -2146,24 +2019,6 @@ impl KvCache {
         match &mut self.inner {
             KvCacheInner::Dense(cache) => cache.advance_sequence_by(sequence_id, delta),
             KvCacheInner::Paged(cache) => cache.advance_sequence_by(sequence_id, delta),
-        }
-    }
-
-    pub fn overwrite_layer(
-        &mut self,
-        sequence_id: u64,
-        layer_index: usize,
-        key: &KvTensor,
-        value: &KvTensor,
-        length: usize,
-    ) {
-        match &mut self.inner {
-            KvCacheInner::Dense(cache) => {
-                cache.overwrite_layer(sequence_id, layer_index, key, value, length)
-            }
-            KvCacheInner::Paged(cache) => {
-                cache.overwrite_layer(sequence_id, layer_index, key, value, length)
-            }
         }
     }
 

@@ -1,4 +1,5 @@
 pub mod cron_scheduler;
+
 pub mod gpu_executor;
 pub mod mesh_routing;
 pub mod priority;
@@ -15,13 +16,32 @@ pub use request_metadata::{determine_priority, RequestMetadata};
 pub use scheduler::{QueueOverflowPolicy, Scheduler};
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    use kapsl_engine_api::{BinaryTensorPacket, InferenceRequest, TensorDtype};
+
+    /// A minimal single-element f32 request, shared by the scheduler tests.
+    pub(crate) fn make_request() -> InferenceRequest {
+        InferenceRequest {
+            input: BinaryTensorPacket {
+                shape: vec![1, 1],
+                dtype: TensorDtype::Float32,
+                data: vec![0, 0, 0, 0],
+            },
+            additional_inputs: Vec::new(),
+            session_id: None,
+            metadata: None,
+            cancellation: None,
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use crate::priority::Priority;
     use crate::scheduler::Scheduler;
+    use crate::test_support::make_request;
     use async_trait::async_trait;
-    use kapsl_engine_api::{
-        BinaryTensorPacket, Engine, EngineError, InferenceRequest, TensorDtype,
-    };
+    use kapsl_engine_api::{BinaryTensorPacket, Engine, EngineError, InferenceRequest};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -79,20 +99,6 @@ mod tests {
 
         fn health_check(&self) -> Result<(), EngineError> {
             Ok(()) // Mock is always healthy
-        }
-    }
-
-    fn make_request() -> InferenceRequest {
-        InferenceRequest {
-            input: BinaryTensorPacket {
-                shape: vec![1, 1],
-                dtype: TensorDtype::Float32,
-                data: vec![0, 0, 0, 0],
-            },
-            additional_inputs: Vec::new(),
-            session_id: None,
-            metadata: None,
-            cancellation: None,
         }
     }
 

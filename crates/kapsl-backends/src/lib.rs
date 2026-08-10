@@ -1,4 +1,5 @@
 pub mod engine_pool;
+mod env_util;
 pub mod factory;
 #[cfg(feature = "gguf-native")]
 pub mod gguf_native;
@@ -13,6 +14,7 @@ pub mod onnx_transcribe;
 pub mod ort_pool_allocator;
 pub mod preprocess;
 mod provider_compat;
+mod tensor_util;
 
 pub use engine_pool::{EnginePool, EnginePoolConfig};
 pub use factory::{BackendFactory, OnnxRuntimeTuning};

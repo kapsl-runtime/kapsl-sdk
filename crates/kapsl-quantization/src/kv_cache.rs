@@ -84,17 +84,6 @@ impl KvCacheQuantizer {
         }
     }
 
-    /// Create a new quantizer with an explicit rotation seed.
-    pub fn with_rotation_seed(config: KvCacheConfig, rotation_seed: u64, qjl_seed: u64) -> Self {
-        let tq_config = TurboQuantConfig::new(config.bits, config.head_dim)
-            .expect("KvCacheConfig already validated bits and head_dim")
-            .with_seed(rotation_seed);
-        Self {
-            inner: QuantizedKVCache::new(tq_config, config.num_layers, qjl_seed),
-            config,
-        }
-    }
-
     /// Append a single key-value pair to `layer`.
     pub fn push(&mut self, layer: usize, key: &[f32], value: &[f32]) -> Result<()> {
         self.inner

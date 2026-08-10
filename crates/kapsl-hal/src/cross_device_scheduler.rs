@@ -194,6 +194,21 @@ mod inner {
             self.device_pools.entry(device_id).or_default().push(pool);
         }
 
+        /// Unregister one geometry view without disturbing other models on the
+        /// same device. Pool identity is pointer-based because two views may
+        /// legitimately have identical geometry and capacity.
+        pub fn unregister_pool(&mut self, device_id: usize, pool: &Arc<GpuBlockPool>) {
+            let remove_device = if let Some(pools) = self.device_pools.get_mut(&device_id) {
+                pools.retain(|registered| !Arc::ptr_eq(registered, pool));
+                pools.is_empty()
+            } else {
+                false
+            };
+            if remove_device {
+                self.device_pools.remove(&device_id);
+            }
+        }
+
         /// Remove all pools for a device (e.g. on hot-unplug or shutdown).
         pub fn unregister_device(&mut self, device_id: usize) {
             self.device_pools.remove(&device_id);
@@ -268,142 +283,6 @@ mod inner {
             }
 
             Err(SchedulerError::InsufficientCapacity { blocks_needed, kv_heads, head_dim })
-        }
-
-        /// Reserve blocks with prefix cache lookup.
-        ///
-        /// 1. Looks up `prefix_hashes` in the cache, collecting a contiguous
-        ///    leading run of hits and incrementing their refcounts.
-        /// 2. Prefers the device that holds the most prefix hits.
-        /// 3. Allocates `additional_blocks` new blocks on that device.
-        /// 4. Returns a combined block list: cached prefix blocks first, then
-        ///    the newly allocated blocks.
-        ///
-        /// The session is recorded with `n_prefix_blocks = n_hits` so that
-        /// `release_session` decrements cache refcounts rather than freeing
-        /// those GPU blocks.
-        pub fn reserve_with_prefix(
-            &mut self,
-            session_id: u64,
-            model_fingerprint: u64,
-            prefix_hashes: &[u64],
-            additional_blocks: usize,
-            preferred_device: Option<usize>,
-            kv_heads: usize,
-            head_dim: usize,
-        ) -> Result<PrefixReserveResult, SchedulerError> {
-            // 1. Prefix cache lookup.
-            let hits: Vec<CachedBlockRef> = match &mut self.prefix_cache {
-                Some(cache) => cache.lookup(model_fingerprint, prefix_hashes),
-                None        => vec![],
-            };
-            let n_hits = hits.len();
-
-            // 2. Determine target device.
-            let target_device = if n_hits > 0 {
-                let mut counts: HashMap<usize, usize> = HashMap::new();
-                for h in &hits { *counts.entry(h.device_id).or_insert(0) += 1; }
-                counts.into_iter().max_by_key(|(_, c)| *c).map(|(d, _)| d).unwrap()
-            } else {
-                preferred_device
-                    .or_else(|| {
-                        self.device_pools.iter()
-                            .max_by_key(|(_, ps)| {
-                                ps.iter()
-                                    .filter(|p| p.is_compatible(kv_heads, head_dim))
-                                    .map(|p| p.free_count())
-                                    .sum::<usize>()
-                            })
-                            .map(|(&d, _)| d)
-                    })
-                    .ok_or(SchedulerError::InsufficientCapacity {
-                        blocks_needed: additional_blocks, kv_heads, head_dim,
-                    })?
-            };
-
-            // 3. Allocate additional blocks.
-            let new_result = {
-                let r = self.try_reserve_on(target_device, additional_blocks, kv_heads, head_dim)?;
-                if let Some(r) = r {
-                    r
-                } else {
-                    self.evict_until_capacity(target_device, additional_blocks, kv_heads, head_dim)?;
-                    self.try_reserve_on(target_device, additional_blocks, kv_heads, head_dim)?
-                        .ok_or(SchedulerError::InsufficientCapacity {
-                            blocks_needed: additional_blocks, kv_heads, head_dim,
-                        })?
-                }
-            };
-
-            // 4. Build combined block list and register session.
-            // Pure-Rust path: each cached ref has exactly one block_id (single-block layout).
-            let mut all_blocks: Vec<u32>  = hits.iter()
-                .filter_map(|h| h.block_ids.first().copied())
-                .collect();
-            let prefix_hash_vec: Vec<u64> = hits.iter().map(|h| h.block_hash).collect();
-            let pool      = new_result.pool.clone();
-            let device_id = new_result.device_id;
-            all_blocks.extend_from_slice(&new_result.blocks);
-
-            self.record_session(
-                session_id, device_id, pool.clone(), all_blocks.clone(),
-                kv_heads, head_dim,
-                n_hits, prefix_hash_vec, model_fingerprint,
-            );
-
-            Ok(PrefixReserveResult { device_id, pool, blocks: all_blocks, n_prefix_hits: n_hits })
-        }
-
-        /// Donate a session's computed KV blocks to the prefix cache.
-        ///
-        /// Transfers ownership of `blocks[n_already_prefix..n_already_prefix + n_blocks]`
-        /// from the session to the prefix cache (refcount = 1 while the session is
-        /// still live).  When `release_session` is called, refcounts drop to 0 and
-        /// the blocks become eligible for LRU eviction — but the GPU memory is
-        /// retained for future sessions with the same prefix.
-        ///
-        /// `hashes` must be the chained block hashes for the blocks being promoted,
-        /// in order.  Blocks for which `cache.insert` fails (cache full, all
-        /// entries live) are silently skipped — the session still owns them and
-        /// they will be freed on `release_session`.
-        pub fn promote_to_prefix_cache(
-            &mut self,
-            session_id: u64,
-            model_fingerprint: u64,
-            n_blocks: usize,
-            hashes: &[u64],
-        ) {
-            let Some(state) = self.sessions.get(&session_id) else { return };
-            let KvTier::Gpu { device_id } = state.tier else { return };
-            let Some(pool) = state.pool.clone() else { return };
-            let already     = state.n_prefix_blocks;
-            let promote_end = (already + n_blocks).min(state.blocks.len());
-            let blocks_copy: Vec<u32> = state.blocks[already..promote_end].to_vec();
-
-            let Some(cache) = &mut self.prefix_cache else { return };
-
-            let mut promoted = 0usize;
-            for (i, &block_id) in blocks_copy.iter().enumerate() {
-                let Some(&hash) = hashes.get(i) else { break };
-                // Pure-Rust path: one physical block per logical position (vec of length 1).
-                // Ownership transfers to the cache only on Inserted; on
-                // AlreadyPresent/Rejected the session keeps the block (freed on
-                // release_session), exactly as documented above.
-                match cache.insert(model_fingerprint, hash, device_id, pool.clone(), vec![block_id], 1) {
-                    crate::prefix_cache::PrefixInsert::Inserted => promoted += 1,
-                    _ => break,
-                }
-            }
-
-            if promoted == 0 { return; }
-
-            let state = self.sessions.get_mut(&session_id).unwrap();
-            let new_n   = already + promoted;
-            let mut new_hashes = state.prefix_hashes.clone();
-            new_hashes.extend_from_slice(&hashes[..promoted]);
-            state.n_prefix_blocks   = new_n;
-            state.prefix_hashes     = new_hashes;
-            state.model_fingerprint = model_fingerprint;
         }
 
         /// Release all blocks held by a session (GPU or CPU).
@@ -545,69 +424,6 @@ mod inner {
             Ok(())
         }
 
-        /// Move a session from one GPU to another via host memory.
-        ///
-        /// Prefix-borrowed blocks are copied to the new device (the KV data is
-        /// preserved), but their cache borrows are released and the copies become
-        /// owned by the session.  This avoids cross-device dangling references
-        /// into the prefix cache.
-        pub fn migrate_session(
-            &mut self,
-            session_id: u64,
-            target_device: usize,
-        ) -> Result<(), SchedulerError> {
-            let state = self.sessions.get(&session_id)
-                .ok_or(SchedulerError::SessionNotFound(session_id))?;
-
-            let KvTier::Gpu { device_id: src_device } = state.tier else {
-                return Err(SchedulerError::SessionNotFound(session_id));
-            };
-            if src_device == target_device { return Ok(()); }
-
-            let n_blocks      = state.blocks.len();
-            let n_prefix      = state.n_prefix_blocks;
-            let src_pool      = state.pool.clone().unwrap();
-            let src_blocks    = state.blocks.clone();
-            let prefix_hashes = state.prefix_hashes.clone();
-            let model_fp      = state.model_fingerprint;
-            let (kv_heads, head_dim) = state.kv_geom;
-
-            let result = self.try_reserve_on(target_device, n_blocks, kv_heads, head_dim)?
-                .ok_or(SchedulerError::InsufficientCapacity {
-                    blocks_needed: n_blocks, kv_heads, head_dim,
-                })?;
-
-            for (i, (&src_blk, &dst_blk)) in src_blocks.iter().zip(&result.blocks).enumerate() {
-                src_pool.copy_block_to_pool(src_blk, &result.pool, dst_blk)?;
-                // Only free source blocks that are owned by this session.
-                // Prefix-borrowed blocks belong to the cache — release the
-                // borrow below instead of freeing.
-                if i >= n_prefix {
-                    src_pool.free_block(src_blk);
-                }
-            }
-
-            // Release prefix borrows now that data is safe on the new device.
-            if let Some(cache) = &mut self.prefix_cache {
-                for &hash in &prefix_hashes {
-                    cache.release(model_fp, hash);
-                }
-            }
-
-            let state = self.sessions.get_mut(&session_id).unwrap();
-            state.tier            = KvTier::Gpu { device_id: target_device };
-            state.pool            = Some(result.pool);
-            state.blocks          = result.blocks;
-            state.n_prefix_blocks = 0;   // all blocks now fully owned by this session
-            state.prefix_hashes   = vec![];
-
-            log::info!(
-                "[xdev-sched] migrated session {} GPU {}→{} ({} blocks)",
-                session_id, src_device, target_device, n_blocks,
-            );
-            Ok(())
-        }
-
         // ── Pressure / metrics ────────────────────────────────────────────────
 
         /// Pool utilisation on a device (0.0 = empty, 1.0 = full).
@@ -643,10 +459,6 @@ mod inner {
                 .filter(|s| s.tier == KvTier::Gpu { device_id })
                 .count()
         }
-        pub fn prefix_cache_size(&self) -> usize {
-            self.prefix_cache.as_ref().map_or(0, |c| c.entry_count())
-        }
-
         // ── Internal helpers ──────────────────────────────────────────────────
 
         fn try_reserve_on(
@@ -782,6 +594,22 @@ mod inner {
             // CPU store was created for this geometry.
             let free = s.device_free_blocks(0, pool.num_kv_heads(), pool.head_dim());
             assert_eq!(free, pool.total_blocks());
+        }
+
+        #[test]
+        fn unregister_pool_removes_only_the_matching_view() {
+            let mut s = sched();
+            let first = small_pool();
+            let second = small_pool();
+            s.register_pool(0, first.clone());
+            s.register_pool(0, second.clone());
+
+            s.unregister_pool(0, &first);
+            assert_eq!(s.registered_devices(), vec![0]);
+            assert_eq!(s.device_free_blocks(0, second.num_kv_heads(), second.head_dim()), 8);
+
+            s.unregister_pool(0, &second);
+            assert!(s.registered_devices().is_empty());
         }
 
         #[test]
