@@ -104,6 +104,40 @@ pub struct OwnerQuota {
     pub max_bytes: usize,
 }
 
+/// Point-in-time usage and admission state for one known pool owner.
+///
+/// `allocatable_bytes` is the largest alignment-1 allocation the owner can
+/// make immediately. It accounts for the owner's maximum, other admitted
+/// owners' protected guarantees, and the largest currently-free range.
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolOwnerSnapshot {
+    pub owner: PoolOwner,
+    pub usage_bytes: usize,
+    pub guaranteed_bytes: usize,
+    pub max_bytes: usize,
+    pub admitted: bool,
+    pub allocatable_bytes: usize,
+}
+
+/// Consistent point-in-time view of a [`GpuDevicePool`].
+///
+/// Fragmentation is the fraction of free bytes that are not in the largest
+/// free range: `1 - largest_free_range_bytes / free_bytes`. It is defined as
+/// zero when the pool has no free bytes.
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, PartialEq)]
+pub struct GpuDevicePoolSnapshot {
+    pub capacity_bytes: usize,
+    pub allocated_bytes: usize,
+    pub live_allocation_count: usize,
+    pub free_bytes: usize,
+    pub free_range_count: usize,
+    pub largest_free_range_bytes: usize,
+    pub fragmentation_ratio: f64,
+    pub owners: Vec<PoolOwnerSnapshot>,
+}
+
 /// Reservation policy for a device pool.
 ///
 /// Guarantees are protected only for admitted owners. This permits elastic
@@ -323,6 +357,10 @@ impl AlignedRangeAllocator {
         self.free.values().copied().sum()
     }
 
+    fn largest_free_range_bytes(&self) -> usize {
+        self.free.values().copied().max().unwrap_or(0)
+    }
+
     fn max_allocatable_units(&self, unit_bytes: usize, alignment: usize) -> usize {
         if unit_bytes == 0 || alignment == 0 {
             return 0;
@@ -345,6 +383,72 @@ impl AlignedRangeAllocator {
                 }
             })
             .fold(0usize, usize::saturating_add)
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn pool_owner_sort_key(owner: PoolOwner) -> (u8, u32) {
+    match owner {
+        PoolOwner::Onnx => (0, 0),
+        PoolOwner::GgufKv { model_id } => (1, model_id),
+        PoolOwner::NativeKv { model_id } => (2, model_id),
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn build_device_pool_snapshot(
+    policy: &PoolPolicy,
+    allocator: &AlignedRangeAllocator,
+) -> GpuDevicePoolSnapshot {
+    let free_bytes = allocator.free_bytes();
+    let largest_free_range_bytes = allocator.largest_free_range_bytes();
+    let fragmentation_ratio = if free_bytes == 0 {
+        0.0
+    } else {
+        1.0 - largest_free_range_bytes as f64 / free_bytes as f64
+    };
+
+    // Quota entries may intentionally outlive a model unload. Only surface
+    // owners that are currently admitted, using bytes, or holding a live
+    // range so stale per-model metric series can be retired.
+    let mut owners: HashSet<PoolOwner> = policy.admitted.iter().copied().collect();
+    owners.extend(
+        policy
+            .usage
+            .iter()
+            .filter_map(|(&owner, &usage)| (usage != 0).then_some(owner)),
+    );
+    owners.extend(allocator.live.values().map(GpuAllocation::owner));
+    let mut owners: Vec<_> = owners.into_iter().collect();
+    owners.sort_unstable_by_key(|owner| pool_owner_sort_key(*owner));
+    let owners = owners
+        .into_iter()
+        .map(|owner| {
+            let quota = policy.quota(owner);
+            PoolOwnerSnapshot {
+                owner,
+                usage_bytes: policy.usage_bytes(owner),
+                guaranteed_bytes: quota.guaranteed_bytes,
+                max_bytes: quota.max_bytes,
+                admitted: policy.admitted.contains(&owner),
+                // With byte alignment, the largest range is the physical
+                // upper bound for one allocation. Policy may lower it further.
+                allocatable_bytes: policy
+                    .available_for(owner, free_bytes)
+                    .min(largest_free_range_bytes),
+            }
+        })
+        .collect();
+
+    GpuDevicePoolSnapshot {
+        capacity_bytes: allocator.capacity,
+        allocated_bytes: allocator.capacity.saturating_sub(free_bytes),
+        live_allocation_count: allocator.live.len(),
+        free_bytes,
+        free_range_count: allocator.free.len(),
+        largest_free_range_bytes,
+        fragmentation_ratio,
+        owners,
     }
 }
 
@@ -498,6 +602,17 @@ impl GpuDevicePool {
 
     pub fn free_bytes(&self) -> usize {
         self.allocator.lock().unwrap().free_bytes()
+    }
+
+    /// Capture pool geometry, allocation, fragmentation, and per-owner policy
+    /// state from one instant.
+    ///
+    /// Policy is locked before the allocator, matching all pool operations, so
+    /// owner usage and live ranges cannot come from different mutations.
+    pub fn snapshot(&self) -> GpuDevicePoolSnapshot {
+        let policy = self.policy.lock().unwrap();
+        let allocator = self.allocator.lock().unwrap();
+        build_device_pool_snapshot(&policy, &allocator)
     }
 
     /// Maximum number of `unit_bytes` allocations currently possible for an
@@ -1234,6 +1349,95 @@ mod tests {
         assert_eq!(policy.available_for(gguf, 120), 120);
         policy.set_admitted(onnx, true);
         assert_eq!(policy.available_for(gguf, 120), 90);
+    }
+
+    #[test]
+    fn device_pool_snapshot_reports_fragmentation_and_owner_state() {
+        let onnx = PoolOwner::Onnx;
+        let gguf = PoolOwner::GgufKv { model_id: 7 };
+        let mut allocator = AlignedRangeAllocator::new(1_000);
+        let first = allocator.alloc(1, onnx, 200, 1).unwrap();
+        let middle = allocator.alloc(1, gguf, 200, 1).unwrap();
+        let third = allocator.alloc(1, onnx, 200, 1).unwrap();
+
+        let mut policy = PoolPolicy::new(1_000);
+        policy.set_quota(onnx, 300, 700).unwrap();
+        policy.set_quota(gguf, 200, 600).unwrap();
+        policy.set_admitted(onnx, true);
+        policy.set_admitted(gguf, true);
+        policy.account_alloc(onnx, first.bytes() + third.bytes());
+        policy.account_alloc(gguf, middle.bytes());
+
+        allocator.free(&middle).unwrap();
+        policy.account_free(gguf, middle.bytes());
+
+        let snapshot = build_device_pool_snapshot(&policy, &allocator);
+        assert_eq!(snapshot.capacity_bytes, 1_000);
+        assert_eq!(snapshot.allocated_bytes, 400);
+        assert_eq!(snapshot.live_allocation_count, 2);
+        assert_eq!(snapshot.free_bytes, 600);
+        assert_eq!(snapshot.free_range_count, 2);
+        assert_eq!(snapshot.largest_free_range_bytes, 400);
+        assert!((snapshot.fragmentation_ratio - (1.0 / 3.0)).abs() < f64::EPSILON);
+        assert_eq!(
+            snapshot.owners,
+            vec![
+                PoolOwnerSnapshot {
+                    owner: onnx,
+                    usage_bytes: 400,
+                    guaranteed_bytes: 300,
+                    max_bytes: 700,
+                    admitted: true,
+                    allocatable_bytes: 300,
+                },
+                PoolOwnerSnapshot {
+                    owner: gguf,
+                    usage_bytes: 0,
+                    guaranteed_bytes: 200,
+                    max_bytes: 600,
+                    admitted: true,
+                    allocatable_bytes: 400,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn device_pool_snapshot_defines_full_pool_fragmentation_as_zero() {
+        let owner = PoolOwner::NativeKv { model_id: 11 };
+        let mut allocator = AlignedRangeAllocator::new(64);
+        let allocation = allocator.alloc(1, owner, 64, 1).unwrap();
+        let mut policy = PoolPolicy::new(64);
+        policy.account_alloc(owner, allocation.bytes());
+
+        let snapshot = build_device_pool_snapshot(&policy, &allocator);
+        assert_eq!(snapshot.allocated_bytes, 64);
+        assert_eq!(snapshot.live_allocation_count, 1);
+        assert_eq!(snapshot.free_bytes, 0);
+        assert_eq!(snapshot.free_range_count, 0);
+        assert_eq!(snapshot.largest_free_range_bytes, 0);
+        assert_eq!(snapshot.fragmentation_ratio, 0.0);
+        assert_eq!(snapshot.owners.len(), 1);
+        assert_eq!(snapshot.owners[0].owner, owner);
+        assert_eq!(snapshot.owners[0].allocatable_bytes, 0);
+    }
+
+    #[test]
+    fn device_pool_snapshot_omits_inactive_quota_only_owner() {
+        let owner = PoolOwner::GgufKv { model_id: 23 };
+        let allocator = AlignedRangeAllocator::new(256);
+        let mut policy = PoolPolicy::new(256);
+        policy.set_quota(owner, 64, 128).unwrap();
+        policy.set_admitted(owner, true);
+        assert_eq!(
+            build_device_pool_snapshot(&policy, &allocator).owners[0].owner,
+            owner
+        );
+
+        policy.set_admitted(owner, false);
+        assert!(build_device_pool_snapshot(&policy, &allocator)
+            .owners
+            .is_empty());
     }
 
     // A tiny pool: 8 blocks, 4 tokens/block, 2 KV heads, 8-dim.
