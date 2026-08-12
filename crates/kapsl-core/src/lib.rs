@@ -3,6 +3,7 @@ pub mod engine_kind;
 pub mod loader;
 pub mod model_registry;
 pub mod provider_pack;
+pub mod provider_policy;
 pub mod requirements;
 
 pub use auto_scaler::{AutoScaler, ScalingPolicy};
@@ -13,4 +14,5 @@ pub use provider_pack::{
     accelerator_provider_pack_installed, AcceleratorProviderPack, ALLOW_UNMANAGED_PROVIDERS_ENV,
     PROVIDER_PATH_ENV,
 };
+pub use provider_policy::{ProviderPolicy, PROVIDER_POLICY_ENV};
 pub use requirements::HardwareRequirements;

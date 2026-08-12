@@ -4,11 +4,11 @@ use prometheus::{Encoder, Registry, TextEncoder};
 use std::sync::Arc;
 
 #[test]
-fn set_kv_cache_metrics_exports_cpu_offload_blocks() {
+fn set_engine_metrics_exports_cache_and_session_fields() {
     let registry = Arc::new(Registry::new());
     let metrics = KapslMetrics::new(&registry);
 
-    metrics.set_kv_cache_metrics(
+    metrics.set_engine_metrics(
         "model-7",
         &EngineMetrics {
             kv_cache_bytes_used: 1024,

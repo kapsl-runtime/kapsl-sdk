@@ -7,6 +7,7 @@ use crate::native::NativeBackend;
 use kapsl_core::loader::Manifest;
 use kapsl_core::EngineKind;
 use kapsl_core::HardwareRequirements;
+use kapsl_core::ProviderPolicy;
 use kapsl_engine_api::Engine;
 #[cfg(any(feature = "gguf-native", feature = "native", feature = "gguf-cuda-shared-kv"))]
 use kapsl_hal::gpu_arena::GpuDevicePool;
@@ -242,16 +243,8 @@ impl BackendFactory {
         providers.push(provider.to_string());
     }
 
-    fn provider_policy() -> String {
-        std::env::var("KAPSL_PROVIDER_POLICY")
-            .or_else(|_| std::env::var("KAPSL_PROVIDER_POLICY"))
-            .unwrap_or_else(|_| "fastest".to_string())
-            .trim()
-            .to_ascii_lowercase()
-    }
-
     fn should_append_fastest_candidates(providers: &[String]) -> bool {
-        if Self::provider_policy() == "manifest" {
+        if ProviderPolicy::from_env().uses_manifest() {
             return false;
         }
 
@@ -328,7 +321,7 @@ impl BackendFactory {
         // ONNX generative path (LLMBackend): autoregressive decode over an ONNX graph.
         if engine_kind.is_onnx_generate() {
             let requirements = &manifest.hardware_requirements;
-            if Self::provider_policy() == "manifest" {
+            if ProviderPolicy::from_env().uses_manifest() {
                 if let Some(provider) = requirements.preferred_provider.clone() {
                     let device_id = requirements.device_id.unwrap_or(0);
                     log::info!(
@@ -448,7 +441,7 @@ impl BackendFactory {
 
         // ONNX generative path (LLMBackend): autoregressive decode over an ONNX graph.
         if engine_kind.is_onnx_generate() {
-            if Self::provider_policy() == "manifest" {
+            if ProviderPolicy::from_env().uses_manifest() {
                 log::info!(
                     "✓ Using LLMBackend with manifest provider override: {}",
                     provider

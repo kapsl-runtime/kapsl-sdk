@@ -15,7 +15,7 @@ use crate::sequence::{
     FinishReason, SamplingParams, Sequence, SequenceGroup, SequenceGroupOutput, SequenceStatus,
 };
 use half::f16;
-use kapsl_core::{accelerator_provider_pack_installed, AcceleratorProviderPack};
+use kapsl_core::{accelerator_provider_pack_installed, AcceleratorProviderPack, ProviderPolicy};
 use kapsl_engine_api::EngineError;
 use kapsl_hal::kernel::KernelBackend;
 use ndarray::{Array2, Array4, ArrayD, IxDyn};
@@ -300,12 +300,6 @@ fn round_up_to_granularity(value: usize, granularity: usize) -> usize {
         .checked_div(granularity)
         .unwrap_or(0)
         .saturating_mul(granularity)
-}
-
-fn llm_provider_policy() -> String {
-    env_var_alias("KAPSL_PROVIDER_POLICY", "KAPSL_PROVIDER_POLICY")
-        .unwrap_or_else(|| "fastest".to_string())
-        .to_ascii_lowercase()
 }
 
 fn llm_provider_available(provider: &str) -> bool {
@@ -1646,7 +1640,7 @@ impl LLMEngine {
                 preferred_device_id
             );
         }
-        if self.provider_override.is_none() && llm_provider_policy() != "manifest" {
+        if self.provider_override.is_none() && ProviderPolicy::from_env().uses_fastest() {
             let provider_is_cpu_or_missing = preferred_provider
                 .as_deref()
                 .map(|provider| provider.trim().eq_ignore_ascii_case("cpu"))

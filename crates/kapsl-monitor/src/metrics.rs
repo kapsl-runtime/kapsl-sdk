@@ -484,7 +484,13 @@ impl KapslMetrics {
         }
     }
 
-    pub fn set_kv_cache_metrics(&self, model: &str, metrics: &kapsl_engine_api::EngineMetrics) {
+    /// Export the cache, token, health, and session-pool fields from one engine
+    /// snapshot to their model-scoped Prometheus collectors.
+    ///
+    /// This is the canonical [`EngineMetrics`](kapsl_engine_api::EngineMetrics)
+    /// mapping for those collectors. Runtime callers should pass the complete
+    /// snapshot here rather than assigning individual collectors themselves.
+    pub fn set_engine_metrics(&self, model: &str, metrics: &kapsl_engine_api::EngineMetrics) {
         self.kv_cache_bytes_used
             .with_label_values(&[model])
             .set(metrics.kv_cache_bytes_used as i64);
@@ -545,6 +551,11 @@ impl KapslMetrics {
         self.onnx_session_pool_wait_seconds_total
             .with_label_values(&[model])
             .set(metrics.onnx_session_pool_wait_seconds_total);
+    }
+
+    /// Backwards-compatible name for [`Self::set_engine_metrics`].
+    pub fn set_kv_cache_metrics(&self, model: &str, metrics: &kapsl_engine_api::EngineMetrics) {
+        self.set_engine_metrics(model, metrics);
     }
 }
 
