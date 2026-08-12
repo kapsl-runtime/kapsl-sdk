@@ -1,16 +1,16 @@
 use kapsl_engine_api::TensorDtype;
-use kapsl_ipc::protocol::{
-    HybridRequest, HybridResponse, RequestHeader, OP_HYBRID_INFER, STATUS_OK,
-};
+use kapsl_ipc::protocol::{HybridRequest, HybridResponse};
 use kapsl_shm::allocator::{ShmPoolAllocator, TieredShmAllocator};
 use kapsl_shm::memory::{ShmManager, TensorHeader};
+use kapsl_transport::protocol::{
+    asynchronous, DEFAULT_MAX_FRAME_PAYLOAD_BYTES, OP_HYBRID_INFER, STATUS_OK,
+};
 use kapsl_transport::RequestMetadata;
 use pyo3::prelude::*;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(windows)]
 use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient, PipeMode};
 #[cfg(unix)]
@@ -126,45 +126,22 @@ impl KapslHybridClient {
                 }
                 let stream = guard.as_mut().unwrap();
 
-                // Serialize payload
-                let payload = bincode::serialize(&request).map_err(std::io::Error::other)?;
+                asynchronous::write_request_value(stream, 0, OP_HYBRID_INFER, &request)
+                    .await
+                    .map_err(std::io::Error::other)?;
 
-                // Send Header
-                let header = RequestHeader {
-                    model_id: 0, // Default model ID 0
-                    op_code: OP_HYBRID_INFER,
-                    payload_size: payload.len() as u32,
-                };
+                let response =
+                    asynchronous::read_response_frame(stream, DEFAULT_MAX_FRAME_PAYLOAD_BYTES)
+                        .await
+                        .map_err(std::io::Error::other)?;
 
-                stream.write_all(&header.model_id.to_le_bytes()).await?;
-                stream.write_all(&header.op_code.to_le_bytes()).await?;
-                stream.write_all(&header.payload_size.to_le_bytes()).await?;
-
-                // Send Payload
-                stream.write_all(&payload).await?;
-
-                // Read Response Header
-                let mut status_buf = [0u8; 4];
-                stream.read_exact(&mut status_buf).await?;
-                let status = u32::from_le_bytes(status_buf);
-
-                let mut size_buf = [0u8; 4];
-                stream.read_exact(&mut size_buf).await?;
-                let payload_size = u32::from_le_bytes(size_buf);
-
-                // Read Payload
-                let mut resp_payload = vec![0u8; payload_size as usize];
-                stream.read_exact(&mut resp_payload).await?;
-
-                if status != STATUS_OK {
-                    let error_msg = String::from_utf8_lossy(&resp_payload).to_string();
-                    return Err(std::io::Error::other(error_msg));
+                if response.header.status != STATUS_OK {
+                    return Err(std::io::Error::other(response.remote_error()));
                 }
 
-                let response: HybridResponse = bincode::deserialize(&resp_payload)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-                Ok(response)
+                response
+                    .deserialize::<HybridResponse>()
+                    .map_err(std::io::Error::other)
             })
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
@@ -195,7 +172,10 @@ unsafe impl Send for RequestSlotLease {}
 
 impl RequestSlotLease {
     fn new(allocator: &TieredShmAllocator, offset: usize) -> Self {
-        Self { allocator: allocator as *const _, offset }
+        Self {
+            allocator: allocator as *const _,
+            offset,
+        }
     }
 }
 

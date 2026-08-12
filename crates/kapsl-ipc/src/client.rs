@@ -1,7 +1,6 @@
 use async_trait::async_trait;
-use kapsl_engine_api::BinaryTensorPacket;
+use kapsl_engine_api::{BinaryTensorPacket, InferenceRequest};
 use kapsl_transport::connection_pool::{ConnectionFactory, ConnectionPool, PoolConfig};
-use kapsl_transport::protocol::infer_over_stream;
 use kapsl_transport::{TransportClient, TransportError};
 
 #[cfg(unix)]
@@ -61,6 +60,25 @@ impl IpcClient {
         let pool = ConnectionPool::new(pool_config, factory);
         Self { pool }
     }
+
+    /// Send a complete inference request, preserving request metadata such as
+    /// authentication, priority, session, and generation settings.
+    pub async fn infer_request(
+        &self,
+        model_id: u32,
+        request: &InferenceRequest,
+    ) -> Result<BinaryTensorPacket, TransportError> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| TransportError::Connection(e.to_string()))?;
+        kapsl_transport::protocol::asynchronous::infer_request_over_stream(
+            &mut *conn, model_id, request,
+        )
+        .await
+        .map_err(TransportError::from)
+    }
 }
 
 #[async_trait]
@@ -70,11 +88,15 @@ impl TransportClient for IpcClient {
         model_id: u32,
         input: BinaryTensorPacket,
     ) -> Result<BinaryTensorPacket, TransportError> {
-        let mut conn = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| TransportError::Connection(e.to_string()))?;
-        infer_over_stream(&mut *conn, model_id, input).await
+        let request = InferenceRequest::new(input);
+        IpcClient::infer_request(self, model_id, &request).await
+    }
+
+    async fn infer_request(
+        &self,
+        model_id: u32,
+        request: &InferenceRequest,
+    ) -> Result<BinaryTensorPacket, TransportError> {
+        IpcClient::infer_request(self, model_id, request).await
     }
 }

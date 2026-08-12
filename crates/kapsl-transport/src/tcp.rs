@@ -1,8 +1,7 @@
 use crate::connection_pool::{ConnectionFactory, ConnectionPool, PoolConfig};
-use crate::protocol::infer_over_stream;
 use crate::{TransportClient, TransportError};
 use async_trait::async_trait;
-use kapsl_engine_api::BinaryTensorPacket;
+use kapsl_engine_api::{BinaryTensorPacket, InferenceRequest};
 use tokio::net::TcpStream;
 
 /// Factory for creating TCP connections
@@ -46,6 +45,23 @@ impl TcpClient {
         let pool = ConnectionPool::new(pool_config, factory);
         Self { pool }
     }
+
+    /// Send a complete request, including authentication and generation
+    /// metadata required by authenticated TCP servers.
+    pub async fn infer_request(
+        &self,
+        model_id: u32,
+        request: &InferenceRequest,
+    ) -> Result<BinaryTensorPacket, TransportError> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|error| TransportError::Connection(error.to_string()))?;
+        crate::protocol::asynchronous::infer_request_over_stream(&mut *conn, model_id, request)
+            .await
+            .map_err(TransportError::from)
+    }
 }
 
 #[async_trait]
@@ -55,11 +71,15 @@ impl TransportClient for TcpClient {
         model_id: u32,
         input: BinaryTensorPacket,
     ) -> Result<BinaryTensorPacket, TransportError> {
-        let mut conn = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| TransportError::Connection(e.to_string()))?;
-        infer_over_stream(&mut *conn, model_id, input).await
+        let request = InferenceRequest::new(input);
+        TcpClient::infer_request(self, model_id, &request).await
+    }
+
+    async fn infer_request(
+        &self,
+        model_id: u32,
+        request: &InferenceRequest,
+    ) -> Result<BinaryTensorPacket, TransportError> {
+        TcpClient::infer_request(self, model_id, request).await
     }
 }

@@ -1,9 +1,8 @@
 #![allow(clippy::useless_conversion)]
 
 use kapsl_engine_api::{BinaryTensorPacket, InferenceRequest, NamedTensor, TensorDtype};
-use kapsl_ipc::{
-    RequestHeader, ResponseHeader, OP_INFER, OP_INFER_STREAM, STATUS_OK, STATUS_STREAM_CHUNK,
-    STATUS_STREAM_END,
+use kapsl_transport::protocol::{
+    blocking, CodecError, StreamResponse, DEFAULT_MAX_FRAME_PAYLOAD_BYTES, OP_INFER_STREAM,
 };
 use pyo3::prelude::*;
 use std::collections::{HashMap, VecDeque};
@@ -58,6 +57,16 @@ enum ClientError {
 impl From<std::io::Error> for ClientError {
     fn from(value: std::io::Error) -> Self {
         Self::Io(value)
+    }
+}
+
+impl From<CodecError> for ClientError {
+    fn from(value: CodecError) -> Self {
+        match value {
+            CodecError::Io(err) => Self::Io(err),
+            CodecError::Remote(message) => Self::Server(message),
+            other => Self::Serialization(other.to_string()),
+        }
     }
 }
 
@@ -393,51 +402,7 @@ impl KapslClient {
         model_id: u32,
         request: &InferenceRequest,
     ) -> Result<BinaryTensorPacket, ClientError> {
-        let input_bytes =
-            bincode::serialize(request).map_err(|e| ClientError::Serialization(e.to_string()))?;
-
-        let header = RequestHeader {
-            model_id,
-            op_code: OP_INFER,
-            payload_size: input_bytes.len() as u32,
-        };
-
-        stream.write_all(&header.model_id.to_le_bytes())?;
-        stream.write_all(&header.op_code.to_le_bytes())?;
-        stream.write_all(&header.payload_size.to_le_bytes())?;
-        stream.write_all(&input_bytes)?;
-        stream.flush()?;
-
-        let mut header_buf = [0u8; 8];
-        stream.read_exact(&mut header_buf)?;
-
-        let resp_header = ResponseHeader {
-            status: u32::from_le_bytes([
-                header_buf[0],
-                header_buf[1],
-                header_buf[2],
-                header_buf[3],
-            ]),
-            payload_size: u32::from_le_bytes([
-                header_buf[4],
-                header_buf[5],
-                header_buf[6],
-                header_buf[7],
-            ]),
-        };
-
-        let mut payload = vec![0u8; resp_header.payload_size as usize];
-        stream.read_exact(&mut payload)?;
-
-        if resp_header.status != STATUS_OK {
-            let error_msg = String::from_utf8_lossy(&payload);
-            return Err(ClientError::Server(error_msg.to_string()));
-        }
-
-        let output: BinaryTensorPacket = bincode::deserialize(&payload)
-            .map_err(|e| ClientError::Serialization(e.to_string()))?;
-
-        Ok(output)
+        blocking::infer_request_over_stream(stream, model_id, request).map_err(ClientError::from)
     }
 
     fn run_infer(
@@ -608,20 +573,9 @@ impl KapslClient {
             metadata,
             cancellation: None,
         };
-        let input_bytes = bincode::serialize(&request)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-
-        let header = RequestHeader {
-            model_id,
-            op_code: OP_INFER_STREAM,
-            payload_size: input_bytes.len() as u32,
-        };
-
-        stream.write_all(&header.model_id.to_le_bytes())?;
-        stream.write_all(&header.op_code.to_le_bytes())?;
-        stream.write_all(&header.payload_size.to_le_bytes())?;
-        stream.write_all(&input_bytes)?;
-        stream.flush()?;
+        blocking::write_request_value(stream.as_mut(), model_id, OP_INFER_STREAM, &request)
+            .map_err(ClientError::from)
+            .map_err(PyErr::from)?;
 
         Ok(StreamIterator { stream })
     }
@@ -639,60 +593,13 @@ impl StreamIterator {
     }
 
     fn __next__(mut slf: PyRefMut<'_, Self>) -> PyResult<Option<Vec<u8>>> {
-        let stream = &mut slf.stream;
-
-        // Read header
-        let mut header_buf = [0u8; 8];
-        match stream.read_exact(&mut header_buf) {
-            Ok(_) => {}
-            Err(e) => {
-                return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                    e.to_string(),
-                ))
-            }
+        match blocking::read_stream_packet(slf.stream.as_mut(), DEFAULT_MAX_FRAME_PAYLOAD_BYTES)
+            .map_err(ClientError::from)
+            .map_err(PyErr::from)?
+        {
+            StreamResponse::Chunk(packet) => Ok(Some(packet.data)),
+            StreamResponse::End => Ok(None),
         }
-
-        let resp_header = ResponseHeader {
-            status: u32::from_le_bytes([
-                header_buf[0],
-                header_buf[1],
-                header_buf[2],
-                header_buf[3],
-            ]),
-            payload_size: u32::from_le_bytes([
-                header_buf[4],
-                header_buf[5],
-                header_buf[6],
-                header_buf[7],
-            ]),
-        };
-
-        if resp_header.payload_size > 0 {
-            let mut payload = vec![0u8; resp_header.payload_size as usize];
-            stream
-                .read_exact(&mut payload)
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-
-            if resp_header.status == STATUS_STREAM_CHUNK {
-                // Deserialize payload to BinaryTensorPacket
-                let packet: BinaryTensorPacket = bincode::deserialize(&payload).map_err(|e| {
-                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
-                })?;
-                return Ok(Some(packet.data));
-            } else if resp_header.status == kapsl_ipc::STATUS_ERR {
-                let error_msg = String::from_utf8_lossy(&payload);
-                return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                    error_msg.to_string(),
-                ));
-            }
-        }
-
-        if resp_header.status == STATUS_STREAM_END {
-            return Ok(None);
-        }
-
-        // If we get here, it's an unexpected status or empty chunk that isn't END
-        Ok(None)
     }
 }
 
@@ -702,4 +609,26 @@ fn kapsl_sdk(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<KapslShmClient>()?;
     m.add_class::<KapslHybridClient>()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codec_io_errors_stay_retryable() {
+        let error = ClientError::from(CodecError::Io(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "stale pooled connection",
+        )));
+
+        assert!(matches!(error, ClientError::Io(_)));
+    }
+
+    #[test]
+    fn remote_codec_errors_remain_server_errors() {
+        let error = ClientError::from(CodecError::Remote("model not found".to_string()));
+
+        assert!(matches!(error, ClientError::Server(message) if message == "model not found"));
+    }
 }

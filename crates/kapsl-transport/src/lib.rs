@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use kapsl_engine_api::BinaryTensorPacket;
+use kapsl_engine_api::{BinaryTensorPacket, InferenceRequest};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -35,7 +35,10 @@ pub enum TransportError {
     ServerError(String),
 }
 
-/// Request metadata shared between transport implementations
+/// Fixed-layout metadata used by shared-memory and hybrid transports.
+///
+/// Stream transports use [`protocol::RequestHeader`] for framing and carry
+/// [`kapsl_engine_api::RequestMetadata`] inside the inference request payload.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct RequestMetadata {
@@ -63,7 +66,8 @@ impl RequestMetadata {
     }
 }
 
-/// Response metadata shared between transport implementations
+/// Fixed-layout response metadata used by shared-memory and hybrid transports.
+/// Stream transports use [`protocol::ResponseHeader`] instead.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ResponseMetadata {
@@ -117,6 +121,17 @@ pub trait TransportClient: Send + Sync {
         model_id: u32,
         input: BinaryTensorPacket,
     ) -> Result<BinaryTensorPacket, TransportError>;
+
+    /// Send a complete inference request. Socket clients override this to
+    /// preserve auth, session, priority, named-input, and generation metadata.
+    /// The default keeps third-party tensor-only transports source compatible.
+    async fn infer_request(
+        &self,
+        model_id: u32,
+        request: &InferenceRequest,
+    ) -> Result<BinaryTensorPacket, TransportError> {
+        self.infer(model_id, request.input.clone()).await
+    }
 
     /// Send streaming inference request
     #[cfg(feature = "streaming")]

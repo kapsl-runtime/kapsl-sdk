@@ -1,16 +1,17 @@
 use crate::protocol::{
-    HybridRequest, HybridResponse, RequestHeader, ResponseHeader, OP_HYBRID_INFER, OP_INFER,
-    OP_INFER_STREAM, STATUS_ERR, STATUS_OK, STATUS_STREAM_CHUNK, STATUS_STREAM_END,
+    HybridRequest, HybridResponse, OP_HYBRID_INFER, OP_INFER, OP_INFER_STREAM, STATUS_ERR,
+    STATUS_OK, STATUS_STREAM_CHUNK, STATUS_STREAM_END,
 };
 use async_trait::async_trait;
-use bincode;
-use kapsl_engine_api::{BinaryTensorPacket, InferenceRequest, NamedTensor, TensorDtype};
+use kapsl_engine_api::{BinaryTensorPacket, InferenceRequest, TensorDtype};
 use kapsl_scheduler::{Priority, ReplicaScheduler};
+use kapsl_transport::protocol::{
+    asynchronous as wire, decode_inference_request, CodecError, DEFAULT_MAX_FRAME_PAYLOAD_BYTES,
+};
 use kapsl_transport::{ResponseMetadata, TransportError, TransportServer};
-use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -23,15 +24,6 @@ use kapsl_shm::memory::{ShmManager, TensorHeader};
 
 pub type SchedulerLookup =
     Arc<dyn Fn(u32) -> Option<Arc<dyn ReplicaScheduler + Send + Sync>> + Send + Sync>;
-
-#[derive(Debug, Deserialize)]
-struct LegacyInferenceRequestV1 {
-    input: BinaryTensorPacket,
-    #[serde(default)]
-    additional_inputs: Vec<NamedTensor>,
-    #[serde(default)]
-    session_id: Option<String>,
-}
 
 fn check_auth(request: &InferenceRequest, expected: Option<&str>) -> Option<String> {
     let Some(expected_token) = expected else {
@@ -60,21 +52,14 @@ fn request_priority(request: &InferenceRequest, default: Priority) -> Priority {
     }
 }
 
-fn decode_inference_request(payload: &[u8]) -> Result<InferenceRequest, String> {
-    match bincode::deserialize::<InferenceRequest>(payload) {
-        Ok(request) => Ok(request),
-        Err(primary_err) => {
-            if let Ok(legacy) = bincode::deserialize::<LegacyInferenceRequestV1>(payload) {
-                return Ok(InferenceRequest {
-                    input: legacy.input,
-                    additional_inputs: legacy.additional_inputs,
-                    session_id: legacy.session_id,
-                    metadata: None,
-                    cancellation: None,
-                });
-            }
-            Err(format!("Deserialization error: {}", primary_err))
-        }
+fn codec_io(error: CodecError) -> std::io::Error {
+    error.into_io_error()
+}
+
+fn inference_decode_message(error: CodecError) -> String {
+    match error {
+        CodecError::Deserialize(message) => format!("Deserialization error: {message}"),
+        other => other.to_string(),
     }
 }
 
@@ -203,83 +188,43 @@ where
     T: AsyncRead + AsyncWrite + Unpin,
 {
     loop {
-        // Read header as raw bytes (not bincode)
-        let mut model_id_buf = [0u8; 4];
-        if connection.read_exact(&mut model_id_buf).await.is_err() {
-            return Ok(()); // Connection closed
-        }
-        let mut op_code_buf = [0u8; 4];
-        connection.read_exact(&mut op_code_buf).await?;
-        let mut payload_size_buf = [0u8; 4];
-        connection.read_exact(&mut payload_size_buf).await?;
-
-        let header = RequestHeader {
-            model_id: u32::from_le_bytes(model_id_buf),
-            op_code: u32::from_le_bytes(op_code_buf),
-            payload_size: u32::from_le_bytes(payload_size_buf),
+        let Some(frame) =
+            wire::read_request_frame_or_eof(&mut connection, DEFAULT_MAX_FRAME_PAYLOAD_BYTES)
+                .await
+                .map_err(codec_io)?
+        else {
+            return Ok(());
         };
 
-        // Read payload
-        let mut payload = vec![0u8; header.payload_size as usize];
-        connection.read_exact(&mut payload).await?;
-
-        match header.op_code {
+        let model_id = frame.header.model_id;
+        match frame.header.op_code {
             OP_INFER_STREAM => {
-                // Deserialize request
-                let request: InferenceRequest = match decode_inference_request(&payload) {
+                let request = match decode_inference_request(&frame.payload) {
                     Ok(req) => req,
-                    Err(error_msg) => {
-                        let resp_header = ResponseHeader {
-                            status: STATUS_ERR,
-                            payload_size: error_msg.len() as u32,
-                        };
-                        connection
-                            .write_all(&resp_header.status.to_le_bytes())
+                    Err(error) => {
+                        write_error_response(&mut connection, &inference_decode_message(error))
                             .await?;
-                        connection
-                            .write_all(&resp_header.payload_size.to_le_bytes())
-                            .await?;
-                        connection.write_all(error_msg.as_bytes()).await?;
                         continue;
                     }
                 };
 
                 if let Some(error_msg) = check_auth(&request, auth_token.as_deref()) {
-                    let resp_header = ResponseHeader {
-                        status: STATUS_ERR,
-                        payload_size: error_msg.len() as u32,
-                    };
-                    connection
-                        .write_all(&resp_header.status.to_le_bytes())
-                        .await?;
-                    connection
-                        .write_all(&resp_header.payload_size.to_le_bytes())
-                        .await?;
-                    connection.write_all(error_msg.as_bytes()).await?;
+                    write_error_response(&mut connection, &error_msg).await?;
                     continue;
                 }
 
-                // Get scheduler for model
-                let scheduler = match scheduler_lookup(header.model_id) {
+                let scheduler = match scheduler_lookup(model_id) {
                     Some(s) => s,
                     None => {
-                        let error_msg = format!("Model {} not found", header.model_id);
-                        let resp_header = ResponseHeader {
-                            status: STATUS_ERR,
-                            payload_size: error_msg.len() as u32,
-                        };
-                        connection
-                            .write_all(&resp_header.status.to_le_bytes())
-                            .await?;
-                        connection
-                            .write_all(&resp_header.payload_size.to_le_bytes())
-                            .await?;
-                        connection.write_all(error_msg.as_bytes()).await?;
+                        write_error_response(
+                            &mut connection,
+                            &format!("Model {model_id} not found"),
+                        )
+                        .await?;
                         continue;
                     }
                 };
 
-                // Execute streaming inference
                 let priority = request_priority(&request, Priority::LatencyCritical);
                 let stream_result = scheduler.infer_stream(request, priority, false).await;
 
@@ -289,180 +234,66 @@ where
                         while let Some(result) = inference_stream.next().await {
                             match result {
                                 Ok(packet) => {
-                                    // Serialize packet
-                                    let response_bytes = match bincode::serialize(&packet) {
-                                        Ok(b) => b,
-                                        Err(e) => {
-                                            log::error!("Serialization error: {}", e);
-                                            break;
-                                        }
-                                    };
-
-                                    // Send chunk header
-                                    let response_header = ResponseHeader {
-                                        status: STATUS_STREAM_CHUNK,
-                                        payload_size: response_bytes.len() as u32,
-                                    };
-
-                                    connection
-                                        .write_all(&response_header.status.to_le_bytes())
-                                        .await?;
-                                    connection
-                                        .write_all(&response_header.payload_size.to_le_bytes())
-                                        .await?;
-                                    connection.write_all(&response_bytes).await?;
-                                    connection.flush().await?;
+                                    wire::write_response_value(
+                                        &mut connection,
+                                        STATUS_STREAM_CHUNK,
+                                        &packet,
+                                    )
+                                    .await
+                                    .map_err(codec_io)?;
                                 }
                                 Err(e) => {
-                                    // Send error frame and stop
-                                    let error_msg = e.to_string();
-                                    let response_bytes = error_msg.as_bytes();
-                                    let response_header = ResponseHeader {
-                                        status: STATUS_ERR,
-                                        payload_size: response_bytes.len() as u32,
-                                    };
-                                    connection
-                                        .write_all(&response_header.status.to_le_bytes())
-                                        .await?;
-                                    connection
-                                        .write_all(&response_header.payload_size.to_le_bytes())
-                                        .await?;
-                                    connection.write_all(response_bytes).await?;
-                                    connection.flush().await?;
+                                    write_error_response(&mut connection, &e.to_string()).await?;
                                     break;
                                 }
                             }
                         }
 
-                        // Send End of Stream frame
-                        let response_header = ResponseHeader {
-                            status: STATUS_STREAM_END,
-                            payload_size: 0,
-                        };
-                        connection
-                            .write_all(&response_header.status.to_le_bytes())
-                            .await?;
-                        connection
-                            .write_all(&response_header.payload_size.to_le_bytes())
-                            .await?;
-                        connection.flush().await?;
+                        wire::write_response_bytes(&mut connection, STATUS_STREAM_END, &[])
+                            .await
+                            .map_err(codec_io)?;
                     }
                     Err(e) => {
-                        // Send error frame for initial failure
-                        let error_msg = e.to_string();
-                        let response_bytes = error_msg.as_bytes();
-                        let response_header = ResponseHeader {
-                            status: STATUS_ERR,
-                            payload_size: response_bytes.len() as u32,
-                        };
-                        connection
-                            .write_all(&response_header.status.to_le_bytes())
-                            .await?;
-                        connection
-                            .write_all(&response_header.payload_size.to_le_bytes())
-                            .await?;
-                        connection.write_all(response_bytes).await?;
-                        connection.flush().await?;
+                        write_error_response(&mut connection, &e.to_string()).await?;
                     }
                 }
             }
             OP_INFER => {
-                // Find scheduler for model_id
-                if let Some(scheduler) = scheduler_lookup(header.model_id) {
-                    // Deserialize payload to InferenceRequest
-                    let request: InferenceRequest = match decode_inference_request(&payload) {
+                if let Some(scheduler) = scheduler_lookup(model_id) {
+                    let request = match decode_inference_request(&frame.payload) {
                         Ok(req) => req,
-                        Err(error_msg) => {
-                            let resp_header = ResponseHeader {
-                                status: STATUS_ERR,
-                                payload_size: error_msg.len() as u32,
-                            };
-                            connection
-                                .write_all(&resp_header.status.to_le_bytes())
+                        Err(error) => {
+                            write_error_response(&mut connection, &inference_decode_message(error))
                                 .await?;
-                            connection
-                                .write_all(&resp_header.payload_size.to_le_bytes())
-                                .await?;
-                            connection.write_all(error_msg.as_bytes()).await?;
                             continue;
                         }
                     };
 
                     if let Some(error_msg) = check_auth(&request, auth_token.as_deref()) {
-                        let resp_header = ResponseHeader {
-                            status: STATUS_ERR,
-                            payload_size: error_msg.len() as u32,
-                        };
-                        connection
-                            .write_all(&resp_header.status.to_le_bytes())
-                            .await?;
-                        connection
-                            .write_all(&resp_header.payload_size.to_le_bytes())
-                            .await?;
-                        connection.write_all(error_msg.as_bytes()).await?;
+                        write_error_response(&mut connection, &error_msg).await?;
                         continue;
                     }
 
-                    // Process. Direct IPC clients default to throughput; delegated
-                    // engines carry the parent scheduler's resolved priority.
                     let priority = request_priority(&request, Priority::Throughput);
                     let result = scheduler.infer(&request, priority, false).await;
 
                     match result {
                         Ok(output) => {
-                            let output_bytes =
-                                bincode::serialize(&output).map_err(std::io::Error::other)?;
-
-                            let resp_header = ResponseHeader {
-                                status: STATUS_OK,
-                                payload_size: output_bytes.len() as u32,
-                            };
-
-                            // Write header as raw bytes (not bincode)
-                            connection
-                                .write_all(&resp_header.status.to_le_bytes())
-                                .await?;
-                            connection
-                                .write_all(&resp_header.payload_size.to_le_bytes())
-                                .await?;
-                            connection.write_all(&output_bytes).await?;
+                            wire::write_response_value(&mut connection, STATUS_OK, &output)
+                                .await
+                                .map_err(codec_io)?;
                         }
                         Err(e) => {
-                            let error_msg = e.to_string();
-                            let resp_header = ResponseHeader {
-                                status: STATUS_ERR,
-                                payload_size: error_msg.len() as u32,
-                            };
-                            connection
-                                .write_all(&resp_header.status.to_le_bytes())
-                                .await?;
-                            connection
-                                .write_all(&resp_header.payload_size.to_le_bytes())
-                                .await?;
-                            connection.write_all(error_msg.as_bytes()).await?;
+                            write_error_response(&mut connection, &e.to_string()).await?;
                         }
                     }
                 } else {
-                    // Model not found
-                    let error_msg = format!("Model {} not found", header.model_id);
-                    let resp_header = ResponseHeader {
-                        status: STATUS_ERR,
-                        payload_size: error_msg.len() as u32,
-                    };
-                    connection
-                        .write_all(&resp_header.status.to_le_bytes())
+                    write_error_response(&mut connection, &format!("Model {model_id} not found"))
                         .await?;
-                    connection
-                        .write_all(&resp_header.payload_size.to_le_bytes())
-                        .await?;
-                    connection.write_all(error_msg.as_bytes()).await?;
                 }
             }
             OP_HYBRID_INFER => {
-                // Payload already read at line 131-132, just deserialize it
-                // Deserialize HybridRequest
-                let hybrid_req: HybridRequest = bincode::deserialize(&payload)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                let hybrid_req: HybridRequest = frame.deserialize().map_err(codec_io)?;
 
                 if let Some(shm_manager) = &shm_manager {
                     let base_ptr = shm_manager.as_ptr();
@@ -547,17 +378,7 @@ where
                             if output_offset + output_size > shm_size {
                                 let error_msg = format!("Output would exceed SHM bounds: offset={}, size={}, shm_size={}",
                                     output_offset, output_size, shm_size);
-                                let resp_header = ResponseHeader {
-                                    status: STATUS_ERR,
-                                    payload_size: error_msg.len() as u32,
-                                };
-                                connection
-                                    .write_all(&resp_header.status.to_le_bytes())
-                                    .await?;
-                                connection
-                                    .write_all(&resp_header.payload_size.to_le_bytes())
-                                    .await?;
-                                connection.write_all(error_msg.as_bytes()).await?;
+                                write_error_response(&mut connection, &error_msg).await?;
                                 continue;
                             }
 
@@ -598,7 +419,6 @@ where
                                 );
                             }
 
-                            // Send HybridResponse
                             let resp = HybridResponse {
                                 metadata: ResponseMetadata {
                                     request_id: hybrid_req.metadata.request_id,
@@ -611,68 +431,34 @@ where
                                     as u64,
                             };
 
-                            let resp_bytes =
-                                bincode::serialize(&resp).map_err(std::io::Error::other)?;
-
-                            let resp_header = ResponseHeader {
-                                status: STATUS_OK,
-                                payload_size: resp_bytes.len() as u32,
-                            };
-
-                            connection
-                                .write_all(&resp_header.status.to_le_bytes())
-                                .await?;
-                            connection
-                                .write_all(&resp_header.payload_size.to_le_bytes())
-                                .await?;
-                            connection.write_all(&resp_bytes).await?;
+                            wire::write_response_value(&mut connection, STATUS_OK, &resp)
+                                .await
+                                .map_err(codec_io)?;
                         }
                         Err(e) => {
-                            let error_msg = e.to_string();
-                            let resp_header = ResponseHeader {
-                                status: STATUS_ERR,
-                                payload_size: error_msg.len() as u32,
-                            };
-                            connection
-                                .write_all(&resp_header.status.to_le_bytes())
-                                .await?;
-                            connection
-                                .write_all(&resp_header.payload_size.to_le_bytes())
-                                .await?;
-                            connection.write_all(error_msg.as_bytes()).await?;
+                            write_error_response(&mut connection, &e.to_string()).await?;
                         }
                     }
                 } else {
-                    let error_msg = "SHM Manager not configured".to_string();
-                    let resp_header = ResponseHeader {
-                        status: STATUS_ERR,
-                        payload_size: error_msg.len() as u32,
-                    };
-                    connection
-                        .write_all(&resp_header.status.to_le_bytes())
-                        .await?;
-                    connection
-                        .write_all(&resp_header.payload_size.to_le_bytes())
-                        .await?;
-                    connection.write_all(error_msg.as_bytes()).await?;
+                    write_error_response(&mut connection, "SHM Manager not configured").await?;
                 }
             }
             _ => {
-                // Unsupported op
-                let resp_header = ResponseHeader {
-                    status: STATUS_ERR,
-                    payload_size: 0,
-                };
-                // Write header as raw bytes (not bincode)
-                connection
-                    .write_all(&resp_header.status.to_le_bytes())
-                    .await?;
-                connection
-                    .write_all(&resp_header.payload_size.to_le_bytes())
-                    .await?;
+                wire::write_response_bytes(&mut connection, STATUS_ERR, &[])
+                    .await
+                    .map_err(codec_io)?;
             }
         }
     }
+}
+
+async fn write_error_response<T>(connection: &mut T, message: &str) -> std::io::Result<()>
+where
+    T: AsyncWrite + Unpin + ?Sized,
+{
+    wire::write_response_bytes(connection, STATUS_ERR, message.as_bytes())
+        .await
+        .map_err(codec_io)
 }
 
 #[cfg(test)]
@@ -680,9 +466,12 @@ mod tests {
     use super::*;
     use futures::Stream;
     use kapsl_engine_api::{EngineError, EngineMetrics, RequestMetadata, TensorDtype};
+    use kapsl_transport::connection_pool::PoolConfig;
+    use kapsl_transport::protocol::ResponseFrame;
+    use kapsl_transport::tcp::TcpClient;
     use std::pin::Pin;
     use std::sync::Mutex;
-    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt, DuplexStream};
+    use tokio::io::{duplex, DuplexStream};
 
     struct PriorityRecordingScheduler {
         seen: Arc<Mutex<Vec<Priority>>>,
@@ -747,36 +536,15 @@ mod tests {
         op_code: u32,
         request: &InferenceRequest,
     ) {
-        let payload = bincode::serialize(request).expect("request serialization");
-        client
-            .write_all(&model_id.to_le_bytes())
+        wire::write_request_value(client, model_id, op_code, request)
             .await
-            .expect("write model id");
-        client
-            .write_all(&op_code.to_le_bytes())
-            .await
-            .expect("write op code");
-        client
-            .write_all(&(payload.len() as u32).to_le_bytes())
-            .await
-            .expect("write payload size");
-        client.write_all(&payload).await.expect("write payload");
+            .expect("write request frame");
     }
 
-    async fn read_response(client: &mut DuplexStream) -> (u32, Vec<u8>) {
-        let mut header = [0u8; 8];
-        client
-            .read_exact(&mut header)
+    async fn read_response(client: &mut DuplexStream) -> ResponseFrame {
+        wire::read_response_frame(client, DEFAULT_MAX_FRAME_PAYLOAD_BYTES)
             .await
-            .expect("read response header");
-        let status = u32::from_le_bytes(header[0..4].try_into().unwrap());
-        let payload_size = u32::from_le_bytes(header[4..8].try_into().unwrap());
-        let mut payload = vec![0u8; payload_size as usize];
-        client
-            .read_exact(&mut payload)
-            .await
-            .expect("read response payload");
-        (status, payload)
+            .expect("read response frame")
     }
 
     fn lookup_for(scheduler: Arc<dyn ReplicaScheduler + Send + Sync>) -> SchedulerLookup {
@@ -784,7 +552,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn infer_uses_priority_stamped_by_delegating_scheduler() {
+    async fn transport_client_codec_round_trips_on_reused_connection() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let scheduler: Arc<dyn ReplicaScheduler + Send + Sync> =
+            Arc::new(PriorityRecordingScheduler { seen: seen.clone() });
+        let (mut client, server) = duplex(4096);
+        let task = tokio::spawn(handle_connection(server, lookup_for(scheduler), None, None));
+        let input = request_with_priority(1).input;
+
+        for _ in 0..2 {
+            let output =
+                kapsl_transport::protocol::infer_over_stream(&mut client, 7, input.clone())
+                    .await
+                    .expect("inference round trip");
+            assert_eq!(output.shape, input.shape);
+            assert_eq!(output.dtype, input.dtype);
+            assert_eq!(output.data, input.data);
+        }
+
+        drop(client);
+        task.await
+            .expect("server task")
+            .expect("connection handler");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![Priority::Throughput, Priority::Throughput]
+        );
+    }
+
+    #[tokio::test]
+    async fn unary_codec_interop_reuses_connection_and_preserves_priority() {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let scheduler: Arc<dyn ReplicaScheduler + Send + Sync> =
             Arc::new(PriorityRecordingScheduler { seen: seen.clone() });
@@ -792,15 +589,27 @@ mod tests {
         let task = tokio::spawn(handle_connection(server, lookup_for(scheduler), None, None));
 
         write_request(&mut client, 7, OP_INFER, &request_with_priority(0)).await;
-        let (status, payload) = read_response(&mut client).await;
-        assert_eq!(status, STATUS_OK);
-        bincode::deserialize::<BinaryTensorPacket>(&payload).expect("response packet");
+        let response = read_response(&mut client).await;
+        assert_eq!(response.header.status, STATUS_OK);
+        response
+            .deserialize::<BinaryTensorPacket>()
+            .expect("response packet");
+
+        write_request(&mut client, 7, OP_INFER, &request_with_priority(1)).await;
+        let response = read_response(&mut client).await;
+        assert_eq!(response.header.status, STATUS_OK);
+        response
+            .deserialize::<BinaryTensorPacket>()
+            .expect("second response packet");
 
         drop(client);
         task.await
             .expect("server task")
             .expect("connection handler");
-        assert_eq!(*seen.lock().unwrap(), vec![Priority::LatencyCritical]);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![Priority::LatencyCritical, Priority::Throughput]
+        );
     }
 
     #[tokio::test]
@@ -812,17 +621,83 @@ mod tests {
         let task = tokio::spawn(handle_connection(server, lookup_for(scheduler), None, None));
 
         write_request(&mut client, 7, OP_INFER_STREAM, &request_with_priority(1)).await;
-        let (status, payload) = read_response(&mut client).await;
-        assert_eq!(status, STATUS_STREAM_CHUNK);
-        bincode::deserialize::<BinaryTensorPacket>(&payload).expect("stream packet");
-        let (status, payload) = read_response(&mut client).await;
-        assert_eq!(status, STATUS_STREAM_END);
-        assert!(payload.is_empty());
+        let response = read_response(&mut client).await;
+        assert_eq!(response.header.status, STATUS_STREAM_CHUNK);
+        response
+            .deserialize::<BinaryTensorPacket>()
+            .expect("stream packet");
+        let response = read_response(&mut client).await;
+        assert_eq!(response.header.status, STATUS_STREAM_END);
+        assert!(response.payload.is_empty());
 
         drop(client);
         task.await
             .expect("server task")
             .expect("connection handler");
+        assert_eq!(*seen.lock().unwrap(), vec![Priority::Throughput]);
+    }
+
+    #[tokio::test]
+    async fn error_frame_does_not_poison_reused_connection() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let scheduler: Arc<dyn ReplicaScheduler + Send + Sync> =
+            Arc::new(PriorityRecordingScheduler { seen: seen.clone() });
+        let (mut client, server) = duplex(4096);
+        let task = tokio::spawn(handle_connection(server, lookup_for(scheduler), None, None));
+
+        write_request(&mut client, 999, OP_INFER, &request_with_priority(0)).await;
+        let response = read_response(&mut client).await;
+        assert_eq!(response.header.status, STATUS_ERR);
+        assert_eq!(
+            std::str::from_utf8(&response.payload).expect("UTF-8 error"),
+            "Model 999 not found"
+        );
+
+        write_request(&mut client, 7, OP_INFER, &request_with_priority(1)).await;
+        let response = read_response(&mut client).await;
+        assert_eq!(response.header.status, STATUS_OK);
+        response
+            .deserialize::<BinaryTensorPacket>()
+            .expect("response after error");
+
+        drop(client);
+        task.await
+            .expect("server task")
+            .expect("connection handler");
+        assert_eq!(*seen.lock().unwrap(), vec![Priority::Throughput]);
+    }
+
+    #[tokio::test]
+    async fn exported_tcp_client_interoperates_and_preserves_auth_metadata() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let scheduler: Arc<dyn ReplicaScheduler + Send + Sync> =
+            Arc::new(PriorityRecordingScheduler { seen: seen.clone() });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test TCP listener");
+        let port = listener.local_addr().expect("listener address").port();
+        let lookup = lookup_for(scheduler);
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept test client");
+            handle_connection(stream, lookup, None, Some(Arc::from("secret"))).await
+        });
+
+        let client = TcpClient::new("127.0.0.1".to_string(), port, PoolConfig::default());
+        let mut request = request_with_priority(1);
+        request
+            .metadata
+            .as_mut()
+            .expect("request metadata")
+            .auth_token = Some("secret".to_string());
+        let output = client
+            .infer_request(7, &request)
+            .await
+            .expect("authenticated TCP inference");
+        assert_eq!(output.data, request.input.data);
+
+        drop(client);
+        task.abort();
+        let _ = task.await;
         assert_eq!(*seen.lock().unwrap(), vec![Priority::Throughput]);
     }
 }

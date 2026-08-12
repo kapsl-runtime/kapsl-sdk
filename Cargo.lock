@@ -2056,14 +2056,12 @@ dependencies = [
 name = "kapsl-pyo3"
 version = "0.1.1"
 dependencies = [
- "bincode",
  "kapsl-engine-api",
  "kapsl-ipc",
  "kapsl-shm",
  "kapsl-transport",
  "libc",
  "pyo3",
- "serde",
  "tokio",
 ]
 
