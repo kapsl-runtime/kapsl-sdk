@@ -1678,7 +1678,6 @@ struct CpuEvictedState {
     slots: Vec<u32>,
     /// Number of owned logical positions that were saved.
     n_logical: usize,
-    n_layers: usize,
     /// Original `n_logical_blocks` at eviction time, used by `needs_restore`
     /// to tell C++ which token count to force-re-reserve.
     n_logical_at_eviction: usize,
@@ -1873,11 +1872,16 @@ impl GgufSharedKvPool {
             user_data: state_ptr.cast(),
             device_id: device_id as u32,
             block_size: pool.block_size() as u32,
-            num_blocks: pool.total_blocks() as u32,
+            // Physical block ids are relative to the whole device backing, so
+            // GGML's buffer must cover the whole addressable span. Allocation
+            // remains limited independently by the view/engine quota.
+            num_blocks: pool.addressable_blocks() as u32,
             num_kv_heads: pool.num_kv_heads() as u32,
             head_dim: pool.head_dim() as u32,
             dtype: LLAMA_KAPSL_KV_DTYPE_F16,
-            device_base: pool.device_base_ptr(),
+            // SAFETY: llama.cpp receives the whole backing plus a block table;
+            // the shared-KV allocator supplies only live blocks owned by this view.
+            device_base: unsafe { pool.device_base_ptr() },
             block_table_device: std::ptr::null_mut(),
             block_table_layer_stride: max_blocks_per_seq as u32,
             n_layers: n_layers as u32,
@@ -2025,7 +2029,6 @@ impl GgufSharedKvPool {
             store,
             slots,
             n_logical: n_owned,
-            n_layers,
             n_logical_at_eviction: n_logical_orig,
         });
 
@@ -2045,7 +2048,7 @@ impl GgufSharedKvPool {
 #[cfg(feature = "gguf-cuda-shared-kv")]
 impl Drop for GgufSharedKvPoolState {
     fn drop(&mut self) {
-        let mut inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap();
         // Release prefix cache borrows (prefix hits + promoted blocks).
         if let Some(cache) = &self.prefix_cache {
             if let Ok(mut c) = cache.lock() {
@@ -3004,14 +3007,6 @@ impl GgufKvPath {
         }
     }
 
-    fn from_u8(v: u8) -> Self {
-        match v {
-            1 => GgufKvPath::SharedKv,
-            2 => GgufKvPath::Native,
-            _ => GgufKvPath::Unloaded,
-        }
-    }
-
     fn as_u8(self) -> u8 {
         match self {
             GgufKvPath::Unloaded => 0,
@@ -3098,7 +3093,7 @@ impl GgufBackend {
     }
 
     #[cfg(feature = "gguf-cuda-shared-kv")]
-    pub fn with_pool_handle(mut self, handle: GpuPoolHandle) -> Self {
+    pub fn with_pool_handle(self, handle: GpuPoolHandle) -> Self {
         *self.pool_slot.lock().unwrap() = Some(handle);
         self
     }
@@ -3383,13 +3378,22 @@ fn run_scheduler(
     request_rx: std_mpsc::Receiver<GgufRequest>,
     config: GgufServingConfig,
     metrics: Arc<Mutex<EngineMetrics>>,
+    ready_tx: std_mpsc::SyncSender<Result<(), String>>,
     #[cfg(feature = "gguf-cuda-shared-kv")] mut shared_kv_pool: Option<GgufSharedKvPool>,
 ) {
+    #[allow(unused_mut)]
+    let mut config = config;
+    #[cfg(feature = "gguf-cuda-shared-kv")]
+    if shared_kv_pool.is_some() && config.exact_prompt_kv_reuse {
+        log::warn!("[gguf] exact prompt KV reuse is unsupported by shared-KV; disabling it");
+        config.exact_prompt_kv_reuse = false;
+    }
     let total_ctx = config.total_ctx();
     let n_ctx = match NonZeroU32::new(total_ctx as u32) {
         Some(v) => v,
         None => {
             log::error!("[gguf] invalid total_ctx=0");
+            let _ = ready_tx.send(Err("invalid GGUF total context size".to_string()));
             return;
         }
     };
@@ -3418,6 +3422,7 @@ fn run_scheduler(
         Ok(c) => c,
         Err(e) => {
             log::error!("[gguf] Failed to create shared context: {e}");
+            let _ = ready_tx.send(Err(format!("GGUF context creation failed: {e}")));
             return;
         }
     };
@@ -3435,7 +3440,6 @@ fn run_scheduler(
         total_ctx.saturating_mul(config.kv_bytes_per_cell) / (1024 * 1024),
         config.kv_bytes_per_cell
     );
-
     let eos_token = model.token_eos();
     let mut samplers = GgufBackendSamplers::new(&model, config.max_concurrent, eos_token);
     // Pre-install a sampler for every seq slot up front so the installed-sampler
@@ -3464,6 +3468,10 @@ fn run_scheduler(
     let mut pending: VecDeque<PendingPrefill> = VecDeque::new();
     let mut active: Vec<ActiveSeq> = Vec::with_capacity(config.max_concurrent);
     update_gguf_metrics(&metrics, config, &waiting, &pending, &active, 0);
+    if ready_tx.send(Ok(())).is_err() {
+        log::warn!("[gguf] loader dropped before scheduler readiness was reported");
+        return;
+    }
 
     'main: loop {
         // ── 1. Drain the request channel ──────────────────────────────────────
@@ -4028,11 +4036,20 @@ impl Engine for GgufBackend {
         let bytes = std::fs::metadata(model_path)
             .map_err(|e| EngineError::backend(format!("stat GGUF model: {e}")))?
             .len() as usize;
-        Ok(ExternalDeviceMemoryReport::single(
-            gguf_allocation_id(model_path),
-            self.device_id,
-            bytes,
-        ))
+        Ok(ExternalDeviceMemoryReport {
+            allocations: vec![
+                ExternalDeviceMemory {
+                    allocation_id: gguf_allocation_id(model_path),
+                    device_id: self.device_id,
+                    bytes,
+                },
+                ExternalDeviceMemory {
+                    allocation_id: format!("gguf-scratch:{}", gguf_model_key(model_path).display()),
+                    device_id: self.device_id,
+                    bytes: (bytes / 8).max(256 * 1024 * 1024),
+                },
+            ],
+        })
     }
 
     async fn load(&mut self, model_path: &Path) -> Result<(), EngineError> {
@@ -4127,6 +4144,24 @@ impl Engine for GgufBackend {
             let handle = {
                 let mut slot = self.pool_slot.lock().unwrap();
                 if let Some((device_pool, owner)) = self.device_pool.as_ref() {
+                    let bytes_per_block = 2usize
+                        .saturating_mul(n_head_kv)
+                        .saturating_mul(block_size)
+                        .saturating_mul(head_dim)
+                        .saturating_mul(std::mem::size_of::<half::f16>());
+                    let required_bytes = requested_blocks.saturating_mul(bytes_per_block);
+                    let current_quota = device_pool.owner_quota(*owner);
+                    device_pool
+                        .set_owner_quota(
+                            *owner,
+                            required_bytes,
+                            current_quota.max_bytes.max(required_bytes),
+                        )
+                        .map_err(|e| {
+                            EngineError::backend(format!(
+                                "shared KV capacity guarantee admission failed: {e}"
+                            ))
+                        })?;
                     let pool = Arc::new(
                         GpuBlockPool::from_device_pool(
                             Arc::clone(device_pool),
@@ -4138,6 +4173,14 @@ impl Engine for GgufBackend {
                         )
                         .map_err(|e| EngineError::backend(format!("shared KV view: {e}")))?,
                     );
+                    if pool.total_blocks() < requested_blocks {
+                        return Err(EngineError::backend(format!(
+                            "shared KV capacity admission failed: requested {requested_blocks} blocks for context={} concurrency={}, but only {} blocks are guaranteed",
+                            config.ctx_per_seq,
+                            config.max_concurrent,
+                            pool.total_blocks()
+                        )));
+                    }
                     let handle = GpuPoolHandle::private(pool);
                     *slot = Some(handle.clone());
                     handle
@@ -4247,6 +4290,7 @@ impl Engine for GgufBackend {
         let model_clone = Arc::clone(&weights.model);
         let backend_clone = Arc::clone(&weights.backend);
         let metrics = Arc::clone(&self.metrics);
+        let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
         let scheduler_thread = std::thread::spawn(move || {
             run_scheduler(
                 model_clone,
@@ -4254,10 +4298,24 @@ impl Engine for GgufBackend {
                 rx,
                 config,
                 metrics,
+                ready_tx,
                 #[cfg(feature = "gguf-cuda-shared-kv")]
                 shared_kv_pool,
             );
         });
+
+        match ready_rx.recv_timeout(Duration::from_secs(300)) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                let _ = scheduler_thread.join();
+                return Err(EngineError::backend(error));
+            }
+            Err(error) => {
+                return Err(EngineError::backend(format!(
+                    "GGUF scheduler did not become ready: {error}"
+                )));
+            }
+        }
 
         log::info!(
             "[gguf] Scheduler started: max_concurrent={}, ctx_per_seq={}",

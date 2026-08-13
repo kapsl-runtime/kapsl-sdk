@@ -28,7 +28,8 @@ mod inner {
 
     use kapsl_engine_api::{
         BatchingPolicy, BinaryTensorPacket, Engine, EngineError, EngineMetrics, EngineModelInfo,
-        EngineStream, ExternalDeviceMemoryReport, InferenceRequest, RequestMetadata, TensorDtype,
+        EngineStream, ExternalDeviceMemory, ExternalDeviceMemoryReport, InferenceRequest,
+        RequestMetadata, TensorDtype,
     };
     use kapsl_hal::gpu_arena::{GpuBlockPool, GpuDevicePool, GpuPoolHandle, PoolOwner};
     use kapsl_loader::weights::DType;
@@ -634,7 +635,7 @@ mod inner {
                     .map_err(|err| EngineError::backend(format!("pos_dev: {err}")))?;
 
                 launch_batch_kv_write(&self.device, &mut BatchKvWriteParams {
-                    kv_cache: self.block_pool.storage_mut(),
+                    kv_cache: unsafe { self.block_pool.storage_mut() },
                     k: &self.prefill.k_all, v: &self.prefill.v_all,
                     physical_blocks: &phys_dev, pos_in_blocks: &pos_dev,
                     seq_len: n as u32, num_kv_heads: num_kv as u32,
@@ -795,7 +796,7 @@ mod inner {
                 use kapsl_kernels::cuda_kernels::{launch_kv_write, KvWriteParams};
                 let physical_block = block_tables[layer_idx][pos_in_seq / block_size];
                 launch_kv_write(&self.device, &mut KvWriteParams {
-                    kv_cache: self.block_pool.storage_mut(),
+                    kv_cache: unsafe { self.block_pool.storage_mut() },
                     k_vec: &self.k_buf, v_vec: &self.v_buf,
                     physical_block: physical_block as u32,
                     pos_in_block: pos_in_block as u32,
@@ -807,7 +808,7 @@ mod inner {
                 let max_blocks = self.gpu_block_tables[layer_idx].len() as u32;
                 launch_paged_attention(&self.device, &mut PagedAttentionParams {
                     out: &mut self.attn_buf, q: &self.q_buf,
-                    kv_cache: self.block_pool.storage(),
+                    kv_cache: unsafe { self.block_pool.storage() },
                     block_tables: &self.gpu_block_tables[layer_idx],
                     context_lens: &self.ctx_scalar_buf,
                     scale, batch_size: 1,
@@ -985,7 +986,7 @@ mod inner {
                     .map_err(|err| e(format!("phys up: {err}")))?;
 
                 launch_batch_kv_write(&self.device, &mut BatchKvWriteParams {
-                    kv_cache: self.block_pool.storage_mut(),
+                    kv_cache: unsafe { self.block_pool.storage_mut() },
                     k: &self.prefill.k_all, v: &self.prefill.v_all,
                     physical_blocks: &phys_dev,
                     pos_in_blocks: &pib_dev,
@@ -1005,7 +1006,7 @@ mod inner {
 
                 launch_paged_attention(&self.device, &mut PagedAttentionParams {
                     out: &mut self.prefill.attn_out, q: &self.prefill.q_all,
-                    kv_cache: self.block_pool.storage(),
+                    kv_cache: unsafe { self.block_pool.storage() },
                     block_tables: &bt_dev,
                     context_lens: &ctx_dev,
                     scale, batch_size: b as u32,
@@ -1365,11 +1366,20 @@ mod inner {
             let bytes = std::fs::metadata(model_path)
                 .map_err(|e| EngineError::backend(format!("stat GGUF model: {e}")))?
                 .len() as usize;
-            Ok(ExternalDeviceMemoryReport::single(
-                self.external_allocation_id.clone(),
-                self.device_id as usize,
-                bytes,
-            ))
+            Ok(ExternalDeviceMemoryReport {
+                allocations: vec![
+                    ExternalDeviceMemory {
+                        allocation_id: self.external_allocation_id.clone(),
+                        device_id: self.device_id as usize,
+                        bytes,
+                    },
+                    ExternalDeviceMemory {
+                        allocation_id: format!("{}:scratch", self.external_allocation_id),
+                        device_id: self.device_id as usize,
+                        bytes: (bytes / 8).max(256 * 1024 * 1024),
+                    },
+                ],
+            })
         }
 
         async fn load(&mut self, model_path: &Path) -> Result<(), EngineError> {

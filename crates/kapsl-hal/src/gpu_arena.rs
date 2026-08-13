@@ -1029,6 +1029,12 @@ impl GpuKvPoolView {
         self.total_blocks().saturating_mul(self.bytes_per_block())
     }
 
+    /// Number of blocks addressable from `device_base_ptr` in this view's
+    /// geometry. This is the backing span, not the view's allocation quota.
+    pub fn addressable_blocks(&self) -> usize {
+        self.device_pool.capacity_bytes() / self.bytes_per_block()
+    }
+
     /// Number of physical blocks currently allocated from the pool.
     pub fn used_count(&self) -> usize {
         let singles = self.live_blocks.lock().unwrap().len();
@@ -1056,9 +1062,12 @@ impl GpuKvPoolView {
     /// Returned layout: `[K_data || V_data]` where each half is
     /// `[num_kv_heads * block_size * head_dim]` f16 elements.
     pub fn download_block(&self, block_id: u32) -> Result<Vec<half::f16>, ArenaError> {
+        self.validate_live_block(block_id)?;
         let elems = self.elems_per_block();
         let base = block_id as usize * elems;
-        let storage = self.storage();
+        // SAFETY: validate_live_block proves this view owns the requested
+        // extent for the duration of this synchronous copy.
+        let storage = unsafe { self.storage() };
         Ok(self
             .device()
             .dtoh_sync_copy(&storage.slice(base..base + elems))?)
@@ -1078,20 +1087,32 @@ impl GpuKvPoolView {
     }
 
     /// Read-only view of the storage slice (for attention kernel reads).
-    pub fn storage(&self) -> CudaView<'_, half::f16> {
+    /// # Safety
+    /// The returned view spans the entire shared backing. The caller must read
+    /// only blocks that are live and owned by this view.
+    pub unsafe fn storage(&self) -> CudaView<'_, half::f16> {
         self.device_pool.f16_storage()
     }
 
     /// Raw CUDA device pointer for FFI integrations that need to wrap the
     /// externally-owned KV storage without taking ownership.
-    pub fn device_base_ptr(&self) -> *mut std::ffi::c_void {
+    /// # Safety
+    /// This pointer addresses the entire shared backing. FFI consumers must
+    /// enforce this view's live-block ownership for every access.
+    pub unsafe fn device_base_ptr(&self) -> *mut std::ffi::c_void {
         self.device_pool.base_ptr()
     }
 
     /// Raw CUDA device pointer to the start of a specific physical block.
-    pub fn block_device_ptr(&self, block_id: u32) -> *mut std::ffi::c_void {
-        (self.device_base_ptr() as usize + block_id as usize * self.bytes_per_block())
-            as *mut std::ffi::c_void
+    pub fn block_device_ptr(
+        &self,
+        block_id: u32,
+    ) -> Result<*mut std::ffi::c_void, ArenaError> {
+        self.validate_live_block(block_id)?;
+        // SAFETY: pointer arithmetic is limited to the validated live block.
+        Ok((unsafe { self.device_base_ptr() } as usize
+            + block_id as usize * self.bytes_per_block())
+            as *mut std::ffi::c_void)
     }
 
     /// Mutable view of the storage slice (for KV-write kernels).
@@ -1100,8 +1121,22 @@ impl GpuKvPoolView {
     /// Caller must ensure that the physical blocks it writes to are not
     /// concurrently written by another caller.  This invariant is upheld by
     /// the alloc_block/free_block protocol — only the block owner writes.
-    pub fn storage_mut(&self) -> CudaViewMut<'_, half::f16> {
+    pub unsafe fn storage_mut(&self) -> CudaViewMut<'_, half::f16> {
         unsafe { self.device_pool.f16_storage_mut() }
+    }
+
+    fn validate_live_block(&self, block_id: u32) -> Result<(), ArenaError> {
+        if self.live_blocks.lock().unwrap().contains_key(&block_id) {
+            return Ok(());
+        }
+        if self.live_runs.lock().unwrap().iter().any(|(&first, &(count, _))| {
+            let block = block_id as usize;
+            let first = first as usize;
+            block >= first && block < first.saturating_add(count)
+        }) {
+            return Ok(());
+        }
+        Err(ArenaError::InvalidFree { owner: self.owner })
     }
 
     pub fn device(&self) -> &Arc<CudaDevice> {
@@ -1126,6 +1161,7 @@ impl GpuKvPoolView {
         host_key: &[half::f16],
         host_val: &[half::f16],
     ) -> Result<(), ArenaError> {
+        self.validate_live_block(block_id)?;
         let half_block = self.num_kv_heads * self.block_size * self.head_dim;
         assert_eq!(host_key.len(), half_block);
         assert_eq!(host_val.len(), half_block);
@@ -1135,14 +1171,16 @@ impl GpuKvPoolView {
         let val_offset = base + half_block;
 
         {
-            let mut storage = self.storage_mut();
+            // SAFETY: validate_live_block proves this view owns the extent.
+            let mut storage = unsafe { self.storage_mut() };
             self.device().htod_sync_copy_into(
                 host_key,
                 &mut storage.slice_mut(key_offset..key_offset + half_block),
             )?;
         }
         {
-            let mut storage = self.storage_mut();
+            // SAFETY: validate_live_block proves this view owns the extent.
+            let mut storage = unsafe { self.storage_mut() };
             self.device().htod_sync_copy_into(
                 host_val,
                 &mut storage.slice_mut(val_offset..val_offset + half_block),
@@ -1474,6 +1512,27 @@ mod tests {
     }
 
     #[test]
+    fn stale_block_helpers_are_rejected() {
+        let pool = small_pool();
+        let block = pool.alloc_block().unwrap();
+        pool.free_block(block);
+        assert!(matches!(
+            pool.block_device_ptr(block),
+            Err(ArenaError::InvalidFree { .. })
+        ));
+        assert!(matches!(
+            pool.download_block(block),
+            Err(ArenaError::InvalidFree { .. })
+        ));
+        let half_block = pool.num_kv_heads() * pool.block_size() * pool.head_dim();
+        let zeros = vec![f16::ZERO; half_block];
+        assert!(matches!(
+            pool.upload_block(block, &zeros, &zeros),
+            Err(ArenaError::InvalidFree { .. })
+        ));
+    }
+
+    #[test]
     fn alloc_exhausted_returns_error() {
         let pool = small_pool();
         let blocks: Vec<u32> = (0..8).map(|_| pool.alloc_block().unwrap()).collect();
@@ -1492,9 +1551,9 @@ mod tests {
         assert_eq!(pool.free_count(), 5);
         // The run is contiguous, so block pointers advance by bytes_per_block.
         let bpb = pool.bytes_per_block();
-        let base = pool.block_device_ptr(first) as usize;
-        assert_eq!(pool.block_device_ptr(first + 1) as usize, base + bpb);
-        assert_eq!(pool.block_device_ptr(first + 2) as usize, base + 2 * bpb);
+        let base = pool.block_device_ptr(first).unwrap() as usize;
+        assert_eq!(pool.block_device_ptr(first + 1).unwrap() as usize, base + bpb);
+        assert_eq!(pool.block_device_ptr(first + 2).unwrap() as usize, base + 2 * bpb);
         pool.free_blocks_contiguous(first, 3);
         assert_eq!(pool.free_count(), 8);
     }

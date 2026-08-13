@@ -9,7 +9,7 @@
 #   gguf-cuda             llama.cpp with static CUDA KV
 #   gguf-native           GGUF with Kapsl's native CUDA kernels
 #   native                safetensors with Kapsl's native CUDA kernels
-#   cuda                  alias for gguf-cuda
+#   cuda                  alias for gguf-cuda-shared-kv
 #
 # Override any path via env var before calling, e.g.:
 #   KAPSL_DIR=/other/path ./scripts/build-kapsl.sh
@@ -28,7 +28,7 @@ KAPSL_FEATURE="${1:-${KAPSL_FEATURE:-gguf-cuda-shared-kv}}"
 # Normalise aliases.
 case "$KAPSL_FEATURE" in
   gguf-cuda-shared-kv|gguf-cuda|gguf-native|native) ;;
-  cuda) KAPSL_FEATURE="gguf-cuda" ;;
+  cuda) KAPSL_FEATURE="gguf-cuda-shared-kv" ;;
   *)
     echo "error: unsupported feature '$KAPSL_FEATURE'" >&2
     echo "       valid: gguf-cuda-shared-kv | gguf-cuda | gguf-native | native | cuda" >&2

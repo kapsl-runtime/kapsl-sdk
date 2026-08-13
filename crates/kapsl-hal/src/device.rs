@@ -553,6 +553,7 @@ impl DeviceInfo {
         devices
     }
 
+    #[cfg(target_os = "macos")]
     fn parse_memory_mb(value: &str) -> Option<u64> {
         let lowered = value.trim().to_ascii_lowercase();
         if lowered.is_empty() {

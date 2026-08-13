@@ -63,6 +63,11 @@ struct PoolOrtAllocator {
     state: AllocState,
 }
 
+// SAFETY: ORT invokes this allocator concurrently. Its mutable allocation map
+// is protected by a mutex, the memory-info handle is immutable after creation,
+// and the registry pins the Box until ORT has been unregistered.
+unsafe impl Send for PoolOrtAllocator {}
+
 unsafe extern "system" fn pool_alloc(
     this_: *mut ort_sys::OrtAllocator,
     size: usize,
@@ -142,9 +147,10 @@ unsafe extern "system" fn pool_reserve(
 
 struct Registration {
     pool: Arc<GpuDevicePool>,
-    /// Pins the ORT environment the allocator was registered on, so it (and
-    /// the leaked allocator vtable) outlive every session that may use it.
-    _env: Arc<ort::environment::Environment>,
+    /// Pins both the environment and allocator at stable addresses until the
+    /// allocator is explicitly unregistered.
+    env: Arc<ort::environment::Environment>,
+    allocator: Box<PoolOrtAllocator>,
 }
 
 static REGISTRY: OnceLock<Mutex<HashMap<i32, Registration>>> = OnceLock::new();
@@ -207,12 +213,12 @@ pub fn register_pool_allocator(device_id: i32, pool: &Arc<GpuDevicePool>) -> Res
             live: Mutex::new(HashMap::new()),
         },
     });
-    // ORT keeps the raw pointer for the environment's lifetime; the
-    // registration entry pins the environment, so leak the allocator.
-    let allocator: &'static mut PoolOrtAllocator = Box::leak(allocator);
-
-    let status =
-        unsafe { (ort::api().RegisterAllocator)(env.ptr().cast_mut(), &mut allocator.ort) };
+    // A Box has a stable pointee address. Keep it owned until successful
+    // unregistration; on registration failure it drops normally with its pool Arc.
+    let mut allocator = allocator;
+    let status = unsafe {
+        (ort::api().RegisterAllocator)(env.ptr().cast_mut(), &mut allocator.ort)
+    };
     status_to_result(status).map_err(|e| format!("ORT RegisterAllocator failed: {e}"))?;
 
     log::info!(
@@ -224,9 +230,40 @@ pub fn register_pool_allocator(device_id: i32, pool: &Arc<GpuDevicePool>) -> Res
         device_id,
         Registration {
             pool: Arc::clone(pool),
-            _env: env,
+            env,
+            allocator,
         },
     );
+    Ok(())
+}
+
+/// Unregister and drop the allocator for `device_id` once all ORT allocations
+/// have been returned. This releases the registry's pool reference and allows
+/// the runtime-owned backing allocation to be reclaimed.
+pub fn unregister_pool_allocator(device_id: i32, pool: &Arc<GpuDevicePool>) -> Result<(), String> {
+    let mut reg = registry().lock().unwrap();
+    let Some(existing) = reg.get(&device_id) else {
+        return Ok(());
+    };
+    if !Arc::ptr_eq(&existing.pool, pool) {
+        return Err(format!(
+            "a different GpuDevicePool is registered with ORT for device {device_id}"
+        ));
+    }
+    if !existing.allocator.state.live.lock().unwrap().is_empty() {
+        return Err(format!(
+            "cannot unregister ORT pool allocator for device {device_id} while allocations are live"
+        ));
+    }
+    let status = unsafe {
+        (ort::api().UnregisterAllocator)(
+            existing.env.ptr().cast_mut(),
+            existing.allocator.state.mem_info.ptr(),
+        )
+    };
+    status_to_result(status).map_err(|e| format!("ORT UnregisterAllocator failed: {e}"))?;
+    reg.remove(&device_id);
+    log::info!("Unregistered runtime GPU device pool from ORT for device {device_id}");
     Ok(())
 }
 

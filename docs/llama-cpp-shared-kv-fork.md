@@ -1,5 +1,10 @@
 # llama.cpp Shared KV Pool Fork Plan
 
+> Status: the integration is implemented and the application-level `cuda`
+> profile now enables `gguf-cuda-shared-kv`. The explicit `gguf-cuda` feature
+> remains the static-KV rollback. The milestones below retain the original
+> rollout context and should not be read as the current feature-selection state.
+
 This is the integration contract for making llama.cpp use Kapsl's GPU-wide KV
 pool instead of allocating a private, fixed-size KV cache per context.
 
@@ -210,16 +215,18 @@ Expected Kapsl files:
 
 ## Build Integration
 
-The cluster build for this path should use the shared-KV feature once it exists:
+The cluster build for this path can select the shared-KV feature directly:
 
 ```bash
 cargo build -p kapsl --release --no-default-features --features gguf-cuda-shared-kv
 ```
 
-Until that feature exists, `gguf-native` is built with:
+The separate native-kernel GGUF backend is built with:
 
 ```bash
 cargo build -p kapsl --release --no-default-features --features gguf-native
 ```
 
-The existing `cuda` feature maps to `gguf-cuda`, not `gguf-native`.
+The stable `cuda` feature maps to `gguf-cuda-shared-kv`. Build with the
+explicit `gguf-cuda` feature to use the static-KV rollback backend; it does not
+map to `gguf-native`.

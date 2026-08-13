@@ -30,7 +30,8 @@ mod inner {
 
     use kapsl_engine_api::{
         BatchingPolicy, BinaryTensorPacket, EngineError, EngineMetrics, EngineModelInfo,
-        EngineStream, ExternalDeviceMemoryReport, InferenceRequest, RequestMetadata, TensorDtype,
+        EngineStream, ExternalDeviceMemory, ExternalDeviceMemoryReport, InferenceRequest,
+        RequestMetadata, TensorDtype,
     };
     use kapsl_hal::gpu_arena::{GpuBlockPool, GpuDevicePool, GpuPoolHandle, PoolOwner};
     use kapsl_kernels::cuda_kernels::{
@@ -639,7 +640,7 @@ mod inner {
                 }).map_err(|err| EngineError::backend(format!("phys_dev: {err}")))?;
 
                 launch_batch_kv_write(&self.device, &mut BatchKvWriteParams {
-                    kv_cache: self.block_pool.storage_mut(),
+                    kv_cache: unsafe { self.block_pool.storage_mut() },
                     k: &self.prefill.k_all, v: &self.prefill.v_all,
                     physical_blocks: &phys_dev, pos_in_blocks: &pos_dev,
                     seq_len: n as u32, num_kv_heads: num_kv as u32,
@@ -828,7 +829,7 @@ mod inner {
                     .map_err(|err| e(format!("pos_dev: {err}")))?;
 
                 launch_batch_kv_write(&self.device, &mut BatchKvWriteParams {
-                    kv_cache: self.block_pool.storage_mut(),
+                    kv_cache: unsafe { self.block_pool.storage_mut() },
                     k: &self.batch.k_buf, v: &self.batch.v_buf,
                     physical_blocks: &phys_dev, pos_in_blocks: &pos_dev,
                     seq_len: b as u32, num_kv_heads: num_kv as u32,
@@ -848,7 +849,7 @@ mod inner {
                 launch_paged_attention(&self.device, &mut PagedAttentionParams {
                     out: &mut self.batch.attn_buf,
                     q: &self.batch.q_buf,
-                    kv_cache: self.block_pool.storage(),
+                    kv_cache: unsafe { self.block_pool.storage() },
                     block_tables: &bt_dev,
                     context_lens: &self.batch.ctx_lens,
                     scale,
@@ -1324,11 +1325,21 @@ mod inner {
             &self,
             model_path: &Path,
         ) -> Result<ExternalDeviceMemoryReport, EngineError> {
-            Ok(ExternalDeviceMemoryReport::single(
-                self.external_allocation_id.clone(),
-                self.device_id as usize,
-                planned_weight_bytes(model_path)?,
-            ))
+            let bytes = planned_weight_bytes(model_path)?;
+            Ok(ExternalDeviceMemoryReport {
+                allocations: vec![
+                    ExternalDeviceMemory {
+                        allocation_id: self.external_allocation_id.clone(),
+                        device_id: self.device_id as usize,
+                        bytes,
+                    },
+                    ExternalDeviceMemory {
+                        allocation_id: format!("{}:scratch", self.external_allocation_id),
+                        device_id: self.device_id as usize,
+                        bytes: (bytes / 8).max(256 * 1024 * 1024),
+                    },
+                ],
+            })
         }
 
         async fn load(&mut self, model_path: &Path) -> Result<(), EngineError> {
