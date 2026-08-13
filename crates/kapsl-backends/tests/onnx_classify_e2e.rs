@@ -50,5 +50,8 @@ async fn onnx_classify_end_to_end_softmaxes_real_session_output() {
     for (got, want) in p.iter().zip(expect) {
         assert!((got - want).abs() < 1e-4, "got {p:?}, want {expect:?}");
     }
-    assert!((p.iter().sum::<f32>() - 1.0).abs() < 1e-5, "not a distribution: {p:?}");
+    assert!(
+        (p.iter().sum::<f32>() - 1.0).abs() < 1e-5,
+        "not a distribution: {p:?}"
+    );
 }

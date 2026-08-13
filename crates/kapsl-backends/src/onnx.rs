@@ -3,8 +3,11 @@ use async_trait::async_trait;
 use half::f16;
 use kapsl_engine_api::{
     BinaryTensorPacket, Engine, EngineError, EngineMetrics, EngineModelInfo,
-    ExternalDeviceMemoryReport, InferenceRequest, TensorDtype,
+    ExternalDeviceMemoryReport, InferenceRequest, MemoryAllocation, MemoryAllocationClass,
+    MemoryAllocationSource, MemoryDomain, MemoryReport, TensorDtype,
 };
+#[cfg(feature = "onnx-cuda-pool")]
+use kapsl_hal::gpu_arena::{PoolAllocationClass, PoolOwner, PoolOwnerScope};
 use ndarray::ArrayD;
 use ort::execution_providers::ExecutionProvider as OrtExecutionProvider;
 use ort::session::builder::GraphOptimizationLevel;
@@ -65,6 +68,8 @@ pub struct OnnxBackend {
     metadata: Arc<RwLock<Option<ModelMetadata>>>,
     warmed_up: Arc<AtomicBool>,
     external_allocation_id: String,
+    #[cfg_attr(not(feature = "onnx-cuda-pool"), allow(dead_code))]
+    memory_owner: Option<(u32, u32)>,
 }
 
 #[derive(Default)]
@@ -333,6 +338,7 @@ pub struct OnnxBackendBuilder {
     bucket_dim_granularity: usize,
     bucket_max_dims: usize,
     peak_concurrency_hint: Option<u32>,
+    memory_owner: Option<(u32, u32)>,
 }
 
 impl OnnxBackendBuilder {
@@ -357,6 +363,7 @@ impl OnnxBackendBuilder {
             bucket_dim_granularity,
             bucket_max_dims,
             peak_concurrency_hint,
+            memory_owner: None,
         }
     }
 
@@ -408,6 +415,12 @@ impl OnnxBackendBuilder {
         self
     }
 
+    /// Attribute provider allocations to a stable runtime model replica.
+    pub fn with_memory_owner(mut self, model_id: u32, replica_id: u32) -> Self {
+        self.memory_owner = Some((model_id, replica_id));
+        self
+    }
+
     pub fn build(self) -> OnnxBackend {
         let level_value = match self.optimization_level {
             GraphOptimizationLevel::Disable => 0,
@@ -437,6 +450,7 @@ impl OnnxBackendBuilder {
                 self.device_id,
                 NEXT_ONNX_EXTERNAL_ALLOCATION_ID.fetch_add(1, Ordering::Relaxed)
             ),
+            memory_owner: self.memory_owner,
         }
     }
 }
@@ -448,6 +462,22 @@ impl Default for OnnxBackendBuilder {
 }
 
 impl OnnxBackend {
+    #[cfg(feature = "onnx-cuda-pool")]
+    fn enter_pool_scope(&self, class: PoolAllocationClass) -> Option<PoolOwnerScope> {
+        if !matches!(
+            self.provider,
+            ExecutionProvider::CUDA | ExecutionProvider::TensorRT
+        ) || !crate::ort_pool_allocator::is_registered(self.device_id)
+        {
+            return None;
+        }
+        let owner = self.memory_owner.map_or_else(
+            || PoolOwner::unattributed(kapsl_hal::gpu_arena::PoolBackend::Onnx, class),
+            |(model_id, replica_id)| PoolOwner::onnx(model_id, replica_id, class),
+        );
+        Some(PoolOwnerScope::enter(owner))
+    }
+
     /// Convert stored u8 optimization level to GraphOptimizationLevel
     fn get_opt_level(&self) -> GraphOptimizationLevel {
         match self.optimization_level {
@@ -670,6 +700,8 @@ impl OnnxBackend {
         model_path: &Path,
         opt_level: GraphOptimizationLevel,
     ) -> Result<Session, EngineError> {
+        #[cfg(feature = "onnx-cuda-pool")]
+        let _pool_scope = self.enter_pool_scope(PoolAllocationClass::PersistentWeights);
         // Common builder setup
         let mut builder = Session::builder()
             .map_err(|e| EngineError::ModelLoadError {
@@ -1560,6 +1592,58 @@ where
 
 #[async_trait]
 impl Engine for OnnxBackend {
+    fn planned_memory(&self, model_path: &Path) -> Result<MemoryReport, EngineError> {
+        let model_bytes = std::fs::metadata(model_path)
+            .map_err(|source| EngineError::ModelLoadError {
+                path: model_path.display().to_string(),
+                source: Box::new(source),
+            })?
+            .len() as usize;
+        let sessions = self.session_pool_size();
+        let mut report = MemoryReport::single(
+            format!("{}:host-session", self.external_allocation_id),
+            MemoryDomain::Host,
+            MemoryAllocationClass::ModelSession,
+            model_bytes.saturating_mul(sessions),
+        );
+
+        let (domain, source) = match self.provider {
+            ExecutionProvider::CUDA | ExecutionProvider::TensorRT => (
+                MemoryDomain::Cuda {
+                    device_id: self.device_id as usize,
+                },
+                if self.uses_external_cuda_memory() {
+                    MemoryAllocationSource::BackendManaged
+                } else {
+                    MemoryAllocationSource::RuntimeManaged
+                },
+            ),
+            ExecutionProvider::CPU => return Ok(report),
+            provider => (
+                MemoryDomain::Provider {
+                    provider: format!("{provider:?}").to_ascii_lowercase(),
+                    device_id: Some(self.device_id as usize),
+                },
+                MemoryAllocationSource::BackendManaged,
+            ),
+        };
+        report.push(MemoryAllocation {
+            allocation_id: self.external_allocation_id.clone(),
+            domain: domain.clone(),
+            class: MemoryAllocationClass::PersistentWeights,
+            source,
+            bytes: model_bytes.saturating_mul(sessions),
+        });
+        report.push(MemoryAllocation {
+            allocation_id: format!("{}:workspace", self.external_allocation_id),
+            domain,
+            class: MemoryAllocationClass::TransientWorkspace,
+            source,
+            bytes: (model_bytes / 4).max(64 * 1024 * 1024),
+        });
+        Ok(report)
+    }
+
     fn planned_external_device_memory(
         &self,
         model_path: &Path,
@@ -1694,6 +1778,8 @@ impl Engine for OnnxBackend {
     }
 
     fn infer(&self, request: &InferenceRequest) -> Result<BinaryTensorPacket, EngineError> {
+        #[cfg(feature = "onnx-cuda-pool")]
+        let _pool_scope = self.enter_pool_scope(PoolAllocationClass::TransientWorkspace);
         let start_time = Instant::now();
         if let Some(session_id) = &request.session_id {
             log::debug!(
@@ -1811,6 +1897,57 @@ impl Engine for OnnxBackend {
         self.warmed_up.store(true, Ordering::SeqCst);
 
         Ok(output_packet)
+    }
+
+    fn actual_memory(&self) -> MemoryReport {
+        let model_path = self.model_path.read().ok().and_then(|path| path.clone());
+        model_path
+            .as_deref()
+            .and_then(|path| self.planned_memory(path).ok())
+            .unwrap_or_default()
+    }
+
+    fn planned_request_memory(&self, request: &InferenceRequest) -> MemoryReport {
+        let bytes = request
+            .additional_inputs
+            .iter()
+            .map(|input| input.tensor.data.len())
+            .fold(request.input.data.len(), usize::saturating_add);
+        let mut report = MemoryReport::single(
+            "request:materialized-inputs",
+            MemoryDomain::Host,
+            MemoryAllocationClass::RequestTransient,
+            bytes,
+        );
+        if matches!(
+            self.provider,
+            ExecutionProvider::CUDA | ExecutionProvider::TensorRT
+        ) {
+            report.push(MemoryAllocation {
+                allocation_id: "request:cuda-staging".to_string(),
+                domain: MemoryDomain::HostPinned {
+                    provider: "cuda".to_string(),
+                    device_id: Some(self.device_id as usize),
+                },
+                class: MemoryAllocationClass::RequestTransient,
+                source: MemoryAllocationSource::BackendManaged,
+                bytes,
+            });
+            report.push(MemoryAllocation {
+                allocation_id: "request:cuda-input-output".to_string(),
+                domain: MemoryDomain::Cuda {
+                    device_id: self.device_id as usize,
+                },
+                class: MemoryAllocationClass::RequestTransient,
+                source: if self.uses_external_cuda_memory() {
+                    MemoryAllocationSource::BackendManaged
+                } else {
+                    MemoryAllocationSource::RuntimeManaged
+                },
+                bytes,
+            });
+        }
+        report
     }
 
     /// Batched inference: stack shape-compatible requests into a single

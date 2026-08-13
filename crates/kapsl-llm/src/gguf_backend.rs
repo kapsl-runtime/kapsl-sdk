@@ -3,7 +3,9 @@ use async_stream::stream;
 use async_trait::async_trait;
 use kapsl_engine_api::{
     BatchingPolicy, BinaryTensorPacket, Engine, EngineError, EngineMetrics, EngineModelInfo,
-    EngineStream, ExternalDeviceMemory, ExternalDeviceMemoryReport, InferenceRequest, TensorDtype,
+    EngineStream, ExternalDeviceMemory, ExternalDeviceMemoryReport, InferenceRequest,
+    MemoryAllocation, MemoryAllocationClass, MemoryAllocationSource, MemoryDomain, MemoryReport,
+    TensorDtype,
 };
 use std::collections::VecDeque;
 use std::num::NonZeroU32;
@@ -24,7 +26,9 @@ use kapsl_hal::cpu_block_store::CpuBlockStore;
 #[cfg(feature = "gguf-cuda-shared-kv")]
 use kapsl_hal::cross_device_scheduler::CrossDevicePoolScheduler;
 #[cfg(feature = "gguf-cuda-shared-kv")]
-use kapsl_hal::gpu_arena::{GpuBlockPool, GpuDevicePool, GpuPoolHandle, PoolOwner};
+use kapsl_hal::gpu_arena::{
+    GpuBlockPool, GpuDevicePool, GpuPoolHandle, PoolAllocationClass, PoolOwner,
+};
 #[cfg(feature = "gguf-cuda-shared-kv")]
 use kapsl_hal::prefix_cache::PrefixBlockCache;
 #[cfg(feature = "gguf")]
@@ -3087,8 +3091,22 @@ impl GgufBackend {
         device_pool: Arc<GpuDevicePool>,
         model_id: u32,
     ) -> Self {
+        Self::new_cuda_device_pool_for_replica(device_id, device_pool, model_id, 0)
+    }
+
+    /// Construct the shared-KV backend with stable model/replica attribution.
+    #[cfg(feature = "gguf-cuda-shared-kv")]
+    pub fn new_cuda_device_pool_for_replica(
+        device_id: usize,
+        device_pool: Arc<GpuDevicePool>,
+        model_id: u32,
+        replica_id: u32,
+    ) -> Self {
         let mut backend = Self::new_cuda_shared_kv(device_id, None);
-        backend.device_pool = Some((device_pool, PoolOwner::GgufKv { model_id }));
+        backend.device_pool = Some((
+            device_pool,
+            PoolOwner::gguf(model_id, replica_id, PoolAllocationClass::KvCache),
+        ));
         backend
     }
 
@@ -4029,6 +4047,52 @@ fn run_scheduler(
 #[cfg(feature = "gguf")]
 #[async_trait]
 impl Engine for GgufBackend {
+    fn planned_memory(&self, model_path: &Path) -> Result<MemoryReport, EngineError> {
+        let bytes = std::fs::metadata(model_path)
+            .map_err(|error| EngineError::backend(format!("stat GGUF model: {error}")))?
+            .len() as usize;
+        let mut report = MemoryReport {
+            allocations: vec![
+                MemoryAllocation {
+                    allocation_id: gguf_allocation_id(model_path),
+                    domain: MemoryDomain::Cuda {
+                        device_id: self.device_id,
+                    },
+                    class: MemoryAllocationClass::PersistentWeights,
+                    source: MemoryAllocationSource::BackendManaged,
+                    bytes,
+                },
+                MemoryAllocation {
+                    allocation_id: format!("gguf-scratch:{}", gguf_model_key(model_path).display()),
+                    domain: MemoryDomain::Cuda {
+                        device_id: self.device_id,
+                    },
+                    class: MemoryAllocationClass::TransientWorkspace,
+                    source: MemoryAllocationSource::BackendManaged,
+                    bytes: (bytes / 8).max(256 * 1024 * 1024),
+                },
+            ],
+        };
+        #[cfg(feature = "gguf-cuda-shared-kv")]
+        let runtime_kv = self.device_pool.is_some();
+        #[cfg(not(feature = "gguf-cuda-shared-kv"))]
+        let runtime_kv = false;
+        report.push(MemoryAllocation {
+            allocation_id: format!("gguf-kv:{}", gguf_model_key(model_path).display()),
+            domain: MemoryDomain::Cuda {
+                device_id: self.device_id,
+            },
+            class: MemoryAllocationClass::KvCache,
+            source: if runtime_kv {
+                MemoryAllocationSource::RuntimeManaged
+            } else {
+                MemoryAllocationSource::BackendManaged
+            },
+            bytes: 0,
+        });
+        Ok(report)
+    }
+
     fn planned_external_device_memory(
         &self,
         model_path: &Path,
@@ -4359,6 +4423,51 @@ impl Engine for GgufBackend {
             })
             .collect();
         ExternalDeviceMemoryReport { allocations }
+    }
+
+    fn actual_memory(&self) -> MemoryReport {
+        let external = self.actual_external_device_memory();
+        let mut report = MemoryReport {
+            allocations: external
+                .allocations
+                .iter()
+                .map(|allocation| MemoryAllocation {
+                    allocation_id: allocation.allocation_id.clone(),
+                    domain: MemoryDomain::Cuda {
+                        device_id: allocation.device_id,
+                    },
+                    class: MemoryAllocationClass::PersistentWeights,
+                    source: MemoryAllocationSource::BackendManaged,
+                    bytes: allocation.bytes,
+                })
+                .collect(),
+        };
+        let metrics = self.metrics_snapshot();
+        let fallback_domain = external
+            .allocations
+            .first()
+            .map(|allocation| MemoryDomain::Cuda {
+                device_id: allocation.device_id,
+            })
+            .unwrap_or(MemoryDomain::Host);
+        #[cfg(feature = "gguf-cuda-shared-kv")]
+        let runtime_kv = self.device_pool.is_some()
+            && self.kv_path.load(std::sync::atomic::Ordering::Acquire)
+                == GgufKvPath::SharedKv.as_u8();
+        #[cfg(not(feature = "gguf-cuda-shared-kv"))]
+        let runtime_kv = false;
+        report.push(MemoryAllocation {
+            allocation_id: "gguf:active-kv".to_string(),
+            domain: fallback_domain,
+            class: MemoryAllocationClass::KvCache,
+            source: if runtime_kv {
+                MemoryAllocationSource::RuntimeManaged
+            } else {
+                MemoryAllocationSource::BackendManaged
+            },
+            bytes: metrics.kv_cache_bytes_used,
+        });
+        report
     }
 
     fn infer(&self, request: &InferenceRequest) -> Result<BinaryTensorPacket, EngineError> {

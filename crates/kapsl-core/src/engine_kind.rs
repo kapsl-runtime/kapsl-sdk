@@ -103,7 +103,11 @@ impl EngineKind {
     pub fn validate(manifest: &Manifest) -> Result<(), String> {
         // Reject explicitly-set values outside the known vocabularies.
         check_known("format", manifest.format.as_deref(), VALID_FORMATS)?;
-        check_known("model_type", manifest.model_type.as_deref(), VALID_MODEL_TYPES)?;
+        check_known(
+            "model_type",
+            manifest.model_type.as_deref(),
+            VALID_MODEL_TYPES,
+        )?;
         check_known("task", manifest.task.as_deref(), VALID_TASKS)?;
 
         let format = effective_format(manifest);
@@ -116,7 +120,11 @@ impl EngineKind {
                 return Err(format!(
                     "model_file `{}` is a {} model but the package resolves to format `{}` \
                      (framework={:?}, format={:?}); set format/framework to `{}`",
-                    manifest.model_file, ext_format, format, manifest.framework, manifest.format,
+                    manifest.model_file,
+                    ext_format,
+                    format,
+                    manifest.framework,
+                    manifest.format,
                     ext_format
                 ));
             }

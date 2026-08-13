@@ -88,7 +88,6 @@ impl ModelConfig {
 
     /// Effective number of KV heads (GQA support).
     pub fn num_kv_heads(&self) -> usize {
-        self.num_key_value_heads
-            .unwrap_or(self.num_attention_heads)
+        self.num_key_value_heads.unwrap_or(self.num_attention_heads)
     }
 }

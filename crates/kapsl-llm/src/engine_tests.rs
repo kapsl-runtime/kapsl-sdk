@@ -1,12 +1,14 @@
 #[cfg(test)]
 mod tests {
     use super::super::{
-        build_kv_array_f16, build_kv_array_f32_from_f16, empty_kv_shape, infer_kv_layout,
-        normalize_metadata_safe_load_setting, parse_safe_load_env_setting, parse_safe_load_setting,
-        resolve_prepend_bos_token_id, tokenizer_add_bos_token, tokenizer_declared_bos_token_id,
-        KvLayout, LLMEngine, LLMMetrics, SafeLoadSetting, SamplingParams, SchedulerConfig,
+        build_kv_array_f16, build_kv_array_f32_from_f16, device_kv_sequence_len, empty_kv_shape,
+        empty_kv_shape_with_seq_len, infer_kv_layout, normalize_metadata_safe_load_setting,
+        parse_safe_load_env_setting, parse_safe_load_setting, resolve_prepend_bos_token_id,
+        tokenizer_add_bos_token, tokenizer_declared_bos_token_id, KvCacheMode, KvLayout, LLMEngine,
+        LLMMetrics, SafeLoadSetting, SamplingParams, SchedulerConfig,
     };
     use half::f16;
+    use ort::tensor::TensorElementType;
     use serde_json::json;
     use std::collections::HashMap;
     use std::fs;
@@ -213,6 +215,145 @@ mod tests {
 
         let shape = empty_kv_shape(None, KvLayout::HeadDimFirst, 3, 7);
         assert_eq!(shape, vec![1, 3, 7, 1]);
+    }
+
+    #[test]
+    fn cuda_empty_kv_shape_uses_a_real_zero_length_sequence() {
+        let seq_first =
+            empty_kv_shape_with_seq_len(Some(&vec![1, 8, -1, 16]), KvLayout::SeqFirst, 8, 16, 0);
+        assert_eq!(seq_first, vec![1, 8, 0, 16]);
+
+        let head_dim_first = empty_kv_shape_with_seq_len(
+            Some(&vec![1, 8, 16, -1]),
+            KvLayout::HeadDimFirst,
+            8,
+            16,
+            0,
+        );
+        assert_eq!(head_dim_first, vec![1, 8, 16, 0]);
+    }
+
+    #[test]
+    fn device_kv_sequence_axis_follows_export_layout() {
+        assert_eq!(
+            device_kv_sequence_len(&[1, 8, 37, 16], KvLayout::SeqFirst),
+            Some(37)
+        );
+        assert_eq!(
+            device_kv_sequence_len(&[1, 8, 16, 41], KvLayout::HeadDimFirst),
+            Some(41)
+        );
+        assert_eq!(
+            device_kv_sequence_len(&[2, 8, 37, 16], KvLayout::SeqFirst),
+            None
+        );
+        assert_eq!(
+            device_kv_sequence_len(&[1, 8, 16], KvLayout::SeqFirst),
+            None
+        );
+    }
+
+    #[test]
+    fn device_kv_contract_requires_paired_past_and_present_tensors() {
+        let (_request_tx, request_rx) = mpsc::channel(1);
+        let mut engine = LLMEngine::new(
+            SchedulerConfig {
+                max_num_batched_tokens: 16,
+                max_num_seqs: 1,
+                max_paddings: 0,
+            },
+            16,
+            1,
+            request_rx,
+            Arc::new(Mutex::new(LLMMetrics::default())),
+            Some("cuda".to_string()),
+            Some(0),
+            None,
+            true,
+        );
+        engine.num_layers = 1;
+        engine.model_input_names = Arc::new(
+            [
+                "input_ids".to_string(),
+                "past_key_values.0.key".to_string(),
+                "past_key_values.0.value".to_string(),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        engine.model_input_shapes = Arc::new(HashMap::from([
+            ("past_key_values.0.key".to_string(), vec![1, 8, -1, 16]),
+            ("past_key_values.0.value".to_string(), vec![1, 8, -1, 16]),
+        ]));
+        engine.model_input_types = Arc::new(HashMap::from([
+            (
+                "past_key_values.0.key".to_string(),
+                TensorElementType::Float16,
+            ),
+            (
+                "past_key_values.0.value".to_string(),
+                TensorElementType::Float16,
+            ),
+        ]));
+        engine.model_output_names = Arc::new(
+            [
+                "logits".to_string(),
+                "present.0.key".to_string(),
+                "present.0.value".to_string(),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        assert!(engine.device_kv_contract_supported());
+
+        Arc::make_mut(&mut engine.model_output_names).remove("present.0.value");
+        assert!(!engine.device_kv_contract_supported());
+
+        Arc::make_mut(&mut engine.model_output_names).insert("present.0.value".to_string());
+        Arc::make_mut(&mut engine.model_input_shapes).remove("past_key_values.0.value");
+        assert!(!engine.device_kv_contract_supported());
+    }
+
+    #[test]
+    fn device_kv_paged_capacity_uses_the_configured_block_budget() {
+        let (_request_tx, request_rx) = mpsc::channel(1);
+        let mut engine = LLMEngine::new(
+            SchedulerConfig {
+                max_num_batched_tokens: 16,
+                max_num_seqs: 1,
+                max_paddings: 0,
+            },
+            16,
+            1,
+            request_rx,
+            Arc::new(Mutex::new(LLMMetrics::default())),
+            Some("cuda".to_string()),
+            Some(0),
+            None,
+            true,
+        );
+        engine.num_layers = 2;
+        engine.num_heads = 3;
+        engine.head_dim = 5;
+        engine.kv_cache_config.mode = KvCacheMode::Paged;
+        engine.kv_cache_config.block_size = 4;
+        engine.kv_cache_config.total_blocks = 10;
+
+        // 2 layers * key/value * 3 heads * 5 elements * 2 bytes = 120
+        // bytes/token; the configured pool represents 40 tokens.
+        assert_eq!(engine.device_kv_usage(), (0, 4_800, 0));
+
+        engine.device_kv_enabled = true;
+        engine.max_seq_len = 12;
+        assert_eq!(
+            engine.projected_kv_reservation_bytes(10, 5, false),
+            Some(1_440)
+        );
+        assert_eq!(
+            engine.projected_kv_reservation_bytes(10, 5, true),
+            Some(1_800)
+        );
     }
 
     fn sampling_params(temperature: f32) -> SamplingParams {

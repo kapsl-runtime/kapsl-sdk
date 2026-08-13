@@ -7,10 +7,14 @@ mod tests {
     use crate::prompt_adapter::ChatPromptTemplate;
     use crate::sequence::{FinishReason, SequenceGroupOutput};
     use futures::StreamExt;
-    use kapsl_engine_api::{BinaryTensorPacket, Engine, InferenceRequest, TensorDtype};
+    use kapsl_engine_api::{
+        BinaryTensorPacket, Engine, InferenceRequest, MemoryAllocationClass, MemoryDomain,
+        TensorDtype,
+    };
     use serde_json::json;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::atomic::Ordering;
     use tokio::sync::mpsc;
 
     fn make_temp_dir(label: &str) -> PathBuf {
@@ -116,6 +120,30 @@ mod tests {
 
         let runtime = load_model_runtime_config(&model_path);
         assert_eq!(runtime.sampling.stop_token_ids, vec![1, 106, 2]);
+    }
+
+    #[test]
+    fn actual_memory_tracks_device_kv_fallback_domain() {
+        let backend = LLMBackend::with_device("cuda".to_string(), 2).with_env_allocators(true);
+        backend.loaded_model_bytes.store(1024, Ordering::Release);
+
+        let kv_allocation = |report: kapsl_engine_api::MemoryReport| {
+            report
+                .allocations
+                .into_iter()
+                .find(|allocation| allocation.class == MemoryAllocationClass::KvCache)
+                .expect("KV allocation")
+        };
+        assert_eq!(
+            kv_allocation(backend.actual_memory()).domain,
+            MemoryDomain::Host
+        );
+
+        backend.metrics.lock().unwrap().kv_cache_device_resident = true;
+        assert_eq!(
+            kv_allocation(backend.actual_memory()).domain,
+            MemoryDomain::Cuda { device_id: 2 }
+        );
     }
 
     #[test]

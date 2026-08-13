@@ -132,7 +132,9 @@ fn replacing_snapshot_removes_stale_owner_series_across_clones() {
     );
 
     let text = gather_text(&registry);
-    assert!(text.contains(r#"kapsl_gpu_device_pool_owner_usage_bytes{device="3",owner="onnx"} 30"#));
+    assert!(
+        text.contains(r#"kapsl_gpu_device_pool_owner_usage_bytes{device="3",owner="onnx"} 30"#)
+    );
     assert!(!text.contains(r#"owner="native_kv:7""#));
 }
 

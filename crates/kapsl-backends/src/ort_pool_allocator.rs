@@ -24,7 +24,9 @@ use std::ffi::{c_void, CStr};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use kapsl_hal::gpu_arena::{GpuAllocation, GpuDevicePool, PoolOwner};
+use kapsl_hal::gpu_arena::{
+    scoped_pool_owner_or, GpuAllocation, GpuDevicePool, PoolAllocationClass, PoolBackend, PoolOwner,
+};
 use ort::memory::{AllocationDevice, AllocatorType, MemoryInfo, MemoryType};
 use ort::sys as ort_sys;
 use ort::AsPointer;
@@ -77,7 +79,11 @@ unsafe extern "system" fn pool_alloc(
         if size == 0 {
             return std::ptr::null_mut();
         }
-        match state.pool.alloc(PoolOwner::Onnx, size, CUDA_ALLOC_ALIGN) {
+        let owner = scoped_pool_owner_or(PoolOwner::unattributed(
+            PoolBackend::Onnx,
+            PoolAllocationClass::ExternallyOwned,
+        ));
+        match state.pool.alloc(owner, size, CUDA_ALLOC_ALIGN) {
             Ok(allocation) => {
                 let ptr = state.pool.allocation_ptr(&allocation) as usize;
                 state.live.lock().unwrap().insert(ptr, allocation);
@@ -107,11 +113,7 @@ unsafe extern "system" fn pool_free(this_: *mut ort_sys::OrtAllocator, p: *mut c
         match allocation {
             Some(allocation) => {
                 if let Err(error) = state.pool.free(allocation.clone()) {
-                    state
-                        .live
-                        .lock()
-                        .unwrap()
-                        .insert(p as usize, allocation);
+                    state.live.lock().unwrap().insert(p as usize, allocation);
                     log::error!(
                         "ORT pool allocator (device {}): failed to free {:p}: {}",
                         state.device_id,
@@ -216,9 +218,8 @@ pub fn register_pool_allocator(device_id: i32, pool: &Arc<GpuDevicePool>) -> Res
     // A Box has a stable pointee address. Keep it owned until successful
     // unregistration; on registration failure it drops normally with its pool Arc.
     let mut allocator = allocator;
-    let status = unsafe {
-        (ort::api().RegisterAllocator)(env.ptr().cast_mut(), &mut allocator.ort)
-    };
+    let status =
+        unsafe { (ort::api().RegisterAllocator)(env.ptr().cast_mut(), &mut allocator.ort) };
     status_to_result(status).map_err(|e| format!("ORT RegisterAllocator failed: {e}"))?;
 
     log::info!(

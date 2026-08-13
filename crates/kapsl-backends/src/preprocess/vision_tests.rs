@@ -48,7 +48,7 @@ fn nchw_solid_color_normalizes_per_channel() {
 
     let values = output_f32(&out);
     let plane = 16; // 4 * 4
-    // Default scale 1/255, mean 0, std 1: R plane == 1.0, G/B planes == 0.0.
+                    // Default scale 1/255, mean 0, std 1: R plane == 1.0, G/B planes == 0.0.
     for &r in &values[0..plane] {
         assert!((r - 1.0).abs() < 1e-6, "R channel expected 1.0, got {r}");
     }
@@ -114,8 +114,12 @@ fn letterbox_pads_non_square_input() {
 
     let v = output_f32(&out);
     let plane = 100; // 10 * 10, R channel
-    // Top-left corner (row 0) is padding -> 0.0; center row is image -> ~1.0.
-    assert!(v[0].abs() < 1e-6, "expected padded corner 0.0, got {}", v[0]);
+                     // Top-left corner (row 0) is padding -> 0.0; center row is image -> ~1.0.
+    assert!(
+        v[0].abs() < 1e-6,
+        "expected padded corner 0.0, got {}",
+        v[0]
+    );
     let center = 5 * 10 + 5; // row 5, col 5
     assert!(
         (v[center] - 1.0).abs() < 1e-6,

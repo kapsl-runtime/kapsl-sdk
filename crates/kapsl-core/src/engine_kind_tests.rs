@@ -14,17 +14,32 @@ fn classifies_known_frameworks() {
 
 #[test]
 fn is_case_and_whitespace_insensitive() {
-    assert_eq!(EngineKind::from_framework("  GGUF "), EngineKind::GgufGenerate);
+    assert_eq!(
+        EngineKind::from_framework("  GGUF "),
+        EngineKind::GgufGenerate
+    );
     assert_eq!(EngineKind::from_framework("LLM"), EngineKind::OnnxGenerate);
-    assert_eq!(EngineKind::from_framework("SafeTensors"), EngineKind::Native);
+    assert_eq!(
+        EngineKind::from_framework("SafeTensors"),
+        EngineKind::Native
+    );
 }
 
 #[test]
 fn unknown_frameworks_fall_through_to_onnx_forward() {
     // Preserves the legacy `else` arm: pytorch/tensorflow/unknown -> stateless ONNX.
-    assert_eq!(EngineKind::from_framework("pytorch"), EngineKind::OnnxForward);
-    assert_eq!(EngineKind::from_framework("tensorflow"), EngineKind::OnnxForward);
-    assert_eq!(EngineKind::from_framework("totally-made-up"), EngineKind::OnnxForward);
+    assert_eq!(
+        EngineKind::from_framework("pytorch"),
+        EngineKind::OnnxForward
+    );
+    assert_eq!(
+        EngineKind::from_framework("tensorflow"),
+        EngineKind::OnnxForward
+    );
+    assert_eq!(
+        EngineKind::from_framework("totally-made-up"),
+        EngineKind::OnnxForward
+    );
     assert_eq!(EngineKind::from_framework(""), EngineKind::OnnxForward);
 }
 
@@ -80,28 +95,61 @@ fn resolve_reads_manifest_framework() {
 
 #[test]
 fn legacy_only_manifests_resolve_unchanged() {
-    assert_eq!(EngineKind::resolve(&mk("llm", None, None, None, "m.onnx")), EngineKind::OnnxGenerate);
-    assert_eq!(EngineKind::resolve(&mk("onnx", None, None, None, "m.onnx")), EngineKind::OnnxForward);
-    assert_eq!(EngineKind::resolve(&mk("safetensors", None, None, None, "m.safetensors")), EngineKind::Native);
+    assert_eq!(
+        EngineKind::resolve(&mk("llm", None, None, None, "m.onnx")),
+        EngineKind::OnnxGenerate
+    );
+    assert_eq!(
+        EngineKind::resolve(&mk("onnx", None, None, None, "m.onnx")),
+        EngineKind::OnnxForward
+    );
+    assert_eq!(
+        EngineKind::resolve(&mk("safetensors", None, None, None, "m.safetensors")),
+        EngineKind::Native
+    );
 }
 
 #[test]
 fn new_axes_take_precedence_over_framework() {
     // framework says onnx (forward), but task=generate -> ONNX generative.
-    let m = mk("onnx", Some("onnx"), Some("causal-lm"), Some("generate"), "m.onnx");
+    let m = mk(
+        "onnx",
+        Some("onnx"),
+        Some("causal-lm"),
+        Some("generate"),
+        "m.onnx",
+    );
     assert_eq!(EngineKind::resolve(&m), EngineKind::OnnxGenerate);
 
     // onnx embedding -> dedicated (not-yet-implemented) embed engine.
-    let m = mk("onnx", Some("onnx"), Some("embedding"), Some("embed"), "m.onnx");
+    let m = mk(
+        "onnx",
+        Some("onnx"),
+        Some("embedding"),
+        Some("embed"),
+        "m.onnx",
+    );
     assert_eq!(EngineKind::resolve(&m), EngineKind::OnnxEmbed);
 }
 
 #[test]
 fn resolve_maps_onnx_tasks_to_distinct_engines() {
-    let embed = mk("onnx", Some("onnx"), Some("embedding"), Some("embed"), "m.onnx");
+    let embed = mk(
+        "onnx",
+        Some("onnx"),
+        Some("embedding"),
+        Some("embed"),
+        "m.onnx",
+    );
     assert_eq!(EngineKind::resolve(&embed), EngineKind::OnnxEmbed);
 
-    let classify = mk("onnx", Some("onnx"), Some("seq-classifier"), Some("classify"), "m.onnx");
+    let classify = mk(
+        "onnx",
+        Some("onnx"),
+        Some("seq-classifier"),
+        Some("classify"),
+        "m.onnx",
+    );
     assert_eq!(EngineKind::resolve(&classify), EngineKind::OnnxClassify);
 }
 
@@ -137,7 +185,9 @@ fn validate_accepts_legacy_manifests() {
     assert!(EngineKind::validate(&mk("gguf", None, None, None, "model.gguf")).is_ok());
     assert!(EngineKind::validate(&mk("llm", None, None, None, "model.onnx")).is_ok());
     assert!(EngineKind::validate(&mk("onnx", None, None, None, "model.onnx")).is_ok());
-    assert!(EngineKind::validate(&mk("safetensors", None, None, None, "model.safetensors")).is_ok());
+    assert!(
+        EngineKind::validate(&mk("safetensors", None, None, None, "model.safetensors")).is_ok()
+    );
 }
 
 #[test]
@@ -149,17 +199,37 @@ fn validate_rejects_llm_tag_on_gguf_file() {
 
 #[test]
 fn validate_rejects_non_causal_gguf() {
-    let err = EngineKind::validate(&mk("gguf", Some("gguf"), Some("embedding"), Some("embed"), "m.gguf"))
-        .unwrap_err();
+    let err = EngineKind::validate(&mk(
+        "gguf",
+        Some("gguf"),
+        Some("embedding"),
+        Some("embed"),
+        "m.gguf",
+    ))
+    .unwrap_err();
     assert!(err.contains("causal-lm"), "unexpected: {err}");
 }
 
 #[test]
 fn validate_rejects_incoherent_task_for_model_type() {
     // causal-lm cannot classify.
-    assert!(EngineKind::validate(&mk("onnx", Some("onnx"), Some("causal-lm"), Some("classify"), "m.onnx")).is_err());
+    assert!(EngineKind::validate(&mk(
+        "onnx",
+        Some("onnx"),
+        Some("causal-lm"),
+        Some("classify"),
+        "m.onnx"
+    ))
+    .is_err());
     // embedding model cannot generate.
-    assert!(EngineKind::validate(&mk("onnx", Some("onnx"), Some("embedding"), Some("generate"), "m.onnx")).is_err());
+    assert!(EngineKind::validate(&mk(
+        "onnx",
+        Some("onnx"),
+        Some("embedding"),
+        Some("generate"),
+        "m.onnx"
+    ))
+    .is_err());
 }
 
 #[test]
@@ -171,5 +241,12 @@ fn validate_rejects_unknown_vocabulary() {
 
 #[test]
 fn validate_accepts_onnx_embedding() {
-    assert!(EngineKind::validate(&mk("onnx", Some("onnx"), Some("embedding"), Some("embed"), "m.onnx")).is_ok());
+    assert!(EngineKind::validate(&mk(
+        "onnx",
+        Some("onnx"),
+        Some("embedding"),
+        Some("embed"),
+        "m.onnx"
+    ))
+    .is_ok());
 }

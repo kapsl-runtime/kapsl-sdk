@@ -11,8 +11,8 @@
 
 [package]
 edition = "2021"
-name = "llama-cpp-sys-2"
-version = "0.1.146"
+name = "kapsl-llama-cpp-sys-2"
+version = "0.1.146-kapsl.1"
 build = "build.rs"
 links = "llama"
 include = [
@@ -72,10 +72,10 @@ autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
-description = "Low Level Bindings to llama.cpp"
+description = "Kapsl-maintained low-level bindings to its llama.cpp shared-KV fork"
 readme = "README.md"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/utilityai/llama-cpp-rs"
+repository = "https://github.com/kapsl-runtime/kapsl-sdk"
 
 [features]
 cuda = []

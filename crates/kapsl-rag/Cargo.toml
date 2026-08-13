@@ -7,7 +7,7 @@ repository.workspace = true
 description = "Retrieval-augmented generation implementation with vector store and WASM plugins for Kapsl"
 
 [dependencies]
-kapsl-rag-sdk = { version = "0.1.1", path = "../kapsl-rag-sdk" }
+kapsl-rag-sdk = { version = "0.1.2", path = "../kapsl-rag-sdk" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "1.0"
@@ -17,8 +17,8 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 hnsw_rs = "0.3"
 log = "0.4"
 toml = "0.8"
-wasmtime = "44"
-wasmtime-wasi = "44"
+wasmtime = "36.0.13"
+wasmtime-wasi = "36.0.13"
 bytes = "1"
 
 [dev-dependencies]

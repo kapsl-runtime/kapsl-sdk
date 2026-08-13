@@ -25,20 +25,15 @@ pub enum CpuStoreError {
 /// Each slot holds one KV block: `2 * num_kv_heads * block_size * head_dim` f16
 /// elements (K half then V half, matching `GpuBlockPool`'s layout).
 pub struct CpuBlockStore {
-    data:           Vec<f16>,
+    data: Vec<f16>,
     elems_per_block: usize,
-    capacity:       usize,
-    free_slots:     Vec<u32>,
+    capacity: usize,
+    free_slots: Vec<u32>,
 }
 
 impl CpuBlockStore {
     /// Allocate storage for `capacity` blocks with the given KV geometry.
-    pub fn new(
-        capacity: usize,
-        num_kv_heads: usize,
-        block_size: usize,
-        head_dim: usize,
-    ) -> Self {
+    pub fn new(capacity: usize, num_kv_heads: usize, block_size: usize, head_dim: usize) -> Self {
         let elems_per_block = 2 * num_kv_heads * block_size * head_dim;
         Self {
             data: vec![f16::ZERO; capacity * elems_per_block],
@@ -49,16 +44,24 @@ impl CpuBlockStore {
     }
 
     /// Number of f16 elements per block.
-    pub fn elems_per_block(&self) -> usize { self.elems_per_block }
+    pub fn elems_per_block(&self) -> usize {
+        self.elems_per_block
+    }
 
     /// Total block capacity.
-    pub fn capacity(&self) -> usize { self.capacity }
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
 
     /// Number of free (unoccupied) slots.
-    pub fn free_count(&self) -> usize { self.free_slots.len() }
+    pub fn free_count(&self) -> usize {
+        self.free_slots.len()
+    }
 
     /// Number of occupied slots.
-    pub fn used_count(&self) -> usize { self.capacity - self.free_slots.len() }
+    pub fn used_count(&self) -> usize {
+        self.capacity - self.free_slots.len()
+    }
 
     /// Write `data` into a free slot and return its slot index.
     ///
@@ -70,8 +73,10 @@ impl CpuBlockStore {
                 expected: self.elems_per_block,
             });
         }
-        let slot = self.free_slots.pop().ok_or(CpuStoreError::Full { capacity: self.capacity })?;
-        let off  = slot as usize * self.elems_per_block;
+        let slot = self.free_slots.pop().ok_or(CpuStoreError::Full {
+            capacity: self.capacity,
+        })?;
+        let off = slot as usize * self.elems_per_block;
         self.data[off..off + self.elems_per_block].copy_from_slice(data);
         Ok(slot)
     }
@@ -102,9 +107,12 @@ mod tests {
     use super::*;
     use half::f16;
 
-    fn make_store(capacity: usize, kv_heads: usize, block_size: usize, head_dim: usize)
-        -> CpuBlockStore
-    {
+    fn make_store(
+        capacity: usize,
+        kv_heads: usize,
+        block_size: usize,
+        head_dim: usize,
+    ) -> CpuBlockStore {
         CpuBlockStore::new(capacity, kv_heads, block_size, head_dim)
     }
 

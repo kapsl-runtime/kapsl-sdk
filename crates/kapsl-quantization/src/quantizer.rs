@@ -141,7 +141,11 @@ pub fn quantize_int4_grouped(
 
     for group in weights.chunks(group_size) {
         let absmax = group.iter().copied().fold(0.0f32, |a, v| a.max(v.abs()));
-        let scale = if absmax == 0.0 { 1.0 } else { absmax / (U4_MAX / 2.0) };
+        let scale = if absmax == 0.0 {
+            1.0
+        } else {
+            absmax / (U4_MAX / 2.0)
+        };
         scales.push(f16::from_f32(scale));
 
         // Quantize group: map [-absmax, absmax] → [0, 15], center at 8
@@ -235,7 +239,9 @@ mod tests {
     fn int8_symmetric_roundtrip() {
         let weights: Vec<f32> = (0..256).map(|i| (i as f32 - 128.0) / 128.0).collect();
         let tensor = quantize_int8_symmetric(&weights, &[256]);
-        let QuantizedTensor::Int8(ref t) = tensor else { panic!() };
+        let QuantizedTensor::Int8(ref t) = tensor else {
+            panic!()
+        };
         let recovered = dequantize_int8(t);
         assert!(max_abs_error(&weights, &recovered) < TOLERANCE_INT8);
     }
@@ -244,7 +250,9 @@ mod tests {
     fn int8_symmetric_all_zeros() {
         let weights = vec![0.0f32; 64];
         let tensor = quantize_int8_symmetric(&weights, &[64]);
-        let QuantizedTensor::Int8(ref t) = tensor else { panic!() };
+        let QuantizedTensor::Int8(ref t) = tensor else {
+            panic!()
+        };
         assert!(t.weight.iter().all(|&q| q == 0));
     }
 
@@ -252,7 +260,9 @@ mod tests {
     fn int8_asymmetric_positive_weights() {
         let weights: Vec<f32> = (0..128).map(|i| i as f32 / 128.0).collect();
         let tensor = quantize_int8_asymmetric(&weights, &[128]);
-        let QuantizedTensor::Int8(ref t) = tensor else { panic!() };
+        let QuantizedTensor::Int8(ref t) = tensor else {
+            panic!()
+        };
         let recovered = dequantize_int8(t);
         assert!(max_abs_error(&weights, &recovered) < TOLERANCE_INT8);
     }
@@ -261,7 +271,9 @@ mod tests {
     fn int4_grouped_roundtrip() {
         let weights: Vec<f32> = (0..256).map(|i| (i as f32 - 128.0) / 128.0).collect();
         let tensor = quantize_int4_grouped(&weights, &[256], 128).unwrap();
-        let QuantizedTensor::Int4(ref t) = tensor else { panic!() };
+        let QuantizedTensor::Int4(ref t) = tensor else {
+            panic!()
+        };
         let recovered = dequantize_int4(t);
         assert!(max_abs_error(&weights, &recovered) < TOLERANCE_INT4);
     }
@@ -276,7 +288,9 @@ mod tests {
     fn int4_grouped_packed_size() {
         let weights = vec![0.5f32; 256];
         let tensor = quantize_int4_grouped(&weights, &[256], 128).unwrap();
-        let QuantizedTensor::Int4(ref t) = tensor else { panic!() };
+        let QuantizedTensor::Int4(ref t) = tensor else {
+            panic!()
+        };
         // 256 values / 2 = 128 bytes packed
         assert_eq!(t.packed.len(), 128);
         // 256 / 128 = 2 groups → 2 scales
@@ -287,7 +301,9 @@ mod tests {
     fn int8_shape_preserved() {
         let weights = vec![1.0f32; 32];
         let tensor = quantize_int8_symmetric(&weights, &[4, 8]);
-        let QuantizedTensor::Int8(ref t) = tensor else { panic!() };
+        let QuantizedTensor::Int8(ref t) = tensor else {
+            panic!()
+        };
         assert_eq!(t.shape, vec![4, 8]);
     }
 }
