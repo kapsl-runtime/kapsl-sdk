@@ -216,8 +216,7 @@ impl SqliteVectorStore {
         }
         let index = &indexes[&key];
 
-        if index.dim() != request.query_embedding.len() || index.live_count() < self.ann_threshold
-        {
+        if index.dim() != request.query_embedding.len() || index.live_count() < self.ann_threshold {
             return Ok(None);
         }
 
@@ -649,8 +648,9 @@ mod tests {
         let mut near = target_query.clone();
         near[0] += 0.01;
 
-        let mut chunks: Vec<EmbeddedChunk> =
-            (0..300).map(|i| chunk(&format!("c{i}"), "doc", pseudo_vec(i))).collect();
+        let mut chunks: Vec<EmbeddedChunk> = (0..300)
+            .map(|i| chunk(&format!("c{i}"), "doc", pseudo_vec(i)))
+            .collect();
         chunks.push(chunk("target", "doc", near.clone()));
         store.upsert(chunks).await.unwrap();
 
@@ -666,8 +666,9 @@ mod tests {
     async fn ann_matches_exact_scan() {
         let store_ann = temp_store("ann_vs_exact_a", 16);
         let store_exact = temp_store("ann_vs_exact_b", usize::MAX);
-        let chunks: Vec<EmbeddedChunk> =
-            (0..200).map(|i| chunk(&format!("c{i}"), "doc", pseudo_vec(i))).collect();
+        let chunks: Vec<EmbeddedChunk> = (0..200)
+            .map(|i| chunk(&format!("c{i}"), "doc", pseudo_vec(i)))
+            .collect();
         store_ann.upsert(chunks.clone()).await.unwrap();
         store_exact.upsert(chunks).await.unwrap();
 
@@ -682,8 +683,9 @@ mod tests {
     async fn delete_tombstones_ann_index() {
         let store = temp_store("ann_delete", 16);
         let target_query = pseudo_vec(777_777);
-        let mut chunks: Vec<EmbeddedChunk> =
-            (0..100).map(|i| chunk(&format!("c{i}"), "doc", pseudo_vec(i))).collect();
+        let mut chunks: Vec<EmbeddedChunk> = (0..100)
+            .map(|i| chunk(&format!("c{i}"), "doc", pseudo_vec(i)))
+            .collect();
         chunks.push(chunk("target", "target-doc", target_query.clone()));
         store.upsert(chunks).await.unwrap();
 
@@ -691,7 +693,10 @@ mod tests {
         let results = store.query(query(target_query.clone(), 1)).await.unwrap();
         assert_eq!(results[0].chunk.id, "target");
 
-        store.delete_by_doc("t1", "w1", "s1", "target-doc").await.unwrap();
+        store
+            .delete_by_doc("t1", "w1", "s1", "target-doc")
+            .await
+            .unwrap();
         let results = store.query(query(target_query, 1)).await.unwrap();
         assert!(results.iter().all(|r| r.chunk.id != "target"));
     }
@@ -701,8 +706,9 @@ mod tests {
         let store = temp_store("ann_replace", 16);
         let old_emb = pseudo_vec(111_111);
         let new_emb = pseudo_vec(222_222);
-        let mut chunks: Vec<EmbeddedChunk> =
-            (0..100).map(|i| chunk(&format!("c{i}"), "doc", pseudo_vec(i))).collect();
+        let mut chunks: Vec<EmbeddedChunk> = (0..100)
+            .map(|i| chunk(&format!("c{i}"), "doc", pseudo_vec(i)))
+            .collect();
         chunks.push(chunk("target", "doc", old_emb.clone()));
         store.upsert(chunks).await.unwrap();
 
@@ -710,7 +716,10 @@ mod tests {
         let results = store.query(query(old_emb.clone(), 1)).await.unwrap();
         assert_eq!(results[0].chunk.id, "target");
 
-        store.upsert(vec![chunk("target", "doc", new_emb.clone())]).await.unwrap();
+        store
+            .upsert(vec![chunk("target", "doc", new_emb.clone())])
+            .await
+            .unwrap();
         let results = store.query(query(new_emb, 1)).await.unwrap();
         assert_eq!(results[0].chunk.id, "target");
         assert!(results[0].score > 0.999);
@@ -724,8 +733,9 @@ mod tests {
         let target_query = pseudo_vec(555_555);
         let mut denied = chunk("denied", "doc", target_query.clone());
         denied.acl.deny_users = vec!["alice".to_string()];
-        let mut chunks: Vec<EmbeddedChunk> =
-            (0..100).map(|i| chunk(&format!("c{i}"), "doc", pseudo_vec(i))).collect();
+        let mut chunks: Vec<EmbeddedChunk> = (0..100)
+            .map(|i| chunk(&format!("c{i}"), "doc", pseudo_vec(i)))
+            .collect();
         chunks.push(denied);
         store.upsert(chunks).await.unwrap();
 
@@ -737,8 +747,9 @@ mod tests {
     #[tokio::test]
     async fn small_scope_uses_exact_scan() {
         let store = temp_store("exact_small", 1024);
-        let chunks: Vec<EmbeddedChunk> =
-            (0..10).map(|i| chunk(&format!("c{i}"), "doc", pseudo_vec(i))).collect();
+        let chunks: Vec<EmbeddedChunk> = (0..10)
+            .map(|i| chunk(&format!("c{i}"), "doc", pseudo_vec(i)))
+            .collect();
         store.upsert(chunks).await.unwrap();
 
         let results = store.query(query(pseudo_vec(3), 3)).await.unwrap();

@@ -217,10 +217,7 @@ impl PackageLoader {
         // archive, so this cannot take the bytes back out from under it.
         if discard_package_after_load() {
             match fs::remove_file(package_path) {
-                Ok(()) => log::info!(
-                    "Discarded package after load: {}",
-                    package_path.display()
-                ),
+                Ok(()) => log::info!("Discarded package after load: {}", package_path.display()),
                 Err(error) => log::warn!(
                     "Failed to discard package {}: {}",
                     package_path.display(),
@@ -309,8 +306,8 @@ impl PackageLoader {
         if metadata_path.exists() {
             // Reuse load() logic but for an already-extracted directory.
             let manifest_file = File::open(&metadata_path)?;
-            let manifest: Manifest = serde_json::from_reader(manifest_file)
-                .map_err(LoaderError::Json)?;
+            let manifest: Manifest =
+                serde_json::from_reader(manifest_file).map_err(LoaderError::Json)?;
             let temp_dir = tempfile::tempdir()?;
             let persisted = dir.join(&manifest.model_file);
             return Ok(Self {

@@ -1,6 +1,9 @@
 #[derive(Default, Clone)]
 pub struct LLMMetrics {
     pub total_inference_time: f64,
+    /// True only while authoritative ONNX KV values are retained in CUDA
+    /// OrtValues. This is internal reporting state rather than a public metric.
+    pub kv_cache_device_resident: bool,
     pub kv_cache_bytes_used: usize,
     pub kv_cache_bytes_capacity: usize,
     pub kv_cache_blocks_total: usize,

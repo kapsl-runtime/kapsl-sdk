@@ -19,8 +19,8 @@
 mod inner {
     use std::collections::{HashMap, HashSet};
     use std::path::Path;
-    use std::sync::{Arc, Mutex};
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
     use cudarc::cublas::{CudaBlas, Gemm};
@@ -31,16 +31,20 @@ mod inner {
     use kapsl_engine_api::{
         BatchingPolicy, BinaryTensorPacket, EngineError, EngineMetrics, EngineModelInfo,
         EngineStream, ExternalDeviceMemory, ExternalDeviceMemoryReport, InferenceRequest,
-        RequestMetadata, TensorDtype,
+        MemoryAllocation as EngineMemoryAllocation,
+        MemoryAllocationClass as EngineMemoryAllocationClass,
+        MemoryAllocationSource as EngineMemoryAllocationSource, MemoryDomain as EngineMemoryDomain,
+        MemoryReport, RequestMetadata, TensorDtype,
     };
-    use kapsl_hal::gpu_arena::{GpuBlockPool, GpuDevicePool, GpuPoolHandle, PoolOwner};
+    use kapsl_hal::gpu_arena::{
+        GpuBlockPool, GpuBuffer, GpuDevicePool, GpuPoolHandle, PoolAllocationClass, PoolOwner,
+    };
     use kapsl_kernels::cuda_kernels::{
-        launch_argmax, launch_batch_kv_write, launch_batch_rope, launch_fused_swiglu,
-        launch_paged_attention, launch_prefill_attention, launch_residual_add, launch_rms_norm,
-        ArgmaxParams, BatchKvWriteParams, BatchRopeParams, PagedAttentionParams, PrefillAttnParams,
-        RmsNormParams,
-        launch_batch_decode_rope, launch_batch_argmax,
-        BatchDecodeRopeParams, BatchArgmaxParams,
+        launch_argmax, launch_batch_argmax, launch_batch_decode_rope, launch_batch_kv_write,
+        launch_batch_rope, launch_fused_swiglu, launch_paged_attention, launch_prefill_attention,
+        launch_residual_add, launch_rms_norm, ArgmaxParams, BatchArgmaxParams,
+        BatchDecodeRopeParams, BatchKvWriteParams, BatchRopeParams, PagedAttentionParams,
+        PrefillAttnParams, RmsNormParams,
     };
     use kapsl_loader::{load_safetensors, ModelConfig, ModelWeights, TensorData};
 
@@ -54,22 +58,22 @@ mod inner {
     // ── GPU weights ──────────────────────────────────────────────────────
 
     struct GpuLayerWeights {
-        input_layernorm: CudaSlice<f16>,
-        q_proj: CudaSlice<f16>,
-        k_proj: CudaSlice<f16>,
-        v_proj: CudaSlice<f16>,
-        o_proj: CudaSlice<f16>,
-        post_attention_layernorm: CudaSlice<f16>,
-        gate_proj: CudaSlice<f16>,
-        up_proj: CudaSlice<f16>,
-        down_proj: CudaSlice<f16>,
+        input_layernorm: GpuBuffer<f16>,
+        q_proj: GpuBuffer<f16>,
+        k_proj: GpuBuffer<f16>,
+        v_proj: GpuBuffer<f16>,
+        o_proj: GpuBuffer<f16>,
+        post_attention_layernorm: GpuBuffer<f16>,
+        gate_proj: GpuBuffer<f16>,
+        up_proj: GpuBuffer<f16>,
+        down_proj: GpuBuffer<f16>,
     }
 
     struct GpuModelWeights {
-        embed_tokens: CudaSlice<f16>,
+        embed_tokens: GpuBuffer<f16>,
         layers: Vec<GpuLayerWeights>,
-        norm: CudaSlice<f16>,
-        lm_head: CudaSlice<f16>,
+        norm: GpuBuffer<f16>,
+        lm_head: GpuBuffer<f16>,
     }
 
     impl GpuLayerWeights {
@@ -95,7 +99,11 @@ mod inner {
         fn byte_len(&self) -> usize {
             (self.embed_tokens.len() + self.norm.len() + self.lm_head.len())
                 * std::mem::size_of::<f16>()
-                + self.layers.iter().map(GpuLayerWeights::byte_len).sum::<usize>()
+                + self
+                    .layers
+                    .iter()
+                    .map(GpuLayerWeights::byte_len)
+                    .sum::<usize>()
         }
     }
 
@@ -109,7 +117,8 @@ mod inner {
         for entry in std::fs::read_dir(dir)
             .map_err(|e| EngineError::backend(format!("read model directory: {e}")))?
         {
-            let entry = entry.map_err(|e| EngineError::backend(format!("read model entry: {e}")))?;
+            let entry =
+                entry.map_err(|e| EngineError::backend(format!("read model entry: {e}")))?;
             if entry.path().extension().and_then(|value| value.to_str()) == Some("safetensors") {
                 bytes = bytes.saturating_add(
                     entry
@@ -122,59 +131,98 @@ mod inner {
         Ok(bytes)
     }
 
-    fn upload_tensor(device: &Arc<CudaDevice>, t: &TensorData) -> Result<CudaSlice<f16>, EngineError> {
-        device
-            .htod_sync_copy(&t.to_f16_vec())
+    fn upload_tensor(
+        device: &Arc<CudaDevice>,
+        pool: Option<&Arc<GpuDevicePool>>,
+        owner: PoolOwner,
+        t: &TensorData,
+    ) -> Result<GpuBuffer<f16>, EngineError> {
+        GpuBuffer::from_host(device, pool, owner, &t.to_f16_vec())
             .map_err(|e| EngineError::backend(format!("GPU upload: {e}")))
     }
 
-    fn upload_f16(device: &Arc<CudaDevice>, v: &[f16]) -> Result<CudaSlice<f16>, EngineError> {
-        device.htod_sync_copy(v)
+    fn upload_f16(
+        device: &Arc<CudaDevice>,
+        pool: Option<&Arc<GpuDevicePool>>,
+        owner: PoolOwner,
+        v: &[f16],
+    ) -> Result<GpuBuffer<f16>, EngineError> {
+        GpuBuffer::from_host(device, pool, owner, v)
             .map_err(|e| EngineError::backend(format!("GPU upload: {e}")))
     }
 
-    fn upload_staged(device: &Arc<CudaDevice>, s: &StagedF16Weights) -> Result<GpuModelWeights, EngineError> {
-        let embed_tokens = upload_f16(device, &s.embed_tokens)?;
-        let norm = upload_f16(device, &s.norm)?;
-        let lm_head = upload_f16(device, &s.lm_head)?;
+    fn upload_staged(
+        device: &Arc<CudaDevice>,
+        pool: Option<&Arc<GpuDevicePool>>,
+        owner: PoolOwner,
+        s: &StagedF16Weights,
+    ) -> Result<GpuModelWeights, EngineError> {
+        let embed_tokens = upload_f16(device, pool, owner, &s.embed_tokens)?;
+        let norm = upload_f16(device, pool, owner, &s.norm)?;
+        let lm_head = upload_f16(device, pool, owner, &s.lm_head)?;
         let mut layers = Vec::with_capacity(s.layers.len());
         for (i, l) in s.layers.iter().enumerate() {
             log::info!("Uploading staged layer {}/{}", i + 1, s.layers.len());
             layers.push(GpuLayerWeights {
-                input_layernorm:          upload_f16(device, &l.input_layernorm)?,
-                q_proj:                   upload_f16(device, &l.q_proj)?,
-                k_proj:                   upload_f16(device, &l.k_proj)?,
-                v_proj:                   upload_f16(device, &l.v_proj)?,
-                o_proj:                   upload_f16(device, &l.o_proj)?,
-                post_attention_layernorm: upload_f16(device, &l.post_attention_layernorm)?,
-                gate_proj:                upload_f16(device, &l.gate_proj)?,
-                up_proj:                  upload_f16(device, &l.up_proj)?,
-                down_proj:                upload_f16(device, &l.down_proj)?,
+                input_layernorm: upload_f16(device, pool, owner, &l.input_layernorm)?,
+                q_proj: upload_f16(device, pool, owner, &l.q_proj)?,
+                k_proj: upload_f16(device, pool, owner, &l.k_proj)?,
+                v_proj: upload_f16(device, pool, owner, &l.v_proj)?,
+                o_proj: upload_f16(device, pool, owner, &l.o_proj)?,
+                post_attention_layernorm: upload_f16(
+                    device,
+                    pool,
+                    owner,
+                    &l.post_attention_layernorm,
+                )?,
+                gate_proj: upload_f16(device, pool, owner, &l.gate_proj)?,
+                up_proj: upload_f16(device, pool, owner, &l.up_proj)?,
+                down_proj: upload_f16(device, pool, owner, &l.down_proj)?,
             });
         }
-        Ok(GpuModelWeights { embed_tokens, layers, norm, lm_head })
+        Ok(GpuModelWeights {
+            embed_tokens,
+            layers,
+            norm,
+            lm_head,
+        })
     }
 
-    fn upload_weights(device: &Arc<CudaDevice>, w: &ModelWeights) -> Result<GpuModelWeights, EngineError> {
-        let embed_tokens = upload_tensor(device, &w.embed_tokens)?;
-        let norm = upload_tensor(device, &w.norm)?;
-        let lm_head = upload_tensor(device, &w.lm_head)?;
+    fn upload_weights(
+        device: &Arc<CudaDevice>,
+        pool: Option<&Arc<GpuDevicePool>>,
+        owner: PoolOwner,
+        w: &ModelWeights,
+    ) -> Result<GpuModelWeights, EngineError> {
+        let embed_tokens = upload_tensor(device, pool, owner, &w.embed_tokens)?;
+        let norm = upload_tensor(device, pool, owner, &w.norm)?;
+        let lm_head = upload_tensor(device, pool, owner, &w.lm_head)?;
         let mut layers = Vec::with_capacity(w.layers.len());
         for (i, l) in w.layers.iter().enumerate() {
             log::info!("Uploading layer {}/{}", i + 1, w.layers.len());
             layers.push(GpuLayerWeights {
-                input_layernorm: upload_tensor(device, &l.input_layernorm)?,
-                q_proj: upload_tensor(device, &l.q_proj)?,
-                k_proj: upload_tensor(device, &l.k_proj)?,
-                v_proj: upload_tensor(device, &l.v_proj)?,
-                o_proj: upload_tensor(device, &l.o_proj)?,
-                post_attention_layernorm: upload_tensor(device, &l.post_attention_layernorm)?,
-                gate_proj: upload_tensor(device, &l.gate_proj)?,
-                up_proj: upload_tensor(device, &l.up_proj)?,
-                down_proj: upload_tensor(device, &l.down_proj)?,
+                input_layernorm: upload_tensor(device, pool, owner, &l.input_layernorm)?,
+                q_proj: upload_tensor(device, pool, owner, &l.q_proj)?,
+                k_proj: upload_tensor(device, pool, owner, &l.k_proj)?,
+                v_proj: upload_tensor(device, pool, owner, &l.v_proj)?,
+                o_proj: upload_tensor(device, pool, owner, &l.o_proj)?,
+                post_attention_layernorm: upload_tensor(
+                    device,
+                    pool,
+                    owner,
+                    &l.post_attention_layernorm,
+                )?,
+                gate_proj: upload_tensor(device, pool, owner, &l.gate_proj)?,
+                up_proj: upload_tensor(device, pool, owner, &l.up_proj)?,
+                down_proj: upload_tensor(device, pool, owner, &l.down_proj)?,
             });
         }
-        Ok(GpuModelWeights { embed_tokens, layers, norm, lm_head })
+        Ok(GpuModelWeights {
+            embed_tokens,
+            layers,
+            norm,
+            lm_head,
+        })
     }
 
     // ── Sampling ─────────────────────────────────────────────────────────
@@ -187,15 +235,26 @@ mod inner {
 
     impl SampleParams {
         fn from_meta(meta: Option<&RequestMetadata>) -> Self {
-            let m = match meta { Some(m) => m, None => return Self::greedy() };
+            let m = match meta {
+                Some(m) => m,
+                None => return Self::greedy(),
+            };
             Self {
                 temperature: m.temperature.unwrap_or(0.0),
                 top_k: m.top_k.unwrap_or(0) as usize,
                 top_p: m.top_p.unwrap_or(1.0),
             }
         }
-        fn greedy() -> Self { Self { temperature: 0.0, top_k: 0, top_p: 1.0 } }
-        fn is_greedy(&self) -> bool { self.temperature < 1e-6 }
+        fn greedy() -> Self {
+            Self {
+                temperature: 0.0,
+                top_k: 0,
+                top_p: 1.0,
+            }
+        }
+        fn is_greedy(&self) -> bool {
+            self.temperature < 1e-6
+        }
     }
 
     // ── Session state ─────────────────────────────────────────────────────
@@ -208,43 +267,51 @@ mod inner {
     // ── Prefill scratch buffers ───────────────────────────────────────────
 
     struct PrefillScratch {
-        cap:       usize,
-        hidden:    CudaSlice<f16>,
-        norm:      CudaSlice<f16>,
-        residual:  CudaSlice<f16>,
-        q_all:     CudaSlice<f16>,
-        k_all:     CudaSlice<f16>,
-        v_all:     CudaSlice<f16>,
-        attn_out:  CudaSlice<f16>,
-        gate_out:  CudaSlice<f16>,
-        up_out:    CudaSlice<f16>,
-        swiglu_out:CudaSlice<f16>,
-        ffn_input: CudaSlice<f16>,
-        ffn_out:   CudaSlice<f16>,
-        o_out:     CudaSlice<f16>,
+        cap: usize,
+        hidden: GpuBuffer<f16>,
+        norm: GpuBuffer<f16>,
+        residual: GpuBuffer<f16>,
+        q_all: GpuBuffer<f16>,
+        k_all: GpuBuffer<f16>,
+        v_all: GpuBuffer<f16>,
+        attn_out: GpuBuffer<f16>,
+        gate_out: GpuBuffer<f16>,
+        up_out: GpuBuffer<f16>,
+        swiglu_out: GpuBuffer<f16>,
+        ffn_input: GpuBuffer<f16>,
+        ffn_out: GpuBuffer<f16>,
+        o_out: GpuBuffer<f16>,
     }
 
     impl PrefillScratch {
-        fn new(device: &Arc<CudaDevice>, h: usize, q_dim: usize, kv_dim: usize, inter: usize)
-            -> Result<Self, EngineError>
-        {
-            let a = |n: usize| device.alloc_zeros::<f16>(n)
-                .map_err(|e| EngineError::backend(format!("prefill scratch: {e}")));
+        fn new(
+            device: &Arc<CudaDevice>,
+            pool: Option<&Arc<GpuDevicePool>>,
+            owner: PoolOwner,
+            h: usize,
+            q_dim: usize,
+            kv_dim: usize,
+            inter: usize,
+        ) -> Result<Self, EngineError> {
+            let a = |n: usize| {
+                GpuBuffer::zeros(device, pool, owner, n)
+                    .map_err(|e| EngineError::backend(format!("prefill scratch: {e}")))
+            };
             Ok(Self {
                 cap: 1,
-                hidden:     a(h)?,
-                norm:       a(h)?,
-                residual:   a(h)?,
-                q_all:      a(q_dim)?,
-                k_all:      a(kv_dim)?,
-                v_all:      a(kv_dim)?,
-                attn_out:   a(q_dim)?,
-                gate_out:   a(inter)?,
-                up_out:     a(inter)?,
+                hidden: a(h)?,
+                norm: a(h)?,
+                residual: a(h)?,
+                q_all: a(q_dim)?,
+                k_all: a(kv_dim)?,
+                v_all: a(kv_dim)?,
+                attn_out: a(q_dim)?,
+                gate_out: a(inter)?,
+                up_out: a(inter)?,
                 swiglu_out: a(inter)?,
-                ffn_input:  a(h)?,
-                ffn_out:    a(h)?,
-                o_out:      a(h)?,
+                ffn_input: a(h)?,
+                ffn_out: a(h)?,
+                o_out: a(h)?,
             })
         }
     }
@@ -253,54 +320,63 @@ mod inner {
 
     struct BatchDecodeScratch {
         /// Capacity in sequences.
-        cap:       usize,
-        hidden:    CudaSlice<f16>,   // [cap * h]
-        norm:      CudaSlice<f16>,   // [cap * h]
-        residual:  CudaSlice<f16>,   // [cap * h]
-        q_buf:     CudaSlice<f16>,   // [cap * q_dim]
-        k_buf:     CudaSlice<f16>,   // [cap * kv_dim]
-        v_buf:     CudaSlice<f16>,   // [cap * kv_dim]
-        attn_buf:  CudaSlice<f16>,   // [cap * q_dim]
-        gate_buf:  CudaSlice<f16>,   // [cap * inter]
-        up_buf:    CudaSlice<f16>,   // [cap * inter]
-        swiglu_buf:CudaSlice<f16>,   // [cap * inter]
-        ffn_input: CudaSlice<f16>,   // [cap * h]
-        ffn_out:   CudaSlice<f16>,   // [cap * h]
-        o_proj:    CudaSlice<f16>,   // [cap * h]
-        logits:    CudaSlice<f16>,   // [cap * vocab]
-        argmax:    CudaSlice<u32>,   // [cap]
-        positions: CudaSlice<i32>,   // [cap]
-        ctx_lens:  CudaSlice<i32>,   // [cap]
+        cap: usize,
+        hidden: GpuBuffer<f16>,     // [cap * h]
+        norm: GpuBuffer<f16>,       // [cap * h]
+        residual: GpuBuffer<f16>,   // [cap * h]
+        q_buf: GpuBuffer<f16>,      // [cap * q_dim]
+        k_buf: GpuBuffer<f16>,      // [cap * kv_dim]
+        v_buf: GpuBuffer<f16>,      // [cap * kv_dim]
+        attn_buf: GpuBuffer<f16>,   // [cap * q_dim]
+        gate_buf: GpuBuffer<f16>,   // [cap * inter]
+        up_buf: GpuBuffer<f16>,     // [cap * inter]
+        swiglu_buf: GpuBuffer<f16>, // [cap * inter]
+        ffn_input: GpuBuffer<f16>,  // [cap * h]
+        ffn_out: GpuBuffer<f16>,    // [cap * h]
+        o_proj: GpuBuffer<f16>,     // [cap * h]
+        logits: GpuBuffer<f16>,     // [cap * vocab]
+        argmax: GpuBuffer<u32>,     // [cap]
+        positions: GpuBuffer<i32>,  // [cap]
+        ctx_lens: GpuBuffer<i32>,   // [cap]
     }
 
     impl BatchDecodeScratch {
         fn new(
             device: &Arc<CudaDevice>,
-            cap: usize, h: usize, q_dim: usize, kv_dim: usize, inter: usize, vocab: usize,
+            pool: Option<&Arc<GpuDevicePool>>,
+            owner: PoolOwner,
+            cap: usize,
+            h: usize,
+            q_dim: usize,
+            kv_dim: usize,
+            inter: usize,
+            vocab: usize,
         ) -> Result<Self, EngineError> {
-            let a = |n: usize| device.alloc_zeros::<f16>(n)
-                .map_err(|e| EngineError::backend(format!("batch scratch: {e}")));
+            let a = |n: usize| {
+                GpuBuffer::zeros(device, pool, owner, n)
+                    .map_err(|e| EngineError::backend(format!("batch scratch: {e}")))
+            };
             Ok(Self {
                 cap,
-                hidden:     a(cap * h)?,
-                norm:       a(cap * h)?,
-                residual:   a(cap * h)?,
-                q_buf:      a(cap * q_dim)?,
-                k_buf:      a(cap * kv_dim)?,
-                v_buf:      a(cap * kv_dim)?,
-                attn_buf:   a(cap * q_dim)?,
-                gate_buf:   a(cap * inter)?,
-                up_buf:     a(cap * inter)?,
+                hidden: a(cap * h)?,
+                norm: a(cap * h)?,
+                residual: a(cap * h)?,
+                q_buf: a(cap * q_dim)?,
+                k_buf: a(cap * kv_dim)?,
+                v_buf: a(cap * kv_dim)?,
+                attn_buf: a(cap * q_dim)?,
+                gate_buf: a(cap * inter)?,
+                up_buf: a(cap * inter)?,
                 swiglu_buf: a(cap * inter)?,
-                ffn_input:  a(cap * h)?,
-                ffn_out:    a(cap * h)?,
-                o_proj:     a(cap * h)?,
-                logits:     a(cap * vocab)?,
-                argmax:     device.alloc_zeros::<u32>(cap)
+                ffn_input: a(cap * h)?,
+                ffn_out: a(cap * h)?,
+                o_proj: a(cap * h)?,
+                logits: a(cap * vocab)?,
+                argmax: GpuBuffer::zeros(device, pool, owner, cap)
                     .map_err(|e| EngineError::backend(format!("batch argmax: {e}")))?,
-                positions:  device.alloc_zeros::<i32>(cap)
+                positions: GpuBuffer::zeros(device, pool, owner, cap)
                     .map_err(|e| EngineError::backend(format!("batch positions: {e}")))?,
-                ctx_lens:   device.alloc_zeros::<i32>(cap)
+                ctx_lens: GpuBuffer::zeros(device, pool, owner, cap)
                     .map_err(|e| EngineError::backend(format!("batch ctx_lens: {e}")))?,
             })
         }
@@ -332,6 +408,8 @@ mod inner {
 
     struct BackendInner {
         device: Arc<CudaDevice>,
+        device_pool: Option<Arc<GpuDevicePool>>,
+        pool_owner: PoolOwner,
         blas: Arc<CudaBlas>,
         config: ModelConfig,
         weights: GpuModelWeights,
@@ -342,9 +420,9 @@ mod inner {
         /// Physical blocks currently held across all active sessions of this backend.
         allocated_blocks: usize,
         // Prefill path reuses these small single-row buffers.
-        norm_buf: CudaSlice<f16>,     // [h]
-        logits_buf: CudaSlice<f16>,   // [vocab]
-        argmax_buf: CudaSlice<u32>,   // [1]
+        norm_buf: GpuBuffer<f16>,   // [h]
+        logits_buf: GpuBuffer<f16>, // [vocab]
+        argmax_buf: GpuBuffer<u32>, // [1]
         // Batch decode scratch (MAX_BATCH capacity).
         batch: BatchDecodeScratch,
         // Multi-turn session KV state (owned by scheduler thread).
@@ -357,9 +435,11 @@ mod inner {
     impl BackendInner {
         // ── Block management ─────────────────────────────────────────────
 
-        fn ensure_block(&mut self, block_tables: &mut Vec<Vec<i32>>, position: usize)
-            -> Result<(), EngineError>
-        {
+        fn ensure_block(
+            &mut self,
+            block_tables: &mut Vec<Vec<i32>>,
+            position: usize,
+        ) -> Result<(), EngineError> {
             let block_size = self.block_pool.block_size();
             let num_layers = self.config.num_hidden_layers;
             let logical = position / block_size;
@@ -376,7 +456,9 @@ mod inner {
                     )));
                 }
                 for l in 0..num_layers {
-                    let phys = self.block_pool.alloc_block()
+                    let phys = self
+                        .block_pool
+                        .alloc_block()
                         .map_err(|e| EngineError::backend(format!("block alloc: {e}")))?;
                     block_tables[l].push(phys as i32);
                     self.allocated_blocks += 1;
@@ -394,7 +476,6 @@ mod inner {
             }
         }
 
-
         // ── Hot-swap ──────────────────────────────────────────────────────
 
         fn to_staged(w: ModelWeights) -> StagedF16Weights {
@@ -403,22 +484,28 @@ mod inner {
                 embed_tokens: w.embed_tokens.to_f16_vec(),
                 norm: w.norm.to_f16_vec(),
                 lm_head: w.lm_head.to_f16_vec(),
-                layers: w.layers.into_iter().map(|l| StagedF16Layer {
-                    input_layernorm:         l.input_layernorm.to_f16_vec(),
-                    q_proj:                  l.q_proj.to_f16_vec(),
-                    k_proj:                  l.k_proj.to_f16_vec(),
-                    v_proj:                  l.v_proj.to_f16_vec(),
-                    o_proj:                  l.o_proj.to_f16_vec(),
-                    post_attention_layernorm: l.post_attention_layernorm.to_f16_vec(),
-                    gate_proj:               l.gate_proj.to_f16_vec(),
-                    up_proj:                 l.up_proj.to_f16_vec(),
-                    down_proj:               l.down_proj.to_f16_vec(),
-                }).collect(),
+                layers: w
+                    .layers
+                    .into_iter()
+                    .map(|l| StagedF16Layer {
+                        input_layernorm: l.input_layernorm.to_f16_vec(),
+                        q_proj: l.q_proj.to_f16_vec(),
+                        k_proj: l.k_proj.to_f16_vec(),
+                        v_proj: l.v_proj.to_f16_vec(),
+                        o_proj: l.o_proj.to_f16_vec(),
+                        post_attention_layernorm: l.post_attention_layernorm.to_f16_vec(),
+                        gate_proj: l.gate_proj.to_f16_vec(),
+                        up_proj: l.up_proj.to_f16_vec(),
+                        down_proj: l.down_proj.to_f16_vec(),
+                    })
+                    .collect(),
             }
         }
 
         fn activate_staged(&mut self) -> Result<(), EngineError> {
-            let staged = self.staged.take()
+            let staged = self
+                .staged
+                .take()
                 .ok_or_else(|| EngineError::backend("no model staged; call stage() first"))?;
 
             let sc = &staged.config;
@@ -430,23 +517,36 @@ mod inner {
                 return Err(EngineError::backend(format!(
                     "staged model architecture mismatch: \
                      layers {}/{}, hidden {}/{}, heads {}/{}",
-                    sc.num_hidden_layers, cc.num_hidden_layers,
-                    sc.hidden_size, cc.hidden_size,
-                    sc.num_attention_heads, cc.num_attention_heads,
+                    sc.num_hidden_layers,
+                    cc.num_hidden_layers,
+                    sc.hidden_size,
+                    cc.hidden_size,
+                    sc.num_attention_heads,
+                    cc.num_attention_heads,
                 )));
             }
 
             log::info!("NativeBackend: activating staged weights (PCIe transfer only)…");
-            let new_weights = upload_staged(&self.device, &staged)?;
+            let new_weights = upload_staged(
+                &self.device,
+                self.device_pool.as_ref(),
+                self.pool_owner
+                    .with_class(PoolAllocationClass::PersistentWeights),
+                &staged,
+            )?;
             self.external_weight_bytes
                 .store(new_weights.byte_len(), Ordering::Release);
             self.weights = new_weights;
             self.config = staged.config;
 
-            let all_bts: Vec<_> = self.sessions.values()
+            let all_bts: Vec<_> = self
+                .sessions
+                .values()
                 .map(|s| s.block_tables.clone())
                 .collect();
-            for bt in all_bts { self.free_block_tables(&bt); }
+            for bt in all_bts {
+                self.free_block_tables(&bt);
+            }
             self.sessions.clear();
             log::info!("NativeBackend: swap complete");
             Ok(())
@@ -455,27 +555,34 @@ mod inner {
         // ── Prefill scratch management ────────────────────────────────────
 
         fn ensure_prefill_scratch(&mut self, n: usize) -> Result<(), EngineError> {
-            if n <= self.prefill.cap { return Ok(()); }
+            if n <= self.prefill.cap {
+                return Ok(());
+            }
             let device = self.device.clone();
-            let h      = self.config.hidden_size;
-            let q_dim  = self.config.num_attention_heads * self.config.head_dim();
+            let h = self.config.hidden_size;
+            let q_dim = self.config.num_attention_heads * self.config.head_dim();
             let kv_dim = self.config.num_kv_heads() * self.config.head_dim();
-            let inter  = self.config.intermediate_size;
-            let a = |sz: usize| device.alloc_zeros::<f16>(sz)
-                .map_err(|e| EngineError::backend(format!("prefill grow: {e}")));
-            self.prefill.hidden     = a(n * h)?;
-            self.prefill.norm       = a(n * h)?;
-            self.prefill.residual   = a(n * h)?;
-            self.prefill.q_all      = a(n * q_dim)?;
-            self.prefill.k_all      = a(n * kv_dim)?;
-            self.prefill.v_all      = a(n * kv_dim)?;
-            self.prefill.attn_out   = a(n * q_dim)?;
-            self.prefill.gate_out   = a(n * inter)?;
-            self.prefill.up_out     = a(n * inter)?;
+            let inter = self.config.intermediate_size;
+            let owner = self
+                .pool_owner
+                .with_class(PoolAllocationClass::TransientWorkspace);
+            let a = |sz: usize| {
+                GpuBuffer::zeros(&device, self.device_pool.as_ref(), owner, sz)
+                    .map_err(|e| EngineError::backend(format!("prefill grow: {e}")))
+            };
+            self.prefill.hidden = a(n * h)?;
+            self.prefill.norm = a(n * h)?;
+            self.prefill.residual = a(n * h)?;
+            self.prefill.q_all = a(n * q_dim)?;
+            self.prefill.k_all = a(n * kv_dim)?;
+            self.prefill.v_all = a(n * kv_dim)?;
+            self.prefill.attn_out = a(n * q_dim)?;
+            self.prefill.gate_out = a(n * inter)?;
+            self.prefill.up_out = a(n * inter)?;
             self.prefill.swiglu_out = a(n * inter)?;
-            self.prefill.ffn_input  = a(n * h)?;
-            self.prefill.ffn_out    = a(n * h)?;
-            self.prefill.o_out      = a(n * h)?;
+            self.prefill.ffn_input = a(n * h)?;
+            self.prefill.ffn_out = a(n * h)?;
+            self.prefill.o_out = a(n * h)?;
             self.prefill.cap = n;
             Ok(())
         }
@@ -483,52 +590,80 @@ mod inner {
         // ── Sampling ─────────────────────────────────────────────────────
 
         fn greedy(logits: &[f32]) -> u32 {
-            logits.iter().enumerate()
+            logits
+                .iter()
+                .enumerate()
                 .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
                 .map(|(i, _)| i as u32)
                 .unwrap_or(0)
         }
 
         fn sample(&mut self, logits: &[f32], p: &SampleParams) -> u32 {
-            if p.is_greedy() { return Self::greedy(logits); }
+            if p.is_greedy() {
+                return Self::greedy(logits);
+            }
 
             let inv_t = 1.0 / p.temperature;
             let mut scores: Vec<f32> = logits.iter().map(|&l| l * inv_t).collect();
 
             if p.top_k > 0 && p.top_k < scores.len() {
                 let mut sorted = scores.clone();
-                sorted.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+                sorted
+                    .sort_unstable_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
                 let thresh = sorted[p.top_k - 1];
-                for s in &mut scores { if *s < thresh { *s = f32::NEG_INFINITY; } }
+                for s in &mut scores {
+                    if *s < thresh {
+                        *s = f32::NEG_INFINITY;
+                    }
+                }
             }
 
             let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
             let mut probs: Vec<f32> = scores.iter().map(|&s| (s - max_s).exp()).collect();
             let sum: f32 = probs.iter().sum();
-            if sum <= 0.0 { return Self::greedy(logits); }
-            for p2 in &mut probs { *p2 /= sum; }
+            if sum <= 0.0 {
+                return Self::greedy(logits);
+            }
+            for p2 in &mut probs {
+                *p2 /= sum;
+            }
 
             if p.top_p < 1.0 {
                 let mut order: Vec<usize> = (0..probs.len()).collect();
                 order.sort_unstable_by(|&a, &b| {
-                    probs[b].partial_cmp(&probs[a]).unwrap_or(std::cmp::Ordering::Equal)
+                    probs[b]
+                        .partial_cmp(&probs[a])
+                        .unwrap_or(std::cmp::Ordering::Equal)
                 });
                 let mut cum = 0.0f32;
                 let mut cutoff = 0.0f32;
                 for &i in &order {
                     cum += probs[i];
-                    if cum >= p.top_p { cutoff = probs[i]; break; }
+                    if cum >= p.top_p {
+                        cutoff = probs[i];
+                        break;
+                    }
                 }
-                for pr in &mut probs { if *pr < cutoff { *pr = 0.0; } }
+                for pr in &mut probs {
+                    if *pr < cutoff {
+                        *pr = 0.0;
+                    }
+                }
                 let new_sum: f32 = probs.iter().sum();
-                if new_sum > 0.0 { for pr in &mut probs { *pr /= new_sum; } }
+                if new_sum > 0.0 {
+                    for pr in &mut probs {
+                        *pr /= new_sum;
+                    }
+                }
             }
 
             let r: f32 = self.rng.gen();
             let mut cum = 0.0f32;
             for (i, &pr) in probs.iter().enumerate() {
                 cum += pr;
-                if r <= cum { return i as u32; }
+                if r <= cum {
+                    return i as u32;
+                }
             }
             (probs.len() - 1) as u32
         }
@@ -541,10 +676,15 @@ mod inner {
 
         fn gemm(
             blas: &CudaBlas,
-            out_dim: i32, batch: i32, in_dim: i32,
-            weight: &CudaSlice<f16>, lda: i32,
-            input: &CudaSlice<f16>,  ldb: i32,
-            out: &mut CudaSlice<f16>, ldc: i32,
+            out_dim: i32,
+            batch: i32,
+            in_dim: i32,
+            weight: &CudaSlice<f16>,
+            lda: i32,
+            input: &CudaSlice<f16>,
+            ldb: i32,
+            out: &mut CudaSlice<f16>,
+            ldc: i32,
             label: &str,
         ) -> Result<(), EngineError> {
             unsafe {
@@ -594,113 +734,267 @@ mod inner {
 
             for (i, &tok) in token_ids.iter().enumerate() {
                 let off = tok as usize * h;
-                self.device.dtod_copy(
-                    &self.weights.embed_tokens.slice(off..off + h),
-                    &mut self.prefill.hidden.slice_mut(i * h..(i + 1) * h),
-                ).map_err(|err| e(format!("embed: {err}")))?;
+                self.device
+                    .dtod_copy(
+                        &self.weights.embed_tokens.slice(off..off + h),
+                        &mut self.prefill.hidden.slice_mut(i * h..(i + 1) * h),
+                    )
+                    .map_err(|err| e(format!("embed: {err}")))?;
             }
 
             let pos_in_blk_host: Vec<i32> = (0..n).map(|p| (p % block_size) as i32).collect();
             // Upload once — pos_in_block is the same for every layer.
-            let pos_dev = self.device.htod_sync_copy(&pos_in_blk_host)
-                .map_err(|err| e(format!("pos_dev: {err}")))?;
+            let pos_dev = GpuBuffer::from_host(
+                &self.device,
+                self.device_pool.as_ref(),
+                self.pool_owner
+                    .with_class(PoolAllocationClass::RequestTransient),
+                &pos_in_blk_host,
+            )
+            .map_err(|err| e(format!("pos_dev: {err}")))?;
 
             let blas = Arc::clone(&self.blas);
             for layer_idx in 0..self.weights.layers.len() {
                 let layer = &self.weights.layers[layer_idx];
 
-                launch_rms_norm(&self.device, &mut RmsNormParams {
-                    out: &mut self.prefill.norm, input: self.prefill.hidden.slice(..),
-                    weight: &layer.input_layernorm,
-                    rows: n as u32, dim: h as u32, eps,
-                }).map_err(e)?;
+                launch_rms_norm(
+                    &self.device,
+                    &mut RmsNormParams {
+                        out: &mut self.prefill.norm,
+                        input: self.prefill.hidden.slice(..),
+                        weight: &layer.input_layernorm,
+                        rows: n as u32,
+                        dim: h as u32,
+                        eps,
+                    },
+                )
+                .map_err(e)?;
 
-                Self::gemm(&blas, (num_q * head_dim) as i32, n as i32, h as i32,
-                    &layer.q_proj, h as i32, &self.prefill.norm, h as i32,
-                    &mut self.prefill.q_all, (num_q * head_dim) as i32, "Q")?;
-                Self::gemm(&blas, (num_kv * head_dim) as i32, n as i32, h as i32,
-                    &layer.k_proj, h as i32, &self.prefill.norm, h as i32,
-                    &mut self.prefill.k_all, (num_kv * head_dim) as i32, "K")?;
-                Self::gemm(&blas, (num_kv * head_dim) as i32, n as i32, h as i32,
-                    &layer.v_proj, h as i32, &self.prefill.norm, h as i32,
-                    &mut self.prefill.v_all, (num_kv * head_dim) as i32, "V")?;
+                Self::gemm(
+                    &blas,
+                    (num_q * head_dim) as i32,
+                    n as i32,
+                    h as i32,
+                    &layer.q_proj,
+                    h as i32,
+                    &self.prefill.norm,
+                    h as i32,
+                    &mut self.prefill.q_all,
+                    (num_q * head_dim) as i32,
+                    "Q",
+                )?;
+                Self::gemm(
+                    &blas,
+                    (num_kv * head_dim) as i32,
+                    n as i32,
+                    h as i32,
+                    &layer.k_proj,
+                    h as i32,
+                    &self.prefill.norm,
+                    h as i32,
+                    &mut self.prefill.k_all,
+                    (num_kv * head_dim) as i32,
+                    "K",
+                )?;
+                Self::gemm(
+                    &blas,
+                    (num_kv * head_dim) as i32,
+                    n as i32,
+                    h as i32,
+                    &layer.v_proj,
+                    h as i32,
+                    &self.prefill.norm,
+                    h as i32,
+                    &mut self.prefill.v_all,
+                    (num_kv * head_dim) as i32,
+                    "V",
+                )?;
 
-                launch_batch_rope(&self.device, &mut BatchRopeParams {
-                    q: &mut self.prefill.q_all, k: &mut self.prefill.k_all,
-                    seq_len: n as u32,
-                    num_q_heads: num_q as u32, num_kv_heads: num_kv as u32,
-                    head_dim: head_dim as u32,
-                    position_offset: start_position,
-                    theta: rope_theta,
-                }).map_err(e)?;
+                launch_batch_rope(
+                    &self.device,
+                    &mut BatchRopeParams {
+                        q: &mut self.prefill.q_all,
+                        k: &mut self.prefill.k_all,
+                        seq_len: n as u32,
+                        num_q_heads: num_q as u32,
+                        num_kv_heads: num_kv as u32,
+                        head_dim: head_dim as u32,
+                        position_offset: start_position,
+                        theta: rope_theta,
+                    },
+                )
+                .map_err(e)?;
 
-                let phys_dev = self.device.htod_sync_copy(&{
-                    (0..n).map(|pos| block_tables[layer_idx][pos / block_size])
-                        .collect::<Vec<i32>>()
-                }).map_err(|err| EngineError::backend(format!("phys_dev: {err}")))?;
+                let phys_host = (0..n)
+                    .map(|pos| block_tables[layer_idx][pos / block_size])
+                    .collect::<Vec<i32>>();
+                let phys_dev = GpuBuffer::from_host(
+                    &self.device,
+                    self.device_pool.as_ref(),
+                    self.pool_owner.with_class(PoolAllocationClass::BlockTable),
+                    &phys_host,
+                )
+                .map_err(|err| EngineError::backend(format!("phys_dev: {err}")))?;
 
-                launch_batch_kv_write(&self.device, &mut BatchKvWriteParams {
-                    kv_cache: unsafe { self.block_pool.storage_mut() },
-                    k: &self.prefill.k_all, v: &self.prefill.v_all,
-                    physical_blocks: &phys_dev, pos_in_blocks: &pos_dev,
-                    seq_len: n as u32, num_kv_heads: num_kv as u32,
-                    block_size: block_size as u32, head_dim: head_dim as u32,
-                }).map_err(e)?;
+                launch_batch_kv_write(
+                    &self.device,
+                    &mut BatchKvWriteParams {
+                        kv_cache: unsafe { self.block_pool.storage_mut() },
+                        k: &self.prefill.k_all,
+                        v: &self.prefill.v_all,
+                        physical_blocks: &phys_dev,
+                        pos_in_blocks: &pos_dev,
+                        seq_len: n as u32,
+                        num_kv_heads: num_kv as u32,
+                        block_size: block_size as u32,
+                        head_dim: head_dim as u32,
+                    },
+                )
+                .map_err(e)?;
 
-                launch_prefill_attention(&self.device, &mut PrefillAttnParams {
-                    out: &mut self.prefill.attn_out,
-                    q: &self.prefill.q_all, k: &self.prefill.k_all, v: &self.prefill.v_all,
-                    scale, seq_len: n as u32,
-                    num_q_heads: num_q as u32, num_kv_heads: num_kv as u32,
-                    head_dim: head_dim as u32,
-                }).map_err(e)?;
+                launch_prefill_attention(
+                    &self.device,
+                    &mut PrefillAttnParams {
+                        out: &mut self.prefill.attn_out,
+                        q: &self.prefill.q_all,
+                        k: &self.prefill.k_all,
+                        v: &self.prefill.v_all,
+                        scale,
+                        seq_len: n as u32,
+                        num_q_heads: num_q as u32,
+                        num_kv_heads: num_kv as u32,
+                        head_dim: head_dim as u32,
+                    },
+                )
+                .map_err(e)?;
 
                 let layer = &self.weights.layers[layer_idx];
-                Self::gemm(&blas, h as i32, n as i32, (num_q * head_dim) as i32,
-                    &layer.o_proj, (num_q * head_dim) as i32,
-                    &self.prefill.attn_out, (num_q * head_dim) as i32,
-                    &mut self.prefill.o_out, h as i32, "O")?;
+                Self::gemm(
+                    &blas,
+                    h as i32,
+                    n as i32,
+                    (num_q * head_dim) as i32,
+                    &layer.o_proj,
+                    (num_q * head_dim) as i32,
+                    &self.prefill.attn_out,
+                    (num_q * head_dim) as i32,
+                    &mut self.prefill.o_out,
+                    h as i32,
+                    "O",
+                )?;
 
-                launch_residual_add(&self.device, &mut self.prefill.residual,
-                    &self.prefill.hidden, &self.prefill.o_out, (n * h) as u32).map_err(e)?;
-
-                let layer = &self.weights.layers[layer_idx];
-                launch_rms_norm(&self.device, &mut RmsNormParams {
-                    out: &mut self.prefill.ffn_input, input: self.prefill.residual.slice(..),
-                    weight: &layer.post_attention_layernorm,
-                    rows: n as u32, dim: h as u32, eps,
-                }).map_err(e)?;
-
-                let layer = &self.weights.layers[layer_idx];
-                Self::gemm(&blas, inter as i32, n as i32, h as i32,
-                    &layer.gate_proj, h as i32, &self.prefill.ffn_input, h as i32,
-                    &mut self.prefill.gate_out, inter as i32, "gate")?;
-                Self::gemm(&blas, inter as i32, n as i32, h as i32,
-                    &layer.up_proj, h as i32, &self.prefill.ffn_input, h as i32,
-                    &mut self.prefill.up_out, inter as i32, "up")?;
-
-                launch_fused_swiglu(&self.device, &mut self.prefill.swiglu_out,
-                    &self.prefill.gate_out, &self.prefill.up_out, (n * inter) as u32).map_err(e)?;
+                launch_residual_add(
+                    &self.device,
+                    &mut self.prefill.residual,
+                    &self.prefill.hidden,
+                    &self.prefill.o_out,
+                    (n * h) as u32,
+                )
+                .map_err(e)?;
 
                 let layer = &self.weights.layers[layer_idx];
-                Self::gemm(&blas, h as i32, n as i32, inter as i32,
-                    &layer.down_proj, inter as i32, &self.prefill.swiglu_out, inter as i32,
-                    &mut self.prefill.ffn_out, h as i32, "down")?;
+                launch_rms_norm(
+                    &self.device,
+                    &mut RmsNormParams {
+                        out: &mut self.prefill.ffn_input,
+                        input: self.prefill.residual.slice(..),
+                        weight: &layer.post_attention_layernorm,
+                        rows: n as u32,
+                        dim: h as u32,
+                        eps,
+                    },
+                )
+                .map_err(e)?;
 
-                launch_residual_add(&self.device, &mut self.prefill.hidden,
-                    &self.prefill.residual, &self.prefill.ffn_out, (n * h) as u32).map_err(e)?;
+                let layer = &self.weights.layers[layer_idx];
+                Self::gemm(
+                    &blas,
+                    inter as i32,
+                    n as i32,
+                    h as i32,
+                    &layer.gate_proj,
+                    h as i32,
+                    &self.prefill.ffn_input,
+                    h as i32,
+                    &mut self.prefill.gate_out,
+                    inter as i32,
+                    "gate",
+                )?;
+                Self::gemm(
+                    &blas,
+                    inter as i32,
+                    n as i32,
+                    h as i32,
+                    &layer.up_proj,
+                    h as i32,
+                    &self.prefill.ffn_input,
+                    h as i32,
+                    &mut self.prefill.up_out,
+                    inter as i32,
+                    "up",
+                )?;
+
+                launch_fused_swiglu(
+                    &self.device,
+                    &mut self.prefill.swiglu_out,
+                    &self.prefill.gate_out,
+                    &self.prefill.up_out,
+                    (n * inter) as u32,
+                )
+                .map_err(e)?;
+
+                let layer = &self.weights.layers[layer_idx];
+                Self::gemm(
+                    &blas,
+                    h as i32,
+                    n as i32,
+                    inter as i32,
+                    &layer.down_proj,
+                    inter as i32,
+                    &self.prefill.swiglu_out,
+                    inter as i32,
+                    &mut self.prefill.ffn_out,
+                    h as i32,
+                    "down",
+                )?;
+
+                launch_residual_add(
+                    &self.device,
+                    &mut self.prefill.hidden,
+                    &self.prefill.residual,
+                    &self.prefill.ffn_out,
+                    (n * h) as u32,
+                )
+                .map_err(e)?;
             }
 
             let last_off = (n - 1) * h;
-            launch_rms_norm(&self.device, &mut RmsNormParams {
-                out: &mut self.norm_buf, input: self.prefill.hidden.slice(last_off..last_off + h),
-                weight: &self.weights.norm,
-                rows: 1, dim: h as u32, eps,
-            }).map_err(e)?;
+            launch_rms_norm(
+                &self.device,
+                &mut RmsNormParams {
+                    out: &mut self.norm_buf,
+                    input: self.prefill.hidden.slice(last_off..last_off + h),
+                    weight: &self.weights.norm,
+                    rows: 1,
+                    dim: h as u32,
+                    eps,
+                },
+            )
+            .map_err(e)?;
 
-            Self::gemm(&blas, vocab as i32, 1, h as i32,
-                &self.weights.lm_head, h as i32, &self.norm_buf, h as i32,
-                &mut self.logits_buf, vocab as i32, "lm_head")?;
+            Self::gemm(
+                &blas,
+                vocab as i32,
+                1,
+                h as i32,
+                &self.weights.lm_head,
+                h as i32,
+                &self.norm_buf,
+                h as i32,
+                &mut self.logits_buf,
+                vocab as i32,
+                "lm_head",
+            )?;
 
             Ok(())
         }
@@ -714,12 +1008,18 @@ mod inner {
             let vocab = self.config.vocab_size;
             let e = |s: String| EngineError::backend(s);
             self.prefill_compute(token_ids, start_position, block_tables)?;
-            launch_argmax(&self.device, &mut ArgmaxParams {
-                input: &self.logits_buf,
-                output: &mut self.argmax_buf,
-                vocab_size: vocab as u32,
-            }).map_err(|s| EngineError::backend(s))?;
-            let ids: Vec<u32> = self.device.dtoh_sync_copy(&self.argmax_buf)
+            launch_argmax(
+                &self.device,
+                &mut ArgmaxParams {
+                    input: &self.logits_buf,
+                    output: &mut self.argmax_buf,
+                    vocab_size: vocab as u32,
+                },
+            )
+            .map_err(|s| EngineError::backend(s))?;
+            let ids: Vec<u32> = self
+                .device
+                .dtoh_sync_copy(&self.argmax_buf)
                 .map_err(|err| e(format!("argmax dl: {err}")))?;
             Ok(ids[0])
         }
@@ -732,7 +1032,9 @@ mod inner {
         ) -> Result<Vec<f32>, EngineError> {
             let e = |s: String| EngineError::backend(s);
             self.prefill_compute(token_ids, start_position, block_tables)?;
-            let f16v: Vec<f16> = self.device.dtoh_sync_copy(&self.logits_buf)
+            let f16v: Vec<f16> = self
+                .device
+                .dtoh_sync_copy(&self.logits_buf)
                 .map_err(|err| e(format!("logits dl: {err}")))?;
             Ok(f16v.iter().map(|v| v.to_f32()).collect())
         }
@@ -748,72 +1050,124 @@ mod inner {
         //
         // Returns one output token per sequence (in the same order).
 
-        fn batch_decode_compute(&mut self, seqs: &[ActiveDecodeSeq]) -> Result<Vec<u32>, EngineError> {
+        fn batch_decode_compute(
+            &mut self,
+            seqs: &[ActiveDecodeSeq],
+        ) -> Result<Vec<u32>, EngineError> {
             let b = seqs.len();
             debug_assert!(b > 0 && b <= MAX_BATCH);
 
-            let h      = self.config.hidden_size;
-            let num_q  = self.config.num_attention_heads;
+            let h = self.config.hidden_size;
+            let num_q = self.config.num_attention_heads;
             let num_kv = self.config.num_kv_heads();
-            let hd     = self.config.head_dim();
-            let inter  = self.config.intermediate_size;
-            let eps    = self.config.rms_norm_eps as f32;
-            let theta  = self.config.rope_theta as f32;
-            let scale  = 1.0 / (hd as f32).sqrt();
-            let bs     = self.block_pool.block_size();
-            let vocab  = self.config.vocab_size;
+            let hd = self.config.head_dim();
+            let inter = self.config.intermediate_size;
+            let eps = self.config.rms_norm_eps as f32;
+            let theta = self.config.rope_theta as f32;
+            let scale = 1.0 / (hd as f32).sqrt();
+            let bs = self.block_pool.block_size();
+            let vocab = self.config.vocab_size;
             let e = |s: String| EngineError::backend(s);
             let blas = Arc::clone(&self.blas);
 
             // Upload positions (= context_len - 1) and context_lens.
-            let positions_host: Vec<i32> = seqs.iter().map(|s| (s.context_len - 1) as i32).collect();
-            let ctx_lens_host: Vec<i32>  = seqs.iter().map(|s| s.context_len as i32).collect();
-            self.device.htod_sync_copy_into(&positions_host, &mut self.batch.positions)
+            let positions_host: Vec<i32> =
+                seqs.iter().map(|s| (s.context_len - 1) as i32).collect();
+            let ctx_lens_host: Vec<i32> = seqs.iter().map(|s| s.context_len as i32).collect();
+            self.device
+                .htod_sync_copy_into(&positions_host, &mut self.batch.positions)
                 .map_err(|err| e(format!("positions upload: {err}")))?;
-            self.device.htod_sync_copy_into(&ctx_lens_host, &mut self.batch.ctx_lens)
+            self.device
+                .htod_sync_copy_into(&ctx_lens_host, &mut self.batch.ctx_lens)
                 .map_err(|err| e(format!("ctx_lens upload: {err}")))?;
 
             // Embed lookup: copy one embed row per sequence into batch.hidden.
             for (i, seq) in seqs.iter().enumerate() {
                 let off = seq.next_token as usize * h;
-                self.device.dtod_copy(
-                    &self.weights.embed_tokens.slice(off..off + h),
-                    &mut self.batch.hidden.slice_mut(i * h..(i + 1) * h),
-                ).map_err(|err| e(format!("embed: {err}")))?;
+                self.device
+                    .dtod_copy(
+                        &self.weights.embed_tokens.slice(off..off + h),
+                        &mut self.batch.hidden.slice_mut(i * h..(i + 1) * h),
+                    )
+                    .map_err(|err| e(format!("embed: {err}")))?;
             }
 
-            let q_dim  = num_q  * hd;
+            let q_dim = num_q * hd;
             let kv_dim = num_kv * hd;
 
             for layer_idx in 0..self.weights.layers.len() {
                 let layer = &self.weights.layers[layer_idx];
 
                 // RMS norm over B rows.
-                launch_rms_norm(&self.device, &mut RmsNormParams {
-                    out: &mut self.batch.norm, input: self.batch.hidden.slice(..),
-                    weight: &layer.input_layernorm,
-                    rows: b as u32, dim: h as u32, eps,
-                }).map_err(e)?;
+                launch_rms_norm(
+                    &self.device,
+                    &mut RmsNormParams {
+                        out: &mut self.batch.norm,
+                        input: self.batch.hidden.slice(..),
+                        weight: &layer.input_layernorm,
+                        rows: b as u32,
+                        dim: h as u32,
+                        eps,
+                    },
+                )
+                .map_err(e)?;
 
                 // Q / K / V projections: [B, h] → [B, q_dim / kv_dim].
-                Self::gemm(&blas, q_dim as i32, b as i32, h as i32,
-                    &layer.q_proj, h as i32, &self.batch.norm, h as i32,
-                    &mut self.batch.q_buf, q_dim as i32, "bQ")?;
-                Self::gemm(&blas, kv_dim as i32, b as i32, h as i32,
-                    &layer.k_proj, h as i32, &self.batch.norm, h as i32,
-                    &mut self.batch.k_buf, kv_dim as i32, "bK")?;
-                Self::gemm(&blas, kv_dim as i32, b as i32, h as i32,
-                    &layer.v_proj, h as i32, &self.batch.norm, h as i32,
-                    &mut self.batch.v_buf, kv_dim as i32, "bV")?;
+                Self::gemm(
+                    &blas,
+                    q_dim as i32,
+                    b as i32,
+                    h as i32,
+                    &layer.q_proj,
+                    h as i32,
+                    &self.batch.norm,
+                    h as i32,
+                    &mut self.batch.q_buf,
+                    q_dim as i32,
+                    "bQ",
+                )?;
+                Self::gemm(
+                    &blas,
+                    kv_dim as i32,
+                    b as i32,
+                    h as i32,
+                    &layer.k_proj,
+                    h as i32,
+                    &self.batch.norm,
+                    h as i32,
+                    &mut self.batch.k_buf,
+                    kv_dim as i32,
+                    "bK",
+                )?;
+                Self::gemm(
+                    &blas,
+                    kv_dim as i32,
+                    b as i32,
+                    h as i32,
+                    &layer.v_proj,
+                    h as i32,
+                    &self.batch.norm,
+                    h as i32,
+                    &mut self.batch.v_buf,
+                    kv_dim as i32,
+                    "bV",
+                )?;
 
                 // Per-sequence RoPE (each seq at its own absolute position).
-                launch_batch_decode_rope(&self.device, &mut BatchDecodeRopeParams {
-                    q: &mut self.batch.q_buf, k: &mut self.batch.k_buf,
-                    positions: &self.batch.positions,
-                    batch_size: b as u32,
-                    num_q_heads: num_q as u32, num_kv_heads: num_kv as u32,
-                    head_dim: hd as u32, theta,
-                }).map_err(e)?;
+                launch_batch_decode_rope(
+                    &self.device,
+                    &mut BatchDecodeRopeParams {
+                        q: &mut self.batch.q_buf,
+                        k: &mut self.batch.k_buf,
+                        positions: &self.batch.positions,
+                        batch_size: b as u32,
+                        num_q_heads: num_q as u32,
+                        num_kv_heads: num_kv as u32,
+                        head_dim: hd as u32,
+                        theta,
+                    },
+                )
+                .map_err(e)?;
 
                 // Write K/V for each seq's current token to the paged pool.
                 let mut phys_host = Vec::with_capacity(b);
@@ -823,105 +1177,236 @@ mod inner {
                     phys_host.push(seq.block_tables[layer_idx][pos / bs]);
                     pos_blk_host.push((pos % bs) as i32);
                 }
-                let phys_dev = self.device.htod_sync_copy(&phys_host)
-                    .map_err(|err| e(format!("phys_dev: {err}")))?;
-                let pos_dev = self.device.htod_sync_copy(&pos_blk_host)
-                    .map_err(|err| e(format!("pos_dev: {err}")))?;
+                let phys_dev = GpuBuffer::from_host(
+                    &self.device,
+                    self.device_pool.as_ref(),
+                    self.pool_owner.with_class(PoolAllocationClass::BlockTable),
+                    &phys_host,
+                )
+                .map_err(|err| e(format!("phys_dev: {err}")))?;
+                let pos_dev = GpuBuffer::from_host(
+                    &self.device,
+                    self.device_pool.as_ref(),
+                    self.pool_owner
+                        .with_class(PoolAllocationClass::RequestTransient),
+                    &pos_blk_host,
+                )
+                .map_err(|err| e(format!("pos_dev: {err}")))?;
 
-                launch_batch_kv_write(&self.device, &mut BatchKvWriteParams {
-                    kv_cache: unsafe { self.block_pool.storage_mut() },
-                    k: &self.batch.k_buf, v: &self.batch.v_buf,
-                    physical_blocks: &phys_dev, pos_in_blocks: &pos_dev,
-                    seq_len: b as u32, num_kv_heads: num_kv as u32,
-                    block_size: bs as u32, head_dim: hd as u32,
-                }).map_err(e)?;
+                launch_batch_kv_write(
+                    &self.device,
+                    &mut BatchKvWriteParams {
+                        kv_cache: unsafe { self.block_pool.storage_mut() },
+                        k: &self.batch.k_buf,
+                        v: &self.batch.v_buf,
+                        physical_blocks: &phys_dev,
+                        pos_in_blocks: &pos_dev,
+                        seq_len: b as u32,
+                        num_kv_heads: num_kv as u32,
+                        block_size: bs as u32,
+                        head_dim: hd as u32,
+                    },
+                )
+                .map_err(e)?;
 
                 // Build flattened batch block table [B, max_blocks_per_seq] for this layer.
-                let max_blks = seqs.iter().map(|s| s.block_tables[layer_idx].len()).max().unwrap_or(1);
+                let max_blks = seqs
+                    .iter()
+                    .map(|s| s.block_tables[layer_idx].len())
+                    .max()
+                    .unwrap_or(1);
                 let mut bt_host = vec![0i32; b * max_blks];
                 for (i, seq) in seqs.iter().enumerate() {
                     let src = &seq.block_tables[layer_idx];
                     bt_host[i * max_blks..i * max_blks + src.len()].copy_from_slice(src);
                 }
-                let bt_dev = self.device.htod_sync_copy(&bt_host)
-                    .map_err(|err| e(format!("bt upload: {err}")))?;
+                let bt_dev = GpuBuffer::from_host(
+                    &self.device,
+                    self.device_pool.as_ref(),
+                    self.pool_owner.with_class(PoolAllocationClass::BlockTable),
+                    &bt_host,
+                )
+                .map_err(|err| e(format!("bt upload: {err}")))?;
 
-                launch_paged_attention(&self.device, &mut PagedAttentionParams {
-                    out: &mut self.batch.attn_buf,
-                    q: &self.batch.q_buf,
-                    kv_cache: unsafe { self.block_pool.storage() },
-                    block_tables: &bt_dev,
-                    context_lens: &self.batch.ctx_lens,
-                    scale,
-                    batch_size: b as u32,
-                    num_q_heads: num_q as u32, num_kv_heads: num_kv as u32,
-                    head_dim: hd as u32, block_size: bs as u32,
-                    max_blocks_per_seq: max_blks as u32,
-                }).map_err(e)?;
-
-                let layer = &self.weights.layers[layer_idx];
-                Self::gemm(&blas, h as i32, b as i32, q_dim as i32,
-                    &layer.o_proj, q_dim as i32, &self.batch.attn_buf, q_dim as i32,
-                    &mut self.batch.o_proj, h as i32, "bO")?;
-
-                launch_residual_add(&self.device, &mut self.batch.residual,
-                    &self.batch.hidden, &self.batch.o_proj, (b * h) as u32).map_err(e)?;
-
-                let layer = &self.weights.layers[layer_idx];
-                launch_rms_norm(&self.device, &mut RmsNormParams {
-                    out: &mut self.batch.ffn_input, input: self.batch.residual.slice(..),
-                    weight: &layer.post_attention_layernorm,
-                    rows: b as u32, dim: h as u32, eps,
-                }).map_err(e)?;
+                launch_paged_attention(
+                    &self.device,
+                    &mut PagedAttentionParams {
+                        out: &mut self.batch.attn_buf,
+                        q: &self.batch.q_buf,
+                        kv_cache: unsafe { self.block_pool.storage() },
+                        block_tables: &bt_dev,
+                        context_lens: &self.batch.ctx_lens,
+                        scale,
+                        batch_size: b as u32,
+                        num_q_heads: num_q as u32,
+                        num_kv_heads: num_kv as u32,
+                        head_dim: hd as u32,
+                        block_size: bs as u32,
+                        max_blocks_per_seq: max_blks as u32,
+                    },
+                )
+                .map_err(e)?;
 
                 let layer = &self.weights.layers[layer_idx];
-                Self::gemm(&blas, inter as i32, b as i32, h as i32,
-                    &layer.gate_proj, h as i32, &self.batch.ffn_input, h as i32,
-                    &mut self.batch.gate_buf, inter as i32, "bgate")?;
-                Self::gemm(&blas, inter as i32, b as i32, h as i32,
-                    &layer.up_proj, h as i32, &self.batch.ffn_input, h as i32,
-                    &mut self.batch.up_buf, inter as i32, "bup")?;
+                Self::gemm(
+                    &blas,
+                    h as i32,
+                    b as i32,
+                    q_dim as i32,
+                    &layer.o_proj,
+                    q_dim as i32,
+                    &self.batch.attn_buf,
+                    q_dim as i32,
+                    &mut self.batch.o_proj,
+                    h as i32,
+                    "bO",
+                )?;
 
-                launch_fused_swiglu(&self.device, &mut self.batch.swiglu_buf,
-                    &self.batch.gate_buf, &self.batch.up_buf, (b * inter) as u32).map_err(e)?;
+                launch_residual_add(
+                    &self.device,
+                    &mut self.batch.residual,
+                    &self.batch.hidden,
+                    &self.batch.o_proj,
+                    (b * h) as u32,
+                )
+                .map_err(e)?;
 
                 let layer = &self.weights.layers[layer_idx];
-                Self::gemm(&blas, h as i32, b as i32, inter as i32,
-                    &layer.down_proj, inter as i32, &self.batch.swiglu_buf, inter as i32,
-                    &mut self.batch.ffn_out, h as i32, "bdown")?;
+                launch_rms_norm(
+                    &self.device,
+                    &mut RmsNormParams {
+                        out: &mut self.batch.ffn_input,
+                        input: self.batch.residual.slice(..),
+                        weight: &layer.post_attention_layernorm,
+                        rows: b as u32,
+                        dim: h as u32,
+                        eps,
+                    },
+                )
+                .map_err(e)?;
 
-                launch_residual_add(&self.device, &mut self.batch.hidden,
-                    &self.batch.residual, &self.batch.ffn_out, (b * h) as u32).map_err(e)?;
+                let layer = &self.weights.layers[layer_idx];
+                Self::gemm(
+                    &blas,
+                    inter as i32,
+                    b as i32,
+                    h as i32,
+                    &layer.gate_proj,
+                    h as i32,
+                    &self.batch.ffn_input,
+                    h as i32,
+                    &mut self.batch.gate_buf,
+                    inter as i32,
+                    "bgate",
+                )?;
+                Self::gemm(
+                    &blas,
+                    inter as i32,
+                    b as i32,
+                    h as i32,
+                    &layer.up_proj,
+                    h as i32,
+                    &self.batch.ffn_input,
+                    h as i32,
+                    &mut self.batch.up_buf,
+                    inter as i32,
+                    "bup",
+                )?;
+
+                launch_fused_swiglu(
+                    &self.device,
+                    &mut self.batch.swiglu_buf,
+                    &self.batch.gate_buf,
+                    &self.batch.up_buf,
+                    (b * inter) as u32,
+                )
+                .map_err(e)?;
+
+                let layer = &self.weights.layers[layer_idx];
+                Self::gemm(
+                    &blas,
+                    h as i32,
+                    b as i32,
+                    inter as i32,
+                    &layer.down_proj,
+                    inter as i32,
+                    &self.batch.swiglu_buf,
+                    inter as i32,
+                    &mut self.batch.ffn_out,
+                    h as i32,
+                    "bdown",
+                )?;
+
+                launch_residual_add(
+                    &self.device,
+                    &mut self.batch.hidden,
+                    &self.batch.residual,
+                    &self.batch.ffn_out,
+                    (b * h) as u32,
+                )
+                .map_err(e)?;
             }
 
             // Final norm + LM head.
-            launch_rms_norm(&self.device, &mut RmsNormParams {
-                out: &mut self.batch.norm, input: self.batch.hidden.slice(..),
-                weight: &self.weights.norm,
-                rows: b as u32, dim: h as u32, eps,
-            }).map_err(e)?;
+            launch_rms_norm(
+                &self.device,
+                &mut RmsNormParams {
+                    out: &mut self.batch.norm,
+                    input: self.batch.hidden.slice(..),
+                    weight: &self.weights.norm,
+                    rows: b as u32,
+                    dim: h as u32,
+                    eps,
+                },
+            )
+            .map_err(e)?;
 
-            Self::gemm(&blas, vocab as i32, b as i32, h as i32,
-                &self.weights.lm_head, h as i32, &self.batch.norm, h as i32,
-                &mut self.batch.logits, vocab as i32, "blm_head")?;
+            Self::gemm(
+                &blas,
+                vocab as i32,
+                b as i32,
+                h as i32,
+                &self.weights.lm_head,
+                h as i32,
+                &self.batch.norm,
+                h as i32,
+                &mut self.batch.logits,
+                vocab as i32,
+                "blm_head",
+            )?;
 
             // Sampling: GPU argmax when all are greedy, CPU otherwise.
             let any_sampled = seqs.iter().any(|s| !s.sp.is_greedy());
             if !any_sampled {
-                launch_batch_argmax(&self.device, &mut BatchArgmaxParams {
-                    input: &self.batch.logits, output: &mut self.batch.argmax,
-                    batch_size: b as u32, vocab_size: vocab as u32,
-                }).map_err(|s| EngineError::backend(s))?;
-                let winners: Vec<u32> = self.device.dtoh_sync_copy(&self.batch.argmax)
+                launch_batch_argmax(
+                    &self.device,
+                    &mut BatchArgmaxParams {
+                        input: &self.batch.logits,
+                        output: &mut self.batch.argmax,
+                        batch_size: b as u32,
+                        vocab_size: vocab as u32,
+                    },
+                )
+                .map_err(|s| EngineError::backend(s))?;
+                let winners: Vec<u32> = self
+                    .device
+                    .dtoh_sync_copy(&self.batch.argmax)
                     .map_err(|err| e(format!("argmax dl: {err}")))?;
                 Ok(winners[..b].to_vec())
             } else {
-                let all_f16: Vec<f16> = self.device.dtoh_sync_copy(&self.batch.logits)
+                let all_f16: Vec<f16> = self
+                    .device
+                    .dtoh_sync_copy(&self.batch.logits)
                     .map_err(|err| e(format!("logits dl: {err}")))?;
                 // Collect into f32 rows, then sample each.  We can't call self.sample()
                 // inside the iterator because it borrows self mutably; collect first.
                 let rows: Vec<Vec<f32>> = (0..b)
-                    .map(|i| all_f16[i * vocab..(i + 1) * vocab].iter().map(|v| v.to_f32()).collect())
+                    .map(|i| {
+                        all_f16[i * vocab..(i + 1) * vocab]
+                            .iter()
+                            .map(|v| v.to_f32())
+                            .collect()
+                    })
                     .collect();
                 let mut tokens = Vec::with_capacity(b);
                 for (row, seq) in rows.iter().zip(seqs.iter()) {
@@ -963,13 +1448,18 @@ mod inner {
         inner: &mut BackendInner,
         active_sessions: &mut HashSet<String>,
     ) {
-        if let Some(sid) = &done.session_id { active_sessions.remove(sid); }
+        if let Some(sid) = &done.session_id {
+            active_sessions.remove(sid);
+        }
         let generated = done.generated.clone();
         if let Some(sid) = done.session_id.clone() {
-            inner.sessions.insert(sid, SessionState {
-                block_tables: done.block_tables.clone(),
-                context_len: done.context_len,
-            });
+            inner.sessions.insert(
+                sid,
+                SessionState {
+                    block_tables: done.block_tables.clone(),
+                    context_len: done.context_len,
+                },
+            );
             done.finish(Ok(generated));
         } else {
             let bt = done.block_tables.clone();
@@ -1008,10 +1498,7 @@ mod inner {
 
     /// Run prefill for a new request.  Returns `None` and sends the error
     /// via `req.result_tx` if prefill fails.
-    fn prefill_request(
-        inner: &mut BackendInner,
-        req: SchedulerRequest,
-    ) -> Option<ActiveDecodeSeq> {
+    fn prefill_request(inner: &mut BackendInner, req: SchedulerRequest) -> Option<ActiveDecodeSeq> {
         if req.prompt_ids.is_empty() {
             let _ = req.result_tx.send(Ok(Vec::new()));
             return None;
@@ -1019,9 +1506,13 @@ mod inner {
 
         // Resolve or create session state.
         let session_id = req.session_id.clone();
-        let mut session = session_id.as_deref()
+        let mut session = session_id
+            .as_deref()
             .and_then(|sid| inner.sessions.remove(sid))
-            .unwrap_or(SessionState { block_tables: Vec::new(), context_len: 0 });
+            .unwrap_or(SessionState {
+                block_tables: Vec::new(),
+                context_len: 0,
+            });
 
         // Ensure blocks for all prompt positions.
         for i in 0..req.prompt_ids.len() {
@@ -1097,7 +1588,9 @@ mod inner {
             }
             SchedulerCmd::Swap { reply } => {
                 for seq in active.drain(..) {
-                    if let Some(sid) = &seq.session_id { active_sessions.remove(sid); }
+                    if let Some(sid) = &seq.session_id {
+                        active_sessions.remove(sid);
+                    }
                     seq.finish(Err(EngineError::backend("model swapped; retry request")));
                 }
                 let _ = reply.send(inner.activate_staged());
@@ -1152,7 +1645,9 @@ mod inner {
                 }
             }
 
-            if active.is_empty() { continue; }
+            if active.is_empty() {
+                continue;
+            }
 
             // ── Ensure blocks for this decode step ────────────────────────
             //
@@ -1165,7 +1660,9 @@ mod inner {
                 let bt = &mut active[i].block_tables;
                 if let Err(e) = inner.ensure_block(bt, pos) {
                     let done = active.swap_remove(i);
-                    if let Some(sid) = &done.session_id { active_sessions.remove(sid); }
+                    if let Some(sid) = &done.session_id {
+                        active_sessions.remove(sid);
+                    }
                     let bt = done.block_tables.clone();
                     done.finish(Err(e));
                     inner.free_block_tables(&bt);
@@ -1175,7 +1672,9 @@ mod inner {
                 }
             }
 
-            if active.is_empty() { continue; }
+            if active.is_empty() {
+                continue;
+            }
 
             // ── Batched forward pass ──────────────────────────────────────
             //
@@ -1187,7 +1686,9 @@ mod inner {
                 Err(e) => {
                     let err_str = format!("{e}");
                     for done in active.drain(..) {
-                        if let Some(sid) = &done.session_id { active_sessions.remove(sid); }
+                        if let Some(sid) = &done.session_id {
+                            active_sessions.remove(sid);
+                        }
                         let bt = done.block_tables.clone();
                         done.finish(Err(EngineError::backend(err_str.clone())));
                         inner.free_block_tables(&bt);
@@ -1204,7 +1705,7 @@ mod inner {
 
             i = 0;
             while i < active.len() {
-                let input_tok  = active[i].next_token;
+                let input_tok = active[i].next_token;
                 let output_tok = output_tokens[i];
 
                 // Emit the input token.
@@ -1220,7 +1721,10 @@ mod inner {
 
                 let is_done = stream_closed
                     || active[i].generated.len() >= active[i].max_new_tokens as usize
-                    || active[i].cancel.as_ref().map_or(false, |c| c.is_cancelled());
+                    || active[i]
+                        .cancel
+                        .as_ref()
+                        .map_or(false, |c| c.is_cancelled());
 
                 if is_done {
                     let done = active.swap_remove(i);
@@ -1279,7 +1783,24 @@ mod inner {
         /// Attach this backend to runtime-owned device storage. Model geometry
         /// is applied later, after safetensors metadata has been loaded.
         pub fn with_device_pool(mut self, pool: Arc<GpuDevicePool>, model_id: u32) -> Self {
-            self.device_pool = Some((pool, PoolOwner::NativeKv { model_id }));
+            self.device_pool = Some((
+                pool,
+                PoolOwner::native(model_id, 0, PoolAllocationClass::KvCache),
+            ));
+            self
+        }
+
+        /// Attach runtime-owned storage with stable model/replica attribution.
+        pub fn with_device_pool_for_replica(
+            mut self,
+            pool: Arc<GpuDevicePool>,
+            model_id: u32,
+            replica_id: u32,
+        ) -> Self {
+            self.device_pool = Some((
+                pool,
+                PoolOwner::native(model_id, replica_id, PoolAllocationClass::KvCache),
+            ));
             self
         }
 
@@ -1289,7 +1810,9 @@ mod inner {
         }
 
         fn get_tx(&self) -> Result<std::sync::mpsc::SyncSender<SchedulerCmd>, EngineError> {
-            self.state.lock().unwrap()
+            self.state
+                .lock()
+                .unwrap()
                 .as_ref()
                 .map(|bs| bs.tx.clone())
                 .ok_or(EngineError::ModelNotLoaded)
@@ -1303,9 +1826,10 @@ mod inner {
                     source: None,
                 });
             }
-            Ok(p.data.chunks_exact(4).map(|b| {
-                i32::from_le_bytes(b.try_into().unwrap()) as u32
-            }).collect())
+            Ok(p.data
+                .chunks_exact(4)
+                .map(|b| i32::from_le_bytes(b.try_into().unwrap()) as u32)
+                .collect())
         }
 
         fn decode_params(req: &InferenceRequest) -> (u32, Option<u32>, SampleParams) {
@@ -1316,15 +1840,66 @@ mod inner {
                 .and_then(|v| v.first().copied());
             (max_new, eos, SampleParams::from_meta(meta))
         }
-
     }
 
     #[async_trait]
     impl kapsl_engine_api::Engine for NativeBackend {
+        fn planned_memory(&self, model_path: &Path) -> Result<MemoryReport, EngineError> {
+            let bytes = planned_weight_bytes(model_path)?;
+            let source = if self.device_pool.is_some() {
+                EngineMemoryAllocationSource::RuntimeManaged
+            } else {
+                EngineMemoryAllocationSource::BackendManaged
+            };
+            Ok(MemoryReport {
+                allocations: vec![
+                    EngineMemoryAllocation {
+                        allocation_id: self.external_allocation_id.clone(),
+                        domain: EngineMemoryDomain::Cuda {
+                            device_id: self.device_id as usize,
+                        },
+                        class: EngineMemoryAllocationClass::PersistentWeights,
+                        source,
+                        bytes,
+                    },
+                    EngineMemoryAllocation {
+                        allocation_id: format!("{}:scratch", self.external_allocation_id),
+                        domain: EngineMemoryDomain::Cuda {
+                            device_id: self.device_id as usize,
+                        },
+                        class: EngineMemoryAllocationClass::TransientWorkspace,
+                        source,
+                        bytes: (bytes / 8).max(256 * 1024 * 1024),
+                    },
+                    EngineMemoryAllocation {
+                        allocation_id: format!("{}:kv", self.external_allocation_id),
+                        domain: EngineMemoryDomain::Cuda {
+                            device_id: self.device_id as usize,
+                        },
+                        class: EngineMemoryAllocationClass::KvCache,
+                        source,
+                        bytes: 0,
+                    },
+                    EngineMemoryAllocation {
+                        allocation_id: format!("{}:block-table", self.external_allocation_id),
+                        domain: EngineMemoryDomain::Cuda {
+                            device_id: self.device_id as usize,
+                        },
+                        class: EngineMemoryAllocationClass::BlockTable,
+                        source,
+                        bytes: 0,
+                    },
+                ],
+            })
+        }
+
         fn planned_external_device_memory(
             &self,
             model_path: &Path,
         ) -> Result<ExternalDeviceMemoryReport, EngineError> {
+            if self.device_pool.is_some() {
+                return Ok(ExternalDeviceMemoryReport::default());
+            }
             let bytes = planned_weight_bytes(model_path)?;
             Ok(ExternalDeviceMemoryReport {
                 allocations: vec![
@@ -1354,16 +1929,32 @@ mod inner {
             let config = cpu.config.clone();
             log::info!(
                 "NativeBackend: {} layers, {}Q/{}KV heads, h={}, vocab={}",
-                config.num_hidden_layers, config.num_attention_heads,
-                config.num_kv_heads(), config.hidden_size, config.vocab_size,
+                config.num_hidden_layers,
+                config.num_attention_heads,
+                config.num_kv_heads(),
+                config.hidden_size,
+                config.vocab_size,
             );
 
             let device = CudaDevice::new(self.device_id as usize)
                 .map_err(|e| EngineError::backend(format!("CUDA: {e}")))?;
-            let blas = Arc::new(CudaBlas::new(device.clone())
-                .map_err(|e| EngineError::backend(format!("cuBLAS: {e}")))?);
+            let blas = Arc::new(
+                CudaBlas::new(device.clone())
+                    .map_err(|e| EngineError::backend(format!("cuBLAS: {e}")))?,
+            );
 
-            let weights = upload_weights(&device, &cpu)?;
+            let pool_owner = self
+                .device_pool
+                .as_ref()
+                .map(|(_, owner)| *owner)
+                .unwrap_or(PoolOwner::native(0, 0, PoolAllocationClass::KvCache));
+            let device_pool = self.device_pool.as_ref().map(|(pool, _)| pool);
+            let weights = upload_weights(
+                &device,
+                device_pool,
+                pool_owner.with_class(PoolAllocationClass::PersistentWeights),
+                &cpu,
+            )?;
             let weight_bytes = weights.byte_len();
             drop(cpu);
 
@@ -1374,18 +1965,31 @@ mod inner {
                 if let Some((device_pool, owner)) = self.device_pool.as_ref() {
                     let bps = (config.max_position_embeddings + block_size - 1) / block_size;
                     let requested_blocks = config.num_hidden_layers * MAX_BATCH * bps;
-                    let p = Arc::new(GpuBlockPool::from_device_pool(
-                        Arc::clone(device_pool), *owner, requested_blocks, block_size,
-                        config.num_kv_heads(), config.head_dim())
-                        .map_err(|e| EngineError::backend(format!("block pool view: {e}")))?);
+                    let p = Arc::new(
+                        GpuBlockPool::from_device_pool(
+                            Arc::clone(device_pool),
+                            *owner,
+                            requested_blocks,
+                            block_size,
+                            config.num_kv_heads(),
+                            config.head_dim(),
+                        )
+                        .map_err(|e| EngineError::backend(format!("block pool view: {e}")))?,
+                    );
                     let h = GpuPoolHandle::private(p.clone());
                     let cap = h.blocks_per_engine.clone();
                     *slot = Some(h);
                     (p, cap)
                 } else if let Some(ref handle) = *slot {
-                    if handle.pool.is_compatible(config.num_kv_heads(), config.head_dim()) {
-                        log::info!("[native] Attaching to shared GpuBlockPool ({} free, cap {})",
-                            handle.pool.free_count(), handle.cap());
+                    if handle
+                        .pool
+                        .is_compatible(config.num_kv_heads(), config.head_dim())
+                    {
+                        log::info!(
+                            "[native] Attaching to shared GpuBlockPool ({} free, cap {})",
+                            handle.pool.free_count(),
+                            handle.cap()
+                        );
                         (handle.pool.clone(), handle.blocks_per_engine.clone())
                     } else {
                         log::warn!("[native] Pool geometry mismatch ({}h×{}d vs {}h×{}d), creating private pool",
@@ -1393,9 +1997,16 @@ mod inner {
                             config.num_kv_heads(), config.head_dim());
                         let bps = (config.max_position_embeddings + block_size - 1) / block_size;
                         let num_blocks = config.num_hidden_layers * MAX_BATCH * bps;
-                        let p = Arc::new(GpuBlockPool::new(device.clone(), num_blocks, block_size,
-                            config.num_kv_heads(), config.head_dim())
-                            .map_err(|e| EngineError::backend(format!("block pool: {e}")))?);
+                        let p = Arc::new(
+                            GpuBlockPool::new(
+                                device.clone(),
+                                num_blocks,
+                                block_size,
+                                config.num_kv_heads(),
+                                config.head_dim(),
+                            )
+                            .map_err(|e| EngineError::backend(format!("block pool: {e}")))?,
+                        );
                         let h = GpuPoolHandle::private(p.clone());
                         let cap = h.blocks_per_engine.clone();
                         *slot = Some(h);
@@ -1404,9 +2015,16 @@ mod inner {
                 } else {
                     let bps = (config.max_position_embeddings + block_size - 1) / block_size;
                     let num_blocks = config.num_hidden_layers * MAX_BATCH * bps;
-                    let p = Arc::new(GpuBlockPool::new(device.clone(), num_blocks, block_size,
-                        config.num_kv_heads(), config.head_dim())
-                        .map_err(|e| EngineError::backend(format!("block pool: {e}")))?);
+                    let p = Arc::new(
+                        GpuBlockPool::new(
+                            device.clone(),
+                            num_blocks,
+                            block_size,
+                            config.num_kv_heads(),
+                            config.head_dim(),
+                        )
+                        .map_err(|e| EngineError::backend(format!("block pool: {e}")))?,
+                    );
                     let h = GpuPoolHandle::private(p.clone());
                     let cap = h.blocks_per_engine.clone();
                     *slot = Some(h);
@@ -1414,27 +2032,54 @@ mod inner {
                 }
             };
 
-            let h     = config.hidden_size;
-            let nq    = config.num_attention_heads;
-            let nkv   = config.num_kv_heads();
-            let hd    = config.head_dim();
+            let h = config.hidden_size;
+            let nq = config.num_attention_heads;
+            let nkv = config.num_kv_heads();
+            let hd = config.head_dim();
             let inter = config.intermediate_size;
             let vocab = config.vocab_size;
 
-            let alloc1 = |n: usize| device.alloc_zeros::<f16>(n)
-                .map_err(|e| EngineError::backend(format!("alloc: {e}")));
+            let workspace_owner = pool_owner.with_class(PoolAllocationClass::TransientWorkspace);
+            let alloc1 = |n: usize| {
+                GpuBuffer::zeros(&device, device_pool, workspace_owner, n)
+                    .map_err(|e| EngineError::backend(format!("alloc: {e}")))
+            };
 
-            let prefill = PrefillScratch::new(&device, h, nq * hd, nkv * hd, inter)?;
-            let batch   = BatchDecodeScratch::new(&device, MAX_BATCH, h, nq * hd, nkv * hd, inter, vocab)?;
+            let prefill = PrefillScratch::new(
+                &device,
+                device_pool,
+                workspace_owner,
+                h,
+                nq * hd,
+                nkv * hd,
+                inter,
+            )?;
+            let batch = BatchDecodeScratch::new(
+                &device,
+                device_pool,
+                workspace_owner,
+                MAX_BATCH,
+                h,
+                nq * hd,
+                nkv * hd,
+                inter,
+                vocab,
+            )?;
 
             let inner = BackendInner {
-                device: device.clone(), blas, weights,
+                device: device.clone(),
+                device_pool: device_pool.cloned(),
+                pool_owner,
+                blas,
+                weights,
                 external_weight_bytes: Arc::clone(&self.external_weight_bytes),
-                block_pool, pool_cap,
-                allocated_blocks: 0, config,
-                norm_buf:   alloc1(h)?,
+                block_pool,
+                pool_cap,
+                allocated_blocks: 0,
+                config,
+                norm_buf: alloc1(h)?,
                 logits_buf: alloc1(vocab)?,
-                argmax_buf: device.alloc_zeros::<u32>(1)
+                argmax_buf: GpuBuffer::zeros(&device, device_pool, workspace_owner, 1)
                     .map_err(|e| EngineError::backend(format!("argmax buf: {e}")))?,
                 batch,
                 sessions: HashMap::new(),
@@ -1452,12 +2097,16 @@ mod inner {
                 thread: Some(handle),
                 is_staged: Arc::new(AtomicBool::new(false)),
             });
-            self.external_weight_bytes.store(weight_bytes, Ordering::Release);
+            self.external_weight_bytes
+                .store(weight_bytes, Ordering::Release);
             log::info!("NativeBackend: scheduler started (MAX_BATCH={})", MAX_BATCH);
             Ok(())
         }
 
         fn actual_external_device_memory(&self) -> ExternalDeviceMemoryReport {
+            if self.device_pool.is_some() {
+                return ExternalDeviceMemoryReport::default();
+            }
             let bytes = self.external_weight_bytes.load(Ordering::Acquire);
             if bytes == 0 {
                 ExternalDeviceMemoryReport::default()
@@ -1467,6 +2116,63 @@ mod inner {
                     self.device_id as usize,
                     bytes,
                 )
+            }
+        }
+
+        fn actual_memory(&self) -> MemoryReport {
+            let bytes = self.external_weight_bytes.load(Ordering::Acquire);
+            if bytes == 0 {
+                return MemoryReport::default();
+            }
+            let domain = EngineMemoryDomain::Cuda {
+                device_id: self.device_id as usize,
+            };
+            let Some((pool, owner)) = self.device_pool.as_ref() else {
+                return MemoryReport {
+                    allocations: vec![EngineMemoryAllocation {
+                        allocation_id: self.external_allocation_id.clone(),
+                        domain,
+                        class: EngineMemoryAllocationClass::PersistentWeights,
+                        source: EngineMemoryAllocationSource::BackendManaged,
+                        bytes,
+                    }],
+                };
+            };
+            let rows = [
+                (
+                    self.external_allocation_id.clone(),
+                    PoolAllocationClass::PersistentWeights,
+                    EngineMemoryAllocationClass::PersistentWeights,
+                ),
+                (
+                    format!("{}:scratch", self.external_allocation_id),
+                    PoolAllocationClass::TransientWorkspace,
+                    EngineMemoryAllocationClass::TransientWorkspace,
+                ),
+                (
+                    format!("{}:kv", self.external_allocation_id),
+                    PoolAllocationClass::KvCache,
+                    EngineMemoryAllocationClass::KvCache,
+                ),
+                (
+                    format!("{}:block-table", self.external_allocation_id),
+                    PoolAllocationClass::BlockTable,
+                    EngineMemoryAllocationClass::BlockTable,
+                ),
+            ];
+            MemoryReport {
+                allocations: rows
+                    .into_iter()
+                    .map(
+                        |(allocation_id, pool_class, class)| EngineMemoryAllocation {
+                            allocation_id,
+                            domain: domain.clone(),
+                            class,
+                            source: EngineMemoryAllocationSource::RuntimeManaged,
+                            bytes: pool.owner_usage_bytes(owner.with_class(pool_class)),
+                        },
+                    )
+                    .collect(),
             }
         }
 
@@ -1485,9 +2191,11 @@ mod inner {
                 cancel: req.cancellation.clone(),
                 stream_tx: None,
                 result_tx,
-            })).map_err(|_| EngineError::backend("scheduler not running"))?;
+            }))
+            .map_err(|_| EngineError::backend("scheduler not running"))?;
 
-            let generated = result_rx.blocking_recv()
+            let generated = result_rx
+                .blocking_recv()
                 .map_err(|_| EngineError::backend("scheduler crashed"))??;
             pack_tokens(&generated)
         }
@@ -1503,8 +2211,10 @@ mod inner {
                 Err(e) => return Box::pin(futures::stream::once(async { Err(e) })),
             };
             let (max_new, eos, sp) = Self::decode_params(req);
-            let (result_tx, result_rx) = tokio::sync::oneshot::channel::<Result<Vec<u32>, EngineError>>();
-            let (stream_tx, stream_rx) = tokio::sync::mpsc::channel::<Result<BinaryTensorPacket, EngineError>>(64);
+            let (result_tx, result_rx) =
+                tokio::sync::oneshot::channel::<Result<Vec<u32>, EngineError>>();
+            let (stream_tx, stream_rx) =
+                tokio::sync::mpsc::channel::<Result<BinaryTensorPacket, EngineError>>(64);
 
             let send_result = tx.send(SchedulerCmd::Request(SchedulerRequest {
                 prompt_ids: prompt,
@@ -1560,7 +2270,9 @@ mod inner {
             // We can't query the scheduler thread synchronously from a non-blocking fn.
             // Return None when unloaded; when loaded we return static info.
             let loaded = self.state.lock().unwrap().is_some();
-            if !loaded { return None; }
+            if !loaded {
+                return None;
+            }
             Some(EngineModelInfo {
                 input_names: vec!["input_ids".into()],
                 output_names: vec!["output_ids".into()],
@@ -1575,14 +2287,21 @@ mod inner {
         }
 
         fn health_check(&self) -> Result<(), EngineError> {
-            if self.state.lock().unwrap().is_some() { Ok(()) }
-            else { Err(EngineError::ModelNotLoaded) }
+            if self.state.lock().unwrap().is_some() {
+                Ok(())
+            } else {
+                Err(EngineError::ModelNotLoaded)
+            }
         }
 
-        fn supports_swap(&self) -> bool { true }
+        fn supports_swap(&self) -> bool {
+            true
+        }
 
         fn is_staged(&self) -> bool {
-            self.state.lock().unwrap()
+            self.state
+                .lock()
+                .unwrap()
                 .as_ref()
                 .map(|bs| bs.is_staged.load(Ordering::Relaxed))
                 .unwrap_or(false)
@@ -1591,13 +2310,18 @@ mod inner {
         async fn stage(&self, path: &Path) -> Result<(), EngineError> {
             let path = path.to_owned();
             let tx = self.get_tx()?;
-            let is_staged_flag = self.state.lock().unwrap()
+            let is_staged_flag = self
+                .state
+                .lock()
+                .unwrap()
                 .as_ref()
                 .map(|bs| Arc::clone(&bs.is_staged))
                 .ok_or(EngineError::ModelNotLoaded)?;
 
             let staged = tokio::task::spawn_blocking(move || {
-                let dir = if path.is_dir() { path.clone() } else {
+                let dir = if path.is_dir() {
+                    path.clone()
+                } else {
                     path.parent().unwrap_or(&path).to_path_buf()
                 };
                 log::info!("NativeBackend: staging model from {:?}…", dir);
@@ -1613,9 +2337,13 @@ mod inner {
             .map_err(|e| EngineError::backend(format!("stage task: {e}")))??;
 
             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-            tx.send(SchedulerCmd::StoreStaged { staged, reply: reply_tx })
-                .map_err(|_| EngineError::backend("scheduler not running"))?;
-            reply_rx.await
+            tx.send(SchedulerCmd::StoreStaged {
+                staged,
+                reply: reply_tx,
+            })
+            .map_err(|_| EngineError::backend("scheduler not running"))?;
+            reply_rx
+                .await
                 .map_err(|_| EngineError::backend("scheduler crashed"))?;
             is_staged_flag.store(true, Ordering::Relaxed);
             Ok(())
@@ -1623,7 +2351,10 @@ mod inner {
 
         async fn swap(&self) -> Result<(), EngineError> {
             let tx = self.get_tx()?;
-            let is_staged_flag = self.state.lock().unwrap()
+            let is_staged_flag = self
+                .state
+                .lock()
+                .unwrap()
                 .as_ref()
                 .map(|bs| Arc::clone(&bs.is_staged))
                 .ok_or(EngineError::ModelNotLoaded)?;
@@ -1631,7 +2362,8 @@ mod inner {
             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
             tx.send(SchedulerCmd::Swap { reply: reply_tx })
                 .map_err(|_| EngineError::backend("scheduler not running"))?;
-            let result = reply_rx.await
+            let result = reply_rx
+                .await
                 .map_err(|_| EngineError::backend("scheduler crashed"))?;
             if result.is_ok() {
                 is_staged_flag.store(false, Ordering::Relaxed);
@@ -1642,13 +2374,14 @@ mod inner {
 
     fn token_to_packet(token_id: u32) -> BinaryTensorPacket {
         let data = (token_id as i32).to_le_bytes().to_vec();
-        BinaryTensorPacket::new(vec![1], TensorDtype::Int32, data)
-            .expect("valid packet")
+        BinaryTensorPacket::new(vec![1], TensorDtype::Int32, data).expect("valid packet")
     }
 
     fn pack_tokens(ids: &[u32]) -> Result<BinaryTensorPacket, EngineError> {
         let mut data = Vec::with_capacity(ids.len() * 4);
-        for &id in ids { data.extend_from_slice(&(id as i32).to_le_bytes()); }
+        for &id in ids {
+            data.extend_from_slice(&(id as i32).to_le_bytes());
+        }
         BinaryTensorPacket::new(vec![ids.len() as i64], TensorDtype::Int32, data)
             .map_err(|e| EngineError::backend(format!("pack: {e}")))
     }

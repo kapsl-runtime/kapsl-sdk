@@ -104,8 +104,7 @@ pub fn load_safetensors(model_dir: &Path) -> Result<ModelWeights, LoadError> {
         let file = File::open(shard_path)?;
         // SAFETY: the mmap is read-only and the file is not modified during loading.
         let mmap = unsafe { Mmap::map(&file)? };
-        let header_len =
-            u64::from_le_bytes(mmap[..8].try_into().unwrap()) as usize;
+        let header_len = u64::from_le_bytes(mmap[..8].try_into().unwrap()) as usize;
         let data_base = 8 + header_len;
         let headers = parse_header(&mmap)?;
 
@@ -116,7 +115,11 @@ pub fn load_safetensors(model_dir: &Path) -> Result<ModelWeights, LoadError> {
             let dtype = match DType::from_str(&h.dtype) {
                 Some(d) => d,
                 None => {
-                    log::warn!("Skipping tensor '{}' with unsupported dtype '{}'", name, h.dtype);
+                    log::warn!(
+                        "Skipping tensor '{}' with unsupported dtype '{}'",
+                        name,
+                        h.dtype
+                    );
                     continue;
                 }
             };
@@ -136,10 +139,11 @@ fn assemble_weights(
     config: ModelConfig,
     mut map: HashMap<String, TensorData>,
 ) -> Result<ModelWeights, LoadError> {
-    let take = |map: &mut HashMap<String, TensorData>, name: &str| -> Result<TensorData, WeightError> {
-        map.remove(name)
-            .ok_or_else(|| WeightError::Missing(name.to_string()))
-    };
+    let take =
+        |map: &mut HashMap<String, TensorData>, name: &str| -> Result<TensorData, WeightError> {
+            map.remove(name)
+                .ok_or_else(|| WeightError::Missing(name.to_string()))
+        };
 
     let embed_tokens = take(&mut map, "model.embed_tokens.weight")?;
     let norm = take(&mut map, "model.norm.weight")?;
@@ -160,10 +164,7 @@ fn assemble_weights(
             k_proj: take(&mut map, &p("self_attn.k_proj.weight"))?,
             v_proj: take(&mut map, &p("self_attn.v_proj.weight"))?,
             o_proj: take(&mut map, &p("self_attn.o_proj.weight"))?,
-            post_attention_layernorm: take(
-                &mut map,
-                &p("post_attention_layernorm.weight"),
-            )?,
+            post_attention_layernorm: take(&mut map, &p("post_attention_layernorm.weight"))?,
             gate_proj: take(&mut map, &p("mlp.gate_proj.weight"))?,
             up_proj: take(&mut map, &p("mlp.up_proj.weight"))?,
             down_proj: take(&mut map, &p("mlp.down_proj.weight"))?,

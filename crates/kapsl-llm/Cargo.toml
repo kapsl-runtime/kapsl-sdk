@@ -41,6 +41,9 @@ gguf = ["dep:llama-cpp-2", "dep:llama-cpp-sys-2"]
 # machines without a CUDA toolkit can still build.
 gguf-cuda = ["gguf", "llama-cpp-2/cuda"]
 gguf-cuda-shared-kv = ["gguf-cuda", "kapsl-hal/cuda", "dep:cudarc"]
+# Attribute ORT CUDA allocations to model/replica/allocation-class scopes when
+# the runtime registers its environment allocator.
+onnx-cuda-pool = ["kapsl-hal/cuda"]
 
 [target.'cfg(target_os = "macos")'.dependencies.llama-cpp-2]
 version = "0.1"

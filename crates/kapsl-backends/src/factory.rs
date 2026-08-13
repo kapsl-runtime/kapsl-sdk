@@ -1,19 +1,23 @@
-use crate::onnx::{ExecutionProvider, OnnxBackend, OnnxBackendBuilder};
-use crate::provider_compat::{resolve_onnx_accelerator_provider, OnnxAcceleratorProvider};
 #[cfg(feature = "gguf-native")]
 use crate::gguf_native::GgufNativeBackend;
 #[cfg(feature = "native")]
 use crate::native::NativeBackend;
+use crate::onnx::{ExecutionProvider, OnnxBackend, OnnxBackendBuilder};
+use crate::provider_compat::{resolve_onnx_accelerator_provider, OnnxAcceleratorProvider};
 use kapsl_core::loader::Manifest;
 use kapsl_core::EngineKind;
 use kapsl_core::HardwareRequirements;
 use kapsl_core::ProviderPolicy;
 use kapsl_engine_api::Engine;
-#[cfg(any(feature = "gguf-native", feature = "native", feature = "gguf-cuda-shared-kv"))]
+use kapsl_hal::device::DeviceInfo;
+#[cfg(any(
+    feature = "gguf-native",
+    feature = "native",
+    feature = "gguf-cuda-shared-kv"
+))]
 use kapsl_hal::gpu_arena::GpuDevicePool;
 #[cfg(any(feature = "gguf-native", feature = "gguf-cuda-shared-kv"))]
 use kapsl_hal::gpu_arena::GpuPoolHandle;
-use kapsl_hal::device::DeviceInfo;
 use kapsl_llm::llm_backend::LLMBackend;
 use kapsl_llm::GgufBackend;
 #[cfg(target_os = "windows")]
@@ -24,7 +28,11 @@ use ort::execution_providers::{
     ROCmExecutionProvider, TensorRTExecutionProvider,
 };
 use ort::session::builder::GraphOptimizationLevel;
-#[cfg(any(feature = "gguf-native", feature = "native", feature = "gguf-cuda-shared-kv"))]
+#[cfg(any(
+    feature = "gguf-native",
+    feature = "native",
+    feature = "gguf-cuda-shared-kv"
+))]
 use std::sync::Arc;
 
 fn use_registered_env_allocator(device_id: i32) -> bool {
@@ -117,9 +125,9 @@ fn maybe_wrap_onnx_postprocess(
                     .map_err(|e| format!("invalid metadata.transcribe: {e}"))?,
                 None => crate::onnx_transcribe::TranscribeConfig::default(),
             };
-            Ok(Box::new(crate::onnx_transcribe::OnnxTranscribeBackend::new(
-                inner, cfg,
-            )))
+            Ok(Box::new(
+                crate::onnx_transcribe::OnnxTranscribeBackend::new(inner, cfg),
+            ))
         }
         _ => Ok(inner),
     }
@@ -155,8 +163,9 @@ fn maybe_wrap_onnx_preprocess(
             )))
         }
         Some("audio") => {
-            let cfg: crate::preprocess::audio::AudioConfig = serde_yaml::from_value(spec.clone())
-                .map_err(|e| format!("invalid metadata.preprocess (audio): {e}"))?;
+            let cfg: crate::preprocess::audio::AudioConfig =
+                serde_yaml::from_value(spec.clone())
+                    .map_err(|e| format!("invalid metadata.preprocess (audio): {e}"))?;
             let pre = crate::preprocess::AudioPreprocessor::new(cfg)
                 .map_err(|e| format!("audio preprocess init failed: {e}"))?;
             log::info!("✓ Wrapping ONNX engine with audio (log-mel) input preprocessing");
@@ -217,11 +226,12 @@ impl BackendFactory {
         builder
     }
 
-    fn build_onnx_backend(
+    fn build_onnx_backend_with_owner(
         provider: ExecutionProvider,
         opt_level: GraphOptimizationLevel,
         device_id: i32,
         tuning: &OnnxRuntimeTuning,
+        memory_owner: Option<(u32, u32)>,
     ) -> Result<Box<dyn Engine>, String> {
         let mut builder = OnnxBackend::builder()
             .with_provider(provider)
@@ -230,6 +240,9 @@ impl BackendFactory {
             builder = builder.with_device_id(device_id)?;
         }
         builder = Self::apply_onnx_tuning(builder, tuning);
+        if let Some((model_id, replica_id)) = memory_owner {
+            builder = builder.with_memory_owner(model_id, replica_id);
+        }
         Ok(Box::new(builder.build()))
     }
 
@@ -275,13 +288,41 @@ impl BackendFactory {
         device_info: &DeviceInfo,
         tuning: &OnnxRuntimeTuning,
     ) -> Result<Box<dyn Engine>, String> {
+        Self::create_best_backend_with_tuning_for_owner(manifest, device_info, tuning, None)
+    }
+
+    /// Create the best backend while propagating stable allocator ownership.
+    pub fn create_best_backend_with_tuning_and_owner(
+        manifest: &Manifest,
+        device_info: &DeviceInfo,
+        tuning: &OnnxRuntimeTuning,
+        model_id: u32,
+        replica_id: u32,
+    ) -> Result<Box<dyn Engine>, String> {
+        Self::create_best_backend_with_tuning_for_owner(
+            manifest,
+            device_info,
+            tuning,
+            Some((model_id, replica_id)),
+        )
+    }
+
+    fn create_best_backend_with_tuning_for_owner(
+        manifest: &Manifest,
+        device_info: &DeviceInfo,
+        tuning: &OnnxRuntimeTuning,
+        memory_owner: Option<(u32, u32)>,
+    ) -> Result<Box<dyn Engine>, String> {
         let engine_kind = EngineKind::resolve(manifest);
 
         // GGUF: prefer native CUDA kernels when gguf-native feature is compiled in.
         #[cfg(feature = "gguf-native")]
         if engine_kind.is_gguf() {
             let device_id = manifest.hardware_requirements.device_id.unwrap_or(0);
-            log::info!("✓ Using GgufNativeBackend (GGUF loader + native CUDA), device {}", device_id);
+            log::info!(
+                "✓ Using GgufNativeBackend (GGUF loader + native CUDA), device {}",
+                device_id
+            );
             return crate::gguf_native::GgufNativeBackend::new(device_id as i32)
                 .map(|b| Box::new(b) as Box<dyn Engine>)
                 .map_err(|e| format!("GgufNativeBackend init failed: {e}"));
@@ -312,7 +353,10 @@ impl BackendFactory {
         #[cfg(feature = "native")]
         if engine_kind == EngineKind::Native {
             let device_id = manifest.hardware_requirements.device_id.unwrap_or(0);
-            log::info!("✓ Using NativeBackend (custom CUDA kernels), device {}", device_id);
+            log::info!(
+                "✓ Using NativeBackend (custom CUDA kernels), device {}",
+                device_id
+            );
             return crate::native::NativeBackend::new(device_id)
                 .map(|b| Box::new(b) as Box<dyn Engine>)
                 .map_err(|e| format!("NativeBackend init failed: {e}"));
@@ -328,18 +372,22 @@ impl BackendFactory {
                         "✓ Using LLMBackend with manifest provider override: {}",
                         provider
                     );
-                    return Ok(Box::new(
-                        LLMBackend::with_device(provider, device_id)
-                            .with_env_allocators(use_registered_env_allocator(device_id)),
-                    ));
+                    let mut backend = LLMBackend::with_device(provider, device_id)
+                        .with_env_allocators(use_registered_env_allocator(device_id));
+                    if let Some((model_id, replica_id)) = memory_owner {
+                        backend = backend.with_memory_owner(model_id, replica_id);
+                    }
+                    return Ok(Box::new(backend));
                 }
             }
             log::info!("✓ Using LLMBackend with runtime fastest-provider selection");
             let device_id = requirements.device_id.unwrap_or(0);
-            return Ok(Box::new(
-                LLMBackend::new()
-                    .with_env_allocators(use_registered_env_allocator(device_id)),
-            ));
+            let mut backend = LLMBackend::with_device_id(device_id)
+                .with_env_allocators(use_registered_env_allocator(device_id));
+            if let Some((model_id, replica_id)) = memory_owner {
+                backend = backend.with_memory_owner(model_id, replica_id);
+            }
+            return Ok(Box::new(backend));
         }
 
         if !engine_kind.is_implemented() {
@@ -377,7 +425,14 @@ impl BackendFactory {
 
         for provider in &providers_to_try {
             let device_id = requirements.device_id.unwrap_or(0);
-            match Self::try_create_provider(provider, device_info, opt_level, device_id, tuning) {
+            match Self::try_create_provider_with_owner(
+                provider,
+                device_info,
+                opt_level,
+                device_id,
+                tuning,
+                memory_owner,
+            ) {
                 Ok(backend) => {
                     log::info!("✓ Using provider: {}", provider);
                     return finalize_onnx_pipeline(engine_kind, manifest, backend);
@@ -392,7 +447,13 @@ impl BackendFactory {
         log::info!("⚠ Using last-resort CPU backend");
         let opt_cpu = parse_optimization_level(requirements.graph_optimization_level.as_ref())
             .unwrap_or(GraphOptimizationLevel::Level3);
-        let inner = Self::build_onnx_backend(ExecutionProvider::CPU, opt_cpu, 0, tuning)?;
+        let inner = Self::build_onnx_backend_with_owner(
+            ExecutionProvider::CPU,
+            opt_cpu,
+            0,
+            tuning,
+            memory_owner,
+        )?;
         finalize_onnx_pipeline(engine_kind, manifest, inner)
     }
 
@@ -403,12 +464,53 @@ impl BackendFactory {
         device_info: &DeviceInfo,
         tuning: &OnnxRuntimeTuning,
     ) -> Result<Box<dyn Engine>, String> {
+        Self::create_backend_for_device_with_tuning_for_owner(
+            manifest,
+            provider,
+            device_id,
+            device_info,
+            tuning,
+            None,
+        )
+    }
+
+    /// Create a device-pinned backend with model/replica allocator ownership.
+    pub fn create_backend_for_device_with_tuning_and_owner(
+        manifest: &Manifest,
+        provider: &str,
+        device_id: usize,
+        device_info: &DeviceInfo,
+        tuning: &OnnxRuntimeTuning,
+        model_id: u32,
+        replica_id: u32,
+    ) -> Result<Box<dyn Engine>, String> {
+        Self::create_backend_for_device_with_tuning_for_owner(
+            manifest,
+            provider,
+            device_id,
+            device_info,
+            tuning,
+            Some((model_id, replica_id)),
+        )
+    }
+
+    fn create_backend_for_device_with_tuning_for_owner(
+        manifest: &Manifest,
+        provider: &str,
+        device_id: usize,
+        device_info: &DeviceInfo,
+        tuning: &OnnxRuntimeTuning,
+        memory_owner: Option<(u32, u32)>,
+    ) -> Result<Box<dyn Engine>, String> {
         let engine_kind = EngineKind::resolve(manifest);
 
         // Native safetensors: route to custom CUDA kernel backend
         #[cfg(feature = "native")]
         if engine_kind == EngineKind::Native {
-            log::info!("✓ Using NativeBackend (custom CUDA kernels) on device {}", device_id);
+            log::info!(
+                "✓ Using NativeBackend (custom CUDA kernels) on device {}",
+                device_id
+            );
             return NativeBackend::new(device_id as i32)
                 .map(|b| Box::new(b) as Box<dyn Engine>)
                 .map_err(|e| format!("NativeBackend init failed: {e}"));
@@ -417,7 +519,10 @@ impl BackendFactory {
         // GGUF: prefer native CUDA kernels when gguf-native feature is compiled in.
         #[cfg(feature = "gguf-native")]
         if engine_kind.is_gguf() {
-            log::info!("✓ Using GgufNativeBackend (GGUF loader + native CUDA), device {}", device_id);
+            log::info!(
+                "✓ Using GgufNativeBackend (GGUF loader + native CUDA), device {}",
+                device_id
+            );
             return crate::gguf_native::GgufNativeBackend::new(device_id as i32)
                 .map(|b| Box::new(b) as Box<dyn Engine>)
                 .map_err(|e| format!("GgufNativeBackend init failed: {e}"));
@@ -446,19 +551,23 @@ impl BackendFactory {
                     "✓ Using LLMBackend with manifest provider override: {}",
                     provider
                 );
-                return Ok(Box::new(
-                    LLMBackend::with_device(provider.to_string(), device_id as i32)
-                        .with_env_allocators(use_registered_env_allocator(device_id as i32)),
-                ));
+                let mut backend = LLMBackend::with_device(provider.to_string(), device_id as i32)
+                    .with_env_allocators(use_registered_env_allocator(device_id as i32));
+                if let Some((model_id, replica_id)) = memory_owner {
+                    backend = backend.with_memory_owner(model_id, replica_id);
+                }
+                return Ok(Box::new(backend));
             }
 
             log::info!(
                 "✓ Using LLMBackend with device pinning and runtime provider auto-selection"
             );
-            return Ok(Box::new(
-                LLMBackend::with_device_id(device_id as i32)
-                    .with_env_allocators(use_registered_env_allocator(device_id as i32)),
-            ));
+            let mut backend = LLMBackend::with_device_id(device_id as i32)
+                .with_env_allocators(use_registered_env_allocator(device_id as i32));
+            if let Some((model_id, replica_id)) = memory_owner {
+                backend = backend.with_memory_owner(model_id, replica_id);
+            }
+            return Ok(Box::new(backend));
         }
 
         if !engine_kind.is_implemented() {
@@ -468,17 +577,24 @@ impl BackendFactory {
         let requirements = &manifest.hardware_requirements;
         let opt_level = parse_optimization_level(requirements.graph_optimization_level.as_ref())
             .map_err(|e| format!("Invalid graph optimization level in manifest: {}", e))?;
-        let inner =
-            Self::try_create_provider(provider, device_info, opt_level, device_id as i32, tuning)?;
+        let inner = Self::try_create_provider_with_owner(
+            provider,
+            device_info,
+            opt_level,
+            device_id as i32,
+            tuning,
+            memory_owner,
+        )?;
         finalize_onnx_pipeline(engine_kind, manifest, inner)
     }
 
-    fn try_create_provider(
+    fn try_create_provider_with_owner(
         provider: &str,
         device_info: &DeviceInfo,
         opt_level: GraphOptimizationLevel,
         device_id: i32,
         tuning: &OnnxRuntimeTuning,
+        memory_owner: Option<(u32, u32)>,
     ) -> Result<Box<dyn Engine>, String> {
         let provider_lower = provider.to_lowercase();
 
@@ -513,7 +629,13 @@ impl BackendFactory {
                     acceptance.bundle,
                     acceptance.device_summary
                 );
-                Self::build_onnx_backend(ExecutionProvider::CUDA, opt_level, device_id, tuning)
+                Self::build_onnx_backend_with_owner(
+                    ExecutionProvider::CUDA,
+                    opt_level,
+                    device_id,
+                    tuning,
+                    memory_owner,
+                )
             }
 
             "tensorrt" => {
@@ -538,7 +660,13 @@ impl BackendFactory {
                     acceptance.bundle,
                     acceptance.device_summary
                 );
-                Self::build_onnx_backend(ExecutionProvider::TensorRT, opt_level, device_id, tuning)
+                Self::build_onnx_backend_with_owner(
+                    ExecutionProvider::TensorRT,
+                    opt_level,
+                    device_id,
+                    tuning,
+                    memory_owner,
+                )
             }
 
             "metal" | "coreml" => {
@@ -573,11 +701,12 @@ impl BackendFactory {
                     }
                     other => other,
                 };
-                Self::build_onnx_backend(
+                Self::build_onnx_backend_with_owner(
                     ExecutionProvider::CoreML,
                     coreml_opt_level,
                     device_id,
                     tuning,
+                    memory_owner,
                 )
             }
             "rocm" => {
@@ -591,7 +720,13 @@ impl BackendFactory {
                     return Err("ROCm execution provider is not available".to_string());
                 }
                 log::info!("   ROCm available");
-                Self::build_onnx_backend(ExecutionProvider::ROCm, opt_level, device_id, tuning)
+                Self::build_onnx_backend_with_owner(
+                    ExecutionProvider::ROCm,
+                    opt_level,
+                    device_id,
+                    tuning,
+                    memory_owner,
+                )
             }
             "directml" => {
                 #[cfg(target_os = "windows")]
@@ -606,11 +741,12 @@ impl BackendFactory {
                         return Err("DirectML execution provider is not available".to_string());
                     }
                     log::info!("   DirectML available");
-                    Self::build_onnx_backend(
+                    Self::build_onnx_backend_with_owner(
                         ExecutionProvider::DirectML,
                         opt_level,
                         device_id,
                         tuning,
+                        memory_owner,
                     )
                 }
                 #[cfg(not(target_os = "windows"))]
@@ -626,12 +762,24 @@ impl BackendFactory {
                     return Err("OpenVINO execution provider is not available".to_string());
                 }
                 log::info!("   OpenVINO available");
-                Self::build_onnx_backend(ExecutionProvider::OpenVINO, opt_level, device_id, tuning)
+                Self::build_onnx_backend_with_owner(
+                    ExecutionProvider::OpenVINO,
+                    opt_level,
+                    device_id,
+                    tuning,
+                    memory_owner,
+                )
             }
 
             "cpu" => {
                 log::info!("   Using CPU execution");
-                Self::build_onnx_backend(ExecutionProvider::CPU, opt_level, 0, tuning)
+                Self::build_onnx_backend_with_owner(
+                    ExecutionProvider::CPU,
+                    opt_level,
+                    0,
+                    tuning,
+                    memory_owner,
+                )
             }
 
             _ => Err(format!("Unknown provider: {}", provider)),
@@ -662,8 +810,19 @@ impl BackendFactory {
         pool: Arc<GpuDevicePool>,
         model_id: u32,
     ) -> Result<GgufNativeBackend, String> {
+        Self::create_gguf_native_device_pool_for_replica(device_id, pool, model_id, 0)
+    }
+
+    /// Create a GGUF native backend with model/replica-aware pool ownership.
+    #[cfg(feature = "gguf-native")]
+    pub fn create_gguf_native_device_pool_for_replica(
+        device_id: i32,
+        pool: Arc<GpuDevicePool>,
+        model_id: u32,
+        replica_id: u32,
+    ) -> Result<GgufNativeBackend, String> {
         GgufNativeBackend::new(device_id)
-            .map(|backend| backend.with_device_pool(pool, model_id))
+            .map(|backend| backend.with_device_pool_for_replica(pool, model_id, replica_id))
             .map_err(|e| format!("GgufNativeBackend init failed: {e}"))
     }
 
@@ -675,10 +834,22 @@ impl BackendFactory {
         pool: Arc<GpuDevicePool>,
         model_id: u32,
     ) -> Result<GgufBackend, String> {
-        Ok(GgufBackend::new_cuda_device_pool(
+        Self::create_gguf_cuda_device_pool_for_replica(device_id, pool, model_id, 0)
+    }
+
+    /// Create the llama.cpp GGUF path with model/replica-aware pool ownership.
+    #[cfg(feature = "gguf-cuda-shared-kv")]
+    pub fn create_gguf_cuda_device_pool_for_replica(
+        device_id: i32,
+        pool: Arc<GpuDevicePool>,
+        model_id: u32,
+        replica_id: u32,
+    ) -> Result<GgufBackend, String> {
+        Ok(GgufBackend::new_cuda_device_pool_for_replica(
             device_id as usize,
             pool,
             model_id,
+            replica_id,
         ))
     }
 
@@ -699,8 +870,19 @@ impl BackendFactory {
         pool: Arc<GpuDevicePool>,
         model_id: u32,
     ) -> Result<NativeBackend, String> {
+        Self::create_native_device_pool_for_replica(device_id, pool, model_id, 0)
+    }
+
+    /// Create a native safetensors backend with model/replica-aware ownership.
+    #[cfg(feature = "native")]
+    pub fn create_native_device_pool_for_replica(
+        device_id: i32,
+        pool: Arc<GpuDevicePool>,
+        model_id: u32,
+        replica_id: u32,
+    ) -> Result<NativeBackend, String> {
         NativeBackend::new(device_id)
-            .map(|backend| backend.with_device_pool(pool, model_id))
+            .map(|backend| backend.with_device_pool_for_replica(pool, model_id, replica_id))
             .map_err(|e| format!("NativeBackend init failed: {e}"))
     }
 

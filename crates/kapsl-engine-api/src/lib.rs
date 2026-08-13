@@ -613,11 +613,7 @@ pub struct ExternalDeviceMemoryReport {
 }
 
 impl ExternalDeviceMemoryReport {
-    pub fn single(
-        allocation_id: impl Into<String>,
-        device_id: usize,
-        bytes: usize,
-    ) -> Self {
+    pub fn single(allocation_id: impl Into<String>, device_id: usize, bytes: usize) -> Self {
         Self {
             allocations: vec![ExternalDeviceMemory {
                 allocation_id: allocation_id.into(),
@@ -633,6 +629,151 @@ impl ExternalDeviceMemoryReport {
             .filter(|allocation| allocation.device_id == device_id)
             .map(|allocation| allocation.bytes)
             .sum()
+    }
+}
+
+/// Physical/accounting domain for backend-owned memory.
+///
+/// Unlike [`ExternalDeviceMemoryReport`], this represents host, page-locked,
+/// mapped, CUDA, and other provider allocations without flattening them into a
+/// CUDA device ID.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum MemoryDomain {
+    Host,
+    HostPinned {
+        provider: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        device_id: Option<usize>,
+    },
+    HostMapped {
+        provider: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        device_id: Option<usize>,
+    },
+    Cuda {
+        device_id: usize,
+    },
+    Provider {
+        provider: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        device_id: Option<usize>,
+    },
+}
+
+/// Backend-neutral purpose of an allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MemoryAllocationClass {
+    PersistentWeights,
+    ModelSession,
+    KvCache,
+    TransientWorkspace,
+    BlockTable,
+    RequestTransient,
+    ExternallyOwned,
+}
+
+/// Which component owns the physical allocation represented by a report row.
+/// Runtime-managed rows are suballocated from a memory authority/pool; backend
+/// rows must be admitted and reconciled as external allocations.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MemoryAllocationSource {
+    RuntimeManaged,
+    #[default]
+    BackendManaged,
+}
+
+/// One stable physical allocation or one accounting reservation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryAllocation {
+    pub allocation_id: String,
+    pub domain: MemoryDomain,
+    pub class: MemoryAllocationClass,
+    #[serde(default)]
+    pub source: MemoryAllocationSource,
+    pub bytes: usize,
+}
+
+/// Planned or actual memory held by a backend.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryReport {
+    #[serde(default)]
+    pub allocations: Vec<MemoryAllocation>,
+}
+
+impl MemoryReport {
+    pub fn single(
+        allocation_id: impl Into<String>,
+        domain: MemoryDomain,
+        class: MemoryAllocationClass,
+        bytes: usize,
+    ) -> Self {
+        Self {
+            allocations: vec![MemoryAllocation {
+                allocation_id: allocation_id.into(),
+                domain,
+                class,
+                source: MemoryAllocationSource::BackendManaged,
+                bytes,
+            }],
+        }
+    }
+
+    pub fn runtime(
+        allocation_id: impl Into<String>,
+        domain: MemoryDomain,
+        class: MemoryAllocationClass,
+        bytes: usize,
+    ) -> Self {
+        Self {
+            allocations: vec![MemoryAllocation {
+                allocation_id: allocation_id.into(),
+                domain,
+                class,
+                source: MemoryAllocationSource::RuntimeManaged,
+                bytes,
+            }],
+        }
+    }
+
+    pub fn push(&mut self, allocation: MemoryAllocation) -> &mut Self {
+        self.allocations.push(allocation);
+        self
+    }
+
+    pub fn extend(&mut self, other: Self) -> &mut Self {
+        self.allocations.extend(other.allocations);
+        self
+    }
+
+    pub fn bytes_for_domain(&self, domain: &MemoryDomain) -> usize {
+        self.allocations
+            .iter()
+            .filter(|allocation| &allocation.domain == domain)
+            .map(|allocation| allocation.bytes)
+            .sum()
+    }
+}
+
+impl From<ExternalDeviceMemoryReport> for MemoryReport {
+    fn from(report: ExternalDeviceMemoryReport) -> Self {
+        Self {
+            allocations: report
+                .allocations
+                .into_iter()
+                .map(|allocation| MemoryAllocation {
+                    allocation_id: allocation.allocation_id,
+                    domain: MemoryDomain::Cuda {
+                        device_id: allocation.device_id,
+                    },
+                    class: MemoryAllocationClass::ExternallyOwned,
+                    source: MemoryAllocationSource::BackendManaged,
+                    bytes: allocation.bytes,
+                })
+                .collect(),
+        }
     }
 }
 
@@ -724,6 +865,16 @@ impl BatchingPolicy {
 
 #[async_trait]
 pub trait Engine: Send + Sync {
+    /// Report memory expected during `load` across every memory domain.
+    ///
+    /// Legacy backends automatically map their external CUDA report into this
+    /// representation. New implementations should override this method when
+    /// they also own host, pinned, mapped, or non-CUDA provider memory.
+    fn planned_memory(&self, model_path: &std::path::Path) -> Result<MemoryReport, EngineError> {
+        self.planned_external_device_memory(model_path)
+            .map(Into::into)
+    }
+
     /// Report external device allocations expected during `load`.
     ///
     /// The default is empty for CPU backends and legacy implementations. The
@@ -744,6 +895,28 @@ pub trait Engine: Send + Sync {
     /// released those allocations.
     fn actual_external_device_memory(&self) -> ExternalDeviceMemoryReport {
         ExternalDeviceMemoryReport::default()
+    }
+
+    /// Report memory currently retained by this backend across all domains.
+    fn actual_memory(&self) -> MemoryReport {
+        self.actual_external_device_memory().into()
+    }
+
+    /// Report the transient memory Kapsl should reserve while one request is
+    /// active. The default covers materialized host input tensors; backends can
+    /// add pinned staging, mapped buffers, outputs, and execution workspace.
+    fn planned_request_memory(&self, request: &InferenceRequest) -> MemoryReport {
+        let bytes = request
+            .additional_inputs
+            .iter()
+            .map(|input| input.tensor.data.len())
+            .fold(request.input.data.len(), usize::saturating_add);
+        MemoryReport::single(
+            "request:materialized-inputs",
+            MemoryDomain::Host,
+            MemoryAllocationClass::RequestTransient,
+            bytes,
+        )
     }
 
     /// Run a single inference request and return the output tensor.
@@ -847,6 +1020,10 @@ pub trait Engine: Send + Sync {
 
 #[async_trait]
 impl Engine for Box<dyn Engine> {
+    fn planned_memory(&self, model_path: &std::path::Path) -> Result<MemoryReport, EngineError> {
+        (**self).planned_memory(model_path)
+    }
+
     fn planned_external_device_memory(
         &self,
         model_path: &std::path::Path,
@@ -860,6 +1037,14 @@ impl Engine for Box<dyn Engine> {
 
     fn actual_external_device_memory(&self) -> ExternalDeviceMemoryReport {
         (**self).actual_external_device_memory()
+    }
+
+    fn actual_memory(&self) -> MemoryReport {
+        (**self).actual_memory()
+    }
+
+    fn planned_request_memory(&self, request: &InferenceRequest) -> MemoryReport {
+        (**self).planned_request_memory(request)
     }
 
     fn infer(&self, request: &InferenceRequest) -> Result<BinaryTensorPacket, EngineError> {
@@ -1061,5 +1246,72 @@ mod tests {
         assert_eq!(decoded_metadata.priority, Some(0));
         assert_eq!(decoded_metadata.max_new_tokens, Some(32));
         assert_eq!(decoded_metadata.auth_token, None);
+    }
+
+    #[test]
+    fn memory_report_preserves_host_and_device_domains() {
+        let report = MemoryReport {
+            allocations: vec![
+                MemoryAllocation {
+                    allocation_id: "session".to_string(),
+                    domain: MemoryDomain::Host,
+                    class: MemoryAllocationClass::ModelSession,
+                    source: MemoryAllocationSource::BackendManaged,
+                    bytes: 10,
+                },
+                MemoryAllocation {
+                    allocation_id: "staging".to_string(),
+                    domain: MemoryDomain::HostPinned {
+                        provider: "cuda".to_string(),
+                        device_id: Some(2),
+                    },
+                    class: MemoryAllocationClass::TransientWorkspace,
+                    source: MemoryAllocationSource::BackendManaged,
+                    bytes: 20,
+                },
+                MemoryAllocation {
+                    allocation_id: "weights".to_string(),
+                    domain: MemoryDomain::Cuda { device_id: 2 },
+                    class: MemoryAllocationClass::PersistentWeights,
+                    source: MemoryAllocationSource::RuntimeManaged,
+                    bytes: 30,
+                },
+            ],
+        };
+        assert_eq!(report.bytes_for_domain(&MemoryDomain::Host), 10);
+        assert_eq!(
+            report.bytes_for_domain(&MemoryDomain::Cuda { device_id: 2 }),
+            30
+        );
+        let encoded = serde_json::to_value(&report).unwrap();
+        let decoded: MemoryReport = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, report);
+    }
+
+    #[test]
+    fn legacy_device_report_maps_without_losing_identity() {
+        let report = MemoryReport::from(ExternalDeviceMemoryReport::single("weights", 4, 99));
+        assert_eq!(
+            report,
+            MemoryReport::single(
+                "weights",
+                MemoryDomain::Cuda { device_id: 4 },
+                MemoryAllocationClass::ExternallyOwned,
+                99,
+            )
+        );
+    }
+
+    #[test]
+    fn legacy_serialized_allocation_defaults_to_backend_managed() {
+        let allocation: MemoryAllocation = serde_json::from_value(serde_json::json!({
+            "allocation_id": "legacy",
+            "domain": { "kind": "host" },
+            "class": "block-table",
+            "bytes": 17
+        }))
+        .unwrap();
+        assert_eq!(allocation.source, MemoryAllocationSource::BackendManaged);
+        assert_eq!(allocation.class, MemoryAllocationClass::BlockTable);
     }
 }

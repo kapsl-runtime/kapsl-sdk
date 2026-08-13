@@ -1,8 +1,6 @@
 use async_trait::async_trait;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use kapsl_engine_api::{
-    BinaryTensorPacket, Engine, EngineError, InferenceRequest, TensorDtype,
-};
+use kapsl_engine_api::{BinaryTensorPacket, Engine, EngineError, InferenceRequest, TensorDtype};
 use kapsl_scheduler::{
     cron_scheduler::{CronJob, CronOverflowPolicy, CronSchedule, CronScheduler},
     priority::Priority,

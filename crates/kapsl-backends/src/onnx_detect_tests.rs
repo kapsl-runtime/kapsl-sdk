@@ -37,7 +37,7 @@ fn thresholds_out_low_scores() {
     // 2 classes, xyxy, no objectness. One strong box, one below threshold.
     let out = detect_from_output(
         &raw_packet(&[
-            vec![0.0, 0.0, 10.0, 10.0, 0.9, 0.1], // class 0 @ 0.9
+            vec![0.0, 0.0, 10.0, 10.0, 0.9, 0.1],   // class 0 @ 0.9
             vec![50.0, 50.0, 60.0, 60.0, 0.1, 0.2], // best 0.2 < 0.25 -> dropped
         ]),
         &cfg(2),
@@ -147,9 +147,15 @@ fn transposed_layout_channel_major() {
     let mut dets = decode_rows(&detect_from_output(&packet, &c).unwrap());
     dets.sort_by(|a, b| a[5].partial_cmp(&b[5]).unwrap());
     assert_eq!(dets.len(), 2);
-    assert_eq!([dets[0][0], dets[0][1], dets[0][2], dets[0][3]], [0.0, 0.0, 10.0, 10.0]);
+    assert_eq!(
+        [dets[0][0], dets[0][1], dets[0][2], dets[0][3]],
+        [0.0, 0.0, 10.0, 10.0]
+    );
     assert_eq!(dets[0][5], 0.0);
-    assert_eq!([dets[1][0], dets[1][1], dets[1][2], dets[1][3]], [20.0, 20.0, 30.0, 30.0]);
+    assert_eq!(
+        [dets[1][0], dets[1][1], dets[1][2], dets[1][3]],
+        [20.0, 20.0, 30.0, 30.0]
+    );
     assert_eq!(dets[1][5], 1.0);
 }
 
@@ -183,7 +189,8 @@ fn max_detections_caps_output() {
 
 #[test]
 fn empty_when_all_below_threshold() {
-    let out = detect_from_output(&raw_packet(&[vec![0.0, 0.0, 10.0, 10.0, 0.01]]), &cfg(1)).unwrap();
+    let out =
+        detect_from_output(&raw_packet(&[vec![0.0, 0.0, 10.0, 10.0, 0.01]]), &cfg(1)).unwrap();
     assert_eq!(out.shape, vec![0, 6]);
     assert!(decode_rows(&out).is_empty());
 }

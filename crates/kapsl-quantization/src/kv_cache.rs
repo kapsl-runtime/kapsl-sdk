@@ -52,7 +52,11 @@ impl KvCacheConfig {
         if num_layers == 0 {
             return Err(anyhow!("num_layers must be > 0"));
         }
-        Ok(Self { bits, head_dim, num_layers })
+        Ok(Self {
+            bits,
+            head_dim,
+            num_layers,
+        })
     }
 }
 
@@ -92,12 +96,7 @@ impl KvCacheQuantizer {
     }
 
     /// Append a batch of key-value pairs to `layer`.
-    pub fn push_batch(
-        &mut self,
-        layer: usize,
-        keys: &[&[f32]],
-        values: &[&[f32]],
-    ) -> Result<()> {
+    pub fn push_batch(&mut self, layer: usize, keys: &[&[f32]], values: &[&[f32]]) -> Result<()> {
         self.inner
             .push_batch(layer, keys, values)
             .map_err(|e| anyhow!("kv_cache push_batch failed: {e}"))

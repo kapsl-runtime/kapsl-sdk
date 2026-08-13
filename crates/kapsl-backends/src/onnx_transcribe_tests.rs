@@ -76,8 +76,8 @@ fn repeat_separated_by_blank_yields_two_tokens() {
 fn adjacent_repeat_without_blank_is_single_token() {
     // 2 2 2 -> single token 2.
     let v = 3;
-    let out = transcribe_from_output(&logits(&[frame(2, v), frame(2, v), frame(2, v)]), &cfg())
-        .unwrap();
+    let out =
+        transcribe_from_output(&logits(&[frame(2, v), frame(2, v), frame(2, v)]), &cfg()).unwrap();
     assert_eq!(decode_ids(&out), vec![2]);
 }
 
@@ -101,7 +101,8 @@ fn non_zero_blank_id() {
     let mut c = cfg();
     c.blank_id = 2;
     let v = 3;
-    let out = transcribe_from_output(&logits(&[frame(0, v), frame(2, v), frame(1, v)]), &c).unwrap();
+    let out =
+        transcribe_from_output(&logits(&[frame(0, v), frame(2, v), frame(1, v)]), &c).unwrap();
     assert_eq!(decode_ids(&out), vec![0, 1]);
 }
 

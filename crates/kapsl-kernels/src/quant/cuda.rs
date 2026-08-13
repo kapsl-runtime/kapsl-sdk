@@ -139,16 +139,19 @@ extern "C" __global__ void q4_k_gemv(
 
     // ── Compiled module (lazily initialised once per process) ─────────────────
 
-    static Q8_0_FN:  OnceLock<cudarc::driver::CudaFunction> = OnceLock::new();
-    static Q4_K_FN:  OnceLock<cudarc::driver::CudaFunction> = OnceLock::new();
+    static Q8_0_FN: OnceLock<cudarc::driver::CudaFunction> = OnceLock::new();
+    static Q4_K_FN: OnceLock<cudarc::driver::CudaFunction> = OnceLock::new();
 
     fn load_functions(device: &Arc<CudaDevice>) {
-        if Q8_0_FN.get().is_some() { return; }
+        if Q8_0_FN.get().is_some() {
+            return;
+        }
         let ptx = compile_ptx_with_opts(KERNEL_SRC, cuda_compile_opts())
             .expect("kapsl: failed to compile quant GEMV kernels");
-        device.load_ptx(ptx, "kapsl_quant_gemv", &["q8_0_gemv", "q4_k_gemv"])
+        device
+            .load_ptx(ptx, "kapsl_quant_gemv", &["q8_0_gemv", "q4_k_gemv"])
             .expect("kapsl: failed to load quant GEMV PTX");
-        let f8  = device.get_func("kapsl_quant_gemv", "q8_0_gemv").unwrap();
+        let f8 = device.get_func("kapsl_quant_gemv", "q8_0_gemv").unwrap();
         let f4k = device.get_func("kapsl_quant_gemv", "q4_k_gemv").unwrap();
         let _ = Q8_0_FN.set(f8);
         let _ = Q4_K_FN.set(f4k);
@@ -177,22 +180,16 @@ extern "C" __global__ void q4_k_gemv(
         load_functions(device);
         let f = Q8_0_FN.get().ok_or("q8_0_gemv not loaded")?;
         let cfg = LaunchConfig {
-            grid_dim:  (p.m.div_ceil(ROWS), p.b, 1),
+            grid_dim: (p.m.div_ceil(ROWS), p.b, 1),
             block_dim: (32, ROWS, 1),
             shared_mem_bytes: 0,
         };
         unsafe {
-            f.clone().launch(
-                cfg,
-                (
-                    &mut *p.out,
-                    p.w,
-                    p.x,
-                    p.m as i32,
-                    p.k as i32,
-                    p.b as i32,
-                ),
-            )
+            f.clone()
+                .launch(
+                    cfg,
+                    (&mut *p.out, p.w, p.x, p.m as i32, p.k as i32, p.b as i32),
+                )
                 .map_err(|e| format!("q8_0_gemv launch: {e}"))
         }
     }
@@ -204,22 +201,16 @@ extern "C" __global__ void q4_k_gemv(
         load_functions(device);
         let f = Q4_K_FN.get().ok_or("q4_k_gemv not loaded")?;
         let cfg = LaunchConfig {
-            grid_dim:  (p.m.div_ceil(ROWS), p.b, 1),
+            grid_dim: (p.m.div_ceil(ROWS), p.b, 1),
             block_dim: (32, ROWS, 1),
             shared_mem_bytes: 0,
         };
         unsafe {
-            f.clone().launch(
-                cfg,
-                (
-                    &mut *p.out,
-                    p.w,
-                    p.x,
-                    p.m as i32,
-                    p.k as i32,
-                    p.b as i32,
-                ),
-            )
+            f.clone()
+                .launch(
+                    cfg,
+                    (&mut *p.out, p.w, p.x, p.m as i32, p.k as i32, p.b as i32),
+                )
                 .map_err(|e| format!("q4_k_gemv launch: {e}"))
         }
     }
