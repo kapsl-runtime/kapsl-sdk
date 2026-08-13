@@ -6,8 +6,8 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use bytes::Bytes;
 use kapsl_rag_sdk::protocol::{ConnectorRequest, ConnectorRequestKind, ConnectorResponse};
 use wasmtime::{Engine, Linker, Module, Store};
-use wasmtime_wasi::p1::{add_to_linker_sync, WasiP1Ctx};
 use wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe};
+use wasmtime_wasi::preview1::{add_to_linker_sync, WasiP1Ctx};
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtxBuilder};
 
 #[derive(thiserror::Error, Debug)]
