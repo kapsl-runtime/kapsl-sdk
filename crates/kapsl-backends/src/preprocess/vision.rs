@@ -33,36 +33,26 @@ use serde::Deserialize;
 use super::Preprocessor;
 
 /// How the decoded image is fit to the model's fixed input size.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ResizeMode {
     /// Resize directly to `width x height`, distorting aspect ratio.
+    #[default]
     Stretch,
     /// Resize preserving aspect ratio to fit within `width x height`, then pad
     /// the remainder with `pad` (letterboxing, as used by YOLO-family models).
     Letterbox,
 }
 
-impl Default for ResizeMode {
-    fn default() -> Self {
-        ResizeMode::Stretch
-    }
-}
-
 /// Channel layout of the emitted tensor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Layout {
     /// `[1, channels, height, width]` — the common PyTorch/ONNX export layout.
+    #[default]
     Nchw,
     /// `[1, height, width, channels]` — some TensorFlow-origin exports.
     Nhwc,
-}
-
-impl Default for Layout {
-    fn default() -> Self {
-        Layout::Nchw
-    }
 }
 
 fn default_width() -> u32 {
@@ -130,7 +120,7 @@ impl VisionConfig {
                 self.width, self.height
             )));
         }
-        if self.std.iter().any(|s| *s == 0.0) {
+        if self.std.contains(&0.0) {
             return Err(EngineError::backend(
                 "vision preprocess: std values must be non-zero (division by zero)",
             ));

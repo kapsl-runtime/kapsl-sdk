@@ -37,8 +37,8 @@ default = []
 # Opt-in llama.cpp CUDA; the default backend build stays portable.
 gguf-cuda = ["kapsl-llm/gguf-cuda"]
 gguf-cuda-shared-kv = ["kapsl-llm/gguf-cuda-shared-kv", "kapsl-hal/cuda", "onnx-cuda-pool"]
-# ORT custom CUDA allocator backed by the shared Kapsl GpuBlockPool, so ONNX
-# sessions draw device memory from the same pool as the GGUF KV cache.
+# ORT custom CUDA allocator backed by the runtime-owned GpuDevicePool, so ONNX
+# sessions draw device memory from the same allocation as GGUF KV views.
 onnx-cuda-pool = ["kapsl-hal/cuda"]
 native = [
     "dep:kapsl-kernels",

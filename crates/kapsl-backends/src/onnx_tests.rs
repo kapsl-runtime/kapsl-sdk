@@ -573,8 +573,10 @@ mod tests {
         let plain = InferenceRequest::new(f32_packet(vec![1, 3], &[1.0, 2.0, 3.0]));
         assert!(!request_wants_top_k(&plain));
 
-        let mut meta = RequestMetadata::default();
-        meta.top_k = Some(5);
+        let meta = RequestMetadata {
+            top_k: Some(5),
+            ..RequestMetadata::default()
+        };
         let with_top_k = plain.clone().with_metadata(meta);
         assert!(request_wants_top_k(&with_top_k));
     }

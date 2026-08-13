@@ -503,25 +503,6 @@ impl GlobalKvScheduler {
         }
     }
 
-    /// Return `tokens` to `engine_id`'s reservation counter without touching
-    /// in-flight or activity state.  Prefer [`complete_tokens`] for normal
-    /// request teardown; use this only for partial / error rollbacks.
-    pub fn release_tokens(&mut self, engine_id: u32, tokens: usize) {
-        if let Some(r) = self.reserved_tokens.get_mut(&engine_id) {
-            *r = r.saturating_sub(tokens);
-        }
-    }
-
-    /// Current in-flight reservation for an engine (tokens, for metrics).
-    pub fn reserved_for(&self, engine_id: u32) -> usize {
-        self.reserved_tokens.get(&engine_id).copied().unwrap_or(0)
-    }
-
-    /// Number of requests currently in-flight for an engine.
-    pub fn inflight_for(&self, engine_id: u32) -> usize {
-        self.inflight.get(&engine_id).copied().unwrap_or(0)
-    }
-
     /// Total number of registered engines.
     pub fn engine_count(&self) -> usize {
         self.engines.len()
@@ -657,8 +638,8 @@ mod global_scheduler_tests {
             .unwrap()
             .max_tokens;
         // Allow ±1 for integer rounding.
-        assert!(b0 >= 249 && b0 <= 251, "b0={b0}");
-        assert!(b1 >= 749 && b1 <= 751, "b1={b1}");
+        assert!((249..=251).contains(&b0), "b0={b0}");
+        assert!((749..=751).contains(&b1), "b1={b1}");
         assert_eq!(b0 + b1, 1000);
     }
 

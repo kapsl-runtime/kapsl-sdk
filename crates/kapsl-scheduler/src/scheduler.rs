@@ -92,6 +92,21 @@ pub struct Scheduler {
     queue_overflow_policy: QueueOverflowPolicy,
 }
 
+impl Drop for Scheduler {
+    fn drop(&mut self) {
+        // Executor tasks own engine handles. Closing their queues wakes the
+        // tasks so model teardown can drop those handles and return backend
+        // allocations to the runtime-owned device pool.
+        for queue in self
+            .gpu_high_priority_queues
+            .iter()
+            .chain(self.gpu_low_priority_queues.iter())
+        {
+            queue.close();
+        }
+    }
+}
+
 impl Scheduler {
     #[allow(clippy::too_many_arguments)]
     pub fn new(

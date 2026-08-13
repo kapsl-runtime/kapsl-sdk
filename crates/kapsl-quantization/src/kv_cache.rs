@@ -41,7 +41,7 @@ pub struct KvCacheConfig {
 impl KvCacheConfig {
     /// Create a new config, returning an error if `bits` or `head_dim` are invalid.
     pub fn new(bits: u8, head_dim: usize, num_layers: usize) -> Result<Self> {
-        if !matches!(bits, 2 | 3 | 4) {
+        if !matches!(bits, 2..=4) {
             return Err(anyhow!("bits must be 2, 3, or 4; got {bits}"));
         }
         if head_dim == 0 || !head_dim.is_power_of_two() {
@@ -78,17 +78,6 @@ impl KvCacheQuantizer {
     pub fn new(config: KvCacheConfig, qjl_seed: u64) -> Self {
         let tq_config = TurboQuantConfig::new(config.bits, config.head_dim)
             .expect("KvCacheConfig already validated bits and head_dim");
-        Self {
-            inner: QuantizedKVCache::new(tq_config, config.num_layers, qjl_seed),
-            config,
-        }
-    }
-
-    /// Create a new quantizer with an explicit rotation seed.
-    pub fn with_rotation_seed(config: KvCacheConfig, rotation_seed: u64, qjl_seed: u64) -> Self {
-        let tq_config = TurboQuantConfig::new(config.bits, config.head_dim)
-            .expect("KvCacheConfig already validated bits and head_dim")
-            .with_seed(rotation_seed);
         Self {
             inner: QuantizedKVCache::new(tq_config, config.num_layers, qjl_seed),
             config,

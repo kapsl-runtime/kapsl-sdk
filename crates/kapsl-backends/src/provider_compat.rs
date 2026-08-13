@@ -1,3 +1,4 @@
+use crate::env_util::read_env_flag;
 use kapsl_core::{
     accelerator_provider_pack_installed, AcceleratorProviderPack, ALLOW_UNMANAGED_PROVIDERS_ENV,
 };
@@ -143,17 +144,6 @@ fn smoke_test_enabled() -> bool {
     read_env_flag(CUDA_SMOKE_TEST_ENV, true)
 }
 
-fn read_env_flag(name: &str, default: bool) -> bool {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => Some(true),
-            "0" | "false" | "no" | "off" => Some(false),
-            _ => None,
-        })
-        .unwrap_or(default)
-}
-
 fn parse_dotted_version(value: &str) -> Option<(u32, u32)> {
     let trimmed = value.trim();
     if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("n/a") {
@@ -184,9 +174,10 @@ fn cuda_device_summary(device: &Device) -> String {
     )
 }
 
-fn smoke_cache() -> &'static Mutex<HashMap<(OnnxAcceleratorProvider, i32), Result<(), String>>> {
-    static CACHE: OnceLock<Mutex<HashMap<(OnnxAcceleratorProvider, i32), Result<(), String>>>> =
-        OnceLock::new();
+type ProviderSmokeCache = Mutex<HashMap<(OnnxAcceleratorProvider, i32), Result<(), String>>>;
+
+fn smoke_cache() -> &'static ProviderSmokeCache {
+    static CACHE: OnceLock<ProviderSmokeCache> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 

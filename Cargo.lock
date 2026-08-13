@@ -2053,31 +2053,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "kapsl-optimizer"
-version = "0.1.1"
-dependencies = [
- "anyhow",
- "kapsl-core",
- "kapsl-engine-api",
- "log",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 1.0.69",
-]
-
-[[package]]
 name = "kapsl-pyo3"
 version = "0.1.1"
 dependencies = [
- "bincode",
  "kapsl-engine-api",
  "kapsl-ipc",
  "kapsl-shm",
  "kapsl-transport",
  "libc",
  "pyo3",
- "serde",
  "tokio",
 ]
 

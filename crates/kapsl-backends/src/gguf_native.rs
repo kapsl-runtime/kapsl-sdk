@@ -28,9 +28,10 @@ mod inner {
 
     use kapsl_engine_api::{
         BatchingPolicy, BinaryTensorPacket, Engine, EngineError, EngineMetrics, EngineModelInfo,
-        EngineStream, InferenceRequest, RequestMetadata, TensorDtype,
+        EngineStream, ExternalDeviceMemory, ExternalDeviceMemoryReport, InferenceRequest,
+        RequestMetadata, TensorDtype,
     };
-    use kapsl_hal::gpu_arena::{GpuBlockPool, GpuPoolHandle};
+    use kapsl_hal::gpu_arena::{GpuBlockPool, GpuDevicePool, GpuPoolHandle, PoolOwner};
     use kapsl_loader::weights::DType;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use kapsl_kernels::cuda_quant_kernels::{launch_q4_k_gemv, launch_q8_0_gemv, QuantGemvParams};
@@ -52,6 +53,15 @@ mod inner {
         Q4_K(CudaSlice<u8>),
     }
 
+    impl GpuWeight {
+        fn byte_len(&self) -> usize {
+            match self {
+                Self::F16(value) => value.len() * std::mem::size_of::<f16>(),
+                Self::Q8_0(value) | Self::Q4_K(value) => value.len(),
+            }
+        }
+    }
+
     struct GpuLayerWeights {
         // Norm weights are element-wise scalars — always f16.
         input_layernorm:          CudaSlice<f16>,
@@ -71,6 +81,28 @@ mod inner {
         layers: Vec<GpuLayerWeights>,
         norm: CudaSlice<f16>,
         lm_head: CudaSlice<f16>,
+    }
+
+    impl GpuLayerWeights {
+        fn byte_len(&self) -> usize {
+            (self.input_layernorm.len() + self.post_attention_layernorm.len())
+                * std::mem::size_of::<f16>()
+                + self.q_proj.byte_len()
+                + self.k_proj.byte_len()
+                + self.v_proj.byte_len()
+                + self.o_proj.byte_len()
+                + self.gate_proj.byte_len()
+                + self.up_proj.byte_len()
+                + self.down_proj.byte_len()
+        }
+    }
+
+    impl GpuModelWeights {
+        fn byte_len(&self) -> usize {
+            (self.embed_tokens.len() + self.norm.len() + self.lm_head.len())
+                * std::mem::size_of::<f16>()
+                + self.layers.iter().map(GpuLayerWeights::byte_len).sum::<usize>()
+        }
     }
 
     fn upload_f16(device: &Arc<CudaDevice>, t: &TensorData) -> Result<CudaSlice<f16>, EngineError> {
@@ -603,7 +635,7 @@ mod inner {
                     .map_err(|err| EngineError::backend(format!("pos_dev: {err}")))?;
 
                 launch_batch_kv_write(&self.device, &mut BatchKvWriteParams {
-                    kv_cache: self.block_pool.storage_mut(),
+                    kv_cache: unsafe { self.block_pool.storage_mut() },
                     k: &self.prefill.k_all, v: &self.prefill.v_all,
                     physical_blocks: &phys_dev, pos_in_blocks: &pos_dev,
                     seq_len: n as u32, num_kv_heads: num_kv as u32,
@@ -764,7 +796,7 @@ mod inner {
                 use kapsl_kernels::cuda_kernels::{launch_kv_write, KvWriteParams};
                 let physical_block = block_tables[layer_idx][pos_in_seq / block_size];
                 launch_kv_write(&self.device, &mut KvWriteParams {
-                    kv_cache: self.block_pool.storage_mut(),
+                    kv_cache: unsafe { self.block_pool.storage_mut() },
                     k_vec: &self.k_buf, v_vec: &self.v_buf,
                     physical_block: physical_block as u32,
                     pos_in_block: pos_in_block as u32,
@@ -776,7 +808,7 @@ mod inner {
                 let max_blocks = self.gpu_block_tables[layer_idx].len() as u32;
                 launch_paged_attention(&self.device, &mut PagedAttentionParams {
                     out: &mut self.attn_buf, q: &self.q_buf,
-                    kv_cache: self.block_pool.storage(),
+                    kv_cache: unsafe { self.block_pool.storage() },
                     block_tables: &self.gpu_block_tables[layer_idx],
                     context_lens: &self.ctx_scalar_buf,
                     scale, batch_size: 1,
@@ -954,7 +986,7 @@ mod inner {
                     .map_err(|err| e(format!("phys up: {err}")))?;
 
                 launch_batch_kv_write(&self.device, &mut BatchKvWriteParams {
-                    kv_cache: self.block_pool.storage_mut(),
+                    kv_cache: unsafe { self.block_pool.storage_mut() },
                     k: &self.prefill.k_all, v: &self.prefill.v_all,
                     physical_blocks: &phys_dev,
                     pos_in_blocks: &pib_dev,
@@ -974,7 +1006,7 @@ mod inner {
 
                 launch_paged_attention(&self.device, &mut PagedAttentionParams {
                     out: &mut self.prefill.attn_out, q: &self.prefill.q_all,
-                    kv_cache: self.block_pool.storage(),
+                    kv_cache: unsafe { self.block_pool.storage() },
                     block_tables: &bt_dev,
                     context_lens: &ctx_dev,
                     scale, batch_size: b as u32,
@@ -1258,22 +1290,31 @@ mod inner {
 
     pub struct GgufNativeBackend {
         device_id: i32,
+        external_allocation_id: String,
         inner: Arc<Mutex<Option<BackendInner>>>,
         /// Pool handle to inject before load(); also populated after load() for sharing.
         pool_slot: Arc<Mutex<Option<GpuPoolHandle>>>,
+        /// Runtime-owned storage used to create the geometry view during load.
+        device_pool: Option<(Arc<GpuDevicePool>, PoolOwner)>,
         batch_dec: Arc<BatchDecodeCoordinator>,
     }
 
     impl GgufNativeBackend {
         pub fn new(device_id: i32) -> Result<Self, EngineError> {
+            static NEXT_ALLOCATION_ID: AtomicUsize = AtomicUsize::new(1);
             CudaDevice::new(device_id as usize)
                 .map_err(|e| EngineError::backend(format!("CUDA device {device_id}: {e}")))?;
             let inner = Arc::new(Mutex::new(None));
             let batch_dec = Arc::new(BatchDecodeCoordinator::spawn(Arc::clone(&inner)));
             Ok(Self {
                 device_id,
+                external_allocation_id: format!(
+                    "gguf-native:{device_id}:{}",
+                    NEXT_ALLOCATION_ID.fetch_add(1, Ordering::Relaxed)
+                ),
                 inner,
                 pool_slot: Arc::new(Mutex::new(None)),
+                device_pool: None,
                 batch_dec,
             })
         }
@@ -1282,6 +1323,13 @@ mod inner {
         /// is incompatible with the model, load() will create a private pool instead.
         pub fn with_pool_handle(self, handle: GpuPoolHandle) -> Self {
             *self.pool_slot.lock().unwrap() = Some(handle);
+            self
+        }
+
+        /// Attach this backend to runtime-owned device storage. Model geometry
+        /// is applied after GGUF metadata has been loaded.
+        pub fn with_device_pool(mut self, pool: Arc<GpuDevicePool>, model_id: u32) -> Self {
+            self.device_pool = Some((pool, PoolOwner::GgufKv { model_id }));
             self
         }
 
@@ -1311,11 +1359,35 @@ mod inner {
 
     #[async_trait]
     impl Engine for GgufNativeBackend {
+        fn planned_external_device_memory(
+            &self,
+            model_path: &Path,
+        ) -> Result<ExternalDeviceMemoryReport, EngineError> {
+            let bytes = std::fs::metadata(model_path)
+                .map_err(|e| EngineError::backend(format!("stat GGUF model: {e}")))?
+                .len() as usize;
+            Ok(ExternalDeviceMemoryReport {
+                allocations: vec![
+                    ExternalDeviceMemory {
+                        allocation_id: self.external_allocation_id.clone(),
+                        device_id: self.device_id as usize,
+                        bytes,
+                    },
+                    ExternalDeviceMemory {
+                        allocation_id: format!("{}:scratch", self.external_allocation_id),
+                        device_id: self.device_id as usize,
+                        bytes: (bytes / 8).max(256 * 1024 * 1024),
+                    },
+                ],
+            })
+        }
+
         async fn load(&mut self, model_path: &Path) -> Result<(), EngineError> {
             let path = model_path.to_owned();
             let device_id = self.device_id;
             let inner_arc = Arc::clone(&self.inner);
             let pool_slot = Arc::clone(&self.pool_slot);
+            let device_pool = self.device_pool.clone();
 
             tokio::task::spawn_blocking(move || {
                 // ── Load GGUF weights → dequantize to f16 ──────────────────
@@ -1349,7 +1421,17 @@ mod inner {
                 let block_size = 16usize;
                 let (block_pool, pool_cap): (Arc<GpuBlockPool>, Arc<AtomicUsize>) = {
                     let mut slot = pool_slot.lock().unwrap();
-                    if let Some(ref handle) = *slot {
+                    if let Some((device_pool, owner)) = device_pool.as_ref() {
+                        let requested_blocks = kv_pool_block_count(&config, block_size);
+                        let p = Arc::new(GpuBlockPool::from_device_pool(
+                            Arc::clone(device_pool), *owner, requested_blocks, block_size,
+                            config.num_kv_heads(), config.head_dim())
+                            .map_err(|e| EngineError::backend(format!("block pool view: {e}")))?);
+                        let h = GpuPoolHandle::private(p.clone());
+                        let cap = h.blocks_per_engine.clone();
+                        *slot = Some(h);
+                        (p, cap)
+                    } else if let Some(ref handle) = *slot {
                         if handle.pool.is_compatible(config.num_kv_heads(), config.head_dim()) {
                             log::info!("[gguf-native] Attaching to shared GpuBlockPool ({} free, cap {})",
                                 handle.pool.free_count(), handle.cap());
@@ -1431,6 +1513,25 @@ mod inner {
             })
             .await
             .map_err(|e| EngineError::backend(format!("load task: {e}")))?
+        }
+
+        fn actual_external_device_memory(&self) -> ExternalDeviceMemoryReport {
+            let bytes = self
+                .inner
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|inner| inner.weights.byte_len())
+                .unwrap_or(0);
+            if bytes == 0 {
+                ExternalDeviceMemoryReport::default()
+            } else {
+                ExternalDeviceMemoryReport::single(
+                    self.external_allocation_id.clone(),
+                    self.device_id as usize,
+                    bytes,
+                )
+            }
         }
 
         fn infer(&self, request: &InferenceRequest) -> Result<BinaryTensorPacket, EngineError> {

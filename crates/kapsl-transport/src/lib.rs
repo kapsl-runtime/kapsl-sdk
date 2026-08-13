@@ -1,9 +1,10 @@
 use async_trait::async_trait;
-use kapsl_engine_api::BinaryTensorPacket;
+use kapsl_engine_api::{BinaryTensorPacket, InferenceRequest};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub mod connection_pool;
+pub mod protocol;
 pub mod tcp;
 
 /// Common error type for all transport implementations
@@ -34,7 +35,10 @@ pub enum TransportError {
     ServerError(String),
 }
 
-/// Request metadata shared between transport implementations
+/// Fixed-layout metadata used by shared-memory and hybrid transports.
+///
+/// Stream transports use [`protocol::RequestHeader`] for framing and carry
+/// [`kapsl_engine_api::RequestMetadata`] inside the inference request payload.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct RequestMetadata {
@@ -62,7 +66,8 @@ impl RequestMetadata {
     }
 }
 
-/// Response metadata shared between transport implementations
+/// Fixed-layout response metadata used by shared-memory and hybrid transports.
+/// Stream transports use [`protocol::ResponseHeader`] instead.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ResponseMetadata {
@@ -105,9 +110,6 @@ pub trait TransportServer: Send + Sync {
 
     /// Gracefully shutdown the server
     async fn shutdown(&self) -> Result<(), TransportError>;
-
-    /// Get the transport type name (for logging/debugging)
-    fn transport_type(&self) -> &'static str;
 }
 
 /// Client-side transport trait
@@ -119,6 +121,17 @@ pub trait TransportClient: Send + Sync {
         model_id: u32,
         input: BinaryTensorPacket,
     ) -> Result<BinaryTensorPacket, TransportError>;
+
+    /// Send a complete inference request. Socket clients override this to
+    /// preserve auth, session, priority, named-input, and generation metadata.
+    /// The default keeps third-party tensor-only transports source compatible.
+    async fn infer_request(
+        &self,
+        model_id: u32,
+        request: &InferenceRequest,
+    ) -> Result<BinaryTensorPacket, TransportError> {
+        self.infer(model_id, request.input.clone()).await
+    }
 
     /// Send streaming inference request
     #[cfg(feature = "streaming")]
@@ -132,9 +145,6 @@ pub trait TransportClient: Send + Sync {
         >,
         TransportError,
     >;
-
-    /// Get the transport type name (for logging/debugging)
-    fn transport_type(&self) -> &'static str;
 }
 
 #[cfg(test)]

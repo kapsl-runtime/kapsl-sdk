@@ -349,7 +349,7 @@ fn build_scheduler_for_queue_tests(
 
     use crate::mesh_routing::MeshRouter;
 
-    let scheduler = Scheduler {
+    Scheduler {
         engines: engines.clone(),
         cpu_pool,
         gpu_high_priority_queues: vec![high_queue],
@@ -363,9 +363,7 @@ fn build_scheduler_for_queue_tests(
         router: MeshRouter::new(None, 1),
         max_micro_batch: 1,
         queue_overflow_policy: QueueOverflowPolicy::Block,
-    };
-
-    scheduler
+    }
 }
 
 #[tokio::test]
@@ -391,6 +389,27 @@ async fn test_get_worker_index_sticky_session() {
 
     assert_eq!(first, second);
     assert!(first < scheduler.gpu_high_priority_queues.len());
+}
+
+#[tokio::test]
+async fn test_drop_scheduler_releases_executor_engine_handles() {
+    let engine = Arc::new(MockEngine::new(EngineMetrics::default()));
+    let engine_handle: EngineHandle = engine.clone();
+    let scheduler = Scheduler::new(vec![engine_handle], 1, 1, 8, false, 1, 0, None);
+
+    drop(scheduler);
+    for _ in 0..100 {
+        if Arc::strong_count(&engine) == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+
+    assert_eq!(
+        Arc::strong_count(&engine),
+        1,
+        "executor task retained its engine after scheduler teardown"
+    );
 }
 
 #[test]
@@ -562,7 +581,7 @@ async fn test_gpu_executor_uses_policy_queue_delay_for_request_coalescing_backen
 
     let recorded = calls.lock().unwrap().clone();
     assert!(
-        recorded.iter().any(|&n| n == 2),
+        recorded.contains(&2),
         "policy queue_delay_ms should allow the executor to coalesce the straggler, got {:?}",
         recorded
     );

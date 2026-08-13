@@ -9,7 +9,7 @@ mod tests {
     use kapsl_scheduler::Priority;
     use kapsl_transport::{RequestMetadata, ResponseMetadata};
     use std::collections::HashMap;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     struct OkScheduler {
@@ -285,6 +285,31 @@ mod tests {
     }
 
     #[test]
+    fn unknown_model_error_response_uses_shared_pool() {
+        let (_backing, base) = alloc_buffer(12 * 1024 * 1024);
+        let schedulers = HashMap::<u32, Arc<dyn ReplicaScheduler + Send + Sync>>::new();
+        let allocator = DynamicPerModelPool::new(
+            &schedulers,
+            128 * 1024,
+            10 * 1024 * 1024,
+            Duration::from_secs(30),
+        );
+
+        let response =
+            error_response_for_model(base, &allocator, 404, 99, 123, None, "Model 404 not found");
+        assert!(!response.metadata.is_success());
+        assert_eq!(response.metadata.request_id, 99);
+        assert_ne!(response.error_offset, 0);
+
+        let error_offset = response.error_offset as usize;
+        let error = unsafe {
+            let len = *(base.add(error_offset) as *const u64) as usize;
+            std::slice::from_raw_parts(base.add(error_offset + std::mem::size_of::<u64>()), len)
+        };
+        assert_eq!(error, b"Model 404 not found");
+    }
+
+    #[test]
     fn test_single_model_class_budgets_uses_shapes_and_dtypes() {
         let info = EngineModelInfo {
             input_names: vec!["input".to_string()],
@@ -430,5 +455,84 @@ mod tests {
         // Both should be non-zero (have dedicated slots).
         assert!(low_largest > 0, "model 1 should have capacity");
         assert!(high_largest > 0, "model 2 should have capacity");
+    }
+
+    #[test]
+    fn dynamic_pool_registers_hot_loaded_models_when_layout_is_idle() {
+        let make_info = || EngineModelInfo {
+            input_names: vec!["input".to_string()],
+            output_names: vec!["output".to_string()],
+            input_shapes: vec![vec![1, 16]],
+            output_shapes: vec![vec![1, 16]],
+            input_dtypes: vec!["float32".to_string()],
+            output_dtypes: vec!["float32".to_string()],
+            framework: Some("onnx".to_string()),
+            model_version: Some("1.0".to_string()),
+            peak_concurrency: Some(1),
+        };
+
+        let mut initial: HashMap<u32, Arc<dyn ReplicaScheduler + Send + Sync>> = HashMap::new();
+        initial.insert(1, Arc::new(MetadataScheduler { info: make_info() }));
+        let pool = DynamicPerModelPool::new(&initial, 0, 32 * 1024 * 1024, Duration::from_secs(30));
+        assert!(pool.layout_summary().contains("model1:"));
+
+        let mut live = initial;
+        live.insert(2, Arc::new(MetadataScheduler { info: make_info() }));
+        let layout = pool
+            .refresh(&live)
+            .expect("idle pool should adopt the live scheduler registry");
+        assert!(layout.contains("model1:"));
+        assert!(layout.contains("model2:"));
+    }
+
+    #[test]
+    fn server_lookup_observes_hot_loaded_scheduler() {
+        let schedulers = Arc::new(Mutex::new(HashMap::<
+            u32,
+            Arc<dyn ReplicaScheduler + Send + Sync>,
+        >::new()));
+        let lookup: SchedulerLookup = {
+            let schedulers = schedulers.clone();
+            Arc::new(move |model_id| {
+                schedulers
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .get(&model_id)
+                    .cloned()
+            })
+        };
+        let snapshot: SchedulerSnapshot = {
+            let schedulers = schedulers.clone();
+            Arc::new(move || {
+                schedulers
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .clone()
+            })
+        };
+        let server = ShmServer::new_with_lookup("/unused", 1024, lookup, snapshot);
+        assert!((server.scheduler_lookup)(7).is_none());
+
+        schedulers
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(
+                7,
+                Arc::new(MetadataScheduler {
+                    info: EngineModelInfo {
+                        input_names: Vec::new(),
+                        output_names: Vec::new(),
+                        input_shapes: Vec::new(),
+                        output_shapes: Vec::new(),
+                        input_dtypes: Vec::new(),
+                        output_dtypes: Vec::new(),
+                        framework: None,
+                        model_version: None,
+                        peak_concurrency: None,
+                    },
+                }),
+            );
+
+        assert!((server.scheduler_lookup)(7).is_some());
     }
 }

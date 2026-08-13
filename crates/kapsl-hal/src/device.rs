@@ -241,11 +241,6 @@ impl DeviceInfo {
         probed
     }
 
-    /// Probe device information (not cached).
-    pub fn try_probe() -> Result<Self, DeviceProbeError> {
-        Self::try_probe_with_timeout(DEFAULT_PROBE_TIMEOUT)
-    }
-
     /// Probe device information with a timeout applied to external commands.
     pub fn try_probe_with_timeout(timeout: Duration) -> Result<Self, DeviceProbeError> {
         let cpu_cores = sys_info::cpu_num()?;
@@ -558,6 +553,7 @@ impl DeviceInfo {
         devices
     }
 
+    #[cfg(target_os = "macos")]
     fn parse_memory_mb(value: &str) -> Option<u64> {
         let lowered = value.trim().to_ascii_lowercase();
         if lowered.is_empty() {

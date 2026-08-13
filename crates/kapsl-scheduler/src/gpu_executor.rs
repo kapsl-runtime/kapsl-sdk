@@ -3,7 +3,7 @@ use crate::request::Request;
 use kapsl_engine_api::{BatchingMode, EngineError, EngineHandle, InferenceRequest};
 use log::info;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
@@ -24,6 +24,7 @@ struct WorkQueueInner {
     queue: Mutex<VecDeque<Request>>,
     capacity: usize,
     queue_len: AtomicUsize,
+    closed: AtomicBool,
     not_empty: Notify,
     not_full: Notify,
 }
@@ -41,10 +42,29 @@ impl WorkQueue {
                 queue: Mutex::new(VecDeque::with_capacity(capacity)),
                 capacity,
                 queue_len: AtomicUsize::new(0),
+                closed: AtomicBool::new(false),
                 not_empty: Notify::new(),
                 not_full: Notify::new(),
             }),
         }
+    }
+
+    pub(crate) fn close(&self) {
+        if self.inner.closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let mut queue = self.inner.queue.lock().unwrap();
+        queue.clear();
+        self.inner.queue_len.store(0, Ordering::Release);
+        drop(queue);
+        self.inner.not_empty.notify_waiters();
+        self.inner.not_empty.notify_one();
+        self.inner.not_full.notify_waiters();
+        self.inner.not_full.notify_one();
+    }
+
+    fn is_closed(&self) -> bool {
+        self.inner.closed.load(Ordering::Acquire)
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -55,8 +75,17 @@ impl WorkQueue {
         self.inner.capacity
     }
 
+    // Returning ownership lets callers retry or report the exact request
+    // without a heap allocation on the scheduler hot path.
+    #[allow(clippy::result_large_err)]
     pub(crate) fn try_push_drop_newest(&self, request: Request) -> Result<(), Request> {
+        if self.is_closed() {
+            return Err(request);
+        }
         let mut queue = self.inner.queue.lock().unwrap();
+        if self.is_closed() {
+            return Err(request);
+        }
         if queue.len() >= self.inner.capacity {
             return Err(request);
         }
@@ -68,7 +97,13 @@ impl WorkQueue {
     }
 
     pub(crate) fn push_drop_oldest(&self, request: Request) -> Option<Request> {
+        if self.is_closed() {
+            return Some(request);
+        }
         let mut queue = self.inner.queue.lock().unwrap();
+        if self.is_closed() {
+            return Some(request);
+        }
         let is_full = queue.len() >= self.inner.capacity;
         let dropped = if is_full { queue.pop_front() } else { None };
         queue.push_back(request);
@@ -83,9 +118,14 @@ impl WorkQueue {
     pub(crate) async fn push_block(&self, request: Request) {
         let mut pending = Some(request);
         loop {
+            if self.is_closed() {
+                return;
+            }
             let queued = {
                 let mut queue = self.inner.queue.lock().unwrap();
-                if queue.len() < self.inner.capacity {
+                if self.is_closed() {
+                    return;
+                } else if queue.len() < self.inner.capacity {
                     queue.push_back(pending.take().expect("pending request must exist"));
                     self.inner.queue_len.fetch_add(1, Ordering::Relaxed);
                     true
@@ -122,6 +162,9 @@ impl WorkQueue {
             if let Some(request) = self.pop_nowait() {
                 return Some(request);
             }
+            if self.is_closed() {
+                return None;
+            }
 
             let now = Instant::now();
             if now >= deadline {
@@ -141,6 +184,9 @@ impl WorkQueue {
     pub(crate) async fn wait_for_item(&self) {
         loop {
             if !self.inner.queue.lock().unwrap().is_empty() {
+                return;
+            }
+            if self.is_closed() {
                 return;
             }
             self.inner.not_empty.notified().await;
@@ -413,6 +459,10 @@ impl GpuExecutor {
             .unwrap_or(self.queue_delay);
 
         loop {
+            if self.high_priority_queue.is_closed() && self.low_priority_queue.is_closed() {
+                info!("GPU Executor stopped");
+                return;
+            }
             // Occupancy-driven admission (self-batching backends only): when the
             // backend signals it is saturated, stop pulling from the priority
             // queues so requests stay priority-ordered there instead of piling

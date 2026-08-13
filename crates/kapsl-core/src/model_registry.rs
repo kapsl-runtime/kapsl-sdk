@@ -431,16 +431,6 @@ impl ModelRegistry {
         }
         false
     }
-
-    /// Get all versions of a model by name
-    pub fn get_versions(&self, name: &str) -> Vec<ModelInfo> {
-        let models = self.models.read();
-        models
-            .values()
-            .filter(|m| m.name == name)
-            .cloned()
-            .collect()
-    }
 }
 
 impl Default for ModelRegistry {

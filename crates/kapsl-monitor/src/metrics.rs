@@ -1,7 +1,42 @@
 use prometheus::{
     GaugeVec, HistogramOpts, HistogramVec, IntCounterVec, IntGaugeVec, Opts, Registry,
 };
-use std::sync::Arc;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, Mutex},
+};
+
+/// Pool-wide values exported for one CUDA device.
+///
+/// This transport type intentionally contains only monitoring primitives, so
+/// runtime callers can populate it without exposing allocator or HAL types to
+/// this crate. `fragmentation_ratio` is expected to be in the inclusive range
+/// `0.0..=1.0`, where zero means that all free space is contiguous.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GpuDevicePoolMetrics {
+    pub allocated_bytes: u64,
+    pub live_allocations: u64,
+    pub free_bytes: u64,
+    pub free_ranges: u64,
+    pub largest_free_range_bytes: u64,
+    pub fragmentation_ratio: f64,
+    pub owners: Vec<GpuDevicePoolOwnerMetrics>,
+}
+
+/// Per-owner values exported for one CUDA device pool.
+///
+/// `owner` is a stable, bounded identity such as `onnx`, `gguf_kv:42`, or
+/// `native_kv:42`. It deliberately combines owner kind and model identity into
+/// one label instead of creating additional high-cardinality label dimensions.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GpuDevicePoolOwnerMetrics {
+    pub owner: String,
+    pub usage_bytes: u64,
+    pub guaranteed_bytes: u64,
+    pub max_bytes: u64,
+    pub admitted: bool,
+    pub allocatable_bytes: u64,
+}
 
 #[derive(Debug, Clone)]
 pub struct KapslMetrics {
@@ -39,6 +74,25 @@ pub struct KapslMetrics {
     pub onnx_session_pool_idle: IntGaugeVec,
     pub onnx_session_pool_waits_total: IntGaugeVec,
     pub onnx_session_pool_wait_seconds_total: GaugeVec,
+    // Runtime-owned per-device memory authority metrics.
+    pub device_memory_budget_bytes: IntGaugeVec,
+    pub device_memory_pooled_bytes: IntGaugeVec,
+    pub device_memory_planned_external_bytes: IntGaugeVec,
+    pub device_memory_external_bytes: IntGaugeVec,
+    pub device_memory_available_bytes: IntGaugeVec,
+    // Runtime-owned CUDA device-pool allocator metrics.
+    pub gpu_device_pool_allocated_bytes: IntGaugeVec,
+    pub gpu_device_pool_live_allocations: IntGaugeVec,
+    pub gpu_device_pool_free_bytes: IntGaugeVec,
+    pub gpu_device_pool_free_ranges: IntGaugeVec,
+    pub gpu_device_pool_largest_free_range_bytes: IntGaugeVec,
+    pub gpu_device_pool_fragmentation_ratio: GaugeVec,
+    pub gpu_device_pool_owner_usage_bytes: IntGaugeVec,
+    pub gpu_device_pool_owner_quota_guaranteed_bytes: IntGaugeVec,
+    pub gpu_device_pool_owner_quota_max_bytes: IntGaugeVec,
+    pub gpu_device_pool_owner_admitted: IntGaugeVec,
+    pub gpu_device_pool_owner_allocatable_bytes: IntGaugeVec,
+    gpu_device_pool_owner_labels: Arc<Mutex<HashMap<String, HashSet<String>>>>,
     /// Most recent time-to-first-token (milliseconds) per model. Surfaced on the
     /// runtime `/api/models` so control-plane autoscalers can scale on TTFT SLOs.
     pub model_ttft_ms: GaugeVec,
@@ -287,6 +341,134 @@ impl KapslMetrics {
             &["model"],
         )
         .unwrap();
+        let device_memory_budget_bytes = IntGaugeVec::new(
+            Opts::new(
+                "kapsl_device_memory_budget_bytes",
+                "Runtime admission budget per CUDA device",
+            ),
+            &["device"],
+        )
+        .unwrap();
+        let device_memory_pooled_bytes = IntGaugeVec::new(
+            Opts::new(
+                "kapsl_device_memory_pooled_bytes",
+                "Bytes owned by the runtime CUDA pool per device",
+            ),
+            &["device"],
+        )
+        .unwrap();
+        let device_memory_planned_external_bytes = IntGaugeVec::new(
+            Opts::new(
+                "kapsl_device_memory_planned_external_bytes",
+                "External CUDA bytes currently reserved for in-progress loads",
+            ),
+            &["device"],
+        )
+        .unwrap();
+        let device_memory_external_bytes = IntGaugeVec::new(
+            Opts::new(
+                "kapsl_device_memory_external_bytes",
+                "Backend and library CUDA bytes charged outside the runtime pool",
+            ),
+            &["device"],
+        )
+        .unwrap();
+        let device_memory_available_bytes = IntGaugeVec::new(
+            Opts::new(
+                "kapsl_device_memory_available_bytes",
+                "Uncommitted runtime admission budget per CUDA device",
+            ),
+            &["device"],
+        )
+        .unwrap();
+        let gpu_device_pool_allocated_bytes = IntGaugeVec::new(
+            Opts::new(
+                "kapsl_gpu_device_pool_allocated_bytes",
+                "Bytes currently allocated from the runtime-owned CUDA device pool",
+            ),
+            &["device"],
+        )
+        .unwrap();
+        let gpu_device_pool_live_allocations = IntGaugeVec::new(
+            Opts::new(
+                "kapsl_gpu_device_pool_live_allocations",
+                "Number of live allocations in the runtime-owned CUDA device pool",
+            ),
+            &["device"],
+        )
+        .unwrap();
+        let gpu_device_pool_free_bytes = IntGaugeVec::new(
+            Opts::new(
+                "kapsl_gpu_device_pool_free_bytes",
+                "Bytes currently free in the runtime-owned CUDA device pool",
+            ),
+            &["device"],
+        )
+        .unwrap();
+        let gpu_device_pool_free_ranges = IntGaugeVec::new(
+            Opts::new(
+                "kapsl_gpu_device_pool_free_ranges",
+                "Number of disjoint free ranges in the runtime-owned CUDA device pool",
+            ),
+            &["device"],
+        )
+        .unwrap();
+        let gpu_device_pool_largest_free_range_bytes = IntGaugeVec::new(
+            Opts::new(
+                "kapsl_gpu_device_pool_largest_free_range_bytes",
+                "Size of the largest free range in the runtime-owned CUDA device pool",
+            ),
+            &["device"],
+        )
+        .unwrap();
+        let gpu_device_pool_fragmentation_ratio = GaugeVec::new(
+            Opts::new(
+                "kapsl_gpu_device_pool_fragmentation_ratio",
+                "CUDA device-pool external fragmentation from 0 (contiguous) to 1",
+            ),
+            &["device"],
+        )
+        .unwrap();
+        let gpu_device_pool_owner_usage_bytes = IntGaugeVec::new(
+            Opts::new(
+                "kapsl_gpu_device_pool_owner_usage_bytes",
+                "CUDA device-pool bytes currently used by an owner",
+            ),
+            &["device", "owner"],
+        )
+        .unwrap();
+        let gpu_device_pool_owner_quota_guaranteed_bytes = IntGaugeVec::new(
+            Opts::new(
+                "kapsl_gpu_device_pool_owner_quota_guaranteed_bytes",
+                "CUDA device-pool bytes guaranteed to an owner while admitted",
+            ),
+            &["device", "owner"],
+        )
+        .unwrap();
+        let gpu_device_pool_owner_quota_max_bytes = IntGaugeVec::new(
+            Opts::new(
+                "kapsl_gpu_device_pool_owner_quota_max_bytes",
+                "Maximum CUDA device-pool bytes an owner may use",
+            ),
+            &["device", "owner"],
+        )
+        .unwrap();
+        let gpu_device_pool_owner_admitted = IntGaugeVec::new(
+            Opts::new(
+                "kapsl_gpu_device_pool_owner_admitted",
+                "Whether a CUDA device-pool owner is admitted (1) or not (0)",
+            ),
+            &["device", "owner"],
+        )
+        .unwrap();
+        let gpu_device_pool_owner_allocatable_bytes = IntGaugeVec::new(
+            Opts::new(
+                "kapsl_gpu_device_pool_owner_allocatable_bytes",
+                "CUDA device-pool bytes currently allocatable by an owner after policy and fragmentation",
+            ),
+            &["device", "owner"],
+        )
+        .unwrap();
 
         registry
             .register(Box::new(inference_latency.clone()))
@@ -381,6 +563,56 @@ impl KapslMetrics {
         registry
             .register(Box::new(onnx_session_pool_wait_seconds_total.clone()))
             .expect("Failed to register onnx_session_pool_wait_seconds_total");
+        registry
+            .register(Box::new(device_memory_budget_bytes.clone()))
+            .expect("Failed to register device_memory_budget_bytes");
+        registry
+            .register(Box::new(device_memory_pooled_bytes.clone()))
+            .expect("Failed to register device_memory_pooled_bytes");
+        registry
+            .register(Box::new(device_memory_planned_external_bytes.clone()))
+            .expect("Failed to register device_memory_planned_external_bytes");
+        registry
+            .register(Box::new(device_memory_external_bytes.clone()))
+            .expect("Failed to register device_memory_external_bytes");
+        registry
+            .register(Box::new(device_memory_available_bytes.clone()))
+            .expect("Failed to register device_memory_available_bytes");
+        registry
+            .register(Box::new(gpu_device_pool_allocated_bytes.clone()))
+            .expect("Failed to register gpu_device_pool_allocated_bytes");
+        registry
+            .register(Box::new(gpu_device_pool_live_allocations.clone()))
+            .expect("Failed to register gpu_device_pool_live_allocations");
+        registry
+            .register(Box::new(gpu_device_pool_free_bytes.clone()))
+            .expect("Failed to register gpu_device_pool_free_bytes");
+        registry
+            .register(Box::new(gpu_device_pool_free_ranges.clone()))
+            .expect("Failed to register gpu_device_pool_free_ranges");
+        registry
+            .register(Box::new(gpu_device_pool_largest_free_range_bytes.clone()))
+            .expect("Failed to register gpu_device_pool_largest_free_range_bytes");
+        registry
+            .register(Box::new(gpu_device_pool_fragmentation_ratio.clone()))
+            .expect("Failed to register gpu_device_pool_fragmentation_ratio");
+        registry
+            .register(Box::new(gpu_device_pool_owner_usage_bytes.clone()))
+            .expect("Failed to register gpu_device_pool_owner_usage_bytes");
+        registry
+            .register(Box::new(
+                gpu_device_pool_owner_quota_guaranteed_bytes.clone(),
+            ))
+            .expect("Failed to register gpu_device_pool_owner_quota_guaranteed_bytes");
+        registry
+            .register(Box::new(gpu_device_pool_owner_quota_max_bytes.clone()))
+            .expect("Failed to register gpu_device_pool_owner_quota_max_bytes");
+        registry
+            .register(Box::new(gpu_device_pool_owner_admitted.clone()))
+            .expect("Failed to register gpu_device_pool_owner_admitted");
+        registry
+            .register(Box::new(gpu_device_pool_owner_allocatable_bytes.clone()))
+            .expect("Failed to register gpu_device_pool_owner_allocatable_bytes");
 
         Self {
             registry: registry.clone(),
@@ -414,11 +646,34 @@ impl KapslMetrics {
             onnx_session_pool_idle,
             onnx_session_pool_waits_total,
             onnx_session_pool_wait_seconds_total,
+            device_memory_budget_bytes,
+            device_memory_pooled_bytes,
+            device_memory_planned_external_bytes,
+            device_memory_external_bytes,
+            device_memory_available_bytes,
+            gpu_device_pool_allocated_bytes,
+            gpu_device_pool_live_allocations,
+            gpu_device_pool_free_bytes,
+            gpu_device_pool_free_ranges,
+            gpu_device_pool_largest_free_range_bytes,
+            gpu_device_pool_fragmentation_ratio,
+            gpu_device_pool_owner_usage_bytes,
+            gpu_device_pool_owner_quota_guaranteed_bytes,
+            gpu_device_pool_owner_quota_max_bytes,
+            gpu_device_pool_owner_admitted,
+            gpu_device_pool_owner_allocatable_bytes,
+            gpu_device_pool_owner_labels: Arc::new(Mutex::new(HashMap::new())),
             model_ttft_ms,
         }
     }
 
-    pub fn set_kv_cache_metrics(&self, model: &str, metrics: &kapsl_engine_api::EngineMetrics) {
+    /// Export the cache, token, health, and session-pool fields from one engine
+    /// snapshot to their model-scoped Prometheus collectors.
+    ///
+    /// This is the canonical [`EngineMetrics`](kapsl_engine_api::EngineMetrics)
+    /// mapping for those collectors. Runtime callers should pass the complete
+    /// snapshot here rather than assigning individual collectors themselves.
+    pub fn set_engine_metrics(&self, model: &str, metrics: &kapsl_engine_api::EngineMetrics) {
         self.kv_cache_bytes_used
             .with_label_values(&[model])
             .set(metrics.kv_cache_bytes_used as i64);
@@ -479,6 +734,136 @@ impl KapslMetrics {
         self.onnx_session_pool_wait_seconds_total
             .with_label_values(&[model])
             .set(metrics.onnx_session_pool_wait_seconds_total);
+    }
+
+    /// Backwards-compatible name for [`Self::set_engine_metrics`].
+    pub fn set_kv_cache_metrics(&self, model: &str, metrics: &kapsl_engine_api::EngineMetrics) {
+        self.set_engine_metrics(model, metrics);
+    }
+
+    /// Replace the live CUDA device-pool snapshot for `device`.
+    ///
+    /// Owner rows omitted from a later snapshot are removed from the
+    /// Prometheus registry, preventing unloaded model identities from leaving
+    /// stale label series behind. Values wider than Prometheus' signed integer
+    /// gauge representation are saturated instead of wrapping.
+    pub fn set_gpu_device_pool_metrics(&self, device: &str, snapshot: &GpuDevicePoolMetrics) {
+        let mut tracked = self
+            .gpu_device_pool_owner_labels
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let current_owners: HashSet<_> = snapshot
+            .owners
+            .iter()
+            .map(|owner| owner.owner.clone())
+            .collect();
+
+        if let Some(previous_owners) = tracked.get(device) {
+            for stale_owner in previous_owners.difference(&current_owners) {
+                self.remove_gpu_device_pool_owner_metrics(device, stale_owner);
+            }
+        }
+
+        let device_labels = &[device];
+        self.gpu_device_pool_allocated_bytes
+            .with_label_values(device_labels)
+            .set(prometheus_i64(snapshot.allocated_bytes));
+        self.gpu_device_pool_live_allocations
+            .with_label_values(device_labels)
+            .set(prometheus_i64(snapshot.live_allocations));
+        self.gpu_device_pool_free_bytes
+            .with_label_values(device_labels)
+            .set(prometheus_i64(snapshot.free_bytes));
+        self.gpu_device_pool_free_ranges
+            .with_label_values(device_labels)
+            .set(prometheus_i64(snapshot.free_ranges));
+        self.gpu_device_pool_largest_free_range_bytes
+            .with_label_values(device_labels)
+            .set(prometheus_i64(snapshot.largest_free_range_bytes));
+        self.gpu_device_pool_fragmentation_ratio
+            .with_label_values(device_labels)
+            .set(normalize_fragmentation(snapshot.fragmentation_ratio));
+
+        for owner in &snapshot.owners {
+            let owner_labels = &[device, owner.owner.as_str()];
+            self.gpu_device_pool_owner_usage_bytes
+                .with_label_values(owner_labels)
+                .set(prometheus_i64(owner.usage_bytes));
+            self.gpu_device_pool_owner_quota_guaranteed_bytes
+                .with_label_values(owner_labels)
+                .set(prometheus_i64(owner.guaranteed_bytes));
+            self.gpu_device_pool_owner_quota_max_bytes
+                .with_label_values(owner_labels)
+                .set(prometheus_i64(owner.max_bytes));
+            self.gpu_device_pool_owner_admitted
+                .with_label_values(owner_labels)
+                .set(i64::from(owner.admitted));
+            self.gpu_device_pool_owner_allocatable_bytes
+                .with_label_values(owner_labels)
+                .set(prometheus_i64(owner.allocatable_bytes));
+        }
+
+        tracked.insert(device.to_owned(), current_owners);
+    }
+
+    /// Remove all pool-wide and per-owner Prometheus series for `device`.
+    pub fn remove_gpu_device_pool_metrics(&self, device: &str) {
+        let mut tracked = self
+            .gpu_device_pool_owner_labels
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(owners) = tracked.remove(device) {
+            for owner in owners {
+                self.remove_gpu_device_pool_owner_metrics(device, &owner);
+            }
+        }
+
+        let labels = &[device];
+        let _ = self
+            .gpu_device_pool_allocated_bytes
+            .remove_label_values(labels);
+        let _ = self
+            .gpu_device_pool_live_allocations
+            .remove_label_values(labels);
+        let _ = self.gpu_device_pool_free_bytes.remove_label_values(labels);
+        let _ = self.gpu_device_pool_free_ranges.remove_label_values(labels);
+        let _ = self
+            .gpu_device_pool_largest_free_range_bytes
+            .remove_label_values(labels);
+        let _ = self
+            .gpu_device_pool_fragmentation_ratio
+            .remove_label_values(labels);
+    }
+
+    fn remove_gpu_device_pool_owner_metrics(&self, device: &str, owner: &str) {
+        let labels = &[device, owner];
+        let _ = self
+            .gpu_device_pool_owner_usage_bytes
+            .remove_label_values(labels);
+        let _ = self
+            .gpu_device_pool_owner_quota_guaranteed_bytes
+            .remove_label_values(labels);
+        let _ = self
+            .gpu_device_pool_owner_quota_max_bytes
+            .remove_label_values(labels);
+        let _ = self
+            .gpu_device_pool_owner_admitted
+            .remove_label_values(labels);
+        let _ = self
+            .gpu_device_pool_owner_allocatable_bytes
+            .remove_label_values(labels);
+    }
+}
+
+fn prometheus_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn normalize_fragmentation(value: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        0.0
     }
 }
 

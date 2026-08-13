@@ -147,10 +147,7 @@ pub fn quantize_int4_grouped(
         // Quantize group: map [-absmax, absmax] → [0, 15], center at 8
         let indices: Vec<u8> = group
             .iter()
-            .map(|&w| {
-                let q = (w / scale + U4_MAX / 2.0).round().clamp(0.0, U4_MAX) as u8;
-                q
-            })
+            .map(|&w| (w / scale + U4_MAX / 2.0).round().clamp(0.0, U4_MAX) as u8)
             .collect();
 
         // Pack pairs of 4-bit values into bytes

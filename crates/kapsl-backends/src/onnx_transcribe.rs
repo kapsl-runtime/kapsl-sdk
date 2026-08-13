@@ -23,6 +23,7 @@
 //!     collapse_repeats: true # standard CTC repeat merge (default true)
 //! ```
 
+use crate::tensor_util::{bytes_to_f32, dim_usize, i32_packet};
 use async_trait::async_trait;
 use kapsl_engine_api::{
     BatchingPolicy, BinaryTensorPacket, Engine, EngineError, EngineMetrics, EngineModelInfo,
@@ -71,8 +72,19 @@ impl OnnxTranscribeBackend {
 
 #[async_trait]
 impl Engine for OnnxTranscribeBackend {
+    fn planned_external_device_memory(
+        &self,
+        model_path: &Path,
+    ) -> Result<kapsl_engine_api::ExternalDeviceMemoryReport, EngineError> {
+        self.inner.planned_external_device_memory(model_path)
+    }
+
     async fn load(&mut self, model_path: &Path) -> Result<(), EngineError> {
         self.inner.load(model_path).await
+    }
+
+    fn actual_external_device_memory(&self) -> kapsl_engine_api::ExternalDeviceMemoryReport {
+        self.inner.actual_external_device_memory()
     }
 
     fn infer(&self, request: &InferenceRequest) -> Result<BinaryTensorPacket, EngineError> {
@@ -208,28 +220,6 @@ fn argmax(row: &[f32]) -> usize {
         }
     }
     best
-}
-
-fn dim_usize(d: i64) -> usize {
-    d.max(0) as usize
-}
-
-fn bytes_to_f32(data: &[u8]) -> Vec<f32> {
-    data.chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        .collect()
-}
-
-fn i32_packet(shape: Vec<i64>, values: Vec<i32>) -> BinaryTensorPacket {
-    let mut data = Vec::with_capacity(values.len() * 4);
-    for v in &values {
-        data.extend_from_slice(&v.to_le_bytes());
-    }
-    BinaryTensorPacket {
-        shape,
-        dtype: TensorDtype::Int32,
-        data,
-    }
 }
 
 #[cfg(test)]

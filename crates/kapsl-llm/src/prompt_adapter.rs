@@ -29,6 +29,8 @@ pub enum ChatPromptTemplate {
         suffix: String,
     },
     Gemma,
+    Qwen,
+    DeepSeek,
     ChatMl,
     Llama2,
     Llama3 {
@@ -49,6 +51,11 @@ impl ChatPromptTemplate {
             Self::Gemma => {
                 format!("<start_of_turn>user\n{prompt}<end_of_turn>\n<start_of_turn>model\n")
             }
+            Self::Qwen => format!(
+                "<|im_start|>system\n{QWEN_DEFAULT_SYSTEM_PROMPT}<|im_end|>\n\
+                 <|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+            ),
+            Self::DeepSeek => format!("<｜User｜>{prompt}<｜Assistant｜><think>\n"),
             Self::ChatMl => {
                 format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n")
             }
@@ -96,7 +103,9 @@ impl ChatPromptTemplate {
 
         match self {
             Self::Gemma => render_gemma_chat(body, prefill),
-            Self::ChatMl => render_chatml_chat(body, prefill),
+            Self::Qwen => render_chatml_chat(body, prefill, Some(QWEN_DEFAULT_SYSTEM_PROMPT)),
+            Self::DeepSeek => render_deepseek_chat(body, prefill),
+            Self::ChatMl => render_chatml_chat(body, prefill, None),
             Self::Llama2 => render_llama2_chat(body, prefill),
             Self::Llama3 {
                 bos_token,
@@ -115,6 +124,9 @@ impl ChatPromptTemplate {
         }
     }
 }
+
+pub const QWEN_DEFAULT_SYSTEM_PROMPT: &str =
+    "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.";
 
 /// Gemma has no system role: its official template rejects one. Folding the
 /// system text into the first user turn is the conventional workaround.
@@ -153,8 +165,19 @@ fn render_gemma_chat(turns: &[ChatTurn], prefill: Option<&str>) -> String {
     out
 }
 
-fn render_chatml_chat(turns: &[ChatTurn], prefill: Option<&str>) -> String {
+fn render_chatml_chat(
+    turns: &[ChatTurn],
+    prefill: Option<&str>,
+    default_system_prompt: Option<&str>,
+) -> String {
     let mut out = String::new();
+    if let Some(system) =
+        default_system_prompt.filter(|_| turns.first().is_none_or(|turn| !turn.is_role("system")))
+    {
+        out.push_str("<|im_start|>system\n");
+        out.push_str(system);
+        out.push_str("<|im_end|>\n");
+    }
     for turn in turns {
         let role = if turn.is_role("system") {
             "system"
@@ -172,6 +195,30 @@ fn render_chatml_chat(turns: &[ChatTurn], prefill: Option<&str>) -> String {
     out.push_str("<|im_start|>assistant\n");
     if let Some(prefill) = prefill {
         out.push_str(prefill);
+    }
+    out
+}
+
+fn render_deepseek_chat(turns: &[ChatTurn], prefill: Option<&str>) -> String {
+    let (system, turns) = split_leading_system(turns);
+    let mut out = system.unwrap_or_default().to_string();
+
+    for turn in turns {
+        if turn.is_role("assistant") {
+            out.push_str("<｜Assistant｜>");
+            out.push_str(turn.content.trim());
+            out.push_str("<｜end▁of▁sentence｜>");
+        } else {
+            out.push_str("<｜User｜>");
+            out.push_str(turn.content.trim());
+        }
+    }
+
+    out.push_str("<｜Assistant｜>");
+    if let Some(prefill) = prefill {
+        out.push_str(prefill);
+    } else {
+        out.push_str("<think>\n");
     }
     out
 }
@@ -277,6 +324,8 @@ pub fn prompt_is_explicitly_formatted(prompt: &str) -> bool {
         "<|start_header_id|>",
         "<|end_header_id|>",
         "<|eot_id|>",
+        "<｜User｜>",
+        "<｜Assistant｜>",
         "[INST]",
         "[/INST]",
         "### Instruction:",
@@ -291,9 +340,11 @@ pub fn chat_template_from_explicit_name(name: &str) -> Option<ChatPromptTemplate
     match lower.as_str() {
         "" | "none" | "raw" | "completion" | "false" => None,
         "gemma" | "gemma2" | "gemma-2" | "gemma3" | "gemma-3" => Some(ChatPromptTemplate::Gemma),
-        "chatml" | "qwen" | "qwen2" | "qwen2.5" | "qwen3" | "deepseek" | "gpt" | "openai" => {
-            Some(ChatPromptTemplate::ChatMl)
+        "qwen" | "qwen2" | "qwen2.5" | "qwen3" => Some(ChatPromptTemplate::Qwen),
+        "deepseek" | "deepseek-r1" | "deepseek-v2" | "deepseek-v3" => {
+            Some(ChatPromptTemplate::DeepSeek)
         }
+        "chatml" | "gpt" | "openai" => Some(ChatPromptTemplate::ChatMl),
         "llama2" | "llama-2" => Some(ChatPromptTemplate::Llama2),
         "llama3" | "llama-3" | "llama3.1" | "llama-3.1" | "llama3.2" | "llama-3.2" | "llama3.3"
         | "llama-3.3" => Some(ChatPromptTemplate::Llama3 {
@@ -302,6 +353,46 @@ pub fn chat_template_from_explicit_name(name: &str) -> Option<ChatPromptTemplate
         }),
         _ => None,
     }
+}
+
+/// Recognize the structural family of a Hugging Face tokenizer chat template.
+///
+/// We deliberately do not execute arbitrary Jinja here. The tokenizer templates
+/// used by common model families can contain custom functions and filters that
+/// are not portable outside Transformers. Detecting their role markers keeps
+/// ONNX prompting model-specific without pretending that generic ChatML and
+/// Qwen's default-system variant are identical.
+pub fn chat_template_from_template_source(template: &str) -> Option<ChatPromptTemplate> {
+    if template.contains("<start_of_turn>") && template.contains("<end_of_turn>") {
+        return Some(ChatPromptTemplate::Gemma);
+    }
+    if template.contains("<|im_start|>") && template.contains("<|im_end|>") {
+        return Some(if template.contains(QWEN_DEFAULT_SYSTEM_PROMPT) {
+            ChatPromptTemplate::Qwen
+        } else {
+            ChatPromptTemplate::ChatMl
+        });
+    }
+    if template.contains("<｜User｜>") && template.contains("<｜Assistant｜>") {
+        return Some(ChatPromptTemplate::DeepSeek);
+    }
+    if template.contains("<|start_header_id|>")
+        && template.contains("<|end_header_id|>")
+        && template.contains("<|eot_id|>")
+    {
+        return Some(ChatPromptTemplate::Llama3 {
+            bos_token: String::new(),
+            think_suffix: if template.contains("<think>") {
+                "<think>\n".to_string()
+            } else {
+                String::new()
+            },
+        });
+    }
+    if template.contains("[INST]") && template.contains("[/INST]") {
+        return Some(ChatPromptTemplate::Llama2);
+    }
+    None
 }
 
 pub fn chat_template_from_model_identifiers<'a, I>(identifiers: I) -> Option<ChatPromptTemplate>
@@ -313,8 +404,11 @@ where
         if lower.contains("gemma") {
             return Some(ChatPromptTemplate::Gemma);
         }
-        if lower.contains("qwen") || lower.contains("deepseek") {
-            return Some(ChatPromptTemplate::ChatMl);
+        if lower.contains("deepseek") {
+            return Some(ChatPromptTemplate::DeepSeek);
+        }
+        if lower.contains("qwen") {
+            return Some(ChatPromptTemplate::Qwen);
         }
         if lower.contains("llama-3") || lower.contains("llama3") {
             return Some(ChatPromptTemplate::Llama3 {
@@ -333,7 +427,8 @@ where
 mod tests {
     use super::{
         chat_template_from_explicit_name, chat_template_from_model_identifiers,
-        prompt_is_explicitly_formatted, ChatPromptTemplate, ChatTurn,
+        chat_template_from_template_source, prompt_is_explicitly_formatted, ChatPromptTemplate,
+        ChatTurn, QWEN_DEFAULT_SYSTEM_PROMPT,
     };
 
     fn turns(pairs: &[(&str, &str)]) -> Vec<ChatTurn> {
@@ -347,6 +442,8 @@ mod tests {
     fn single_user_turn_matches_single_turn_render() {
         for template in [
             ChatPromptTemplate::Gemma,
+            ChatPromptTemplate::Qwen,
+            ChatPromptTemplate::DeepSeek,
             ChatPromptTemplate::ChatMl,
             ChatPromptTemplate::Llama2,
             ChatPromptTemplate::Llama3 {
@@ -360,6 +457,43 @@ mod tests {
                 "{template:?} multi-turn render diverged on a single user turn"
             );
         }
+    }
+
+    #[test]
+    fn qwen_adds_its_default_system_prompt_only_when_missing() {
+        let rendered = ChatPromptTemplate::Qwen.render_chat(&turns(&[("user", "who are you?")]));
+        assert_eq!(
+            rendered,
+            format!(
+                "<|im_start|>system\n{QWEN_DEFAULT_SYSTEM_PROMPT}<|im_end|>\n\
+                 <|im_start|>user\nwho are you?<|im_end|>\n\
+                 <|im_start|>assistant\n"
+            )
+        );
+
+        let rendered = ChatPromptTemplate::Qwen.render_chat(&turns(&[
+            ("system", "Use a custom identity."),
+            ("user", "who are you?"),
+        ]));
+        assert!(rendered.starts_with(
+            "<|im_start|>system\nUse a custom identity.<|im_end|>\n<|im_start|>user\n"
+        ));
+        assert!(!rendered.contains(QWEN_DEFAULT_SYSTEM_PROMPT));
+    }
+
+    #[test]
+    fn deepseek_uses_its_native_role_tokens_and_reasoning_prefill() {
+        let rendered = ChatPromptTemplate::DeepSeek.render_chat(&turns(&[
+            ("system", "Be concise."),
+            ("user", "hello"),
+            ("assistant", "Hi."),
+            ("user", "again"),
+        ]));
+        assert_eq!(
+            rendered,
+            "Be concise.<｜User｜>hello<｜Assistant｜>Hi.<｜end▁of▁sentence｜>\
+             <｜User｜>again<｜Assistant｜><think>\n"
+        );
     }
 
     #[test]
@@ -457,10 +591,8 @@ mod tests {
 
     #[test]
     fn unknown_roles_fall_back_to_user() {
-        let rendered = ChatPromptTemplate::ChatMl.render_chat(&turns(&[
-            ("tool", "some tool output"),
-            ("user", "hi"),
-        ]));
+        let rendered = ChatPromptTemplate::ChatMl
+            .render_chat(&turns(&[("tool", "some tool output"), ("user", "hi")]));
         assert!(
             rendered.starts_with("<|im_start|>user\nsome tool output<|im_end|>"),
             "unknown role should render as a user turn: {rendered}"
@@ -481,6 +613,9 @@ mod tests {
         ));
         assert!(prompt_is_explicitly_formatted(
             "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n"
+        ));
+        assert!(prompt_is_explicitly_formatted(
+            "<｜User｜>Hello<｜Assistant｜><think>\n"
         ));
         assert!(prompt_is_explicitly_formatted("<s>[INST] Hello [/INST]"));
     }
@@ -504,6 +639,14 @@ mod tests {
             Some(ChatPromptTemplate::ChatMl)
         );
         assert_eq!(
+            chat_template_from_explicit_name("qwen2.5"),
+            Some(ChatPromptTemplate::Qwen)
+        );
+        assert_eq!(
+            chat_template_from_explicit_name("deepseek-r1"),
+            Some(ChatPromptTemplate::DeepSeek)
+        );
+        assert_eq!(
             chat_template_from_explicit_name("llama2"),
             Some(ChatPromptTemplate::Llama2)
         );
@@ -511,6 +654,44 @@ mod tests {
             chat_template_from_explicit_name("llama3"),
             Some(ChatPromptTemplate::Llama3 { .. })
         ));
+    }
+
+    #[test]
+    fn embedded_template_detection_preserves_model_family_differences() {
+        let qwen = format!(
+            "{{% for message in messages %}}<|im_start|>{{{{ message.role }}}}\n\
+             {QWEN_DEFAULT_SYSTEM_PROMPT}<|im_end|>{{% endfor %}}"
+        );
+        assert_eq!(
+            chat_template_from_template_source(&qwen),
+            Some(ChatPromptTemplate::Qwen)
+        );
+        assert_eq!(
+            chat_template_from_template_source(
+                "{% for message in messages %}<|im_start|>{{ message.role }}<|im_end|>{% endfor %}"
+            ),
+            Some(ChatPromptTemplate::ChatMl)
+        );
+        assert_eq!(
+            chat_template_from_template_source("<start_of_turn>{{ role }}<end_of_turn>"),
+            Some(ChatPromptTemplate::Gemma)
+        );
+        assert!(matches!(
+            chat_template_from_template_source(
+                "<|start_header_id|>{{ role }}<|end_header_id|>{{ text }}<|eot_id|>"
+            ),
+            Some(ChatPromptTemplate::Llama3 { .. })
+        ));
+        assert_eq!(
+            chat_template_from_template_source("[INST] {{ prompt }} [/INST]"),
+            Some(ChatPromptTemplate::Llama2)
+        );
+        assert_eq!(
+            chat_template_from_template_source(
+                "{{ bos_token }}<｜User｜>{{ prompt }}<｜Assistant｜><think>"
+            ),
+            Some(ChatPromptTemplate::DeepSeek)
+        );
     }
 
     #[test]
@@ -523,6 +704,17 @@ mod tests {
         assert_eq!(
             chat_template_from_model_identifiers(["GemmaForCausalLM"]),
             Some(ChatPromptTemplate::Gemma)
+        );
+        assert_eq!(
+            chat_template_from_model_identifiers(["Qwen2ForCausalLM"]),
+            Some(ChatPromptTemplate::Qwen)
+        );
+        assert_eq!(
+            chat_template_from_model_identifiers([
+                "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+                "Qwen2ForCausalLM",
+            ]),
+            Some(ChatPromptTemplate::DeepSeek)
         );
     }
 }

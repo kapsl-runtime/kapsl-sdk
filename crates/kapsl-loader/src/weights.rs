@@ -22,6 +22,11 @@ pub enum WeightError {
 }
 
 /// Element type of a tensor.
+///
+/// Quantized variants keep GGML's own spelling (`Q8_0`, `Q4_K`) so the names
+/// match the GGUF type table and the kernels that consume them, rather than
+/// Rust's camel case.
+#[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DType {
     F32,
@@ -42,7 +47,10 @@ impl DType {
             DType::F32 => 4,
             DType::F16 | DType::BF16 => 2,
             DType::I8 | DType::U8 => 1,
-            DType::Q8_0 | DType::Q4_K => panic!("byte_size() not valid for quantized dtype {:?} — use raw_bytes_for_numel()", self),
+            DType::Q8_0 | DType::Q4_K => panic!(
+                "byte_size() not valid for quantized dtype {:?} — use raw_bytes_for_numel()",
+                self
+            ),
         }
     }
 
@@ -55,10 +63,9 @@ impl DType {
         }
     }
 
-    pub fn is_quantized(self) -> bool {
-        matches!(self, DType::Q8_0 | DType::Q4_K)
-    }
-
+    /// Parse a safetensors dtype spelling. This intentionally returns `Option`
+    /// because callers attach the tensor name to unsupported-dtype errors.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "F32" => Some(DType::F32),
@@ -91,11 +98,6 @@ impl TensorData {
 
     pub fn numel(&self) -> usize {
         self.shape.iter().product()
-    }
-
-    /// Raw byte count accounting for quantized block layouts.
-    pub fn raw_byte_len(&self) -> usize {
-        self.dtype.raw_bytes_for_numel(self.numel())
     }
 
     /// View as f16 slice (panics if dtype is not F16).

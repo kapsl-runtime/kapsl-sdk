@@ -166,18 +166,6 @@ pub fn new_shared_allocator(
     )))
 }
 
-/// Return the current free-block count of a shared allocator without holding
-/// the lock beyond this call.
-pub fn shared_allocator_free_blocks(allocator: &SharedBlockAllocator) -> usize {
-    allocator.lock().get_num_free_blocks()
-}
-
-/// Return total-block count of a shared allocator without holding the lock
-/// beyond this call.
-pub fn shared_allocator_total_blocks(allocator: &SharedBlockAllocator) -> usize {
-    allocator.lock().get_num_total_blocks()
-}
-
 /// Internal dispatch: each `BlockManager` holds either a private allocator or
 /// a reference to a pool shared with other managers.
 enum BlockManagerAllocator {
@@ -383,21 +371,6 @@ impl BlockManager {
                 self.allocator.free(*block);
             }
             self.held_blocks = self.held_blocks.saturating_sub(count);
-        }
-    }
-
-    /// Free blocks for `sequence_id` and return the number of blocks returned
-    /// to the pool. Returns 0 if the sequence had no tracked blocks.
-    pub fn free_returning_count(&mut self, sequence_id: u64) -> usize {
-        if let Some(table) = self.block_tables.remove(&sequence_id) {
-            let count = table.len();
-            for block in table.get_physical_blocks() {
-                self.allocator.free(*block);
-            }
-            self.held_blocks = self.held_blocks.saturating_sub(count);
-            count
-        } else {
-            0
         }
     }
 

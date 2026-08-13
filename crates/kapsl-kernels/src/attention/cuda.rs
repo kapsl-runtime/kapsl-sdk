@@ -9,26 +9,11 @@
 
 #[cfg(feature = "cuda")]
 mod inner {
-    use cudarc::driver::{CudaDevice, CudaFunction, CudaSlice, CudaView, LaunchAsync, LaunchConfig};
-    use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
+    use crate::nvrtc_util::cuda_compile_opts;
+    use cudarc::driver::{CudaDevice, CudaSlice, CudaView, CudaViewMut, LaunchAsync, LaunchConfig};
+    use cudarc::nvrtc::compile_ptx_with_opts;
     use half::f16;
-    use std::sync::{Arc, OnceLock};
-
-    fn cuda_compile_opts() -> CompileOptions {
-        let cuda_include = std::env::var("CUDA_PATH")
-            .or_else(|_| std::env::var("CUDA_HOME"))
-            .map(|p| format!("{p}/include"))
-            .unwrap_or_else(|_| "/usr/local/cuda/include".to_string());
-        CompileOptions {
-            include_paths: vec![cuda_include],
-            ..Default::default()
-        }
-    }
-
-    /// Compiled PTX module, lazily initialised.
-    struct KernelModule {
-        device: Arc<CudaDevice>,
-    }
+    use std::sync::Arc;
 
     static MODULE_NAME: &str = "kapsl_paged_attn";
     static KERNEL_NAME: &str = "paged_attention_v1";
@@ -194,7 +179,7 @@ __global__ void paged_attention_v1(
         /// Query:   [batch, num_q_heads, head_dim], device f16.
         pub q: &'a CudaSlice<f16>,
         /// KV pool: [num_blocks, 2, num_kv_heads, block_size, head_dim], device f16.
-        pub kv_cache: &'a CudaSlice<f16>,
+        pub kv_cache: CudaView<'a, f16>,
         /// Block tables: [batch, max_blocks_per_seq], device i32.
         pub block_tables: &'a CudaSlice<i32>,
         /// Context lengths: [batch], device i32.
@@ -227,7 +212,7 @@ __global__ void paged_attention_v1(
         // We conservatively allocate for the maximum context length across the batch.
         // The host should pass a reasonable upper bound via max_blocks_per_seq * block_size.
         let max_ctx = params.max_blocks_per_seq * params.block_size;
-        let shared_bytes = ((params.head_dim + max_ctx + 1024) * 4) as u32;
+        let shared_bytes = (params.head_dim + max_ctx + 1024) * 4;
 
         let cfg = LaunchConfig {
             grid_dim: (params.batch_size, params.num_q_heads, 1),
@@ -242,7 +227,7 @@ __global__ void paged_attention_v1(
                     (
                         &mut *params.out,
                         params.q,
-                        params.kv_cache,
+                        &params.kv_cache,
                         params.block_tables,
                         params.context_lens,
                         params.scale,
@@ -395,7 +380,7 @@ __global__ void fused_swiglu(
             .ok_or("swiglu not found")?;
 
         let threads = 256u32;
-        let blocks = (n + threads - 1) / threads;
+        let blocks = n.div_ceil(threads);
         let cfg = LaunchConfig {
             grid_dim: (blocks, 1, 1),
             block_dim: (threads, 1, 1),
@@ -562,7 +547,7 @@ __global__ void write_kv_to_pool(
     static KV_WRITE_KERNEL: &str = "write_kv_to_pool";
 
     pub struct KvWriteParams<'a> {
-        pub kv_cache: &'a mut CudaSlice<f16>,
+        pub kv_cache: CudaViewMut<'a, f16>,
         pub k_vec: &'a CudaSlice<f16>,
         pub v_vec: &'a CudaSlice<f16>,
         pub physical_block: u32,
@@ -597,7 +582,7 @@ __global__ void write_kv_to_pool(
                 .launch(
                     cfg,
                     (
-                        &mut *params.kv_cache,
+                        &mut params.kv_cache,
                         params.k_vec,
                         params.v_vec,
                         params.physical_block as i32,
@@ -656,7 +641,7 @@ __global__ void residual_add(
             .ok_or("residual_add not found")?;
 
         let threads = 256u32;
-        let blocks = (n + threads - 1) / threads;
+        let blocks = n.div_ceil(threads);
         let cfg = LaunchConfig {
             grid_dim: (blocks, 1, 1),
             block_dim: (threads, 1, 1),
@@ -897,8 +882,7 @@ __global__ void prefill_attention(
             .ok_or("prefill_attention not found")?;
 
         let threads = 256u32;
-        let shared =
-            ((p.head_dim + p.seq_len + 1024) * 4) as u32;
+        let shared = (p.head_dim + p.seq_len + 1024) * 4;
         let cfg = LaunchConfig {
             grid_dim: (p.seq_len, p.num_q_heads, 1),
             block_dim: (threads, 1, 1),
@@ -971,7 +955,7 @@ __global__ void batch_kv_write(
     static BATCH_KV_WRITE_KERNEL: &str = "batch_kv_write";
 
     pub struct BatchKvWriteParams<'a> {
-        pub kv_cache: &'a mut CudaSlice<f16>,
+        pub kv_cache: CudaViewMut<'a, f16>,
         pub k: &'a CudaSlice<f16>,
         pub v: &'a CudaSlice<f16>,
         pub physical_blocks: &'a CudaSlice<i32>,
@@ -1010,7 +994,7 @@ __global__ void batch_kv_write(
                 .launch(
                     cfg,
                     (
-                        &mut *p.kv_cache,
+                        &mut p.kv_cache,
                         p.k,
                         p.v,
                         p.physical_blocks,
@@ -1030,21 +1014,11 @@ __global__ void batch_kv_write(
 
 #[cfg(feature = "cuda")]
 mod argmax_inner {
+    use crate::nvrtc_util::cuda_compile_opts;
     use cudarc::driver::{CudaDevice, CudaSlice, LaunchAsync, LaunchConfig};
-    use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
+    use cudarc::nvrtc::compile_ptx_with_opts;
     use half::f16;
     use std::sync::Arc;
-
-    fn cuda_compile_opts() -> CompileOptions {
-        let cuda_include = std::env::var("CUDA_PATH")
-            .or_else(|_| std::env::var("CUDA_HOME"))
-            .map(|p| format!("{p}/include"))
-            .unwrap_or_else(|_| "/usr/local/cuda/include".to_string());
-        CompileOptions {
-            include_paths: vec![cuda_include],
-            ..Default::default()
-        }
-    }
 
     /// Parallel argmax over a single row of f16 logits stored in GPU memory.
     ///
