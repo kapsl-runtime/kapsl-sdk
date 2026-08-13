@@ -5,11 +5,6 @@
 //! llama.cpp. This makes it easier to keep up with the changes in llama.cpp, but does mean that
 //! the API is not as nice as it could be.
 //!
-//! # Examples
-//!
-//! - [simple](https://github.com/utilityai/llama-cpp-rs/tree/main/examples/simple)
-//! - [tools](https://github.com/utilityai/llama-cpp-rs/tree/main/examples/tools)
-//!
 //! # Feature Flags
 //!
 //! - `cuda` enables CUDA gpu support.

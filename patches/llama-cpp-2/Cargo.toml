@@ -11,18 +11,19 @@
 
 [package]
 edition = "2021"
-name = "llama-cpp-2"
-version = "0.1.146"
+name = "kapsl-llama-cpp-2"
+version = "0.1.146-kapsl.1"
 build = "build.rs"
 autolib = false
 autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
-description = "llama.cpp bindings for Rust"
+description = "Kapsl-maintained Rust bindings to its llama.cpp shared-KV fork"
 readme = "README.md"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/utilityai/llama-cpp-rs"
+repository = "https://github.com/kapsl-runtime/kapsl-sdk"
+exclude = [".cargo-ok", ".cargo_vcs_info.json", "Cargo.toml.orig"]
 
 [package.metadata.docs.rs]
 features = ["sampler"]
@@ -65,7 +66,8 @@ version = "0.8.35"
 version = "0.7.12"
 
 [dependencies.llama-cpp-sys-2]
-version = "0.1.146"
+package = "kapsl-llama-cpp-sys-2"
+version = "=0.1.146-kapsl.1"
 
 [dependencies.llguidance]
 version = "1.7.2"
@@ -98,7 +100,8 @@ version = "0.3"
 features = ["json"]
 
 [target.'cfg(all(target_os = "macos", any(target_arch = "aarch64", target_arch = "arm64")))'.dependencies.llama-cpp-sys-2]
-version = "0.1.146"
+package = "kapsl-llama-cpp-sys-2"
+version = "=0.1.146-kapsl.1"
 features = ["metal"]
 
 [lints.clippy.pedantic]
