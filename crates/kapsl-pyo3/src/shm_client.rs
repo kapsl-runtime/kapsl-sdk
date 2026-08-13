@@ -131,8 +131,8 @@ impl KapslShmClient {
                     };
 
                     // Release GIL while waiting
-                    let ret = Python::with_gil(|py| {
-                        py.allow_threads(|| {
+                    let ret = Python::attach(|py| {
+                        py.detach(|| {
                             libc::select(
                                 read_fd + 1,
                                 &mut read_fds,
@@ -222,7 +222,7 @@ impl KapslShmClient {
             }
 
             // Yield to Python interpreter to allow signal handling
-            Python::with_gil(|py| py.check_signals())?;
+            Python::attach(|py| py.check_signals())?;
 
             // Small sleep if we missed the notification or it was spurious
             std::thread::sleep(std::time::Duration::from_micros(1));
