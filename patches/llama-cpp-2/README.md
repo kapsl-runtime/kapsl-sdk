@@ -1,15 +1,15 @@
-# llama-cpp-rs-2
+# kapsl-llama-cpp-2
 
-[utilityai]: https://utilityai.ca
+Kapsl-maintained Rust bindings for the pinned `llama.cpp-kapsl` ABI. The
+package includes Kapsl's shared-KV and device-memory reporting extensions and
+is published under a distinct name so downstream applications can resolve the
+complete runtime dependency graph from crates.io.
 
-A wrapper around the [llama-cpp](https://github.com/ggerganov/llama.cpp/) library for rust.
+The Rust library name remains `llama_cpp_2` for source compatibility. This
+crate is derived from `llama-cpp-2` and retains its MIT OR Apache-2.0 license;
+the repository history records the upstream source and Kapsl modifications.
 
-# Info
-
-This is part of the project powering all the LLMs at [utilityai], it is tightly coupled llama.cpp and mimics its API as
-closly as possible while being safe in order to stay up to date.
-
-# Tool Calling
+## Tool calling
 
 `llama-cpp-2` exposes the raw llama.cpp OpenAI-compatible tool-calling flow, so Rust callers can pass tool definitions into chat templates and get the generated grammar back.
 
@@ -71,24 +71,17 @@ let result = model.apply_chat_template_oaicompat(&template, &params)?;
 
 For standalone grammar generation from a JSON schema string, use `llama_cpp_2::json_schema_to_grammar`.
 
-# Dependencies
+## Build dependencies
 
 This uses bindgen to build the bindings to llama.cpp. This means that you need to have clang installed on your system.
 
-If this is a problem for you, open an issue, and we can look into including the bindings. 
-
 See [bindgen](https://rust-lang.github.io/rust-bindgen/requirements.html) for more information.
 
-# Disclaimer
+## Safety
 
-This crate is *not safe*. There is absolutly ways to misuse the llama.cpp API provided to create UB, please create an issue if you spot one. Do not use this code for tasks where UB is not acceptable.
+This crate exposes thin wrappers over a native C/C++ API. Some operations are
+unsafe, and misuse can cause undefined behavior. Report Kapsl-specific issues
+in the Kapsl SDK repository.
 
-This is not a simple library to use. In an ideal world a nice abstraction would be written on top of this crate to
-provide an ergonomic API - the benefits of this crate over raw bindings is safety (and not much of it as that) and not much else.
-
-We compensate for this shortcoming (we hope) by providing lots of examples and good documentation. Testing is a work in
-progress.
-
-# Contributing
-
-Contributions are welcome. Please open an issue before starting work on a non-trivial PR.
+The higher-level Kapsl backend is the recommended integration surface for
+applications.

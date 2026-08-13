@@ -67,11 +67,13 @@ ort = { version = "=2.0.0-rc.11", features = ["download-binaries", "directml", "
 ort = { version = "=2.0.0-rc.11", features = ["download-binaries", "cuda", "tensorrt", "coreml", "openvino", "half", "ndarray"] }
 
 [target.'cfg(target_os = "macos")'.dependencies.llama-cpp-2]
-version = "0.1"
+package = "kapsl-llama-cpp-2"
+version = "=0.1.146-kapsl.1"
 optional = true
 features = ["metal"]
 
 [target.'cfg(not(target_os = "macos"))'.dependencies.llama-cpp-2]
-version = "0.1"
+package = "kapsl-llama-cpp-2"
+version = "=0.1.146-kapsl.1"
 optional = true
 features = ["cuda"]
