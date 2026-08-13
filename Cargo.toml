@@ -17,6 +17,11 @@ members = [
     "crates/kapsl-shm",
     "crates/kapsl-transport",
 ]
+exclude = [
+    "patches/esaxx-rs",
+    "patches/llama-cpp-2",
+    "patches/llama-cpp-sys-2",
+]
 default-members = [
     "crates/kapsl-backends",
     "crates/kapsl-core",
@@ -41,11 +46,11 @@ resolver = "2"
 # Patch esaxx-rs to use dynamic CRT (/MD) on Windows MSVC, matching llama-cpp-sys-2.
 # Without this, the linker fails with LNK2038 (RuntimeLibrary mismatch).
 esaxx-rs = { path = "patches/esaxx-rs" }
-llama-cpp-sys-2 = { path = "patches/llama-cpp-sys-2" }
-llama-cpp-2 = { path = "patches/llama-cpp-2" }
+kapsl-llama-cpp-sys-2 = { path = "patches/llama-cpp-sys-2" }
+kapsl-llama-cpp-2 = { path = "patches/llama-cpp-2" }
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/kapsl-runtime/kapsl-sdk"

@@ -211,10 +211,15 @@ fn main() {
 
     let target_dir = get_cargo_target_dir().unwrap();
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("Failed to get CARGO_MANIFEST_DIR");
-    let default_kapsl_llama_src = Path::new(&manifest_dir)
-        .join("../..")
-        .join("third_party")
-        .join("llama.cpp-kapsl");
+    let packaged_llama_src = Path::new(&manifest_dir).join("llama.cpp");
+    let default_kapsl_llama_src = if packaged_llama_src.is_dir() {
+        packaged_llama_src
+    } else {
+        Path::new(&manifest_dir)
+            .join("../..")
+            .join("third_party")
+            .join("llama.cpp-kapsl")
+    };
     let llama_src = env::var("KAPSL_LLAMA_CPP_DIR")
         .map(PathBuf::from)
         .unwrap_or(default_kapsl_llama_src);
