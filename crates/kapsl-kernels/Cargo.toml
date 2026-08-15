@@ -7,7 +7,7 @@ repository.workspace = true
 description = "Compute kernels for matrix operations and attention in Kapsl"
 
 [dependencies]
-kapsl-hal = { version = "0.1.2", path = "../kapsl-hal" }
+kapsl-hal = { version = "0.1.3", path = "../kapsl-hal" }
 thiserror = "1.0"
 log = "0.4"
 rayon = "1.11.0"
