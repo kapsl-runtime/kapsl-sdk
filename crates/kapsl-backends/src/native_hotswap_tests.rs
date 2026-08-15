@@ -12,23 +12,22 @@
 
 #[cfg(all(feature = "native", test))]
 mod native_hotswap {
-    use std::path::Path;
     use kapsl_engine_api::{
         BatchingMode, BinaryTensorPacket, Engine, InferenceRequest, TensorDtype,
     };
+    use std::path::Path;
 
-    fn model_a() -> Option<String> { std::env::var("KAPSL_TEST_MODEL_A").ok() }
-    fn model_b() -> Option<String> { std::env::var("KAPSL_TEST_MODEL_B").ok() }
+    fn model_a() -> Option<String> {
+        std::env::var("KAPSL_TEST_MODEL_A").ok()
+    }
+    fn model_b() -> Option<String> {
+        std::env::var("KAPSL_TEST_MODEL_B").ok()
+    }
 
     fn make_request(token_ids: &[i32]) -> InferenceRequest {
-        let data: Vec<u8> = token_ids.iter()
-            .flat_map(|&t| t.to_le_bytes())
-            .collect();
-        let input = BinaryTensorPacket::new(
-            vec![token_ids.len() as i64],
-            TensorDtype::Int32,
-            data,
-        ).expect("valid packet");
+        let data: Vec<u8> = token_ids.iter().flat_map(|&t| t.to_le_bytes()).collect();
+        let input = BinaryTensorPacket::new(vec![token_ids.len() as i64], TensorDtype::Int32, data)
+            .expect("valid packet");
         InferenceRequest {
             input,
             additional_inputs: Vec::new(),
@@ -58,7 +57,10 @@ mod native_hotswap {
     async fn test_stage_sets_is_staged() {
         let (a, b) = match (model_a(), model_b()) {
             (Some(a), Some(b)) => (a, b),
-            _ => { eprintln!("skip: KAPSL_TEST_MODEL_A/B not set"); return; }
+            _ => {
+                eprintln!("skip: KAPSL_TEST_MODEL_A/B not set");
+                return;
+            }
         };
         let mut backend = new_backend();
         backend.load(Path::new(&a)).await.expect("load A");
@@ -77,7 +79,10 @@ mod native_hotswap {
     async fn test_inference_works_before_and_after_swap() {
         let (a, b) = match (model_a(), model_b()) {
             (Some(a), Some(b)) => (a, b),
-            _ => { eprintln!("skip: KAPSL_TEST_MODEL_A/B not set"); return; }
+            _ => {
+                eprintln!("skip: KAPSL_TEST_MODEL_A/B not set");
+                return;
+            }
         };
         let mut backend = new_backend();
         backend.load(Path::new(&a)).await.expect("load A");
@@ -91,7 +96,11 @@ mod native_hotswap {
 
         // Inference must still work while staged (model A still active).
         let result_staged = backend.infer(&req);
-        assert!(result_staged.is_ok(), "infer while staged: {:?}", result_staged.err());
+        assert!(
+            result_staged.is_ok(),
+            "infer while staged: {:?}",
+            result_staged.err()
+        );
 
         backend.swap().await.expect("swap to B");
 
@@ -104,7 +113,10 @@ mod native_hotswap {
     async fn test_sessions_cleared_after_swap() {
         let (a, b) = match (model_a(), model_b()) {
             (Some(a), Some(b)) => (a, b),
-            _ => { eprintln!("skip: KAPSL_TEST_MODEL_A/B not set"); return; }
+            _ => {
+                eprintln!("skip: KAPSL_TEST_MODEL_A/B not set");
+                return;
+            }
         };
         let mut backend = new_backend();
         backend.load(Path::new(&a)).await.expect("load A");
@@ -126,7 +138,11 @@ mod native_hotswap {
         // We verify indirectly: infer with the same session_id should succeed
         // (fresh prefill, not a decode on stale cache).
         let result = backend.infer(&req);
-        assert!(result.is_ok(), "fresh session after swap: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "fresh session after swap: {:?}",
+            result.err()
+        );
     }
 
     #[ignore]
@@ -134,14 +150,20 @@ mod native_hotswap {
     async fn test_swap_without_stage_returns_error() {
         let a = match model_a() {
             Some(a) => a,
-            None => { eprintln!("skip: KAPSL_TEST_MODEL_A not set"); return; }
+            None => {
+                eprintln!("skip: KAPSL_TEST_MODEL_A not set");
+                return;
+            }
         };
         let mut backend = new_backend();
         backend.load(Path::new(&a)).await.expect("load A");
 
         // swap() with nothing staged should return an error, not panic.
         let result = backend.swap().await;
-        assert!(result.is_err(), "expected error when swapping without staging");
+        assert!(
+            result.is_err(),
+            "expected error when swapping without staging"
+        );
     }
 
     // ── GPU argmax correctness ─────────────────────────────────────────────
@@ -156,7 +178,10 @@ mod native_hotswap {
 
         let a = match model_a() {
             Some(a) => a,
-            None => { eprintln!("skip: KAPSL_TEST_MODEL_A not set"); return; }
+            None => {
+                eprintln!("skip: KAPSL_TEST_MODEL_A not set");
+                return;
+            }
         };
         let mut backend = new_backend();
         backend.load(Path::new(&a)).await.expect("load A");
@@ -172,7 +197,7 @@ mod native_hotswap {
         }
 
         let greedy_result = backend.infer(&req_with_temp(0.0)).expect("greedy");
-        let near_greedy   = backend.infer(&req_with_temp(1e-7)).expect("near-greedy");
+        let near_greedy = backend.infer(&req_with_temp(1e-7)).expect("near-greedy");
 
         assert_eq!(
             greedy_result.data, near_greedy.data,

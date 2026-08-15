@@ -13,9 +13,15 @@ fn masked_mean_pool_averages_active_tokens() {
     // batch=1, seq=2, dim=2: rows [1,2] and [3,4].
     let hidden = vec![1.0, 2.0, 3.0, 4.0];
     // Both tokens active -> mean = [2, 3].
-    approx(&masked_mean_pool(&hidden, 1, 2, 2, &[1.0, 1.0]), &[2.0, 3.0]);
+    approx(
+        &masked_mean_pool(&hidden, 1, 2, 2, &[1.0, 1.0]),
+        &[2.0, 3.0],
+    );
     // Second token masked out -> just the first row [1, 2].
-    approx(&masked_mean_pool(&hidden, 1, 2, 2, &[1.0, 0.0]), &[1.0, 2.0]);
+    approx(
+        &masked_mean_pool(&hidden, 1, 2, 2, &[1.0, 0.0]),
+        &[1.0, 2.0],
+    );
 }
 
 #[test]

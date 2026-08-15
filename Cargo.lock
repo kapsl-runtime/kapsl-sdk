@@ -2013,6 +2013,7 @@ dependencies = [
  "kapsl-kernels",
  "kapsl-llama-cpp-2",
  "kapsl-llama-cpp-sys-2",
+ "kapsl-loader",
  "kapsl-quantization",
  "log",
  "ndarray",

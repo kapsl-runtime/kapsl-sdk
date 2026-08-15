@@ -47,7 +47,10 @@ impl Default for KvCacheConfig {
             block_size: 16,
             total_blocks: 2048,
             eviction_policy: KvEvictionPolicy::LruInactive,
-            dense_free_list_cap: 32,
+            // Retained sequences need a model-lifetime authority lease. Keep
+            // the default cache fully elastic; operators may opt into a
+            // bounded retained free list explicitly.
+            dense_free_list_cap: 0,
             initial_seq_len: 256,
             tq_compression_bits: None,
         }
@@ -329,7 +332,7 @@ pub struct DenseKvCache {
 
 impl DenseKvCache {
     pub fn new(num_layers: usize, num_heads: usize, max_seq_len: usize, head_dim: usize) -> Self {
-        Self::new_with_config(num_layers, num_heads, max_seq_len, head_dim, 32, 256)
+        Self::new_with_config(num_layers, num_heads, max_seq_len, head_dim, 0, 256)
     }
 
     pub fn new_with_config(
@@ -693,11 +696,44 @@ impl DenseKvCache {
     }
 
     pub fn stats(&self) -> KvCacheStats {
-        let per_seq_bytes =
-            self.num_layers * self.num_heads * self.max_seq_len * self.head_dim * 2 * 2;
-        let allocated_sequences = self.sequences.len() + self.free_list.len();
-        let bytes_capacity = allocated_sequences * per_seq_bytes;
-        let bytes_used = self.sequences.len() * per_seq_bytes;
+        let sequence_bytes = |sequence: &SequenceKvCache| {
+            let tensor_bytes = sequence
+                .layers
+                .iter()
+                .map(|layer| {
+                    layer
+                        .key
+                        .as_slice()
+                        .len()
+                        .saturating_add(layer.value.as_slice().len())
+                        .saturating_mul(std::mem::size_of::<f16>())
+                })
+                .fold(0usize, usize::saturating_add);
+            let packed_bytes = sequence
+                .packed_layers
+                .iter()
+                .filter_map(Option::as_ref)
+                .map(|layer| {
+                    layer
+                        .key
+                        .len()
+                        .saturating_add(layer.value.len())
+                        .saturating_mul(std::mem::size_of::<f16>())
+                })
+                .fold(0usize, usize::saturating_add);
+            tensor_bytes.saturating_add(packed_bytes)
+        };
+        let bytes_used = self
+            .sequences
+            .values()
+            .map(sequence_bytes)
+            .fold(0usize, usize::saturating_add);
+        let bytes_capacity = bytes_used.saturating_add(
+            self.free_list
+                .iter()
+                .map(sequence_bytes)
+                .fold(0usize, usize::saturating_add),
+        );
         let packed_layers = self
             .sequences
             .values()

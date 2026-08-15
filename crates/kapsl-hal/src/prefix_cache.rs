@@ -44,9 +44,9 @@
 //! `lookup` increments refcounts for every hit.
 //! `release` decrements one borrow (called when a session ends or is evicted).
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::collections::hash_map::DefaultHasher;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -57,7 +57,7 @@ use crate::gpu_arena::GpuBlockPool;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BlockCacheKey {
     pub model_fingerprint: u64,
-    pub block_hash:        u64,
+    pub block_hash: u64,
 }
 
 // ── Entry (internal) ──────────────────────────────────────────────────────────
@@ -65,11 +65,11 @@ pub struct BlockCacheKey {
 struct PrefixCacheEntry {
     device_id: usize,
     /// Pool used to free the blocks when this entry is evicted.
-    pool:      Arc<GpuBlockPool>,
+    pool: Arc<GpuBlockPool>,
     /// Physical block IDs: length 1 for all-layers-in-one layout, or N for
     /// per-layer layout (one block per transformer layer).
     block_ids: Vec<u32>,
-    refcount:  usize,
+    refcount: usize,
     last_used: Instant,
 }
 
@@ -78,11 +78,11 @@ struct PrefixCacheEntry {
 /// A borrowed reference to a cached KV block group, returned by
 /// [`PrefixBlockCache::lookup`].
 pub struct CachedBlockRef {
-    pub device_id:  usize,
-    pub pool:       Arc<GpuBlockPool>,
+    pub device_id: usize,
+    pub pool: Arc<GpuBlockPool>,
     /// Physical block IDs for this logical position.
     /// `[0]` for single-block layout; `[0..n_layers]` for per-layer layout.
-    pub block_ids:  Vec<u32>,
+    pub block_ids: Vec<u32>,
     /// The chained hash that identifies this block group in the cache.
     pub block_hash: u64,
 }
@@ -108,13 +108,16 @@ pub enum PrefixInsert {
 ///
 /// Thread-safety: not `Sync` — wrap in `Mutex` when sharing across threads.
 pub struct PrefixBlockCache {
-    entries:  HashMap<BlockCacheKey, PrefixCacheEntry>,
+    entries: HashMap<BlockCacheKey, PrefixCacheEntry>,
     capacity: usize,
 }
 
 impl PrefixBlockCache {
     pub fn new(capacity: usize) -> Self {
-        Self { entries: HashMap::new(), capacity }
+        Self {
+            entries: HashMap::new(),
+            capacity,
+        }
     }
 
     // ── Hashing helpers ───────────────────────────────────────────────────────
@@ -141,9 +144,11 @@ impl PrefixBlockCache {
         block_size: usize,
     ) -> Vec<u64> {
         let mut hashes = Vec::new();
-        let mut prev   = 0u64;
+        let mut prev = 0u64;
         for chunk in tokens.chunks(block_size) {
-            if chunk.len() < block_size { break; }
+            if chunk.len() < block_size {
+                break;
+            }
             let h = Self::compute_block_hash(model_fingerprint, prev, chunk);
             hashes.push(h);
             prev = h;
@@ -169,22 +174,21 @@ impl PrefixBlockCache {
     ///
     /// Stops at the first miss — downstream blocks are invalid without their
     /// full preceding context.
-    pub fn lookup(
-        &mut self,
-        model_fingerprint: u64,
-        hashes: &[u64],
-    ) -> Vec<CachedBlockRef> {
+    pub fn lookup(&mut self, model_fingerprint: u64, hashes: &[u64]) -> Vec<CachedBlockRef> {
         let mut result = Vec::new();
         for &hash in hashes {
-            let key = BlockCacheKey { model_fingerprint, block_hash: hash };
+            let key = BlockCacheKey {
+                model_fingerprint,
+                block_hash: hash,
+            };
             match self.entries.get_mut(&key) {
                 Some(entry) => {
-                    entry.refcount  += 1;
-                    entry.last_used  = Instant::now();
+                    entry.refcount += 1;
+                    entry.last_used = Instant::now();
                     result.push(CachedBlockRef {
-                        device_id:  entry.device_id,
-                        pool:       entry.pool.clone(),
-                        block_ids:  entry.block_ids.clone(),
+                        device_id: entry.device_id,
+                        pool: entry.pool.clone(),
+                        block_ids: entry.block_ids.clone(),
                         block_hash: hash,
                     });
                 }
@@ -219,7 +223,10 @@ impl PrefixBlockCache {
         block_ids: Vec<u32>,
         refcount: usize,
     ) -> PrefixInsert {
-        let key = BlockCacheKey { model_fingerprint, block_hash };
+        let key = BlockCacheKey {
+            model_fingerprint,
+            block_hash,
+        };
         if let Some(entry) = self.entries.get_mut(&key) {
             entry.last_used = Instant::now();
             return PrefixInsert::AlreadyPresent;
@@ -227,13 +234,16 @@ impl PrefixBlockCache {
         if self.entries.len() >= self.capacity && !self.evict_one_lru() {
             return PrefixInsert::Rejected;
         }
-        self.entries.insert(key, PrefixCacheEntry {
-            device_id,
-            pool,
-            block_ids,
-            refcount,
-            last_used: Instant::now(),
-        });
+        self.entries.insert(
+            key,
+            PrefixCacheEntry {
+                device_id,
+                pool,
+                block_ids,
+                refcount,
+                last_used: Instant::now(),
+            },
+        );
         PrefixInsert::Inserted
     }
 
@@ -242,7 +252,10 @@ impl PrefixBlockCache {
     /// When refcount reaches 0 the entry is eligible for LRU eviction — the GPU
     /// blocks are retained for future requests that share the same prefix.
     pub fn release(&mut self, model_fingerprint: u64, block_hash: u64) {
-        let key = BlockCacheKey { model_fingerprint, block_hash };
+        let key = BlockCacheKey {
+            model_fingerprint,
+            block_hash,
+        };
         if let Some(entry) = self.entries.get_mut(&key) {
             entry.refcount = entry.refcount.saturating_sub(1);
         }
@@ -260,7 +273,9 @@ impl PrefixBlockCache {
         device_id: usize,
         n: usize,
     ) -> Vec<(Arc<GpuBlockPool>, Vec<u32>)> {
-        let mut candidates: Vec<(BlockCacheKey, Instant)> = self.entries.iter()
+        let mut candidates: Vec<(BlockCacheKey, Instant)> = self
+            .entries
+            .iter()
             .filter(|(_, e)| e.device_id == device_id && e.refcount == 0)
             .map(|(k, e)| (k.clone(), e.last_used))
             .collect();
@@ -277,23 +292,33 @@ impl PrefixBlockCache {
 
     // ── Metrics ───────────────────────────────────────────────────────────────
 
-    pub fn entry_count(&self) -> usize { self.entries.len() }
-    pub fn capacity(&self)    -> usize { self.capacity }
-    pub fn is_full(&self)     -> bool  { self.entries.len() >= self.capacity }
+    pub fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+    pub fn is_full(&self) -> bool {
+        self.entries.len() >= self.capacity
+    }
 
     // ── Internal ──────────────────────────────────────────────────────────────
 
     /// Evict the single least-recently-used zero-refcount entry, freeing all its
     /// GPU blocks.  Returns `false` when every entry has a live borrow.
     fn evict_one_lru(&mut self) -> bool {
-        let key = self.entries.iter()
+        let key = self
+            .entries
+            .iter()
             .filter(|(_, e)| e.refcount == 0)
             .min_by_key(|(_, e)| e.last_used)
             .map(|(k, _)| k.clone());
         match key {
             Some(k) => {
                 if let Some(entry) = self.entries.remove(&k) {
-                    for id in entry.block_ids { entry.pool.free_block(id); }
+                    for id in entry.block_ids {
+                        entry.pool.free_block(id);
+                    }
                 }
                 true
             }

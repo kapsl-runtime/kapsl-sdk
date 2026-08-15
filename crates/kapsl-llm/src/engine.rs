@@ -7,7 +7,7 @@ behavior while making the KV geometry configurable at model-load time.
 */
 
 use crate::block_manager::{BlockManager, SharedBlockAllocator};
-use crate::kv_cache::{KvCache, KvCacheConfig, KvCacheMode, KvEvictionPolicy};
+use crate::kv_cache::{KvCache, KvCacheConfig, KvCacheError, KvCacheMode, KvEvictionPolicy};
 use crate::llm_metrics::LLMMetrics;
 use crate::model_paths::{find_model_asset, find_model_root};
 use crate::scheduler::{LLMScheduler, SchedulerConfig};
@@ -17,6 +17,8 @@ use crate::sequence::{
 use half::f16;
 use kapsl_core::{accelerator_provider_pack_installed, AcceleratorProviderPack, ProviderPolicy};
 use kapsl_engine_api::EngineError;
+#[cfg(feature = "onnx-cuda-pool")]
+use kapsl_hal::gpu_arena::{PoolAllocationClass, PoolBackend, PoolOwner, PoolOwnerScope};
 use kapsl_hal::kernel::KernelBackend;
 use ndarray::{Array2, Array4, ArrayD, IxDyn};
 #[cfg(target_os = "windows")]
@@ -26,11 +28,12 @@ use ort::execution_providers::{
     CUDAExecutionProvider, CoreMLExecutionProvider, OpenVINOExecutionProvider,
     ROCmExecutionProvider, TensorRTExecutionProvider,
 };
+use ort::memory::{AllocationDevice, AllocatorType, MemoryInfo, MemoryType};
 use ort::session::{
     builder::GraphOptimizationLevel, builder::SessionBuilder, Session, SessionInputValue,
 };
 use ort::tensor::TensorElementType;
-use ort::value::{DynValue, TensorRef, Value};
+use ort::value::{DynTensorValueType, DynValue, TensorRef, Value};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
@@ -39,7 +42,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use crate::global_scheduler::{EngineHealth, GlobalKvScheduler};
+use crate::global_scheduler::{
+    EngineHealth, GlobalKvScheduler, PreemptionRequest, PreemptionResult,
+};
 use futures::FutureExt;
 use tokenizers::Tokenizer;
 use tokio::sync::mpsc;
@@ -102,6 +107,38 @@ impl EngineHealthReporter {
             scheduler: self.scheduler.clone(),
             engine_id: self.engine_id,
         }
+    }
+
+    fn report_preemption_state(&self, lowest_running_priority: Option<u8>, freeable_blocks: usize) {
+        self.scheduler.lock().report_preemption_state(
+            self.engine_id,
+            lowest_running_priority,
+            freeable_blocks,
+        );
+    }
+
+    fn route_preemption(&self, blocks_needed: usize, request_priority: u8) -> Option<u32> {
+        self.scheduler.lock().request_preemption(PreemptionRequest {
+            requesting_engine_id: self.engine_id,
+            blocks_needed,
+            request_priority,
+        })
+    }
+
+    fn take_preemption_requests(&self) -> Vec<PreemptionRequest> {
+        self.scheduler
+            .lock()
+            .take_preemption_requests(self.engine_id)
+    }
+
+    fn finish_preemption(&self, request: &PreemptionRequest, blocks_freed: usize) {
+        self.scheduler.lock().finish_preemption(
+            PreemptionResult {
+                donor_engine_id: self.engine_id,
+                blocks_freed,
+            },
+            request.requesting_engine_id,
+        );
     }
 }
 
@@ -239,6 +276,20 @@ fn llm_decode_profile_enabled() -> bool {
             })
             .unwrap_or(false)
     })
+}
+
+/// Device-resident ONNX KV is enabled automatically when the runtime has
+/// installed its CUDA pool as the ORT environment allocator. Keep an escape
+/// hatch for models whose exported present tensors are not full-history KV.
+fn onnx_device_kv_enabled() -> bool {
+    std::env::var("KAPSL_LLM_ONNX_DEVICE_KV")
+        .ok()
+        .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        })
+        .unwrap_or(true)
 }
 
 fn parse_byte_size(value: &str) -> Option<usize> {
@@ -872,13 +923,23 @@ fn empty_kv_shape(
     num_heads: usize,
     head_dim: usize,
 ) -> Vec<usize> {
-    // Use seq_len=1 (not 0) so CoreML EP doesn't reject zero-element tensors.
-    // The single dummy timestep is masked out by a leading 0 in the attention mask.
+    empty_kv_shape_with_seq_len(shape_def, kv_layout, num_heads, head_dim, 1)
+}
+
+fn empty_kv_shape_with_seq_len(
+    shape_def: Option<&Vec<i64>>,
+    kv_layout: KvLayout,
+    num_heads: usize,
+    head_dim: usize,
+    seq_len: usize,
+) -> Vec<usize> {
+    // Host/CoreML callers pass seq_len=1 because CoreML rejects zero-element
+    // tensors. The CUDA I/O-binding path passes 0 and does not need a dummy.
     if let Some(def) = shape_def {
         if def.len() == 4 {
             return match kv_layout {
-                KvLayout::SeqFirst => vec![1, num_heads, 1, head_dim],
-                KvLayout::HeadDimFirst => vec![1, num_heads, head_dim, 1],
+                KvLayout::SeqFirst => vec![1, num_heads, seq_len, head_dim],
+                KvLayout::HeadDimFirst => vec![1, num_heads, head_dim, seq_len],
             };
         }
 
@@ -893,8 +954,8 @@ fn empty_kv_shape(
     }
 
     match kv_layout {
-        KvLayout::SeqFirst => vec![1, num_heads, 1, head_dim],
-        KvLayout::HeadDimFirst => vec![1, num_heads, head_dim, 1],
+        KvLayout::SeqFirst => vec![1, num_heads, seq_len, head_dim],
+        KvLayout::HeadDimFirst => vec![1, num_heads, head_dim, seq_len],
     }
 }
 
@@ -955,6 +1016,171 @@ fn get_empty_kv_value_cached(
     }
 }
 
+/// One layer of an ONNX sequence cache held entirely in execution-provider
+/// memory. `DynValue` owns the ORT allocation, so dropping/replacing a layer
+/// returns its CUDA extent to the registered `GpuDevicePool` allocator.
+struct DeviceKvLayer {
+    key: DynValue,
+    value: DynValue,
+}
+
+struct DeviceKvSequence {
+    layers: Vec<Option<DeviceKvLayer>>,
+    length: usize,
+}
+
+impl DeviceKvSequence {
+    fn empty(num_layers: usize) -> Self {
+        let mut layers = Vec::with_capacity(num_layers);
+        layers.resize_with(num_layers, || None);
+        Self { layers, length: 0 }
+    }
+
+    fn logical_bytes(&self) -> usize {
+        self.layers
+            .iter()
+            .flatten()
+            .map(|layer| device_tensor_bytes(&layer.key) + device_tensor_bytes(&layer.value))
+            .sum()
+    }
+}
+
+fn device_tensor_bytes(value: &DynValue) -> usize {
+    let elements = value
+        .shape()
+        .iter()
+        .try_fold(1usize, |product, &dim| {
+            (dim >= 0).then(|| product.saturating_mul(dim as usize))
+        })
+        .unwrap_or(0);
+    value.data_type().byte_size(elements)
+}
+
+fn device_kv_sequence_len(shape: &[i64], layout: KvLayout) -> Option<usize> {
+    if shape.len() != 4 || shape[0] != 1 {
+        return None;
+    }
+    let axis = match layout {
+        KvLayout::SeqFirst => 2,
+        KvLayout::HeadDimFirst => 3,
+    };
+    (shape[axis] >= 0).then_some(shape[axis] as usize)
+}
+
+fn validate_device_kv_tensor(
+    value: &DynValue,
+    label: &str,
+    layout: KvLayout,
+    expected_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+    device_id: i32,
+) -> Result<(), EngineError> {
+    let tensor = value
+        .downcast_ref::<DynTensorValueType>()
+        .map_err(|error| EngineError::backend(error.to_string()))?;
+    if tensor.memory_info().allocation_device() != AllocationDevice::CUDA
+        || tensor.memory_info().device_id() != device_id
+    {
+        return Err(EngineError::backend(format!(
+            "{} was not retained on CUDA device {} (got {:?} device {})",
+            label,
+            device_id,
+            tensor.memory_info().allocation_device(),
+            tensor.memory_info().device_id()
+        )));
+    }
+    if !matches!(
+        value.data_type(),
+        TensorElementType::Float16 | TensorElementType::Float32
+    ) {
+        return Err(EngineError::backend(format!(
+            "Unsupported device KV dtype for {}: {:?}",
+            label,
+            value.data_type()
+        )));
+    }
+
+    let shape = value.shape().to_vec();
+    let seq_len = device_kv_sequence_len(&shape, layout).ok_or_else(|| {
+        EngineError::backend(format!(
+            "Device-resident KV requires rank-4 batch-1 tensors; {} has shape {:?}",
+            label, shape
+        ))
+    })?;
+    let (heads, dim) = match layout {
+        KvLayout::SeqFirst => (shape[1], shape[3]),
+        KvLayout::HeadDimFirst => (shape[1], shape[2]),
+    };
+    if heads != num_heads as i64 || dim != head_dim as i64 || seq_len != expected_len {
+        return Err(EngineError::backend(format!(
+            "Device-resident KV output {} has shape {:?}; expected heads={}, head_dim={}, full sequence length={}",
+            label, shape, num_heads, head_dim, expected_len
+        )));
+    }
+    Ok(())
+}
+
+fn copy_device_tensor_to_f16(
+    value: &DynValue,
+    label: &str,
+) -> Result<(Vec<i64>, Vec<f16>), EngineError> {
+    let tensor = value
+        .downcast_ref::<DynTensorValueType>()
+        .map_err(|error| EngineError::backend(error.to_string()))?;
+    let cpu = tensor.to(AllocationDevice::CPU, 0).map_err(|error| {
+        EngineError::backend(format!("Failed to copy {} to CPU: {}", label, error))
+    })?;
+    match cpu.data_type() {
+        TensorElementType::Float16 => {
+            let (shape, data) = cpu
+                .try_extract_tensor::<f16>()
+                .map_err(|error| EngineError::backend(error.to_string()))?;
+            Ok((shape.to_vec(), data.to_vec()))
+        }
+        TensorElementType::Float32 => {
+            let (shape, data) = cpu
+                .try_extract_tensor::<f32>()
+                .map_err(|error| EngineError::backend(error.to_string()))?;
+            Ok((
+                shape.to_vec(),
+                data.iter().map(|value| f16::from_f32(*value)).collect(),
+            ))
+        }
+        other => Err(EngineError::backend(format!(
+            "Unsupported device KV dtype for {}: {:?}",
+            label, other
+        ))),
+    }
+}
+
+fn validate_host_materialization_shape(
+    shape: &[i64],
+    layout: KvLayout,
+    expected_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+    layer_index: usize,
+) -> Result<(), EngineError> {
+    let seq_len = device_kv_sequence_len(shape, layout).ok_or_else(|| {
+        EngineError::backend(format!(
+            "Cannot materialize device KV layer {} with shape {:?}",
+            layer_index, shape
+        ))
+    })?;
+    let (heads, dim) = match layout {
+        KvLayout::SeqFirst => (shape[1], shape[3]),
+        KvLayout::HeadDimFirst => (shape[1], shape[2]),
+    };
+    if heads != num_heads as i64 || dim != head_dim as i64 || seq_len != expected_len {
+        return Err(EngineError::backend(format!(
+            "Cannot materialize device KV layer {} with shape {:?}; expected heads={}, head_dim={}, sequence={}",
+            layer_index, shape, num_heads, head_dim, expected_len
+        )));
+    }
+    Ok(())
+}
+
 /// Item used during batched prefill steps; lives at module level so the pool Vec
 /// can be stored on LLMEngine and reused across calls without reallocating.
 struct PrefillItem {
@@ -992,6 +1218,7 @@ pub struct LLMEngine {
     device_id_override: Option<i32>,
     device_ids_override: Option<Vec<i32>>,
     use_env_allocators: bool,
+    memory_owner: Option<(u32, u32)>,
     pipeline_stages: Option<Vec<PipelineStage>>,
 
     // KV cache (recreated when model geometry detected)
@@ -1010,13 +1237,23 @@ pub struct LLMEngine {
     model_input_shapes: Arc<HashMap<String, Vec<i64>>>,
     // Keep model-declared input element types so we can match expected dtypes.
     model_input_types: Arc<HashMap<String, TensorElementType>>,
+    // Output names are needed by the CUDA I/O-binding path so only logits are
+    // copied to the host while present KV stays on the device.
+    model_output_names: Arc<HashSet<String>>,
     // Optional dedicated decode graph metadata. When present, single-token decode can run through
     // a smaller ONNX/CoreML session than the primary prefill graph.
     decode_model_input_names: Arc<HashSet<String>>,
     decode_model_input_shapes: Arc<HashMap<String, Vec<i64>>>,
     decode_model_input_types: Arc<HashMap<String, TensorElementType>>,
+    decode_model_output_names: Arc<HashSet<String>>,
     // Cache of zero-length KV arrays keyed by name/dtype/shape to avoid reallocs.
     empty_kv_cache: HashMap<String, EmptyKvArray>,
+
+    // Persistent ONNX KV values retained in CUDA memory through ORT I/O
+    // binding. This path is active only for pooled CUDA/TensorRT sessions.
+    device_kv_cache: HashMap<u64, DeviceKvSequence>,
+    device_kv_enabled: bool,
+    device_kv_device_id: i32,
 
     // Detected model geometry (set at load time). Defaults are used until detection.
     num_layers: usize,
@@ -1090,6 +1327,26 @@ impl Drop for LLMEngine {
 }
 
 impl LLMEngine {
+    #[cfg(feature = "onnx-cuda-pool")]
+    fn enter_pool_scope(
+        &self,
+        device_id: i32,
+        class: PoolAllocationClass,
+    ) -> Option<PoolOwnerScope> {
+        if !self.use_env_allocators || device_id < 0 {
+            return None;
+        }
+        let owner = self.memory_owner.map_or_else(
+            || PoolOwner::unattributed(PoolBackend::Onnx, class),
+            |(model_id, replica_id)| PoolOwner::onnx(model_id, replica_id, class),
+        );
+        Some(PoolOwnerScope::enter(owner))
+    }
+
+    pub fn set_memory_owner(&mut self, model_id: u32, replica_id: u32) {
+        self.memory_owner = Some((model_id, replica_id));
+    }
+
     fn get_empty_kv_value(
         &mut self,
         name: &str,
@@ -1194,6 +1451,7 @@ impl LLMEngine {
             device_id_override,
             device_ids_override,
             use_env_allocators,
+            memory_owner: None,
             pipeline_stages: None,
             kv_cache,
             kv_cache_config: KvCacheConfig::default(),
@@ -1203,10 +1461,15 @@ impl LLMEngine {
             model_input_names: Arc::new(HashSet::new()),
             model_input_shapes: Arc::new(HashMap::new()),
             model_input_types: Arc::new(HashMap::new()),
+            model_output_names: Arc::new(HashSet::new()),
             decode_model_input_names: Arc::new(HashSet::new()),
             decode_model_input_shapes: Arc::new(HashMap::new()),
             decode_model_input_types: Arc::new(HashMap::new()),
+            decode_model_output_names: Arc::new(HashSet::new()),
             empty_kv_cache: HashMap::new(),
+            device_kv_cache: HashMap::new(),
+            device_kv_enabled: false,
+            device_kv_device_id: 0,
             num_layers: DEFAULT_NUM_LAYERS,
             num_heads: DEFAULT_NUM_HEADS,
             head_dim: DEFAULT_HEAD_DIM,
@@ -1413,6 +1676,10 @@ impl LLMEngine {
 
         self.model_path = Some(model_path.to_path_buf());
         self.coreml_cpu_fallback_attempted = false;
+        // Release values from a previously loaded session before replacing it.
+        // Each value owns a live ORT/GpuDevicePool allocation.
+        self.device_kv_cache.clear();
+        self.device_kv_enabled = false;
         // Reset to default each load; metadata and model capabilities may override.
         self.use_kv_cache = true;
         let model_root = find_model_root(model_path);
@@ -1537,9 +1804,7 @@ impl LLMEngine {
                         }
                     }
                     if let Some(v) = kv.get("dense_free_list_cap").and_then(|v| v.as_u64()) {
-                        if v > 0 {
-                            kv_cache_config.dense_free_list_cap = v as usize;
-                        }
+                        kv_cache_config.dense_free_list_cap = v as usize;
                     }
                     if let Some(bits) = kv.get("tq_compression_bits").and_then(|v| v.as_u64()) {
                         if (2..=4).contains(&bits) {
@@ -1756,9 +2021,7 @@ impl LLMEngine {
         }
         if let Some(v) = env_var_alias("KAPSL_LLM_KV_FREE_LIST_CAP", "KAPSL_LLM_KV_FREE_LIST_CAP") {
             if let Ok(parsed) = v.parse::<usize>() {
-                if parsed > 0 {
-                    kv_cache_config.dense_free_list_cap = parsed;
-                }
+                kv_cache_config.dense_free_list_cap = parsed;
             }
         }
         if let Some(v) = env_var_alias(
@@ -1892,7 +2155,8 @@ impl LLMEngine {
                             builder = builder
                                 .with_execution_providers([CUDAExecutionProvider::default()
                                     .with_device_id(device_id)
-                                    .build()])
+                                    .build()
+                                    .error_on_failure()])
                                 .map_err(|e| {
                                     EngineError::backend(format!("Failed to enable CUDA: {}", e))
                                 })?;
@@ -1913,7 +2177,8 @@ impl LLMEngine {
                                         .build(),
                                     CUDAExecutionProvider::default()
                                         .with_device_id(device_id)
-                                        .build(),
+                                        .build()
+                                        .error_on_failure(),
                                 ])
                                 .map_err(|e| {
                                     EngineError::backend(format!(
@@ -2028,6 +2293,9 @@ impl LLMEngine {
                                                provider: Option<&str>,
                                                device_id: i32|
          -> Result<Session, EngineError> {
+            #[cfg(feature = "onnx-cuda-pool")]
+            let _pool_scope =
+                self.enter_pool_scope(device_id, PoolAllocationClass::PersistentWeights);
             let mut builder = make_builder(provider, device_id)?;
             if safe_load {
                 builder = apply_safe_load(builder)?;
@@ -2059,10 +2327,18 @@ impl LLMEngine {
 
             Ok(session)
         };
-        let build_session = |path: &Path, device_id: i32| -> Result<Session, EngineError> {
+        let build_session = |path: &Path, device_id: i32| -> Result<(Session, bool), EngineError> {
             let primary_provider = preferred_provider.as_deref();
+            let requested_pooled_device = primary_provider
+                .map(|provider| {
+                    matches!(
+                        provider.trim().to_ascii_lowercase().as_str(),
+                        "cuda" | "tensorrt"
+                    )
+                })
+                .unwrap_or(false);
             match try_build_session_with_provider(path, primary_provider, device_id) {
-                Ok(session) => Ok(session),
+                Ok(session) => Ok((session, requested_pooled_device)),
                 Err(primary_error) => {
                     let provider_name = primary_provider.unwrap_or("cpu");
                     if !allow_cpu_fallback || provider_name.eq_ignore_ascii_case("cpu") {
@@ -2075,14 +2351,16 @@ impl LLMEngine {
                         provider_name,
                         primary_error_message
                     );
-                    try_build_session_with_provider(path, Some("cpu"), 0).map_err(|cpu_error| {
-                        EngineError::backend(format!(
-                            "Failed to create session with provider `{}` ({}); CPU fallback also failed ({})",
-                            provider_name,
-                            primary_error_message,
-                            cpu_error
-                        ))
-                    })
+                    try_build_session_with_provider(path, Some("cpu"), 0)
+                        .map(|session| (session, false))
+                        .map_err(|cpu_error| {
+                            EngineError::backend(format!(
+                                "Failed to create session with provider `{}` ({}); CPU fallback also failed ({})",
+                                provider_name,
+                                primary_error_message,
+                                cpu_error
+                            ))
+                        })
                 }
             }
         };
@@ -2094,9 +2372,12 @@ impl LLMEngine {
         let mut decode_input_names_set: HashSet<String> = HashSet::new();
         let mut decode_input_shapes_map: HashMap<String, Vec<i64>> = HashMap::new();
         let mut decode_input_types_map: HashMap<String, TensorElementType> = HashMap::new();
+        let mut decode_output_names_set: HashSet<String> = HashSet::new();
         let mut pipeline_stages: Option<Vec<PipelineStage>> = None;
         let mut session: Option<Session> = None;
         let mut decode_session: Option<Session> = None;
+        let mut primary_session_uses_pooled_device = false;
+        let mut decode_session_uses_pooled_device = false;
 
         if !pipeline_stage_files.is_empty() {
             if decode_model_file.is_some() {
@@ -2132,7 +2413,7 @@ impl LLMEngine {
                     stage_device_id
                 );
 
-                let stage_session = build_session(&stage_path, stage_device_id)?;
+                let (stage_session, _) = build_session(&stage_path, stage_device_id)?;
                 let (stage_inputs, stage_shapes, stage_types, stage_outputs) =
                     capture_session_io(&stage_session);
 
@@ -2167,7 +2448,9 @@ impl LLMEngine {
 
             pipeline_stages = Some(stages);
         } else {
-            let built_session = build_session(model_path, preferred_device_id)?;
+            let (built_session, uses_pooled_device) =
+                build_session(model_path, preferred_device_id)?;
+            primary_session_uses_pooled_device = uses_pooled_device;
             let (names, shapes, types, outputs) = capture_session_io(&built_session);
             input_names_set = names;
             input_shapes_map = shapes;
@@ -2180,15 +2463,17 @@ impl LLMEngine {
                     if decode_path != model_path {
                         ensure_external_data_near_model(&decode_path, &model_root);
                         match build_session(&decode_path, preferred_device_id) {
-                            Ok(built_decode_session) => {
-                                let (dn, dsh, dt, _) = capture_session_io(&built_decode_session);
+                            Ok((built_decode_session, uses_pooled_device)) => {
+                                let (dn, dsh, dt, dout) = capture_session_io(&built_decode_session);
                                 decode_input_names_set = dn;
                                 decode_input_shapes_map = dsh;
                                 decode_input_types_map = dt;
+                                decode_output_names_set = dout;
                                 log::info!(
                                     "Loaded dedicated decode session from {}",
                                     decode_path.display()
                                 );
+                                decode_session_uses_pooled_device = uses_pooled_device;
                                 decode_session = Some(built_decode_session);
                             }
                             Err(e) => {
@@ -2490,13 +2775,35 @@ impl LLMEngine {
         self.model_input_names = Arc::new(input_names_set);
         self.model_input_shapes = Arc::new(input_shapes_map);
         self.model_input_types = Arc::new(input_types_map);
+        self.model_output_names = Arc::new(output_names_set);
         self.decode_model_input_names = Arc::new(decode_input_names_set);
         self.decode_model_input_shapes = Arc::new(decode_input_shapes_map);
         self.decode_model_input_types = Arc::new(decode_input_types_map);
+        self.decode_model_output_names = Arc::new(decode_output_names_set);
         self.empty_kv_cache.clear();
         self.pipeline_stages = pipeline_stages;
         self.session = session;
         self.decode_session = decode_session;
+        let sessions_use_pooled_device = primary_session_uses_pooled_device
+            && (self.decode_session.is_none() || decode_session_uses_pooled_device);
+        self.device_kv_device_id = preferred_device_id;
+        self.device_kv_enabled = self.use_kv_cache
+            && self.use_env_allocators
+            && onnx_device_kv_enabled()
+            && sessions_use_pooled_device
+            && self.pipeline_stages.is_none();
+        if self.device_kv_enabled && !self.device_kv_contract_supported() {
+            log::warn!(
+                "ONNX graph does not expose paired rank-4 past/present KV tensors; using the host KV cache"
+            );
+            self.device_kv_enabled = false;
+        }
+        if self.device_kv_enabled {
+            log::info!(
+                "ONNX persistent KV cache enabled on CUDA device {} (ORT I/O binding, pooled allocations)",
+                self.device_kv_device_id
+            );
+        }
         self.update_kv_cache_metrics();
 
         Ok(())
@@ -2530,11 +2837,212 @@ impl LLMEngine {
         }
     }
 
+    fn decode_model_output_names(&self) -> Arc<HashSet<String>> {
+        if self.decode_session.is_some() {
+            self.decode_model_output_names.clone()
+        } else {
+            self.model_output_names.clone()
+        }
+    }
+
+    fn device_kv_contract_supported_for(
+        &self,
+        input_names: &HashSet<String>,
+        input_shapes: &HashMap<String, Vec<i64>>,
+        input_types: &HashMap<String, TensorElementType>,
+        output_names: &HashSet<String>,
+    ) -> bool {
+        if !output_names.contains("logits") {
+            return false;
+        }
+
+        let mut found_layer = false;
+        for layer in 0..self.num_layers {
+            let past_key = format!("past_key_values.{}.key", layer);
+            let past_value = format!("past_key_values.{}.value", layer);
+            let present_key = format!("present.{}.key", layer);
+            let present_value = format!("present.{}.value", layer);
+            let has_past_key = input_names.contains(&past_key);
+            let has_past_value = input_names.contains(&past_value);
+            let has_present_key = output_names.contains(&present_key);
+            let has_present_value = output_names.contains(&present_value);
+
+            if !has_past_key && !has_past_value && !has_present_key && !has_present_value {
+                continue;
+            }
+            found_layer = true;
+            if !(has_past_key && has_past_value && has_present_key && has_present_value) {
+                return false;
+            }
+            for name in [&past_key, &past_value] {
+                if input_shapes.get(name).is_none_or(|shape| shape.len() != 4) {
+                    return false;
+                }
+                if !matches!(
+                    input_types.get(name).copied(),
+                    Some(TensorElementType::Float16 | TensorElementType::Float32)
+                ) {
+                    return false;
+                }
+            }
+        }
+        found_layer
+    }
+
+    fn device_kv_contract_supported(&self) -> bool {
+        if !self.device_kv_contract_supported_for(
+            &self.model_input_names,
+            &self.model_input_shapes,
+            &self.model_input_types,
+            &self.model_output_names,
+        ) {
+            return false;
+        }
+        self.decode_session.is_none()
+            || self.device_kv_contract_supported_for(
+                &self.decode_model_input_names,
+                &self.decode_model_input_shapes,
+                &self.decode_model_input_types,
+                &self.decode_model_output_names,
+            )
+    }
+
+    fn persistent_kv_has_sequence(&self, sequence_id: u64) -> bool {
+        if self.device_kv_enabled {
+            self.device_kv_cache.contains_key(&sequence_id)
+        } else {
+            self.kv_cache.has_sequence(sequence_id)
+        }
+    }
+
+    fn allocate_persistent_kv_sequence(
+        &mut self,
+        sequence_id: u64,
+        tokens: &[u32],
+        priority: u8,
+    ) -> Result<usize, KvCacheError> {
+        if self.device_kv_enabled {
+            if let Some(sequence) = self.device_kv_cache.get(&sequence_id) {
+                return Ok(sequence.length);
+            }
+            self.device_kv_cache
+                .insert(sequence_id, DeviceKvSequence::empty(self.num_layers));
+            // Device values are sequence-owned. Prefix reuse remains on the
+            // host cache fallback until device-side slicing is available.
+            Ok(0)
+        } else {
+            let cached = self.kv_cache.allocate_sequence(sequence_id, tokens)?;
+            self.kv_cache.set_sequence_priority(sequence_id, priority);
+            Ok(cached)
+        }
+    }
+
+    fn set_persistent_kv_priority(&mut self, sequence_id: u64, priority: u8) {
+        if !self.device_kv_enabled {
+            self.kv_cache.set_sequence_priority(sequence_id, priority);
+        }
+    }
+
+    fn remove_persistent_kv_sequence(&mut self, sequence_id: u64) {
+        if self.device_kv_enabled {
+            self.device_kv_cache.remove(&sequence_id);
+        } else {
+            self.kv_cache.remove_sequence(sequence_id);
+        }
+    }
+
+    fn device_kv_bytes_per_token(&self) -> usize {
+        let elements = self.num_heads.saturating_mul(self.head_dim);
+        let mut bytes = 0usize;
+        for layer in 0..self.num_layers {
+            for suffix in ["key", "value"] {
+                let name = format!("past_key_values.{}.{}", layer, suffix);
+                if self.model_input_names.contains(&name) {
+                    let dtype = self
+                        .model_input_types
+                        .get(&name)
+                        .copied()
+                        .unwrap_or(TensorElementType::Float16);
+                    bytes = bytes.saturating_add(dtype.byte_size(elements));
+                }
+            }
+        }
+        if bytes == 0 {
+            self.kv_bytes_per_token().unwrap_or(0)
+        } else {
+            bytes
+        }
+    }
+
+    fn device_kv_usage(&self) -> (usize, usize, usize) {
+        let used = self
+            .device_kv_cache
+            .values()
+            .map(DeviceKvSequence::logical_bytes)
+            .sum();
+        let capacity = match self.kv_cache_config.mode {
+            // Preserve the configured block budget for admission even though
+            // the live values themselves are owned by ORT/GpuDevicePool.
+            KvCacheMode::Paged => self
+                .kv_cache_config
+                .total_blocks
+                .saturating_mul(self.kv_cache_config.block_size)
+                .saturating_mul(self.device_kv_bytes_per_token()),
+            KvCacheMode::Dense => self
+                .device_kv_cache
+                .len()
+                .saturating_mul(self.max_seq_len)
+                .saturating_mul(self.device_kv_bytes_per_token()),
+        }
+        .max(used);
+        (used, capacity, self.device_kv_cache.len())
+    }
+
     fn update_kv_cache_metrics(&self) {
-        let stats = self.kv_cache.stats();
+        let host_stats = self.kv_cache.stats();
+        if self.device_kv_enabled {
+            let (used, capacity, sequences) = self.device_kv_usage();
+            let mut metrics = self.metrics.lock().unwrap();
+            metrics.kv_cache_device_resident = true;
+            metrics.kv_cache_bytes_used = used;
+            metrics.kv_cache_bytes_capacity = capacity.saturating_add(host_stats.bytes_capacity);
+            metrics.kv_cache_host_bytes_retained = host_stats.bytes_capacity;
+            metrics.kv_cache_device_bytes_retained = used;
+            metrics.kv_cache_request_reservation_bytes = self
+                .max_seq_len
+                .saturating_mul(self.device_kv_bytes_per_token());
+            metrics.kv_cache_host_fallback_reservation_bytes =
+                if host_stats.mode == KvCacheMode::Dense {
+                    self.max_seq_len
+                        .saturating_mul(self.kv_bytes_per_token().unwrap_or(0))
+                } else {
+                    0
+                };
+            metrics.kv_cache_blocks_total = 0;
+            metrics.kv_cache_blocks_free = 0;
+            metrics.kv_cache_sequences = sequences;
+            metrics.kv_cache_evicted_blocks = 0;
+            metrics.kv_cache_evicted_sequences = 0;
+            metrics.kv_cache_packed_layers = 0;
+            metrics.kv_cache_cpu_offloaded_blocks = 0;
+            metrics.kv_cache_prefix_reuse_hits = 0;
+            metrics.kv_cache_prefix_reuse_tokens_saved = 0;
+            return;
+        }
+        let stats = host_stats;
         let mut metrics = self.metrics.lock().unwrap();
+        metrics.kv_cache_device_resident = false;
         metrics.kv_cache_bytes_used = stats.bytes_used;
         metrics.kv_cache_bytes_capacity = stats.bytes_capacity;
+        metrics.kv_cache_host_bytes_retained = stats.bytes_capacity;
+        metrics.kv_cache_device_bytes_retained = 0;
+        metrics.kv_cache_request_reservation_bytes = if stats.mode == KvCacheMode::Dense {
+            self.max_seq_len
+                .saturating_mul(self.kv_bytes_per_token().unwrap_or(0))
+        } else {
+            0
+        };
+        metrics.kv_cache_host_fallback_reservation_bytes = 0;
         metrics.kv_cache_blocks_total = stats.blocks_total;
         metrics.kv_cache_blocks_free = stats.blocks_free;
         metrics.kv_cache_sequences = stats.sequences;
@@ -2583,6 +3091,15 @@ impl LLMEngine {
         max_new_tokens: usize,
         has_live_sequence: bool,
     ) -> Option<usize> {
+        if self.device_kv_enabled {
+            let requested_tokens = prompt_tokens.saturating_add(max_new_tokens);
+            let reserved_tokens = if has_live_sequence {
+                requested_tokens
+            } else {
+                self.max_seq_len.min(requested_tokens)
+            };
+            return Some(reserved_tokens.saturating_mul(self.device_kv_bytes_per_token()));
+        }
         match self.kv_cache_config.mode {
             KvCacheMode::Dense => {
                 if has_live_sequence {
@@ -2629,9 +3146,15 @@ impl LLMEngine {
             _ => return Ok(()),
         };
 
-        let stats = self.kv_cache.stats();
-        let projected = stats.bytes_used.saturating_add(additional_reserved);
-        let (soft_limit, hard_limit) = self.kv_admission_limits(stats.bytes_capacity);
+        let (bytes_used, bytes_capacity) = if self.device_kv_enabled {
+            let (used, capacity, _) = self.device_kv_usage();
+            (used, capacity)
+        } else {
+            let stats = self.kv_cache.stats();
+            (stats.bytes_used, stats.bytes_capacity)
+        };
+        let projected = bytes_used.saturating_add(additional_reserved);
+        let (soft_limit, hard_limit) = self.kv_admission_limits(bytes_capacity);
         let session_suffix = session_id
             .map(|id| format!(" session='{}'", id))
             .unwrap_or_default();
@@ -2644,7 +3167,7 @@ impl LLMEngine {
                     session_suffix,
                     projected,
                     limit,
-                    stats.bytes_used,
+                    bytes_used,
                     additional_reserved,
                 )));
             }
@@ -2658,7 +3181,7 @@ impl LLMEngine {
                     session_suffix,
                     projected,
                     limit,
-                    stats.bytes_used,
+                    bytes_used,
                     additional_reserved,
                 )));
             }
@@ -2667,10 +3190,97 @@ impl LLMEngine {
         Ok(())
     }
 
+    fn release_preempted_kv_sequences(&mut self, sequence_ids: &[u64]) {
+        if !self.use_kv_cache || sequence_ids.is_empty() {
+            return;
+        }
+        let mut released = HashSet::with_capacity(sequence_ids.len());
+        for &sequence_id in sequence_ids {
+            if released.insert(sequence_id) {
+                self.remove_persistent_kv_sequence(sequence_id);
+            }
+        }
+        self.update_kv_cache_metrics();
+    }
+
+    fn ensure_scheduled_kv_sequences(
+        &mut self,
+        groups: &[Arc<Mutex<SequenceGroup>>],
+    ) -> Result<(), EngineError> {
+        if !self.use_kv_cache {
+            return Ok(());
+        }
+
+        let mut missing = Vec::new();
+        for group_arc in groups {
+            let group = group_arc.lock().unwrap();
+            let priority = group.priority;
+            for (&sequence_id, sequence_arc) in &group.sequences {
+                if self.persistent_kv_has_sequence(sequence_id) {
+                    self.set_persistent_kv_priority(sequence_id, priority);
+                    continue;
+                }
+                let tokens = {
+                    let sequence = sequence_arc.lock().unwrap();
+                    let mut tokens = sequence.prompt_token_ids.clone();
+                    tokens.extend_from_slice(&sequence.output_token_ids);
+                    tokens
+                };
+                missing.push((sequence_id, sequence_arc.clone(), priority, tokens));
+            }
+        }
+
+        for (sequence_id, sequence_arc, priority, tokens) in missing {
+            let cached = self
+                .allocate_persistent_kv_sequence(sequence_id, &tokens, priority)
+                .map_err(|error| EngineError::resource_exhausted(error.to_string()))?;
+            sequence_arc.lock().unwrap().kv_cached_len = cached;
+        }
+        Ok(())
+    }
+
+    fn report_preemption_state(&self) {
+        let Some(reporter) = self.health_reporter.as_ref() else {
+            return;
+        };
+        let (priority, blocks) = self.scheduler.preemption_state();
+        reporter.report_preemption_state(priority, blocks);
+    }
+
+    fn service_global_preemptions(&mut self) {
+        let Some(reporter) = self
+            .health_reporter
+            .as_ref()
+            .map(EngineHealthReporter::clone_handle)
+        else {
+            return;
+        };
+        for request in reporter.take_preemption_requests() {
+            let outcome = self
+                .scheduler
+                .preempt_lower_priority(request.blocks_needed, request.request_priority);
+            self.release_preempted_kv_sequences(&outcome.sequence_ids);
+            if outcome.blocks_freed > 0 {
+                log::info!(
+                    "[kv-preemption] engine {} released {} blocks for engine {} (priority {})",
+                    reporter.engine_id,
+                    outcome.blocks_freed,
+                    request.requesting_engine_id,
+                    request.request_priority,
+                );
+            }
+            reporter.finish_preemption(&request, outcome.blocks_freed);
+        }
+        self.report_preemption_state();
+    }
+
     pub async fn run_loop(&mut self) {
         loop {
             // Heartbeat for the watchdog: record that the loop is alive this tick.
             self.heartbeat.store(now_millis(), Ordering::Relaxed);
+            // Execute commands selected by the cross-engine arbiter before this
+            // engine can reacquire any donated blocks in its own schedule pass.
+            self.service_global_preemptions();
 
             // Circuit breaker: when open, fail fast until the cooldown elapses,
             // then let a single half-open trial batch through.
@@ -2697,7 +3307,10 @@ impl LLMEngine {
 
                 let existing_seq_arc = session_id.as_ref().and_then(|session_key| {
                     let arc = self.sessions.get(session_key).cloned()?;
-                    let cur_len = arc.lock().unwrap().get_len();
+                    let (cur_len, sequence_id) = {
+                        let sequence = arc.lock().unwrap();
+                        (sequence.get_len(), sequence.sequence_id)
+                    };
                     if cur_len >= self.max_session_tokens {
                         log::info!(
                             "Session '{}' reached max context ({} tokens); starting fresh.",
@@ -2705,6 +3318,9 @@ impl LLMEngine {
                             cur_len
                         );
                         self.sessions.remove(session_key);
+                        if self.device_kv_enabled {
+                            self.device_kv_cache.remove(&sequence_id);
+                        }
                         None
                     } else {
                         Some(arc)
@@ -2749,7 +3365,7 @@ impl LLMEngine {
                 if let Some(existing_seq_arc) = existing_seq_arc {
                     let existing_seq_id = existing_seq_arc.lock().unwrap().sequence_id;
                     let has_live_sequence =
-                        self.use_kv_cache && self.kv_cache.has_sequence(existing_seq_id);
+                        self.use_kv_cache && self.persistent_kv_has_sequence(existing_seq_id);
                     if let Err(engine_err) = self.enforce_kv_admission(
                         &req.request_id,
                         session_id.as_deref(),
@@ -2781,9 +3397,10 @@ impl LLMEngine {
                         seq.rng_state = rng_state;
                     }
 
-                    if self.use_kv_cache && !self.kv_cache.has_sequence(seq_id) {
+                    if self.use_kv_cache && !self.persistent_kv_has_sequence(seq_id) {
                         // Pass token_ids for prefix matching
-                        match self.kv_cache.allocate_sequence(seq_id, &token_ids) {
+                        match self.allocate_persistent_kv_sequence(seq_id, &token_ids, req.priority)
+                        {
                             Ok(cached_len) => {
                                 // If we reused KV cache, we should update the sequence state
                                 // so that the next step skips these tokens.
@@ -2801,6 +3418,7 @@ impl LLMEngine {
                             }
                         }
                     }
+                    self.set_persistent_kv_priority(seq_id, req.priority);
 
                     req.sequences.clear();
                     req.sequences.insert(seq_id, existing_seq_arc);
@@ -2851,7 +3469,7 @@ impl LLMEngine {
                         .insert(session_key.clone(), req_seq_arc.clone());
                 }
                 if self.use_kv_cache {
-                    match self.kv_cache.allocate_sequence(seq_id, &token_ids) {
+                    match self.allocate_persistent_kv_sequence(seq_id, &token_ids, req.priority) {
                         Ok(cached_len) => {
                             let mut seq = req_seq_arc.lock().unwrap();
                             seq.kv_cached_len = cached_len;
@@ -2897,13 +3515,40 @@ impl LLMEngine {
                 continue;
             }
 
-            if self.use_kv_cache {
+            if self.use_kv_cache && !self.device_kv_enabled {
                 self.kv_cache.set_active_sequences(&active_ids);
             }
 
             let outputs = self.scheduler.schedule();
+            self.release_preempted_kv_sequences(&outputs.preempted_sequence_ids);
+            self.report_preemption_state();
+            if let (Some(reporter), Some(request)) =
+                (self.health_reporter.as_ref(), outputs.preemption_request)
+            {
+                if let Some(donor) =
+                    reporter.route_preemption(request.blocks_needed, request.request_priority)
+                {
+                    log::debug!(
+                        "[kv-preemption] engine {} requested {} blocks from engine {} (priority {})",
+                        reporter.engine_id,
+                        request.blocks_needed,
+                        donor,
+                        request.request_priority,
+                    );
+                }
+            }
             if outputs.scheduled_seq_groups.is_empty() {
                 tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                continue;
+            }
+
+            if let Err(error) = self.ensure_scheduled_kv_sequences(&outputs.scheduled_seq_groups) {
+                self.fail_groups_with_error(&outputs.scheduled_seq_groups, &error);
+                let finished = self.scheduler.free_finished_sequences();
+                for sequence_id in finished {
+                    self.remove_persistent_kv_sequence(sequence_id);
+                }
+                self.update_kv_cache_metrics();
                 continue;
             }
 
@@ -2941,9 +3586,13 @@ impl LLMEngine {
             let finished_ids = self.scheduler.free_finished_sequences();
             if self.use_kv_cache {
                 for seq_id in finished_ids {
-                    self.kv_cache.remove_sequence(seq_id);
+                    self.remove_persistent_kv_sequence(seq_id);
                 }
-                let evicted = self.kv_cache.drain_evicted_sequences();
+                let evicted = if self.device_kv_enabled {
+                    Vec::new()
+                } else {
+                    self.kv_cache.drain_evicted_sequences()
+                };
                 if !evicted.is_empty() {
                     let evicted_set: HashSet<u64> = evicted.into_iter().collect();
                     self.sessions.retain(|_, seq_arc| {
@@ -2951,7 +3600,9 @@ impl LLMEngine {
                         !evicted_set.contains(&seq.sequence_id)
                     });
                 }
-                self.kv_cache.clear_active_sequences();
+                if !self.device_kv_enabled {
+                    self.kv_cache.clear_active_sequences();
+                }
             }
 
             self.update_kv_cache_metrics();
@@ -3109,6 +3760,532 @@ impl LLMEngine {
         }
 
         active_count > 0
+    }
+
+    /// Execute all scheduled sequences with persistent KV values bound directly
+    /// from CUDA memory. Only logits are bound to CPU memory. The existing host
+    /// implementation remains the fallback for CPU/non-pooled sessions.
+    fn try_execute_device_kv_step(
+        &mut self,
+        groups: &[Arc<Mutex<SequenceGroup>>],
+    ) -> Result<bool, EngineError> {
+        if !self.device_kv_enabled {
+            return Ok(false);
+        }
+
+        let mut processed_any = false;
+        for group_arc in groups {
+            if Self::cancel_group_if_needed(group_arc) {
+                continue;
+            }
+            let seqs: Vec<_> = {
+                let group = group_arc.lock().unwrap();
+                group.sequences.values().cloned().collect()
+            };
+
+            for seq_arc in seqs {
+                let Some((input_tokens, seq_id, total_len, kv_cached_len)) =
+                    Self::decode_inputs_for_sequence(&seq_arc, true)
+                else {
+                    continue;
+                };
+                let old_cache = self
+                    .device_kv_cache
+                    .remove(&seq_id)
+                    .unwrap_or_else(|| DeviceKvSequence::empty(self.num_layers));
+
+                match self.execute_device_kv_sequence(
+                    group_arc,
+                    &seq_arc,
+                    seq_id,
+                    &input_tokens,
+                    total_len,
+                    kv_cached_len,
+                    &old_cache,
+                ) {
+                    Ok(new_cache) => {
+                        self.device_kv_cache.insert(seq_id, new_cache);
+                        processed_any = true;
+                    }
+                    Err(error) => {
+                        self.device_kv_cache.insert(seq_id, old_cache);
+                        log::warn!(
+                            "Disabling ONNX device-resident KV after an I/O-binding execution failure; materializing the retained history on CPU: {}",
+                            error
+                        );
+                        self.fallback_device_kv_to_host()?;
+                        if processed_any {
+                            return Err(error);
+                        }
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+
+        Ok(true)
+    }
+
+    fn fallback_device_kv_to_host(&mut self) -> Result<(), EngineError> {
+        let sequence_ids: Vec<u64> = self.device_kv_cache.keys().copied().collect();
+        for &sequence_id in &sequence_ids {
+            // A previous failed materialization may have left a partial host
+            // entry. Always rebuild each sequence from the retained device
+            // value as one transaction.
+            self.kv_cache.remove_sequence(sequence_id);
+        }
+        self.kv_cache.set_active_sequences(&sequence_ids);
+        let materialized = self.materialize_device_kv_to_host();
+        self.kv_cache.clear_active_sequences();
+
+        if let Err(error) = materialized {
+            for sequence_id in sequence_ids {
+                self.kv_cache.remove_sequence(sequence_id);
+            }
+            return Err(error);
+        }
+
+        // Drop device values only after every sequence was copied successfully.
+        self.device_kv_cache.clear();
+        self.device_kv_enabled = false;
+        Ok(())
+    }
+
+    fn materialize_device_kv_to_host(&mut self) -> Result<(), EngineError> {
+        for (&sequence_id, sequence) in &self.device_kv_cache {
+            self.kv_cache
+                .allocate_sequence(sequence_id, &[])
+                .map_err(|error| EngineError::resource_exhausted(error.to_string()))?;
+
+            for (layer_index, layer) in sequence.layers.iter().enumerate() {
+                let Some(layer) = layer else {
+                    continue;
+                };
+                let key_label = format!("device key layer {}", layer_index);
+                let value_label = format!("device value layer {}", layer_index);
+                let (key_shape, key) = copy_device_tensor_to_f16(&layer.key, &key_label)?;
+                let (value_shape, value) = copy_device_tensor_to_f16(&layer.value, &value_label)?;
+                if key_shape != value_shape {
+                    return Err(EngineError::backend(format!(
+                        "Cannot materialize device KV layer {}: key/value shapes differ ({:?} vs {:?})",
+                        layer_index, key_shape, value_shape
+                    )));
+                }
+                validate_host_materialization_shape(
+                    &key_shape,
+                    self.kv_layout,
+                    sequence.length,
+                    self.num_heads,
+                    self.head_dim,
+                    layer_index,
+                )?;
+
+                let mut packed_key =
+                    Vec::with_capacity(self.num_heads * sequence.length * self.head_dim);
+                let mut packed_value =
+                    Vec::with_capacity(self.num_heads * sequence.length * self.head_dim);
+                match self.kv_layout {
+                    KvLayout::SeqFirst => {
+                        for head in 0..self.num_heads {
+                            let start = head * sequence.length * self.head_dim;
+                            let end = start + sequence.length * self.head_dim;
+                            self.kv_cache
+                                .append_head_range_seq_first(
+                                    sequence_id,
+                                    layer_index,
+                                    head,
+                                    0,
+                                    &key[start..end],
+                                    &value[start..end],
+                                )
+                                .map_err(|error| {
+                                    EngineError::resource_exhausted(error.to_string())
+                                })?;
+                            packed_key.extend_from_slice(&key[start..end]);
+                            packed_value.extend_from_slice(&value[start..end]);
+                        }
+                    }
+                    KvLayout::HeadDimFirst => {
+                        for head in 0..self.num_heads {
+                            let mut head_key = vec![f16::ZERO; sequence.length * self.head_dim];
+                            let mut head_value = vec![f16::ZERO; sequence.length * self.head_dim];
+                            for dim in 0..self.head_dim {
+                                for position in 0..sequence.length {
+                                    let source =
+                                        (head * self.head_dim + dim) * sequence.length + position;
+                                    let target = position * self.head_dim + dim;
+                                    head_key[target] = key[source];
+                                    head_value[target] = value[source];
+                                }
+                            }
+                            self.kv_cache
+                                .append_head_range_seq_first(
+                                    sequence_id,
+                                    layer_index,
+                                    head,
+                                    0,
+                                    &head_key,
+                                    &head_value,
+                                )
+                                .map_err(|error| {
+                                    EngineError::resource_exhausted(error.to_string())
+                                })?;
+                            packed_key.extend_from_slice(&head_key);
+                            packed_value.extend_from_slice(&head_value);
+                        }
+                    }
+                }
+                if sequence.length > 0 {
+                    self.kv_cache.set_packed_layer(
+                        sequence_id,
+                        layer_index,
+                        sequence.length,
+                        &packed_key,
+                        &packed_value,
+                    );
+                }
+            }
+            if sequence.length > 0 {
+                self.kv_cache
+                    .advance_sequence_by(sequence_id, sequence.length);
+            }
+        }
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_device_kv_sequence(
+        &mut self,
+        group_arc: &Arc<Mutex<SequenceGroup>>,
+        seq_arc: &Arc<Mutex<Sequence>>,
+        seq_id: u64,
+        input_tokens: &[u32],
+        total_len: usize,
+        kv_cached_len: usize,
+        old_cache: &DeviceKvSequence,
+    ) -> Result<DeviceKvSequence, EngineError> {
+        if old_cache.length != kv_cached_len {
+            return Err(EngineError::backend(format!(
+                "Device KV cursor mismatch for sequence {}: cache={}, sequence={}",
+                seq_id, old_cache.length, kv_cached_len
+            )));
+        }
+        let input_len = input_tokens.len();
+        if old_cache.length.saturating_add(input_len) != total_len {
+            return Err(EngineError::backend(format!(
+                "Device KV input length mismatch for sequence {}: past {} + input {} != total {}",
+                seq_id, old_cache.length, input_len, total_len
+            )));
+        }
+
+        let use_decode_session =
+            self.decode_session.is_some() && old_cache.length > 0 && input_len == 1;
+        let input_names = if use_decode_session {
+            self.decode_model_input_names.clone()
+        } else {
+            self.model_input_names.clone()
+        };
+        let input_shapes = if use_decode_session {
+            self.decode_model_input_shapes.clone()
+        } else {
+            self.model_input_shapes.clone()
+        };
+        let input_types = if use_decode_session {
+            self.decode_model_input_types.clone()
+        } else {
+            self.model_input_types.clone()
+        };
+        let output_names = if use_decode_session {
+            self.decode_model_output_names()
+        } else {
+            self.model_output_names.clone()
+        };
+
+        if !input_names.contains("input_ids") {
+            return Err(EngineError::backend(
+                "Model input 'input_ids' not found".to_string(),
+            ));
+        }
+
+        // CPU-resident scalar/token inputs. I/O binding copies only these to
+        // the EP; past KV is bound below from its existing CUDA OrtValue.
+        let mut owned_inputs: Vec<(String, DynValue)> = Vec::with_capacity(3 + self.num_layers * 2);
+        let input_ids_type = input_types
+            .get("input_ids")
+            .copied()
+            .unwrap_or(TensorElementType::Int64);
+        let input_ids: DynValue = match input_ids_type {
+            TensorElementType::Int64 => Value::from_array(
+                Array2::from_shape_vec(
+                    (1, input_len),
+                    input_tokens.iter().map(|&token| token as i64).collect(),
+                )
+                .map_err(|error| EngineError::backend(error.to_string()))?,
+            )
+            .map_err(|error| EngineError::backend(error.to_string()))?
+            .into_dyn(),
+            TensorElementType::Int32 => Value::from_array(
+                Array2::from_shape_vec(
+                    (1, input_len),
+                    input_tokens.iter().map(|&token| token as i32).collect(),
+                )
+                .map_err(|error| EngineError::backend(error.to_string()))?,
+            )
+            .map_err(|error| EngineError::backend(error.to_string()))?
+            .into_dyn(),
+            other => {
+                return Err(EngineError::backend(format!(
+                    "Unsupported input_ids dtype: {:?}",
+                    other
+                )))
+            }
+        };
+        owned_inputs.push(("input_ids".to_string(), input_ids));
+
+        if input_names.contains("attention_mask") {
+            let mask_type = input_types
+                .get("attention_mask")
+                .copied()
+                .unwrap_or(TensorElementType::Int64);
+            let mask: DynValue = match mask_type {
+                TensorElementType::Int64 => {
+                    Value::from_array(Array2::from_elem((1, total_len), 1i64))
+                        .map_err(|error| EngineError::backend(error.to_string()))?
+                        .into_dyn()
+                }
+                TensorElementType::Int32 => {
+                    Value::from_array(Array2::from_elem((1, total_len), 1i32))
+                        .map_err(|error| EngineError::backend(error.to_string()))?
+                        .into_dyn()
+                }
+                TensorElementType::Bool => {
+                    Value::from_array(Array2::from_elem((1, total_len), true))
+                        .map_err(|error| EngineError::backend(error.to_string()))?
+                        .into_dyn()
+                }
+                TensorElementType::Float32 => {
+                    Value::from_array(Array2::from_elem((1, total_len), 1.0f32))
+                        .map_err(|error| EngineError::backend(error.to_string()))?
+                        .into_dyn()
+                }
+                other => {
+                    return Err(EngineError::backend(format!(
+                        "Unsupported attention_mask dtype: {:?}",
+                        other
+                    )))
+                }
+            };
+            owned_inputs.push(("attention_mask".to_string(), mask));
+        }
+
+        if input_names.contains("position_ids") {
+            let position_start = total_len.saturating_sub(input_len);
+            let position_type = input_types
+                .get("position_ids")
+                .copied()
+                .unwrap_or(TensorElementType::Int64);
+            let positions: DynValue = match position_type {
+                TensorElementType::Int64 => Value::from_array(
+                    Array2::from_shape_vec(
+                        (1, input_len),
+                        (position_start..total_len)
+                            .map(|position| position as i64)
+                            .collect(),
+                    )
+                    .map_err(|error| EngineError::backend(error.to_string()))?,
+                )
+                .map_err(|error| EngineError::backend(error.to_string()))?
+                .into_dyn(),
+                TensorElementType::Int32 => Value::from_array(
+                    Array2::from_shape_vec(
+                        (1, input_len),
+                        (position_start..total_len)
+                            .map(|position| position as i32)
+                            .collect(),
+                    )
+                    .map_err(|error| EngineError::backend(error.to_string()))?,
+                )
+                .map_err(|error| EngineError::backend(error.to_string()))?
+                .into_dyn(),
+                other => {
+                    return Err(EngineError::backend(format!(
+                        "Unsupported position_ids dtype: {:?}",
+                        other
+                    )))
+                }
+            };
+            owned_inputs.push(("position_ids".to_string(), positions));
+        }
+
+        // CUDA accepts true zero-length past tensors, so unlike the CoreML
+        // fallback there is no dummy timestep to carry through the cache.
+        if old_cache.length == 0 {
+            for layer in 0..self.num_layers {
+                for suffix in ["key", "value"] {
+                    let name = format!("past_key_values.{}.{}", layer, suffix);
+                    if !input_names.contains(&name) {
+                        continue;
+                    }
+                    let dtype = input_types
+                        .get(&name)
+                        .copied()
+                        .unwrap_or(TensorElementType::Float16);
+                    let shape = empty_kv_shape_with_seq_len(
+                        input_shapes.get(&name),
+                        self.kv_layout,
+                        self.num_heads,
+                        self.head_dim,
+                        0,
+                    );
+                    let value = self.get_empty_kv_value(&name, dtype, &shape)?;
+                    owned_inputs.push((name, value));
+                }
+            }
+        }
+
+        let cuda_memory = MemoryInfo::new(
+            AllocationDevice::CUDA,
+            self.device_kv_device_id,
+            AllocatorType::Device,
+            MemoryType::Default,
+        )
+        .map_err(|error| EngineError::backend(error.to_string()))?;
+        let cpu_output_memory = MemoryInfo::new(
+            AllocationDevice::CPU,
+            0,
+            AllocatorType::Device,
+            MemoryType::CPUOutput,
+        )
+        .map_err(|error| EngineError::backend(error.to_string()))?;
+
+        #[cfg(feature = "onnx-cuda-pool")]
+        let _pool_scope =
+            self.enter_pool_scope(self.device_kv_device_id, PoolAllocationClass::KvCache);
+        let session = if use_decode_session {
+            self.decode_session
+                .as_mut()
+                .ok_or(EngineError::ModelNotLoaded)?
+        } else {
+            self.session.as_mut().ok_or(EngineError::ModelNotLoaded)?
+        };
+        let mut binding = session
+            .create_binding()
+            .map_err(|error| EngineError::backend(error.to_string()))?;
+        for (name, value) in &owned_inputs {
+            binding
+                .bind_input(name, value)
+                .map_err(|error| EngineError::backend(error.to_string()))?;
+        }
+        if old_cache.length > 0 {
+            for layer in 0..self.num_layers {
+                let key_name = format!("past_key_values.{}.key", layer);
+                let value_name = format!("past_key_values.{}.value", layer);
+                if !input_names.contains(&key_name) && !input_names.contains(&value_name) {
+                    continue;
+                }
+                let cached = old_cache
+                    .layers
+                    .get(layer)
+                    .and_then(Option::as_ref)
+                    .ok_or_else(|| {
+                        EngineError::backend(format!(
+                            "Missing device KV layer {} for sequence {}",
+                            layer, seq_id
+                        ))
+                    })?;
+                binding
+                    .bind_input(&key_name, &cached.key)
+                    .map_err(|error| EngineError::backend(error.to_string()))?;
+                binding
+                    .bind_input(&value_name, &cached.value)
+                    .map_err(|error| EngineError::backend(error.to_string()))?;
+            }
+        }
+
+        binding
+            .bind_output_to_device("logits", &cpu_output_memory)
+            .map_err(|error| EngineError::backend(error.to_string()))?;
+        let mut bound_layers = Vec::new();
+        for layer in 0..self.num_layers {
+            let key_name = format!("present.{}.key", layer);
+            let value_name = format!("present.{}.value", layer);
+            if !output_names.contains(&key_name) && !output_names.contains(&value_name) {
+                continue;
+            }
+            if !output_names.contains(&key_name) || !output_names.contains(&value_name) {
+                return Err(EngineError::backend(format!(
+                    "ONNX layer {} does not expose paired present key/value outputs",
+                    layer
+                )));
+            }
+            binding
+                .bind_output_to_device(&key_name, &cuda_memory)
+                .map_err(|error| EngineError::backend(error.to_string()))?;
+            binding
+                .bind_output_to_device(&value_name, &cuda_memory)
+                .map_err(|error| EngineError::backend(error.to_string()))?;
+            bound_layers.push(layer);
+        }
+
+        let mut outputs = session
+            .run_binding(&binding)
+            .map_err(|error| EngineError::backend(error.to_string()))?;
+        binding
+            .synchronize_outputs()
+            .map_err(|error| EngineError::backend(error.to_string()))?;
+
+        let mut new_cache = DeviceKvSequence::empty(self.num_layers);
+        new_cache.length = total_len;
+        for layer in bound_layers {
+            let key_name = format!("present.{}.key", layer);
+            let value_name = format!("present.{}.value", layer);
+            let key = outputs.remove(&key_name).ok_or_else(|| {
+                EngineError::backend(format!("Missing bound output {}", key_name))
+            })?;
+            let value = outputs.remove(&value_name).ok_or_else(|| {
+                EngineError::backend(format!("Missing bound output {}", value_name))
+            })?;
+            validate_device_kv_tensor(
+                &key,
+                &key_name,
+                self.kv_layout,
+                total_len,
+                self.num_heads,
+                self.head_dim,
+                self.device_kv_device_id,
+            )?;
+            validate_device_kv_tensor(
+                &value,
+                &value_name,
+                self.kv_layout,
+                total_len,
+                self.num_heads,
+                self.head_dim,
+                self.device_kv_device_id,
+            )?;
+            if key.shape() != value.shape() {
+                return Err(EngineError::backend(format!(
+                    "Device KV key/value shape mismatch on layer {}: {:?} vs {:?}",
+                    layer,
+                    key.shape(),
+                    value.shape()
+                )));
+            }
+            new_cache.layers[layer] = Some(DeviceKvLayer { key, value });
+        }
+
+        Self::sample_and_emit(
+            outputs,
+            self.vocab_size,
+            self.tokenizer.as_ref().ok_or(EngineError::ModelNotLoaded)?,
+            group_arc,
+            seq_arc,
+            seq_id,
+            true,
+            input_len,
+        )?;
+        Ok(new_cache)
     }
 
     fn try_execute_batched_prefill_step(
@@ -3383,6 +4560,11 @@ impl LLMEngine {
             }
         }
 
+        #[cfg(feature = "onnx-cuda-pool")]
+        let _pool_scope = self.enter_pool_scope(
+            self.device_kv_device_id,
+            PoolAllocationClass::TransientWorkspace,
+        );
         let outputs = self
             .session
             .as_mut()
@@ -4074,6 +5256,11 @@ impl LLMEngine {
             .map(|started| started.elapsed().as_secs_f64() * 1000.0)
             .unwrap_or(0.0);
         let ort_started = profile_decode.then(Instant::now);
+        #[cfg(feature = "onnx-cuda-pool")]
+        let _pool_scope = self.enter_pool_scope(
+            self.device_kv_device_id,
+            PoolAllocationClass::TransientWorkspace,
+        );
         let outputs = if self.decode_session.is_some() {
             self.decode_session
                 .as_mut()
@@ -4436,6 +5623,9 @@ impl LLMEngine {
     ) -> Result<(), EngineError> {
         if self.pipeline_stages.is_some() {
             return self.execute_pipeline_step(groups).await;
+        }
+        if self.try_execute_device_kv_step(groups)? {
+            return Ok(());
         }
         // Arc-clone model-declared inputs & shapes (O(1) pointer bump) to avoid borrowing self
         // while mutably borrowing session.
@@ -4977,6 +6167,11 @@ impl LLMEngine {
                 }
 
                 // Run inference.
+                #[cfg(feature = "onnx-cuda-pool")]
+                let _pool_scope = self.enter_pool_scope(
+                    self.device_kv_device_id,
+                    PoolAllocationClass::TransientWorkspace,
+                );
                 let outputs = if use_dedicated_decode_session {
                     self.decode_session
                         .as_mut()
@@ -5279,6 +6474,11 @@ impl LLMEngine {
         &mut self,
         groups: &[Arc<Mutex<SequenceGroup>>],
     ) -> Result<(), EngineError> {
+        #[cfg(feature = "onnx-cuda-pool")]
+        let _pool_scope = self.enter_pool_scope(
+            self.device_kv_device_id,
+            PoolAllocationClass::TransientWorkspace,
+        );
         let stages = match self.pipeline_stages.as_mut() {
             Some(stages) => stages,
             None => return Err(EngineError::ModelNotLoaded),

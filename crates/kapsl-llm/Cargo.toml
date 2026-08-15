@@ -11,6 +11,7 @@ kapsl-core = { version = "0.1.2", path = "../kapsl-core" }
 kapsl-engine-api = { version = "0.1.2", path = "../kapsl-engine-api" }
 kapsl-quantization = { version = "0.1.2", path = "../kapsl-quantization" }
 kapsl-kernels = { version = "0.1.2", path = "../kapsl-kernels" }
+kapsl-loader = { version = "0.1.2", path = "../kapsl-loader", optional = true }
 tokio = { version = "1.32", features = ["full"] }
 tracing = "0.1"
 uuid = { version = "1.4", features = ["v4"] }
@@ -36,11 +37,14 @@ ort = { version = "=2.0.0-rc.11", features = ["ndarray", "half", "download-binar
 
 [features]
 default = ["gguf"]
-gguf = ["dep:llama-cpp-2", "dep:llama-cpp-sys-2"]
+gguf = ["dep:llama-cpp-2", "dep:llama-cpp-sys-2", "dep:kapsl-loader"]
 # Opt-in CUDA acceleration for GGUF. Keep default CPU/Metal portable so Linux
 # machines without a CUDA toolkit can still build.
 gguf-cuda = ["gguf", "llama-cpp-2/cuda"]
 gguf-cuda-shared-kv = ["gguf-cuda", "kapsl-hal/cuda", "dep:cudarc"]
+# Attribute ORT CUDA allocations to model/replica/allocation-class scopes when
+# the runtime registers its environment allocator.
+onnx-cuda-pool = ["kapsl-hal/cuda"]
 
 [target.'cfg(target_os = "macos")'.dependencies.llama-cpp-2]
 package = "kapsl-llama-cpp-2"

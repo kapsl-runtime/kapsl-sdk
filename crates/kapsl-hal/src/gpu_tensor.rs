@@ -39,16 +39,13 @@ impl<T: cudarc::driver::DeviceRepr> GpuTensor<T> {
 }
 
 #[cfg(feature = "cuda")]
-impl<T: cudarc::driver::DeviceRepr + Clone> GpuTensor<T> {
-}
+impl<T: cudarc::driver::DeviceRepr + Clone> GpuTensor<T> {}
 
 #[cfg(feature = "cuda")]
-impl GpuTensor<half::f16> {
-}
+impl GpuTensor<half::f16> {}
 
 #[cfg(feature = "cuda")]
-impl<T: cudarc::driver::DeviceRepr + Default + Clone> GpuTensor<T> {
-}
+impl<T: cudarc::driver::DeviceRepr + Default + Clone> GpuTensor<T> {}
 
 #[cfg(feature = "cuda")]
 impl<T: cudarc::driver::DeviceRepr> std::fmt::Debug for GpuTensor<T> {

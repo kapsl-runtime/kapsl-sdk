@@ -17,7 +17,8 @@ use async_trait::async_trait;
 use futures::stream::{self, Stream, StreamExt};
 use kapsl_engine_api::{
     BatchingPolicy, BinaryTensorPacket, Engine, EngineError, EngineMetrics, ExternalDeviceMemory,
-    ExternalDeviceMemoryReport, InferenceRequest, TensorDtype,
+    ExternalDeviceMemoryReport, InferenceRequest, MemoryAllocation, MemoryAllocationClass,
+    MemoryAllocationSource, MemoryDomain, MemoryReport, TensorDtype,
 };
 use serde_json::Value;
 use std::fs;
@@ -51,6 +52,8 @@ pub struct LLMBackend {
     device_ids_override: Option<Vec<i32>>,
     /// Opt CUDA/TensorRT sessions into allocators registered on the ORT environment.
     use_env_allocators: bool,
+    /// Runtime model/replica identity propagated into ORT allocator scopes.
+    memory_owner: Option<(u32, u32)>,
     /// Optional shared block pool.  When set, the engine draws from this pool
     /// instead of a private allocator, enabling unified KV memory across models.
     shared_pool: Option<SharedBlockAllocator>,
@@ -76,6 +79,7 @@ pub struct LLMBackend {
     /// task ends (drops), so the runtime can fully deregister the dead engine.
     on_engine_death: Option<Arc<dyn Fn(u32) + Send + Sync>>,
     external_allocation_id: String,
+    loaded_model_bytes: AtomicUsize,
 }
 
 #[derive(Clone)]
@@ -94,6 +98,109 @@ fn default_sampling_params() -> SamplingParams {
         stop_token_ids: Vec::new(),
         repetition_penalty: 1.15,
         seed: None,
+    }
+}
+
+/// Estimate KV bytes that are physically materialized while the model loads.
+/// Dense/device KV stays request-elastic; paged host KV owns its full backing
+/// vectors immediately, so it must appear in the pre-load authority plan.
+fn planned_host_kv_backing_bytes(model_path: &Path, block_cap: Option<usize>) -> usize {
+    const DEFAULT_LAYERS: usize = 32;
+    const DEFAULT_HEADS: usize = 32;
+    const DEFAULT_HEAD_DIM: usize = 128;
+    const DEFAULT_MAX_SEQ_LEN: usize = 4096;
+
+    let model_config =
+        find_model_asset(model_path, "config.json").and_then(|path| read_json(&path));
+    let metadata = read_json(&find_model_root(model_path).join("metadata.json"));
+    let llm = metadata
+        .as_ref()
+        .and_then(|value| value.get("metadata"))
+        .and_then(|value| value.get("llm"));
+    let kv = llm.and_then(|value| value.get("kv_cache"));
+
+    let from_json = |value: Option<&Value>, keys: &[&str]| {
+        keys.iter().find_map(|key| {
+            value
+                .and_then(|value| value.get(*key))
+                .and_then(Value::as_u64)
+                .filter(|value| *value > 0)
+                .map(|value| value as usize)
+        })
+    };
+    let layers = from_json(llm, &["num_layers"])
+        .or_else(|| from_json(model_config.as_ref(), &["num_hidden_layers", "n_layer"]))
+        .unwrap_or(DEFAULT_LAYERS);
+    let attention_heads = from_json(model_config.as_ref(), &["num_attention_heads", "n_head"])
+        .unwrap_or(DEFAULT_HEADS);
+    let kv_heads = from_json(llm, &["num_kv_heads", "num_key_value_heads"])
+        .or_else(|| {
+            from_json(
+                model_config.as_ref(),
+                &["num_key_value_heads", "num_attention_heads", "n_head"],
+            )
+        })
+        .unwrap_or(attention_heads);
+    let head_dim = from_json(llm, &["head_dim"])
+        .or_else(|| from_json(model_config.as_ref(), &["head_dim"]))
+        .or_else(|| {
+            from_json(model_config.as_ref(), &["hidden_size", "n_embd"])
+                .map(|hidden| hidden / attention_heads.max(1))
+        })
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_HEAD_DIM);
+    let max_seq_len = from_json(llm, &["max_sequence_length", "max_seq_len"])
+        .or_else(|| {
+            from_json(
+                model_config.as_ref(),
+                &["max_position_embeddings", "n_positions"],
+            )
+        })
+        .unwrap_or(DEFAULT_MAX_SEQ_LEN);
+
+    let env_usize = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+    };
+    let mode = std::env::var("KAPSL_LLM_KV_CACHE_MODE")
+        .ok()
+        .or_else(|| {
+            kv.and_then(|value| value.get("mode"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "dense".to_string());
+    let block_size = env_usize("KAPSL_LLM_KV_CACHE_BLOCK_SIZE")
+        .or_else(|| from_json(kv, &["block_size"]))
+        .unwrap_or(16);
+    let total_blocks = env_usize("KAPSL_LLM_KV_CACHE_TOTAL_BLOCKS")
+        .or_else(|| from_json(kv, &["total_blocks"]))
+        .unwrap_or(2048);
+    let total_blocks = block_cap
+        .filter(|cap| *cap > 0)
+        .map_or(total_blocks, |cap| total_blocks.min(cap));
+    let dense_free_list_cap = env_usize("KAPSL_LLM_KV_FREE_LIST_CAP")
+        .or_else(|| {
+            kv.and_then(|value| value.get("dense_free_list_cap"))
+                .and_then(Value::as_u64)
+                .map(|value| value as usize)
+        })
+        .unwrap_or(0);
+    let bytes_per_token = layers
+        .saturating_mul(kv_heads)
+        .saturating_mul(head_dim)
+        .saturating_mul(2)
+        .saturating_mul(std::mem::size_of::<half::f16>());
+
+    if mode.eq_ignore_ascii_case("paged") {
+        total_blocks
+            .saturating_mul(block_size)
+            .saturating_mul(bytes_per_token)
+    } else {
+        dense_free_list_cap
+            .saturating_mul(max_seq_len)
+            .saturating_mul(bytes_per_token)
     }
 }
 
@@ -471,6 +578,19 @@ impl Drop for GlobalTokenGuard {
 }
 
 impl LLMBackend {
+    /// Translate the engine metadata convention (smaller values are more
+    /// important) into the ONNX sequence scheduler convention (larger values
+    /// are more important). Unstamped direct SDK calls retain the historical
+    /// normal-priority value of zero.
+    fn sequence_priority(request: &InferenceRequest) -> u8 {
+        request
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.priority)
+            .map(|priority| u8::MAX.saturating_sub(priority))
+            .unwrap_or(0)
+    }
+
     pub fn new() -> Self {
         Self {
             request_tx: RwLock::new(None),
@@ -484,6 +604,7 @@ impl LLMBackend {
             device_id_override: None,
             device_ids_override: None,
             use_env_allocators: false,
+            memory_owner: None,
             shared_pool: None,
             kv_blocks_cap: None,
             kv_compression_bits: None,
@@ -495,6 +616,7 @@ impl LLMBackend {
                 "llm-ort:{}",
                 NEXT_LLM_EXTERNAL_ALLOCATION_ID.fetch_add(1, Ordering::Relaxed)
             ),
+            loaded_model_bytes: AtomicUsize::new(0),
         }
     }
 
@@ -535,6 +657,12 @@ impl LLMBackend {
         self
     }
 
+    /// Attribute ONNX provider allocations to a stable model replica.
+    pub fn with_memory_owner(mut self, model_id: u32, replica_id: u32) -> Self {
+        self.memory_owner = Some((model_id, replica_id));
+        self
+    }
+
     /// Attach a live KV block cap updated by the runtime on engine join/leave.
     ///
     /// When set, `infer_stream` reads the current cap value and injects it into
@@ -542,6 +670,11 @@ impl LLMBackend {
     /// that the effective block limit tracks the live fleet without an engine
     /// restart.
     pub fn with_live_kv_cap(mut self, cap: Arc<AtomicUsize>) -> Self {
+        if let Some(scheduler) = self.global_scheduler.as_ref() {
+            scheduler
+                .lock()
+                .register_block_cap(self.engine_id, cap.clone());
+        }
         self.live_kv_cap = Some(cap);
         self
     }
@@ -560,6 +693,13 @@ impl LLMBackend {
     ) -> Self {
         self.global_scheduler = Some(scheduler);
         self.engine_id = engine_id;
+        if let (Some(scheduler), Some(cap)) =
+            (self.global_scheduler.as_ref(), self.live_kv_cap.as_ref())
+        {
+            scheduler
+                .lock()
+                .register_block_cap(self.engine_id, cap.clone());
+        }
         self
     }
 
@@ -604,23 +744,8 @@ impl LLMBackend {
         backend.device_ids_override = Some(device_ids);
         backend
     }
-}
 
-impl Default for LLMBackend {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[async_trait]
-impl Engine for LLMBackend {
-    fn planned_external_device_memory(
-        &self,
-        model_path: &Path,
-    ) -> Result<ExternalDeviceMemoryReport, EngineError> {
-        if self.use_env_allocators {
-            return Ok(ExternalDeviceMemoryReport::default());
-        }
+    fn cuda_device_ids(&self) -> Vec<usize> {
         let uses_cuda = self
             .provider_override
             .as_deref()
@@ -631,6 +756,123 @@ impl Engine for LLMBackend {
                 self.device_id_override.is_some() || self.device_ids_override.is_some()
             });
         if !uses_cuda {
+            return Vec::new();
+        }
+        let mut devices = self
+            .device_ids_override
+            .clone()
+            .or_else(|| self.device_id_override.map(|device_id| vec![device_id]))
+            .unwrap_or_else(|| vec![0]);
+        devices.retain(|device_id| *device_id >= 0);
+        devices.sort_unstable();
+        devices.dedup();
+        devices
+            .into_iter()
+            .map(|device_id| device_id as usize)
+            .collect()
+    }
+}
+
+impl Default for LLMBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl Engine for LLMBackend {
+    fn planned_memory(&self, model_path: &Path) -> Result<MemoryReport, EngineError> {
+        let model_bytes = fs::metadata(model_path)
+            .map_err(|source| EngineError::ModelLoadError {
+                path: model_path.display().to_string(),
+                source: Box::new(source),
+            })?
+            .len() as usize;
+        let mut report = MemoryReport::single(
+            format!("{}:host-session", self.external_allocation_id),
+            MemoryDomain::Host,
+            MemoryAllocationClass::ModelSession,
+            model_bytes,
+        );
+        let host_kv_backing = planned_host_kv_backing_bytes(model_path, self.kv_blocks_cap);
+        let devices = self.cuda_device_ids();
+        if devices.is_empty() {
+            report.push(MemoryAllocation {
+                allocation_id: format!("{}:host-weights", self.external_allocation_id),
+                domain: MemoryDomain::Host,
+                class: MemoryAllocationClass::PersistentWeights,
+                source: MemoryAllocationSource::BackendManaged,
+                bytes: model_bytes,
+            });
+            report.push(MemoryAllocation {
+                allocation_id: format!("{}:host-kv", self.external_allocation_id),
+                domain: MemoryDomain::Host,
+                class: MemoryAllocationClass::KvCache,
+                source: MemoryAllocationSource::BackendManaged,
+                bytes: host_kv_backing,
+            });
+            return Ok(report);
+        }
+
+        let per_device_bytes =
+            model_bytes.saturating_add(devices.len().saturating_sub(1)) / devices.len().max(1);
+        let source = if self.use_env_allocators {
+            MemoryAllocationSource::RuntimeManaged
+        } else {
+            MemoryAllocationSource::BackendManaged
+        };
+        for device_id in devices {
+            report.push(MemoryAllocation {
+                allocation_id: self.external_allocation_id.clone(),
+                domain: MemoryDomain::Cuda { device_id },
+                class: MemoryAllocationClass::PersistentWeights,
+                source,
+                bytes: per_device_bytes,
+            });
+            report.push(MemoryAllocation {
+                allocation_id: format!("{}:workspace", self.external_allocation_id),
+                domain: MemoryDomain::Cuda { device_id },
+                class: MemoryAllocationClass::TransientWorkspace,
+                source,
+                bytes: (per_device_bytes / 4).max(64 * 1024 * 1024),
+            });
+            report.push(MemoryAllocation {
+                allocation_id: format!("{}:kv", self.external_allocation_id),
+                domain: if self.use_env_allocators {
+                    MemoryDomain::Cuda { device_id }
+                } else {
+                    MemoryDomain::Host
+                },
+                class: MemoryAllocationClass::KvCache,
+                source: if self.use_env_allocators {
+                    source
+                } else {
+                    MemoryAllocationSource::BackendManaged
+                },
+                bytes: 0,
+            });
+        }
+        if host_kv_backing > 0 {
+            report.push(MemoryAllocation {
+                allocation_id: format!("{}:host-kv", self.external_allocation_id),
+                domain: MemoryDomain::Host,
+                class: MemoryAllocationClass::KvCache,
+                source: MemoryAllocationSource::BackendManaged,
+                bytes: host_kv_backing,
+            });
+        }
+        Ok(report)
+    }
+
+    fn planned_external_device_memory(
+        &self,
+        model_path: &Path,
+    ) -> Result<ExternalDeviceMemoryReport, EngineError> {
+        if self.use_env_allocators {
+            return Ok(ExternalDeviceMemoryReport::default());
+        }
+        let device_ids = self.cuda_device_ids();
+        if device_ids.is_empty() {
             return Ok(ExternalDeviceMemoryReport::default());
         }
 
@@ -640,14 +882,6 @@ impl Engine for LLMBackend {
                 source: Box::new(source),
             })?
             .len() as usize;
-        let mut device_ids = self
-            .device_ids_override
-            .clone()
-            .or_else(|| self.device_id_override.map(|device_id| vec![device_id]))
-            .unwrap_or_else(|| vec![0]);
-        device_ids.retain(|device_id| *device_id >= 0);
-        device_ids.sort_unstable();
-        device_ids.dedup();
         let per_device_bytes = model_bytes.saturating_add(device_ids.len().saturating_sub(1))
             / device_ids.len().max(1);
         Ok(ExternalDeviceMemoryReport {
@@ -655,15 +889,185 @@ impl Engine for LLMBackend {
                 .into_iter()
                 .map(|device_id| ExternalDeviceMemory {
                     allocation_id: self.external_allocation_id.clone(),
-                    device_id: device_id as usize,
+                    device_id,
                     bytes: per_device_bytes,
                 })
                 .collect(),
         })
     }
 
+    fn actual_external_device_memory(&self) -> ExternalDeviceMemoryReport {
+        if self.use_env_allocators {
+            return ExternalDeviceMemoryReport::default();
+        }
+        let model_bytes = self.loaded_model_bytes.load(Ordering::Acquire);
+        let devices = self.cuda_device_ids();
+        if model_bytes == 0 || devices.is_empty() {
+            return ExternalDeviceMemoryReport::default();
+        }
+        let per_device_bytes =
+            model_bytes.saturating_add(devices.len().saturating_sub(1)) / devices.len().max(1);
+        ExternalDeviceMemoryReport {
+            allocations: devices
+                .into_iter()
+                .map(|device_id| ExternalDeviceMemory {
+                    allocation_id: self.external_allocation_id.clone(),
+                    device_id,
+                    bytes: per_device_bytes,
+                })
+                .collect(),
+        }
+    }
+
+    fn actual_memory(&self) -> MemoryReport {
+        let model_bytes = self.loaded_model_bytes.load(Ordering::Acquire);
+        if model_bytes == 0 {
+            return MemoryReport::default();
+        }
+        let mut report = MemoryReport::single(
+            format!("{}:host-session", self.external_allocation_id),
+            MemoryDomain::Host,
+            MemoryAllocationClass::ModelSession,
+            model_bytes,
+        );
+        let devices = self.cuda_device_ids();
+        if devices.is_empty() {
+            report.push(MemoryAllocation {
+                allocation_id: format!("{}:host-weights", self.external_allocation_id),
+                domain: MemoryDomain::Host,
+                class: MemoryAllocationClass::PersistentWeights,
+                source: MemoryAllocationSource::BackendManaged,
+                bytes: model_bytes,
+            });
+        } else {
+            let per_device_bytes =
+                model_bytes.saturating_add(devices.len().saturating_sub(1)) / devices.len().max(1);
+            let source = if self.use_env_allocators {
+                MemoryAllocationSource::RuntimeManaged
+            } else {
+                MemoryAllocationSource::BackendManaged
+            };
+            for device_id in devices.iter().copied() {
+                report.push(MemoryAllocation {
+                    allocation_id: self.external_allocation_id.clone(),
+                    domain: MemoryDomain::Cuda { device_id },
+                    class: MemoryAllocationClass::PersistentWeights,
+                    source,
+                    bytes: per_device_bytes,
+                });
+                report.push(MemoryAllocation {
+                    allocation_id: format!("{}:workspace", self.external_allocation_id),
+                    domain: MemoryDomain::Cuda { device_id },
+                    class: MemoryAllocationClass::TransientWorkspace,
+                    source,
+                    bytes: (per_device_bytes / 4).max(64 * 1024 * 1024),
+                });
+            }
+        }
+
+        let metrics = self.metrics.lock().unwrap();
+        if metrics.kv_cache_host_bytes_retained > 0 || !metrics.kv_cache_device_resident {
+            report.push(MemoryAllocation {
+                allocation_id: format!("{}:host-kv", self.external_allocation_id),
+                domain: MemoryDomain::Host,
+                class: MemoryAllocationClass::KvCache,
+                source: MemoryAllocationSource::BackendManaged,
+                bytes: metrics.kv_cache_host_bytes_retained,
+            });
+        }
+        if metrics.kv_cache_device_resident {
+            if let Some(device_id) = devices.first().copied() {
+                report.push(MemoryAllocation {
+                    allocation_id: format!("{}:kv", self.external_allocation_id),
+                    domain: MemoryDomain::Cuda { device_id },
+                    class: MemoryAllocationClass::KvCache,
+                    source: MemoryAllocationSource::RuntimeManaged,
+                    bytes: metrics.kv_cache_device_bytes_retained,
+                });
+            }
+        }
+        report
+    }
+
+    fn planned_request_memory(&self, request: &InferenceRequest) -> MemoryReport {
+        let bytes = request
+            .additional_inputs
+            .iter()
+            .map(|input| input.tensor.data.len())
+            .fold(request.input.data.len(), usize::saturating_add);
+        let mut report = MemoryReport::single(
+            "request:materialized-inputs",
+            MemoryDomain::Host,
+            MemoryAllocationClass::RequestTransient,
+            bytes,
+        );
+        if let Some(device_id) = self.cuda_device_ids().first().copied() {
+            report.push(MemoryAllocation {
+                allocation_id: "request:cuda-staging".to_string(),
+                domain: MemoryDomain::HostPinned {
+                    provider: "cuda".to_string(),
+                    device_id: Some(device_id),
+                },
+                class: MemoryAllocationClass::RequestTransient,
+                source: MemoryAllocationSource::BackendManaged,
+                bytes,
+            });
+            report.push(MemoryAllocation {
+                allocation_id: "request:cuda-input-output".to_string(),
+                domain: MemoryDomain::Cuda { device_id },
+                class: MemoryAllocationClass::RequestTransient,
+                source: if self.use_env_allocators {
+                    MemoryAllocationSource::RuntimeManaged
+                } else {
+                    MemoryAllocationSource::BackendManaged
+                },
+                bytes,
+            });
+        }
+        let metrics = self.metrics.lock().unwrap();
+        let kv_bytes = metrics.kv_cache_request_reservation_bytes;
+        if kv_bytes > 0 {
+            if metrics.kv_cache_device_resident {
+                if let Some(device_id) = self.cuda_device_ids().first().copied() {
+                    report.push(MemoryAllocation {
+                        allocation_id: "request:cuda-kv".to_string(),
+                        domain: MemoryDomain::Cuda { device_id },
+                        class: MemoryAllocationClass::KvCache,
+                        source: MemoryAllocationSource::RuntimeManaged,
+                        bytes: kv_bytes,
+                    });
+                    // Device-to-host fallback briefly holds both copies. Admit
+                    // the destination up front so migration never allocates
+                    // ungoverned host KV after a provider failure.
+                    report.push(MemoryAllocation {
+                        allocation_id: "request:host-kv-fallback".to_string(),
+                        domain: MemoryDomain::Host,
+                        class: MemoryAllocationClass::KvCache,
+                        source: MemoryAllocationSource::BackendManaged,
+                        bytes: metrics.kv_cache_host_fallback_reservation_bytes,
+                    });
+                }
+            } else {
+                report.push(MemoryAllocation {
+                    allocation_id: "request:host-kv".to_string(),
+                    domain: MemoryDomain::Host,
+                    class: MemoryAllocationClass::KvCache,
+                    source: MemoryAllocationSource::BackendManaged,
+                    bytes: kv_bytes,
+                });
+            }
+        }
+        report
+    }
+
     async fn load(&mut self, model_path: &Path) -> Result<(), EngineError> {
         log::info!("Starting LLMEngine for model: {}", model_path.display());
+        let loaded_model_bytes = fs::metadata(model_path)
+            .map_err(|source| EngineError::ModelLoadError {
+                path: model_path.display().to_string(),
+                source: Box::new(source),
+            })?
+            .len() as usize;
 
         let runtime_cfg = load_model_runtime_config(model_path);
         {
@@ -740,6 +1144,7 @@ impl Engine for LLMBackend {
         let device_id_override = self.device_id_override;
         let device_ids_override = self.device_ids_override.clone();
         let use_env_allocators = self.use_env_allocators;
+        let memory_owner = self.memory_owner;
         let engine_block_size = hints.block_size;
         let engine_num_gpu_blocks = hints.num_gpu_blocks;
         let shared_pool = self.shared_pool.clone();
@@ -761,6 +1166,10 @@ impl Engine for LLMBackend {
                 device_ids_override,
                 use_env_allocators,
             );
+            let mut engine = engine;
+            if let Some((model_id, replica_id)) = memory_owner {
+                engine.set_memory_owner(model_id, replica_id);
+            }
             // If a shared pool was attached, replace the private allocator.
             let mut engine = if let Some(pool) = shared_pool {
                 engine.with_shared_pool(pool)
@@ -817,6 +1226,8 @@ impl Engine for LLMBackend {
             Ok(Ok(_)) => {
                 let mut tx_guard = self.request_tx.write().unwrap();
                 *tx_guard = Some(request_tx);
+                self.loaded_model_bytes
+                    .store(loaded_model_bytes, Ordering::Release);
                 Ok(())
             }
             Ok(Err(e)) => Err(e),
@@ -981,7 +1392,7 @@ impl Engine for LLMBackend {
             estimated_tokens
         };
 
-        let seq_group = SequenceGroup::new(
+        let mut seq_group = SequenceGroup::new(
             request_id,
             request.session_id.clone(),
             prompt,
@@ -990,6 +1401,7 @@ impl Engine for LLMBackend {
             cancellation.clone(),
             response_tx,
         );
+        seq_group.priority = Self::sequence_priority(request);
 
         // Hard admission gate: reserve against the global budget.  If the budget
         // is exhausted we reject immediately rather than queuing silently.
@@ -1128,6 +1540,7 @@ impl Engine for LLMBackend {
             // A disconnected channel also confirms task teardown after panic.
             let _ = done.recv();
         }
+        self.loaded_model_bytes.store(0, Ordering::Release);
     }
 
     fn metrics(&self) -> EngineMetrics {
@@ -1153,7 +1566,10 @@ impl Engine for LLMBackend {
     }
 
     fn batching_policy(&self) -> BatchingPolicy {
-        BatchingPolicy::continuous(1)
+        // The outer scheduler stamps its resolved queue priority into request
+        // metadata; `infer_stream` translates it into the ONNX sequence and KV
+        // eviction ordering above.
+        BatchingPolicy::continuous(1).with_priority_support()
     }
 
     fn health_check(&self) -> Result<(), EngineError> {

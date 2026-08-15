@@ -165,7 +165,8 @@ __global__ void paged_attention_v1(
         if device.get_func(MODULE_NAME, KERNEL_NAME).is_some() {
             return Ok(());
         }
-        let ptx = compile_ptx_with_opts(KERNEL_SRC, cuda_compile_opts()).map_err(|e| format!("NVRTC compile failed: {e}"))?;
+        let ptx = compile_ptx_with_opts(KERNEL_SRC, cuda_compile_opts())
+            .map_err(|e| format!("NVRTC compile failed: {e}"))?;
         device
             .load_ptx(ptx, MODULE_NAME, &[KERNEL_NAME])
             .map_err(|e| format!("PTX load failed: {e}"))?;
@@ -303,8 +304,8 @@ __global__ void rms_norm(
         params: &mut RmsNormParams<'_>,
     ) -> Result<(), String> {
         if device.get_func(RMSNORM_MODULE, RMSNORM_KERNEL).is_none() {
-            let ptx =
-                compile_ptx_with_opts(RMSNORM_SRC, cuda_compile_opts()).map_err(|e| format!("NVRTC rmsnorm compile: {e}"))?;
+            let ptx = compile_ptx_with_opts(RMSNORM_SRC, cuda_compile_opts())
+                .map_err(|e| format!("NVRTC rmsnorm compile: {e}"))?;
             device
                 .load_ptx(ptx, RMSNORM_MODULE, &[RMSNORM_KERNEL])
                 .map_err(|e| format!("PTX load: {e}"))?;
@@ -369,8 +370,8 @@ __global__ void fused_swiglu(
         n: u32,
     ) -> Result<(), String> {
         if device.get_func(SWIGLU_MODULE, SWIGLU_KERNEL).is_none() {
-            let ptx =
-                compile_ptx_with_opts(SWIGLU_SRC, cuda_compile_opts()).map_err(|e| format!("NVRTC swiglu compile: {e}"))?;
+            let ptx = compile_ptx_with_opts(SWIGLU_SRC, cuda_compile_opts())
+                .map_err(|e| format!("NVRTC swiglu compile: {e}"))?;
             device
                 .load_ptx(ptx, SWIGLU_MODULE, &[SWIGLU_KERNEL])
                 .map_err(|e| format!("PTX load: {e}"))?;
@@ -467,7 +468,8 @@ __global__ void rope_forward(
         params: &mut RopeParams<'_>,
     ) -> Result<(), String> {
         if device.get_func(ROPE_MODULE, ROPE_KERNEL).is_none() {
-            let ptx = compile_ptx_with_opts(ROPE_SRC, cuda_compile_opts()).map_err(|e| format!("NVRTC rope compile: {e}"))?;
+            let ptx = compile_ptx_with_opts(ROPE_SRC, cuda_compile_opts())
+                .map_err(|e| format!("NVRTC rope compile: {e}"))?;
             device
                 .load_ptx(ptx, ROPE_MODULE, &[ROPE_KERNEL])
                 .map_err(|e| format!("PTX load: {e}"))?;
@@ -562,8 +564,8 @@ __global__ void write_kv_to_pool(
         params: &mut KvWriteParams<'_>,
     ) -> Result<(), String> {
         if device.get_func(KV_WRITE_MODULE, KV_WRITE_KERNEL).is_none() {
-            let ptx =
-                compile_ptx_with_opts(KV_WRITE_SRC, cuda_compile_opts()).map_err(|e| format!("NVRTC kv_write compile: {e}"))?;
+            let ptx = compile_ptx_with_opts(KV_WRITE_SRC, cuda_compile_opts())
+                .map_err(|e| format!("NVRTC kv_write compile: {e}"))?;
             device
                 .load_ptx(ptx, KV_WRITE_MODULE, &[KV_WRITE_KERNEL])
                 .map_err(|e| format!("PTX load: {e}"))?;
@@ -720,7 +722,10 @@ __global__ void batch_rope_forward(
         device: &Arc<CudaDevice>,
         p: &mut BatchRopeParams<'_>,
     ) -> Result<(), String> {
-        if device.get_func(BATCH_ROPE_MODULE, BATCH_ROPE_KERNEL).is_none() {
+        if device
+            .get_func(BATCH_ROPE_MODULE, BATCH_ROPE_KERNEL)
+            .is_none()
+        {
             let ptx = compile_ptx_with_opts(BATCH_ROPE_SRC, cuda_compile_opts())
                 .map_err(|e| format!("NVRTC batch_rope compile: {e}"))?;
             device
@@ -1068,23 +1073,27 @@ __global__ void argmax_f16(
     static ARGMAX_KERNEL: &str = "argmax_f16";
 
     pub struct ArgmaxParams<'a> {
-        pub input:      &'a CudaSlice<f16>,
-        pub output:     &'a mut CudaSlice<u32>,
+        pub input: &'a CudaSlice<f16>,
+        pub output: &'a mut CudaSlice<u32>,
         pub vocab_size: u32,
     }
 
-    pub fn launch_argmax(
-        device: &Arc<CudaDevice>,
-        p: &mut ArgmaxParams<'_>,
-    ) -> Result<(), String> {
+    pub fn launch_argmax(device: &Arc<CudaDevice>, p: &mut ArgmaxParams<'_>) -> Result<(), String> {
         if device.get_func(ARGMAX_MODULE, ARGMAX_KERNEL).is_none() {
             let ptx = compile_ptx_with_opts(ARGMAX_SRC, cuda_compile_opts())
                 .map_err(|e| format!("NVRTC argmax compile: {e}"))?;
-            device.load_ptx(ptx, ARGMAX_MODULE, &[ARGMAX_KERNEL])
+            device
+                .load_ptx(ptx, ARGMAX_MODULE, &[ARGMAX_KERNEL])
                 .map_err(|e| format!("PTX load: {e}"))?;
         }
-        let func = device.get_func(ARGMAX_MODULE, ARGMAX_KERNEL).ok_or("argmax not found")?;
-        let cfg = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        let func = device
+            .get_func(ARGMAX_MODULE, ARGMAX_KERNEL)
+            .ok_or("argmax not found")?;
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
         unsafe {
             func.clone()
                 .launch(cfg, (p.input, &mut *p.output, p.vocab_size as i32))
@@ -1148,21 +1157,24 @@ __global__ void batch_decode_rope(
     static BATCH_DECODE_ROPE_KERNEL: &str = "batch_decode_rope";
 
     pub struct BatchDecodeRopeParams<'a> {
-        pub q:            &'a mut CudaSlice<f16>,
-        pub k:            &'a mut CudaSlice<f16>,
-        pub positions:    &'a CudaSlice<i32>,
-        pub batch_size:   u32,
-        pub num_q_heads:  u32,
+        pub q: &'a mut CudaSlice<f16>,
+        pub k: &'a mut CudaSlice<f16>,
+        pub positions: &'a CudaSlice<i32>,
+        pub batch_size: u32,
+        pub num_q_heads: u32,
         pub num_kv_heads: u32,
-        pub head_dim:     u32,
-        pub theta:        f32,
+        pub head_dim: u32,
+        pub theta: f32,
     }
 
     pub fn launch_batch_decode_rope(
         device: &Arc<CudaDevice>,
         p: &mut BatchDecodeRopeParams<'_>,
     ) -> Result<(), String> {
-        if device.get_func(BATCH_DECODE_ROPE_MODULE, BATCH_DECODE_ROPE_KERNEL).is_none() {
+        if device
+            .get_func(BATCH_DECODE_ROPE_MODULE, BATCH_DECODE_ROPE_KERNEL)
+            .is_none()
+        {
             let ptx = compile_ptx_with_opts(BATCH_DECODE_ROPE_SRC, cuda_compile_opts())
                 .map_err(|e| format!("NVRTC batch_decode_rope compile: {e}"))?;
             device
@@ -1175,8 +1187,8 @@ __global__ void batch_decode_rope(
 
         let max_heads = p.num_q_heads.max(p.num_kv_heads);
         let cfg = LaunchConfig {
-            grid_dim:        (p.batch_size, max_heads, 1),
-            block_dim:       (p.head_dim / 2, 1, 1),
+            grid_dim: (p.batch_size, max_heads, 1),
+            block_dim: (p.head_dim / 2, 1, 1),
             shared_mem_bytes: 0,
         };
         unsafe {
@@ -1252,8 +1264,8 @@ __global__ void batch_argmax_f16(
     static BATCH_ARGMAX_KERNEL: &str = "batch_argmax_f16";
 
     pub struct BatchArgmaxParams<'a> {
-        pub input:      &'a CudaSlice<f16>,
-        pub output:     &'a mut CudaSlice<u32>,
+        pub input: &'a CudaSlice<f16>,
+        pub output: &'a mut CudaSlice<u32>,
         pub batch_size: u32,
         pub vocab_size: u32,
     }
@@ -1262,7 +1274,10 @@ __global__ void batch_argmax_f16(
         device: &Arc<CudaDevice>,
         p: &mut BatchArgmaxParams<'_>,
     ) -> Result<(), String> {
-        if device.get_func(BATCH_ARGMAX_MODULE, BATCH_ARGMAX_KERNEL).is_none() {
+        if device
+            .get_func(BATCH_ARGMAX_MODULE, BATCH_ARGMAX_KERNEL)
+            .is_none()
+        {
             let ptx = compile_ptx_with_opts(BATCH_ARGMAX_SRC, cuda_compile_opts())
                 .map_err(|e| format!("NVRTC batch_argmax compile: {e}"))?;
             device
@@ -1273,8 +1288,8 @@ __global__ void batch_argmax_f16(
             .get_func(BATCH_ARGMAX_MODULE, BATCH_ARGMAX_KERNEL)
             .ok_or("batch_argmax not found")?;
         let cfg = LaunchConfig {
-            grid_dim:        (p.batch_size, 1, 1),
-            block_dim:       (256, 1, 1),
+            grid_dim: (p.batch_size, 1, 1),
+            block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
         unsafe {
@@ -1287,10 +1302,9 @@ __global__ void batch_argmax_f16(
 }
 
 #[cfg(feature = "cuda")]
-pub use inner::*;
-#[cfg(feature = "cuda")]
 pub use argmax_inner::{
-    launch_argmax, ArgmaxParams,
-    launch_batch_decode_rope, BatchDecodeRopeParams,
-    launch_batch_argmax, BatchArgmaxParams,
+    launch_argmax, launch_batch_argmax, launch_batch_decode_rope, ArgmaxParams, BatchArgmaxParams,
+    BatchDecodeRopeParams,
 };
+#[cfg(feature = "cuda")]
+pub use inner::*;

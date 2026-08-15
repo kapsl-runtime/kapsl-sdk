@@ -39,7 +39,7 @@ gguf-cuda = ["kapsl-llm/gguf-cuda"]
 gguf-cuda-shared-kv = ["kapsl-llm/gguf-cuda-shared-kv", "kapsl-hal/cuda", "onnx-cuda-pool"]
 # ORT custom CUDA allocator backed by the runtime-owned GpuDevicePool, so ONNX
 # sessions draw device memory from the same allocation as GGUF KV views.
-onnx-cuda-pool = ["kapsl-hal/cuda"]
+onnx-cuda-pool = ["kapsl-hal/cuda", "kapsl-llm/onnx-cuda-pool"]
 native = [
     "dep:kapsl-kernels",
     "dep:kapsl-loader",

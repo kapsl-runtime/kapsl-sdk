@@ -17,11 +17,16 @@
 //! ```
 
 #[cfg(feature = "cuda")]
-use cudarc::driver::{CudaDevice, CudaSlice, CudaView, CudaViewMut, DevicePtr, DeviceSlice};
+use cudarc::driver::{
+    CudaDevice, CudaSlice, CudaView, CudaViewMut, DevicePtr, DevicePtrMut, DeviceRepr, DeviceSlice,
+    ValidAsZeroBits,
+};
 #[cfg(feature = "cuda")]
-use std::cell::UnsafeCell;
+use std::cell::{Cell, UnsafeCell};
 #[cfg(feature = "cuda")]
 use std::collections::{BTreeMap, HashMap, HashSet};
+#[cfg(feature = "cuda")]
+use std::ops::{Deref, DerefMut};
 #[cfg(feature = "cuda")]
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 #[cfg(feature = "cuda")]
@@ -59,13 +64,166 @@ pub enum ArenaError {
 
 // ─── Geometry-neutral device pool ──────────────────────────────────────────
 
-/// Logical consumer of a range in [`GpuDevicePool`].
+/// Backend family responsible for a device-pool allocation.
 #[cfg(feature = "cuda")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum PoolOwner {
+pub enum PoolBackend {
     Onnx,
-    GgufKv { model_id: u32 },
-    NativeKv { model_id: u32 },
+    Gguf,
+    Native,
+}
+
+/// Backend-neutral purpose of a device-pool allocation.
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PoolAllocationClass {
+    PersistentWeights,
+    KvCache,
+    TransientWorkspace,
+    BlockTable,
+    RequestTransient,
+    ExternallyOwned,
+}
+
+/// Logical consumer of a range in [`GpuDevicePool`].
+///
+/// `None` model/replica IDs are reserved for allocations made by a provider on
+/// a worker thread where no scoped owner propagated. They remain visibly
+/// unattributed instead of being charged to an arbitrary model.
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PoolOwner {
+    backend: PoolBackend,
+    model_id: Option<u32>,
+    replica_id: Option<u32>,
+    class: PoolAllocationClass,
+}
+
+/// Quota/admission identity shared by every allocation class belonging to one
+/// model replica. Allocation accounting remains keyed by [`PoolOwner`], while
+/// guarantees and hard limits apply to the aggregate workload.
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PoolWorkload {
+    backend: PoolBackend,
+    model_id: Option<u32>,
+    replica_id: Option<u32>,
+}
+
+#[cfg(feature = "cuda")]
+impl PoolWorkload {
+    pub const fn backend(self) -> PoolBackend {
+        self.backend
+    }
+
+    pub const fn model_id(self) -> Option<u32> {
+        self.model_id
+    }
+
+    pub const fn replica_id(self) -> Option<u32> {
+        self.replica_id
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl PoolOwner {
+    pub const fn new(
+        backend: PoolBackend,
+        model_id: u32,
+        replica_id: u32,
+        class: PoolAllocationClass,
+    ) -> Self {
+        Self {
+            backend,
+            model_id: Some(model_id),
+            replica_id: Some(replica_id),
+            class,
+        }
+    }
+
+    pub const fn unattributed(backend: PoolBackend, class: PoolAllocationClass) -> Self {
+        Self {
+            backend,
+            model_id: None,
+            replica_id: None,
+            class,
+        }
+    }
+
+    pub const fn onnx(model_id: u32, replica_id: u32, class: PoolAllocationClass) -> Self {
+        Self::new(PoolBackend::Onnx, model_id, replica_id, class)
+    }
+
+    pub const fn gguf(model_id: u32, replica_id: u32, class: PoolAllocationClass) -> Self {
+        Self::new(PoolBackend::Gguf, model_id, replica_id, class)
+    }
+
+    pub const fn native(model_id: u32, replica_id: u32, class: PoolAllocationClass) -> Self {
+        Self::new(PoolBackend::Native, model_id, replica_id, class)
+    }
+
+    pub const fn backend(self) -> PoolBackend {
+        self.backend
+    }
+
+    pub const fn model_id(self) -> Option<u32> {
+        self.model_id
+    }
+
+    pub const fn replica_id(self) -> Option<u32> {
+        self.replica_id
+    }
+
+    pub const fn class(self) -> PoolAllocationClass {
+        self.class
+    }
+
+    pub const fn workload(self) -> PoolWorkload {
+        PoolWorkload {
+            backend: self.backend,
+            model_id: self.model_id,
+            replica_id: self.replica_id,
+        }
+    }
+
+    pub const fn with_class(self, class: PoolAllocationClass) -> Self {
+        Self { class, ..self }
+    }
+}
+
+#[cfg(feature = "cuda")]
+thread_local! {
+    static SCOPED_POOL_OWNER: Cell<Option<PoolOwner>> = const { Cell::new(None) };
+}
+
+/// RAII attribution for allocator callbacks made synchronously on this thread.
+#[cfg(feature = "cuda")]
+pub struct PoolOwnerScope {
+    previous: Option<PoolOwner>,
+}
+
+#[cfg(feature = "cuda")]
+impl PoolOwnerScope {
+    pub fn enter(owner: PoolOwner) -> Self {
+        let previous = SCOPED_POOL_OWNER.with(|active| active.replace(Some(owner)));
+        Self { previous }
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for PoolOwnerScope {
+    fn drop(&mut self) {
+        SCOPED_POOL_OWNER.with(|active| active.set(self.previous));
+    }
+}
+
+/// Return the owner propagated to the current provider call, or `fallback`
+/// when an allocator callback runs on an unscoped provider worker thread.
+#[cfg(feature = "cuda")]
+pub fn scoped_pool_owner_or(fallback: PoolOwner) -> PoolOwner {
+    SCOPED_POOL_OWNER
+        .with(|active| active.get())
+        .unwrap_or(fallback)
 }
 
 /// A byte extent allocated from [`GpuDevicePool`].
@@ -148,9 +306,13 @@ pub struct GpuDevicePoolSnapshot {
 #[derive(Debug)]
 pub struct PoolPolicy {
     capacity_bytes: usize,
-    quotas: HashMap<PoolOwner, OwnerQuota>,
+    quotas: HashMap<PoolWorkload, OwnerQuota>,
     usage: HashMap<PoolOwner, usize>,
-    admitted: HashSet<PoolOwner>,
+    admitted: HashSet<PoolWorkload>,
+    /// Representative owner used to surface an admitted workload before its
+    /// first physical allocation. Once allocations exist, snapshots also emit
+    /// their exact allocation-class owners.
+    admission_owners: HashMap<PoolWorkload, PoolOwner>,
 }
 
 #[cfg(feature = "cuda")]
@@ -161,6 +323,7 @@ impl PoolPolicy {
             quotas: HashMap::new(),
             usage: HashMap::new(),
             admitted: HashSet::new(),
+            admission_owners: HashMap::new(),
         }
     }
 
@@ -173,7 +336,8 @@ impl PoolPolicy {
         if guaranteed_bytes > max_bytes || max_bytes > self.capacity_bytes {
             return Err(ArenaError::InvalidAllocationRequest);
         }
-        let usage = self.usage_bytes(owner);
+        let workload = owner.workload();
+        let usage = self.workload_usage_bytes(workload);
         if usage > max_bytes {
             return Err(ArenaError::QuotaExceeded {
                 owner,
@@ -182,7 +346,7 @@ impl PoolPolicy {
             });
         }
         self.quotas.insert(
-            owner,
+            workload,
             OwnerQuota {
                 guaranteed_bytes,
                 max_bytes,
@@ -192,15 +356,22 @@ impl PoolPolicy {
     }
 
     fn set_admitted(&mut self, owner: PoolOwner, admitted: bool) {
+        let workload = owner.workload();
         if admitted {
-            self.admitted.insert(owner);
-        } else if self.usage_bytes(owner) == 0 {
-            self.admitted.remove(&owner);
+            self.admitted.insert(workload);
+            self.admission_owners.insert(workload, owner);
+        } else if self.workload_usage_bytes(workload) == 0 {
+            self.admitted.remove(&workload);
+            self.admission_owners.remove(&workload);
         }
     }
 
     pub fn quota(&self, owner: PoolOwner) -> OwnerQuota {
-        self.quotas.get(&owner).copied().unwrap_or(OwnerQuota {
+        self.quota_for_workload(owner.workload())
+    }
+
+    fn quota_for_workload(&self, workload: PoolWorkload) -> OwnerQuota {
+        self.quotas.get(&workload).copied().unwrap_or(OwnerQuota {
             guaranteed_bytes: 0,
             max_bytes: self.capacity_bytes,
         })
@@ -210,14 +381,23 @@ impl PoolPolicy {
         self.usage.get(&owner).copied().unwrap_or(0)
     }
 
+    pub fn workload_usage_bytes(&self, workload: PoolWorkload) -> usize {
+        self.usage
+            .iter()
+            .filter(|(owner, _)| owner.workload() == workload)
+            .map(|(_, bytes)| *bytes)
+            .fold(0usize, usize::saturating_add)
+    }
+
     fn unmet_other_reservations(&self, owner: PoolOwner) -> usize {
+        let workload = owner.workload();
         self.admitted
             .iter()
-            .filter(|&&other| other != owner)
+            .filter(|&&other| other != workload)
             .map(|&other| {
-                self.quota(other)
+                self.quota_for_workload(other)
                     .guaranteed_bytes
-                    .saturating_sub(self.usage_bytes(other))
+                    .saturating_sub(self.workload_usage_bytes(other))
             })
             .fold(0usize, usize::saturating_add)
     }
@@ -225,10 +405,10 @@ impl PoolPolicy {
     fn unmet_reservations(&self) -> usize {
         self.admitted
             .iter()
-            .map(|&owner| {
-                self.quota(owner)
+            .map(|&workload| {
+                self.quota_for_workload(workload)
                     .guaranteed_bytes
-                    .saturating_sub(self.usage_bytes(owner))
+                    .saturating_sub(self.workload_usage_bytes(workload))
             })
             .fold(0usize, usize::saturating_add)
     }
@@ -237,7 +417,7 @@ impl PoolPolicy {
         let owner_remaining = self
             .quota(owner)
             .max_bytes
-            .saturating_sub(self.usage_bytes(owner));
+            .saturating_sub(self.workload_usage_bytes(owner.workload()));
         let reservation_safe = free_bytes.saturating_sub(self.unmet_other_reservations(owner));
         owner_remaining.min(reservation_safe)
     }
@@ -387,12 +567,21 @@ impl AlignedRangeAllocator {
 }
 
 #[cfg(feature = "cuda")]
-fn pool_owner_sort_key(owner: PoolOwner) -> (u8, u32) {
-    match owner {
-        PoolOwner::Onnx => (0, 0),
-        PoolOwner::GgufKv { model_id } => (1, model_id),
-        PoolOwner::NativeKv { model_id } => (2, model_id),
-    }
+fn pool_owner_sort_key(owner: PoolOwner) -> (u8, Option<u32>, Option<u32>, u8) {
+    let backend = match owner.backend() {
+        PoolBackend::Onnx => 0,
+        PoolBackend::Gguf => 1,
+        PoolBackend::Native => 2,
+    };
+    let class = match owner.class() {
+        PoolAllocationClass::PersistentWeights => 0,
+        PoolAllocationClass::KvCache => 1,
+        PoolAllocationClass::TransientWorkspace => 2,
+        PoolAllocationClass::BlockTable => 3,
+        PoolAllocationClass::RequestTransient => 4,
+        PoolAllocationClass::ExternallyOwned => 5,
+    };
+    (backend, owner.model_id(), owner.replica_id(), class)
 }
 
 #[cfg(feature = "cuda")]
@@ -411,7 +600,11 @@ fn build_device_pool_snapshot(
     // Quota entries may intentionally outlive a model unload. Only surface
     // owners that are currently admitted, using bytes, or holding a live
     // range so stale per-model metric series can be retired.
-    let mut owners: HashSet<PoolOwner> = policy.admitted.iter().copied().collect();
+    let mut owners: HashSet<PoolOwner> = policy
+        .admitted
+        .iter()
+        .filter_map(|workload| policy.admission_owners.get(workload).copied())
+        .collect();
     owners.extend(
         policy
             .usage
@@ -430,7 +623,7 @@ fn build_device_pool_snapshot(
                 usage_bytes: policy.usage_bytes(owner),
                 guaranteed_bytes: quota.guaranteed_bytes,
                 max_bytes: quota.max_bytes,
-                admitted: policy.admitted.contains(&owner),
+                admitted: policy.admitted.contains(&owner.workload()),
                 // With byte alignment, the largest range is the physical
                 // upper bound for one allocation. Policy may lower it further.
                 allocatable_bytes: policy
@@ -460,7 +653,10 @@ static NEXT_DEVICE_POOL_ID: AtomicU64 = AtomicU64::new(1);
 pub struct GpuDevicePool {
     pool_id: u64,
     device: Arc<CudaDevice>,
-    storage: UnsafeCell<CudaSlice<u8>>,
+    // Kept optional so Drop can release the cudaMallocAsync allocation before
+    // trimming CUDA's default memory pool. CudaSlice::drop alone returns the
+    // range to that pool, but the driver is free to retain the physical pages.
+    storage: UnsafeCell<Option<CudaSlice<u8>>>,
     allocator: Mutex<AlignedRangeAllocator>,
     policy: Mutex<PoolPolicy>,
 }
@@ -497,7 +693,7 @@ impl GpuDevicePool {
         Ok(Self {
             pool_id: NEXT_DEVICE_POOL_ID.fetch_add(1, Ordering::Relaxed),
             device,
-            storage: UnsafeCell::new(storage),
+            storage: UnsafeCell::new(Some(storage)),
             allocator: Mutex::new(AlignedRangeAllocator::new(capacity_bytes)),
             policy: Mutex::new(PoolPolicy::new(capacity_bytes)),
         })
@@ -549,13 +745,14 @@ impl GpuDevicePool {
     ) -> Result<(), ArenaError> {
         let mut policy = self.policy.lock().unwrap();
         let allocator = self.allocator.lock().unwrap();
-        let previous = policy.quotas.get(&owner).copied();
+        let workload = owner.workload();
+        let previous = policy.quotas.get(&workload).copied();
         policy.set_quota(owner, guaranteed_bytes, max_bytes)?;
         if policy.unmet_reservations() > allocator.free_bytes() {
             if let Some(previous) = previous {
-                policy.quotas.insert(owner, previous);
+                policy.quotas.insert(workload, previous);
             } else {
-                policy.quotas.remove(&owner);
+                policy.quotas.remove(&workload);
             }
             return Err(ArenaError::QuotaExceeded {
                 owner,
@@ -569,19 +766,23 @@ impl GpuDevicePool {
     pub fn set_owner_admitted(&self, owner: PoolOwner, admitted: bool) -> Result<(), ArenaError> {
         let mut policy = self.policy.lock().unwrap();
         let allocator = self.allocator.lock().unwrap();
-        if !admitted && policy.usage_bytes(owner) != 0 {
-            return Err(ArenaError::OwnerInUse {
-                owner,
-                usage: policy.usage_bytes(owner),
-            });
+        let workload = owner.workload();
+        let usage = policy.workload_usage_bytes(workload);
+        if !admitted && usage != 0 {
+            return Err(ArenaError::OwnerInUse { owner, usage });
         }
-        let was_admitted = policy.admitted.contains(&owner);
+        let was_admitted = policy.admitted.contains(&workload);
+        let previous_owner = policy.admission_owners.get(&workload).copied();
         policy.set_admitted(owner, admitted);
         if admitted && policy.unmet_reservations() > allocator.free_bytes() {
             if was_admitted {
-                policy.admitted.insert(owner);
+                policy.admitted.insert(workload);
+                if let Some(previous_owner) = previous_owner {
+                    policy.admission_owners.insert(workload, previous_owner);
+                }
             } else {
-                policy.admitted.remove(&owner);
+                policy.admitted.remove(&workload);
+                policy.admission_owners.remove(&workload);
             }
             return Err(ArenaError::QuotaExceeded {
                 owner,
@@ -594,6 +795,14 @@ impl GpuDevicePool {
 
     pub fn owner_usage_bytes(&self, owner: PoolOwner) -> usize {
         self.policy.lock().unwrap().usage_bytes(owner)
+    }
+
+    /// Aggregate bytes owned by all allocation classes for this model replica.
+    pub fn workload_usage_bytes(&self, owner: PoolOwner) -> usize {
+        self.policy
+            .lock()
+            .unwrap()
+            .workload_usage_bytes(owner.workload())
     }
 
     pub fn owner_quota(&self, owner: PoolOwner) -> OwnerQuota {
@@ -628,7 +837,9 @@ impl GpuDevicePool {
     }
 
     pub fn base_ptr(&self) -> *mut std::ffi::c_void {
-        let storage = unsafe { &*self.storage.get() };
+        let storage = unsafe { &*self.storage.get() }
+            .as_ref()
+            .expect("live GPU device pool storage");
         *storage.device_ptr() as *mut std::ffi::c_void
     }
 
@@ -638,7 +849,9 @@ impl GpuDevicePool {
     }
 
     pub fn capacity_bytes(&self) -> usize {
-        let storage = unsafe { &*self.storage.get() };
+        let storage = unsafe { &*self.storage.get() }
+            .as_ref()
+            .expect("live GPU device pool storage");
         storage.len()
     }
 
@@ -647,7 +860,9 @@ impl GpuDevicePool {
     }
 
     fn f16_storage(&self) -> CudaView<'_, half::f16> {
-        let storage = unsafe { &*self.storage.get() };
+        let storage = unsafe { &*self.storage.get() }
+            .as_ref()
+            .expect("live GPU device pool storage");
         // CUDA allocations are sufficiently aligned for f16; a trailing odd
         // byte, if any, is intentionally not exposed through the typed view.
         unsafe { storage.transmute(storage.len() / std::mem::size_of::<half::f16>()) }
@@ -658,9 +873,321 @@ impl GpuDevicePool {
     /// The caller must write only extents allocated to it. Multiple mutable
     /// views may coexist because ownership is enforced by the range allocator.
     unsafe fn f16_storage_mut(&self) -> CudaViewMut<'_, half::f16> {
-        let storage = unsafe { &mut *self.storage.get() };
+        let storage = unsafe { &mut *self.storage.get() }
+            .as_mut()
+            .expect("live GPU device pool storage");
         let len = storage.len() / std::mem::size_of::<half::f16>();
         unsafe { storage.transmute_mut(len) }.expect("f16 view fits device pool")
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for GpuDevicePool {
+    fn drop(&mut self) {
+        let capacity = unsafe { &mut *self.storage.get() }
+            .take()
+            .map(|storage| {
+                let capacity = storage.len();
+                // On memory-pool-capable devices this enqueues cudaFreeAsync.
+                drop(storage);
+                capacity
+            })
+            .unwrap_or(0);
+
+        if capacity == 0 {
+            return;
+        }
+        if let Err(error) = self.device.synchronize() {
+            log::warn!(
+                "GPU device pool released {} bytes but could not synchronize before trimming CUDA's default memory pool: {}",
+                capacity,
+                error
+            );
+            return;
+        }
+
+        let memory_pools_supported = self
+            .device
+            .attribute(
+                cudarc::driver::sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED,
+            )
+            .map(|supported| supported > 0)
+            .unwrap_or(false);
+        if !memory_pools_supported {
+            log::info!(
+                "GPU device pool backing released: {} MiB",
+                capacity / (1024 * 1024)
+            );
+            return;
+        }
+
+        let trim_result = unsafe {
+            use cudarc::driver::sys;
+
+            let mut default_pool = std::ptr::null_mut();
+            sys::lib()
+                .cuDeviceGetDefaultMemPool(&mut default_pool, *self.device.cu_device())
+                .result()
+                .and_then(|()| sys::lib().cuMemPoolTrimTo(default_pool, 0).result())
+        };
+        match trim_result {
+            Ok(()) => log::info!(
+                "GPU device pool backing released and CUDA default memory pool trimmed: {} MiB",
+                capacity / (1024 * 1024)
+            ),
+            Err(error) => log::warn!(
+                "GPU device pool backing released, but CUDA default memory pool trim failed: {}",
+                error
+            ),
+        }
+    }
+}
+
+// ─── Pool-backed typed buffers ─────────────────────────────────────────────
+
+/// A typed CUDA slice whose physical bytes belong to [`GpuDevicePool`].
+///
+/// `cudarc::CudaSlice` normally calls `cudaFree` when dropped. This wrapper
+/// instead leaks that temporary typed handle and returns the exact extent to
+/// the central pool. The device is synchronized before reuse so no in-flight
+/// kernel can retain access to an extent after ownership changes.
+#[cfg(feature = "cuda")]
+pub struct GpuPoolBuffer<T> {
+    pool: Arc<GpuDevicePool>,
+    allocation: Option<GpuAllocation>,
+    slice: Option<CudaSlice<T>>,
+}
+
+#[cfg(feature = "cuda")]
+impl<T> std::fmt::Debug for GpuPoolBuffer<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GpuPoolBuffer")
+            .field("allocation", &self.allocation)
+            .field("len", &self.slice.as_ref().map(CudaSlice::len).unwrap_or(0))
+            .finish()
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl<T: DeviceRepr> GpuPoolBuffer<T> {
+    /// Create an uninitialized typed view over a newly-owned pool extent.
+    /// Callers should normally use [`zeros`](Self::zeros) or
+    /// [`from_host`](Self::from_host).
+    ///
+    /// # Safety
+    /// The caller must initialize every element before it is read.
+    pub unsafe fn uninitialized(
+        pool: Arc<GpuDevicePool>,
+        owner: PoolOwner,
+        len: usize,
+    ) -> Result<Self, ArenaError> {
+        let bytes = len
+            .checked_mul(std::mem::size_of::<T>())
+            .ok_or(ArenaError::InvalidAllocationRequest)?;
+        if bytes == 0 {
+            return Err(ArenaError::InvalidAllocationRequest);
+        }
+        let alignment = 256usize.max(std::mem::align_of::<T>());
+        let allocation = pool.alloc(owner, bytes, alignment)?;
+        let ptr = pool.allocation_ptr(&allocation) as usize as u64;
+        // SAFETY: the allocation owns `bytes == len * size_of::<T>()` live
+        // bytes for this wrapper's exclusive lifetime. Drop prevents the
+        // temporary CudaSlice from calling cudaFree on the suballocation.
+        let slice = unsafe { pool.device().upgrade_device_ptr::<T>(ptr, len) };
+        Ok(Self {
+            pool,
+            allocation: Some(allocation),
+            slice: Some(slice),
+        })
+    }
+
+    pub fn from_host(
+        pool: Arc<GpuDevicePool>,
+        owner: PoolOwner,
+        data: &[T],
+    ) -> Result<Self, ArenaError> {
+        // SAFETY: the synchronous host-to-device copy below initializes the
+        // complete allocation before it is returned.
+        let mut buffer = unsafe { Self::uninitialized(pool, owner, data.len())? };
+        buffer
+            .pool
+            .device()
+            .htod_sync_copy_into(data, buffer.slice.as_mut().expect("pool buffer slice"))?;
+        Ok(buffer)
+    }
+
+    pub fn allocation(&self) -> &GpuAllocation {
+        self.allocation
+            .as_ref()
+            .expect("live pool buffer allocation")
+    }
+
+    pub fn pool(&self) -> &Arc<GpuDevicePool> {
+        &self.pool
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl<T: ValidAsZeroBits + DeviceRepr> GpuPoolBuffer<T> {
+    pub fn zeros(
+        pool: Arc<GpuDevicePool>,
+        owner: PoolOwner,
+        len: usize,
+    ) -> Result<Self, ArenaError> {
+        // SAFETY: memset_zeros initializes every element, and T explicitly
+        // declares the all-zero bit pattern valid.
+        let mut buffer = unsafe { Self::uninitialized(pool, owner, len)? };
+        buffer
+            .pool
+            .device()
+            .memset_zeros(buffer.slice.as_mut().expect("pool buffer slice"))?;
+        Ok(buffer)
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl<T> Deref for GpuPoolBuffer<T> {
+    type Target = CudaSlice<T>;
+
+    fn deref(&self) -> &Self::Target {
+        self.slice.as_ref().expect("live pool buffer slice")
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl<T> DerefMut for GpuPoolBuffer<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.slice.as_mut().expect("live pool buffer slice")
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl<T> Drop for GpuPoolBuffer<T> {
+    fn drop(&mut self) {
+        if let Some(slice) = self.slice.take() {
+            let _ = slice.leak();
+        }
+        let Some(allocation) = self.allocation.take() else {
+            return;
+        };
+        if let Err(error) = self.pool.device().synchronize() {
+            // Keep the extent live rather than making potentially in-flight
+            // memory available to another owner.
+            log::error!("failed to synchronize pool buffer before release: {error}");
+            return;
+        }
+        if let Err(error) = self.pool.free(allocation) {
+            log::error!("failed to release typed pool buffer: {error}");
+        }
+    }
+}
+
+/// CUDA buffer that can use the central pool when one is materialized and
+/// falls back to an ordinary `CudaSlice` when pool mode is off.
+#[cfg(feature = "cuda")]
+#[derive(Debug)]
+pub enum GpuBuffer<T> {
+    Device(CudaSlice<T>),
+    Pool(GpuPoolBuffer<T>),
+}
+
+#[cfg(feature = "cuda")]
+impl<T: DeviceRepr> GpuBuffer<T> {
+    pub fn from_host(
+        device: &Arc<CudaDevice>,
+        pool: Option<&Arc<GpuDevicePool>>,
+        owner: PoolOwner,
+        data: &[T],
+    ) -> Result<Self, ArenaError> {
+        if data.is_empty() || pool.is_none() {
+            return Ok(Self::Device(device.htod_sync_copy(data)?));
+        }
+        let pool = Arc::clone(pool.expect("pool checked above"));
+        if !Arc::ptr_eq(pool.device(), device) {
+            return Err(ArenaError::InvalidAllocationRequest);
+        }
+        Ok(Self::Pool(GpuPoolBuffer::from_host(pool, owner, data)?))
+    }
+
+    pub fn is_pool_backed(&self) -> bool {
+        matches!(self, Self::Pool(_))
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl<T: ValidAsZeroBits + DeviceRepr> GpuBuffer<T> {
+    pub fn zeros(
+        device: &Arc<CudaDevice>,
+        pool: Option<&Arc<GpuDevicePool>>,
+        owner: PoolOwner,
+        len: usize,
+    ) -> Result<Self, ArenaError> {
+        if len == 0 || pool.is_none() {
+            return Ok(Self::Device(device.alloc_zeros(len)?));
+        }
+        let pool = Arc::clone(pool.expect("pool checked above"));
+        if !Arc::ptr_eq(pool.device(), device) {
+            return Err(ArenaError::InvalidAllocationRequest);
+        }
+        Ok(Self::Pool(GpuPoolBuffer::zeros(pool, owner, len)?))
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl<T> Deref for GpuBuffer<T> {
+    type Target = CudaSlice<T>;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Device(slice) => slice,
+            Self::Pool(slice) => slice,
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl<T> DerefMut for GpuBuffer<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Device(slice) => slice,
+            Self::Pool(slice) => slice,
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl<T> DeviceSlice<T> for GpuBuffer<T> {
+    fn len(&self) -> usize {
+        self.deref().len()
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl<T> DevicePtr<T> for GpuBuffer<T> {
+    fn device_ptr(&self) -> &cudarc::driver::sys::CUdeviceptr {
+        self.deref().device_ptr()
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl<T> DevicePtrMut<T> for GpuBuffer<T> {
+    fn device_ptr_mut(&mut self) -> &mut cudarc::driver::sys::CUdeviceptr {
+        self.deref_mut().device_ptr_mut()
+    }
+}
+
+#[cfg(feature = "cuda")]
+unsafe impl<T: DeviceRepr> DeviceRepr for &GpuBuffer<T> {
+    fn as_kernel_param(&self) -> *mut std::ffi::c_void {
+        self.device_ptr() as *const cudarc::driver::sys::CUdeviceptr as *mut std::ffi::c_void
+    }
+}
+
+#[cfg(feature = "cuda")]
+unsafe impl<T: DeviceRepr> DeviceRepr for &mut GpuBuffer<T> {
+    fn as_kernel_param(&self) -> *mut std::ffi::c_void {
+        self.device_ptr() as *const cudarc::driver::sys::CUdeviceptr as *mut std::ffi::c_void
     }
 }
 
@@ -807,7 +1334,7 @@ impl GpuKvPoolView {
         let device_pool = Arc::new(GpuDevicePool::new(device, bytes)?);
         Self::from_device_pool(
             device_pool,
-            PoolOwner::NativeKv { model_id: 0 },
+            PoolOwner::native(0, 0, PoolAllocationClass::KvCache),
             num_blocks,
             block_size,
             num_kv_heads,
@@ -828,7 +1355,7 @@ impl GpuKvPoolView {
             || block_size == 0
             || num_kv_heads == 0
             || head_dim == 0
-            || !matches!(owner, PoolOwner::GgufKv { .. } | PoolOwner::NativeKv { .. })
+            || owner.class() != PoolAllocationClass::KvCache
         {
             return Err(ArenaError::InvalidAllocationRequest);
         }
@@ -1104,15 +1631,13 @@ impl GpuKvPoolView {
     }
 
     /// Raw CUDA device pointer to the start of a specific physical block.
-    pub fn block_device_ptr(
-        &self,
-        block_id: u32,
-    ) -> Result<*mut std::ffi::c_void, ArenaError> {
+    pub fn block_device_ptr(&self, block_id: u32) -> Result<*mut std::ffi::c_void, ArenaError> {
         self.validate_live_block(block_id)?;
         // SAFETY: pointer arithmetic is limited to the validated live block.
-        Ok((unsafe { self.device_base_ptr() } as usize
-            + block_id as usize * self.bytes_per_block())
-            as *mut std::ffi::c_void)
+        Ok(
+            (unsafe { self.device_base_ptr() } as usize
+                + block_id as usize * self.bytes_per_block()) as *mut std::ffi::c_void,
+        )
     }
 
     /// Mutable view of the storage slice (for KV-write kernels).
@@ -1129,11 +1654,17 @@ impl GpuKvPoolView {
         if self.live_blocks.lock().unwrap().contains_key(&block_id) {
             return Ok(());
         }
-        if self.live_runs.lock().unwrap().iter().any(|(&first, &(count, _))| {
-            let block = block_id as usize;
-            let first = first as usize;
-            block >= first && block < first.saturating_add(count)
-        }) {
+        if self
+            .live_runs
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(&first, &(count, _))| {
+                let block = block_id as usize;
+                let first = first as usize;
+                block >= first && block < first.saturating_add(count)
+            })
+        {
             return Ok(());
         }
         Err(ArenaError::InvalidFree { owner: self.owner })
@@ -1321,7 +1852,7 @@ mod tests {
 
     #[test]
     fn aligned_ranges_support_arbitrary_alignment_and_coalesce() {
-        let owner = PoolOwner::Onnx;
+        let owner = PoolOwner::onnx(1, 0, PoolAllocationClass::TransientWorkspace);
         let mut allocator = AlignedRangeAllocator::new(1024);
         let first = allocator.alloc(1, owner, 100, 256).unwrap();
         let second = allocator.alloc(1, owner, 100, 300).unwrap();
@@ -1339,11 +1870,11 @@ mod tests {
 
     #[test]
     fn range_free_verifies_owner_and_live_extent() {
-        let owner = PoolOwner::GgufKv { model_id: 7 };
+        let owner = PoolOwner::gguf(7, 0, PoolAllocationClass::KvCache);
         let mut allocator = AlignedRangeAllocator::new(1024);
         let allocation = allocator.alloc(1, owner, 128, 64).unwrap();
         let wrong_owner = GpuAllocation {
-            owner: PoolOwner::Onnx,
+            owner: PoolOwner::onnx(7, 0, PoolAllocationClass::KvCache),
             ..allocation.clone()
         };
         assert!(matches!(
@@ -1359,8 +1890,8 @@ mod tests {
 
     #[test]
     fn quota_policy_protects_other_admitted_owner() {
-        let gguf = PoolOwner::GgufKv { model_id: 1 };
-        let onnx = PoolOwner::Onnx;
+        let gguf = PoolOwner::gguf(1, 0, PoolAllocationClass::KvCache);
+        let onnx = PoolOwner::onnx(2, 0, PoolAllocationClass::TransientWorkspace);
         let mut policy = PoolPolicy::new(120);
         policy.set_quota(gguf, 60, 90).unwrap();
         policy.set_quota(onnx, 30, 60).unwrap();
@@ -1377,8 +1908,8 @@ mod tests {
 
     #[test]
     fn quota_policy_allows_borrowing_from_unadmitted_owner() {
-        let gguf = PoolOwner::GgufKv { model_id: 1 };
-        let onnx = PoolOwner::Onnx;
+        let gguf = PoolOwner::gguf(1, 0, PoolAllocationClass::KvCache);
+        let onnx = PoolOwner::onnx(2, 0, PoolAllocationClass::TransientWorkspace);
         let mut policy = PoolPolicy::new(120);
         policy.set_quota(gguf, 60, 120).unwrap();
         policy.set_quota(onnx, 30, 60).unwrap();
@@ -1390,9 +1921,50 @@ mod tests {
     }
 
     #[test]
+    fn quota_policy_aggregates_all_classes_for_one_replica() {
+        let weights = PoolOwner::native(4, 2, PoolAllocationClass::PersistentWeights);
+        let kv = PoolOwner::native(4, 2, PoolAllocationClass::KvCache);
+        let workspace = PoolOwner::native(4, 2, PoolAllocationClass::TransientWorkspace);
+        let other = PoolOwner::onnx(9, 0, PoolAllocationClass::PersistentWeights);
+        let mut policy = PoolPolicy::new(200);
+        policy.set_quota(weights, 80, 140).unwrap();
+        policy.set_quota(other, 40, 100).unwrap();
+        policy.set_admitted(weights, true);
+        policy.set_admitted(other, true);
+
+        policy.account_alloc(weights, 70);
+        policy.account_alloc(kv, 50);
+        assert_eq!(policy.usage_bytes(weights), 70);
+        assert_eq!(policy.usage_bytes(kv), 50);
+        assert_eq!(policy.workload_usage_bytes(weights.workload()), 120);
+        // Only 20 bytes remain beneath the replica's aggregate hard maximum.
+        assert_eq!(policy.available_for(workspace, 80), 20);
+        assert_eq!(policy.quota(kv), policy.quota(weights));
+    }
+
+    #[test]
+    fn pool_owner_scope_restores_nested_attribution() {
+        let fallback =
+            PoolOwner::unattributed(PoolBackend::Onnx, PoolAllocationClass::ExternallyOwned);
+        let outer = PoolOwner::onnx(1, 2, PoolAllocationClass::PersistentWeights);
+        let inner = PoolOwner::onnx(1, 2, PoolAllocationClass::KvCache);
+
+        assert_eq!(scoped_pool_owner_or(fallback), fallback);
+        let outer_scope = PoolOwnerScope::enter(outer);
+        assert_eq!(scoped_pool_owner_or(fallback), outer);
+        {
+            let _inner_scope = PoolOwnerScope::enter(inner);
+            assert_eq!(scoped_pool_owner_or(fallback), inner);
+        }
+        assert_eq!(scoped_pool_owner_or(fallback), outer);
+        drop(outer_scope);
+        assert_eq!(scoped_pool_owner_or(fallback), fallback);
+    }
+
+    #[test]
     fn device_pool_snapshot_reports_fragmentation_and_owner_state() {
-        let onnx = PoolOwner::Onnx;
-        let gguf = PoolOwner::GgufKv { model_id: 7 };
+        let onnx = PoolOwner::onnx(2, 0, PoolAllocationClass::TransientWorkspace);
+        let gguf = PoolOwner::gguf(7, 0, PoolAllocationClass::KvCache);
         let mut allocator = AlignedRangeAllocator::new(1_000);
         let first = allocator.alloc(1, onnx, 200, 1).unwrap();
         let middle = allocator.alloc(1, gguf, 200, 1).unwrap();
@@ -1442,7 +2014,7 @@ mod tests {
 
     #[test]
     fn device_pool_snapshot_defines_full_pool_fragmentation_as_zero() {
-        let owner = PoolOwner::NativeKv { model_id: 11 };
+        let owner = PoolOwner::native(11, 0, PoolAllocationClass::KvCache);
         let mut allocator = AlignedRangeAllocator::new(64);
         let allocation = allocator.alloc(1, owner, 64, 1).unwrap();
         let mut policy = PoolPolicy::new(64);
@@ -1462,7 +2034,7 @@ mod tests {
 
     #[test]
     fn device_pool_snapshot_omits_inactive_quota_only_owner() {
-        let owner = PoolOwner::GgufKv { model_id: 23 };
+        let owner = PoolOwner::gguf(23, 0, PoolAllocationClass::KvCache);
         let allocator = AlignedRangeAllocator::new(256);
         let mut policy = PoolPolicy::new(256);
         policy.set_quota(owner, 64, 128).unwrap();
@@ -1552,8 +2124,14 @@ mod tests {
         // The run is contiguous, so block pointers advance by bytes_per_block.
         let bpb = pool.bytes_per_block();
         let base = pool.block_device_ptr(first).unwrap() as usize;
-        assert_eq!(pool.block_device_ptr(first + 1).unwrap() as usize, base + bpb);
-        assert_eq!(pool.block_device_ptr(first + 2).unwrap() as usize, base + 2 * bpb);
+        assert_eq!(
+            pool.block_device_ptr(first + 1).unwrap() as usize,
+            base + bpb
+        );
+        assert_eq!(
+            pool.block_device_ptr(first + 2).unwrap() as usize,
+            base + 2 * bpb
+        );
         pool.free_blocks_contiguous(first, 3);
         assert_eq!(pool.free_count(), 8);
     }

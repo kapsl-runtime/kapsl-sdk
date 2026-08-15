@@ -379,14 +379,21 @@ impl BlockManager {
     }
 
     pub fn can_allocate(&self, num_blocks: usize) -> bool {
-        if self.allocator.get_num_free_blocks() < num_blocks {
-            return false;
-        }
-        // Also respect the per-engine quota: remaining headroom under the cap.
-        if let Some(cap) = self.cap() {
-            return cap.saturating_sub(self.held_blocks) >= num_blocks;
-        }
-        true
+        self.allocatable_blocks() >= num_blocks
+    }
+
+    /// Number of blocks this manager could allocate immediately, accounting
+    /// for both the shared physical pool and its live per-engine quota.
+    ///
+    /// Schedulers use this to request only the actual shortage during
+    /// priority preemption. Asking a donor to release the full request size
+    /// would otherwise evict more work than necessary when some headroom is
+    /// already available locally.
+    pub fn allocatable_blocks(&self) -> usize {
+        let physical = self.allocator.get_num_free_blocks();
+        self.cap()
+            .map(|cap| physical.min(cap.saturating_sub(self.held_blocks)))
+            .unwrap_or(physical)
     }
 
     pub fn block_size(&self) -> usize {

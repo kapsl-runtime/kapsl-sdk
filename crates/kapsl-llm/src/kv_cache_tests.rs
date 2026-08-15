@@ -17,6 +17,30 @@ mod tests {
     }
 
     #[test]
+    fn dense_stats_track_allocated_buffers_and_release_without_a_free_list() {
+        let config = KvCacheConfig {
+            mode: KvCacheMode::Dense,
+            block_size: 16,
+            total_blocks: 1,
+            eviction_policy: KvEvictionPolicy::None,
+            dense_free_list_cap: 0,
+            initial_seq_len: 2,
+            tq_compression_bits: None,
+        };
+        let mut cache = KvCache::new_with_config(1, 1, 8, 2, config);
+        cache.allocate_sequence(1, &[]).unwrap();
+        let allocated = cache.stats();
+        // key + value, each [1 head, 2 positions, 2 dims] of f16.
+        assert_eq!(allocated.bytes_used, 16);
+        assert_eq!(allocated.bytes_capacity, 16);
+
+        cache.remove_sequence(1);
+        let released = cache.stats();
+        assert_eq!(released.bytes_used, 0);
+        assert_eq!(released.bytes_capacity, 0);
+    }
+
+    #[test]
     fn append_token_pads_or_truncates_inputs() {
         let mut cache = KvCache::new(1, 2, 4, 3);
         cache.allocate_sequence(1, &[]).unwrap();
