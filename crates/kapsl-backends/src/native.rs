@@ -131,6 +131,28 @@ mod inner {
         Ok(bytes)
     }
 
+    fn planned_kv_bytes(model_path: &Path) -> Result<usize, EngineError> {
+        let dir = if model_path.is_dir() {
+            model_path
+        } else {
+            model_path.parent().unwrap_or(model_path)
+        };
+        let config = ModelConfig::from_model_dir(dir)
+            .map_err(|error| EngineError::backend(format!("read model config: {error}")))?;
+        let block_size = 16usize;
+        let blocks_per_sequence = config.max_position_embeddings.div_ceil(block_size);
+        let blocks = config
+            .num_hidden_layers
+            .saturating_mul(MAX_BATCH)
+            .saturating_mul(blocks_per_sequence);
+        Ok(blocks
+            .saturating_mul(2)
+            .saturating_mul(config.num_kv_heads())
+            .saturating_mul(block_size)
+            .saturating_mul(config.head_dim())
+            .saturating_mul(std::mem::size_of::<f16>()))
+    }
+
     fn upload_tensor(
         device: &Arc<CudaDevice>,
         pool: Option<&Arc<GpuDevicePool>>,
@@ -1074,11 +1096,13 @@ mod inner {
             let positions_host: Vec<i32> =
                 seqs.iter().map(|s| (s.context_len - 1) as i32).collect();
             let ctx_lens_host: Vec<i32> = seqs.iter().map(|s| s.context_len as i32).collect();
+            let mut positions_device = self.batch.positions.slice_mut(..b);
             self.device
-                .htod_sync_copy_into(&positions_host, &mut self.batch.positions)
+                .htod_sync_copy_into(&positions_host, &mut positions_device)
                 .map_err(|err| e(format!("positions upload: {err}")))?;
+            let mut ctx_lens_device = self.batch.ctx_lens.slice_mut(..b);
             self.device
-                .htod_sync_copy_into(&ctx_lens_host, &mut self.batch.ctx_lens)
+                .htod_sync_copy_into(&ctx_lens_host, &mut ctx_lens_device)
                 .map_err(|err| e(format!("ctx_lens upload: {err}")))?;
 
             // Embed lookup: copy one embed row per sequence into batch.hidden.
@@ -1748,6 +1772,7 @@ mod inner {
         device_id: i32,
         external_allocation_id: String,
         external_weight_bytes: Arc<AtomicUsize>,
+        kv_layers: Arc<AtomicUsize>,
         state: Arc<Mutex<Option<BackendState>>>,
         /// Pool handle to inject before load(); also populated after load() for sharing.
         pool_slot: Arc<Mutex<Option<GpuPoolHandle>>>,
@@ -1767,6 +1792,7 @@ mod inner {
                     NEXT_ALLOCATION_ID.fetch_add(1, Ordering::Relaxed)
                 ),
                 external_weight_bytes: Arc::new(AtomicUsize::new(0)),
+                kv_layers: Arc::new(AtomicUsize::new(0)),
                 state: Arc::new(Mutex::new(None)),
                 pool_slot: Arc::new(Mutex::new(None)),
                 device_pool: None,
@@ -1846,6 +1872,7 @@ mod inner {
     impl kapsl_engine_api::Engine for NativeBackend {
         fn planned_memory(&self, model_path: &Path) -> Result<MemoryReport, EngineError> {
             let bytes = planned_weight_bytes(model_path)?;
+            let kv_bytes = planned_kv_bytes(model_path)?;
             let source = if self.device_pool.is_some() {
                 EngineMemoryAllocationSource::RuntimeManaged
             } else {
@@ -1878,7 +1905,11 @@ mod inner {
                         },
                         class: EngineMemoryAllocationClass::KvCache,
                         source,
-                        bytes: 0,
+                        bytes: if self.device_pool.is_some() {
+                            0
+                        } else {
+                            kv_bytes
+                        },
                     },
                     EngineMemoryAllocation {
                         allocation_id: format!("{}:block-table", self.external_allocation_id),
@@ -1927,6 +1958,8 @@ mod inner {
             let cpu = load_safetensors(&dir)
                 .map_err(|e| EngineError::backend(format!("safetensors: {e}")))?;
             let config = cpu.config.clone();
+            self.kv_layers
+                .store(config.num_hidden_layers, Ordering::Release);
             log::info!(
                 "NativeBackend: {} layers, {}Q/{}KV heads, h={}, vocab={}",
                 config.num_hidden_layers,
@@ -1936,8 +1969,12 @@ mod inner {
                 config.vocab_size,
             );
 
-            let device = CudaDevice::new(self.device_id as usize)
-                .map_err(|e| EngineError::backend(format!("CUDA: {e}")))?;
+            let device = if let Some((pool, _)) = self.device_pool.as_ref() {
+                Arc::clone(pool.device())
+            } else {
+                CudaDevice::new(self.device_id as usize)
+                    .map_err(|e| EngineError::backend(format!("CUDA: {e}")))?
+            };
             let blas = Arc::new(
                 CudaBlas::new(device.clone())
                     .map_err(|e| EngineError::backend(format!("cuBLAS: {e}")))?,
@@ -2128,14 +2165,37 @@ mod inner {
                 device_id: self.device_id as usize,
             };
             let Some((pool, owner)) = self.device_pool.as_ref() else {
+                let kv_bytes = self
+                    .pool_slot
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|handle| handle.pool.capacity_bytes())
+                    .unwrap_or(0);
                 return MemoryReport {
-                    allocations: vec![EngineMemoryAllocation {
-                        allocation_id: self.external_allocation_id.clone(),
-                        domain,
-                        class: EngineMemoryAllocationClass::PersistentWeights,
-                        source: EngineMemoryAllocationSource::BackendManaged,
-                        bytes,
-                    }],
+                    allocations: vec![
+                        EngineMemoryAllocation {
+                            allocation_id: self.external_allocation_id.clone(),
+                            domain: domain.clone(),
+                            class: EngineMemoryAllocationClass::PersistentWeights,
+                            source: EngineMemoryAllocationSource::BackendManaged,
+                            bytes,
+                        },
+                        EngineMemoryAllocation {
+                            allocation_id: format!("{}:scratch", self.external_allocation_id),
+                            domain: domain.clone(),
+                            class: EngineMemoryAllocationClass::TransientWorkspace,
+                            source: EngineMemoryAllocationSource::BackendManaged,
+                            bytes: (bytes / 8).max(256 * 1024 * 1024),
+                        },
+                        EngineMemoryAllocation {
+                            allocation_id: format!("{}:kv", self.external_allocation_id),
+                            domain,
+                            class: EngineMemoryAllocationClass::KvCache,
+                            source: EngineMemoryAllocationSource::BackendManaged,
+                            bytes: kv_bytes,
+                        },
+                    ],
                 };
             };
             let rows = [
@@ -2173,6 +2233,40 @@ mod inner {
                         },
                     )
                     .collect(),
+            }
+        }
+
+        fn planned_request_memory(&self, request: &InferenceRequest) -> MemoryReport {
+            if self.device_pool.is_none() {
+                return MemoryReport::default();
+            }
+            let Some(handle) = self.pool_slot.lock().unwrap().clone() else {
+                return MemoryReport::default();
+            };
+            let prompt_tokens = request.input.data.len() / std::mem::size_of::<i32>();
+            let max_new_tokens = request
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.max_new_tokens)
+                .unwrap_or(128) as usize;
+            let token_blocks = prompt_tokens
+                .saturating_add(max_new_tokens)
+                .div_ceil(handle.pool.block_size());
+            let blocks = self
+                .kv_layers
+                .load(Ordering::Acquire)
+                .saturating_mul(token_blocks)
+                .min(handle.cap());
+            MemoryReport {
+                allocations: vec![EngineMemoryAllocation {
+                    allocation_id: format!("{}:request-kv", self.external_allocation_id),
+                    domain: EngineMemoryDomain::Cuda {
+                        device_id: self.device_id as usize,
+                    },
+                    class: EngineMemoryAllocationClass::KvCache,
+                    source: EngineMemoryAllocationSource::RuntimeManaged,
+                    bytes: blocks.saturating_mul(handle.pool.bytes_per_block()),
+                }],
             }
         }
 
@@ -2250,6 +2344,7 @@ mod inner {
                 }
             }
             self.external_weight_bytes.store(0, Ordering::Release);
+            self.kv_layers.store(0, Ordering::Release);
             log::info!("NativeBackend: unloaded");
         }
 

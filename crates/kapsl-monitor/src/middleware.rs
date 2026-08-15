@@ -262,6 +262,13 @@ impl<E: Engine> MonitoringMiddleware<E> {
 
 #[async_trait]
 impl<E: Engine> Engine for MonitoringMiddleware<E> {
+    fn planned_memory(
+        &self,
+        model_path: &std::path::Path,
+    ) -> Result<kapsl_engine_api::MemoryReport, EngineError> {
+        self.inner.planned_memory(model_path)
+    }
+
     fn planned_external_device_memory(
         &self,
         model_path: &std::path::Path,
@@ -275,6 +282,14 @@ impl<E: Engine> Engine for MonitoringMiddleware<E> {
 
     fn actual_external_device_memory(&self) -> kapsl_engine_api::ExternalDeviceMemoryReport {
         self.inner.actual_external_device_memory()
+    }
+
+    fn actual_memory(&self) -> kapsl_engine_api::MemoryReport {
+        self.inner.actual_memory()
+    }
+
+    fn planned_request_memory(&self, request: &InferenceRequest) -> kapsl_engine_api::MemoryReport {
+        self.inner.planned_request_memory(request)
     }
 
     fn infer(&self, request: &InferenceRequest) -> Result<BinaryTensorPacket, EngineError> {
@@ -471,8 +486,41 @@ mod tests {
 
     #[async_trait]
     impl Engine for MockEngine {
+        fn planned_memory(
+            &self,
+            _model_path: &std::path::Path,
+        ) -> Result<kapsl_engine_api::MemoryReport, EngineError> {
+            Ok(kapsl_engine_api::MemoryReport::single(
+                "mock:planned",
+                kapsl_engine_api::MemoryDomain::Host,
+                kapsl_engine_api::MemoryAllocationClass::ModelSession,
+                11,
+            ))
+        }
+
         async fn load(&mut self, _model_path: &std::path::Path) -> Result<(), EngineError> {
             Ok(())
+        }
+
+        fn actual_memory(&self) -> kapsl_engine_api::MemoryReport {
+            kapsl_engine_api::MemoryReport::single(
+                "mock:actual",
+                kapsl_engine_api::MemoryDomain::Host,
+                kapsl_engine_api::MemoryAllocationClass::ModelSession,
+                22,
+            )
+        }
+
+        fn planned_request_memory(
+            &self,
+            _request: &InferenceRequest,
+        ) -> kapsl_engine_api::MemoryReport {
+            kapsl_engine_api::MemoryReport::single(
+                "mock:request",
+                kapsl_engine_api::MemoryDomain::Host,
+                kapsl_engine_api::MemoryAllocationClass::RequestTransient,
+                33,
+            )
         }
 
         fn infer(&self, request: &InferenceRequest) -> Result<BinaryTensorPacket, EngineError> {
@@ -527,6 +575,32 @@ mod tests {
         let result = middleware.infer(&request);
 
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn cross_domain_memory_reports_are_delegated_without_loss() {
+        let registry = std::sync::Arc::new(prometheus::Registry::new());
+        let middleware = MonitoringMiddleware::new(
+            MockEngine,
+            "memory".to_string(),
+            "v1".to_string(),
+            &registry,
+        );
+        let request = raw_media_request(1);
+
+        assert_eq!(
+            middleware
+                .planned_memory(std::path::Path::new("model"))
+                .unwrap()
+                .allocations[0]
+                .bytes,
+            11
+        );
+        assert_eq!(middleware.actual_memory().allocations[0].bytes, 22);
+        assert_eq!(
+            middleware.planned_request_memory(&request).allocations[0].bytes,
+            33
+        );
     }
 
     #[test]

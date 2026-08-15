@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use base64::Engine as _;
-use futures::stream::Stream;
+use futures::{stream::Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::fmt;
@@ -532,6 +532,79 @@ impl CancellationToken {
     }
 }
 
+/// One-shot hook used by a self-scheduling backend to acquire request memory
+/// only after it has assigned an execution slot.
+///
+/// The returned guard owns the runtime lease. Backends must hold it until the
+/// slot's backing memory has been released; dropping it returns the reservation
+/// to the runtime authority.
+#[derive(Clone)]
+pub struct RequestMemoryAdmission {
+    inner: Arc<RequestMemoryAdmissionInner>,
+}
+
+struct RequestMemoryAdmissionInner {
+    acquired: AtomicBool,
+    acquire:
+        Box<dyn Fn() -> Result<RequestMemoryAdmissionGuard, EngineError> + Send + Sync + 'static>,
+}
+
+impl RequestMemoryAdmission {
+    pub fn new<F, T>(acquire: F) -> Self
+    where
+        F: Fn() -> Result<T, EngineError> + Send + Sync + 'static,
+        T: Send + 'static,
+    {
+        Self {
+            inner: Arc::new(RequestMemoryAdmissionInner {
+                acquired: AtomicBool::new(false),
+                acquire: Box::new(move || acquire().map(RequestMemoryAdmissionGuard::new)),
+            }),
+        }
+    }
+
+    /// Acquire this request's memory exactly once.
+    pub fn acquire(&self) -> Result<RequestMemoryAdmissionGuard, EngineError> {
+        if self.inner.acquired.swap(true, Ordering::AcqRel) {
+            return Err(EngineError::backend(
+                "request memory admission was acquired more than once",
+            ));
+        }
+        (self.inner.acquire)()
+    }
+}
+
+impl fmt::Debug for RequestMemoryAdmission {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RequestMemoryAdmission")
+            .field("acquired", &self.inner.acquired.load(Ordering::Acquire))
+            .finish_non_exhaustive()
+    }
+}
+
+/// Opaque request-lifetime memory lease returned by
+/// [`RequestMemoryAdmission::acquire`].
+pub struct RequestMemoryAdmissionGuard {
+    _lease: Box<dyn Send + 'static>,
+}
+
+impl RequestMemoryAdmissionGuard {
+    fn new<T: Send + 'static>(lease: T) -> Self {
+        Self {
+            _lease: Box::new(lease),
+        }
+    }
+}
+
+impl fmt::Debug for RequestMemoryAdmissionGuard {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RequestMemoryAdmissionGuard")
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferenceRequest {
     pub input: BinaryTensorPacket,
@@ -919,6 +992,21 @@ pub trait Engine: Send + Sync {
         )
     }
 
+    /// Run one request under a runtime-provided memory admission hook.
+    ///
+    /// The default acquires immediately before inference. Self-scheduling
+    /// backends may override this to enqueue the hook and acquire it only when
+    /// they assign an execution slot, but must hold the returned guard until
+    /// all backing memory for that slot has been released.
+    fn infer_with_memory_admission(
+        &self,
+        request: &InferenceRequest,
+        admission: RequestMemoryAdmission,
+    ) -> Result<BinaryTensorPacket, EngineError> {
+        let _guard = admission.acquire()?;
+        self.infer(request)
+    }
+
     /// Run a single inference request and return the output tensor.
     fn infer(&self, request: &InferenceRequest) -> Result<BinaryTensorPacket, EngineError>;
 
@@ -969,6 +1057,26 @@ pub trait Engine: Send + Sync {
 
     /// Run a streaming inference request.
     fn infer_stream(&self, request: &InferenceRequest) -> EngineStream;
+
+    /// Stream one request under a runtime-provided memory admission hook.
+    ///
+    /// The default acquires before constructing the stream and retains the
+    /// guard until the stream completes or is dropped. Self-scheduling
+    /// backends can override this to acquire at their internal slot boundary.
+    fn infer_stream_with_memory_admission(
+        &self,
+        request: &InferenceRequest,
+        admission: RequestMemoryAdmission,
+    ) -> EngineStream {
+        let guard = match admission.acquire() {
+            Ok(guard) => guard,
+            Err(error) => return Box::pin(futures::stream::once(async move { Err(error) })),
+        };
+        Box::pin(self.infer_stream(request).map(move |item| {
+            let _hold = &guard;
+            item
+        }))
+    }
 
     /// Warm up the model runtime before serving requests.
     async fn warmup(&self) -> Result<(), EngineError> {
@@ -1047,6 +1155,14 @@ impl Engine for Box<dyn Engine> {
         (**self).planned_request_memory(request)
     }
 
+    fn infer_with_memory_admission(
+        &self,
+        request: &InferenceRequest,
+        admission: RequestMemoryAdmission,
+    ) -> Result<BinaryTensorPacket, EngineError> {
+        (**self).infer_with_memory_admission(request, admission)
+    }
+
     fn infer(&self, request: &InferenceRequest) -> Result<BinaryTensorPacket, EngineError> {
         (**self).infer(request)
     }
@@ -1072,6 +1188,14 @@ impl Engine for Box<dyn Engine> {
 
     fn infer_stream(&self, request: &InferenceRequest) -> EngineStream {
         (**self).infer_stream(request)
+    }
+
+    fn infer_stream_with_memory_admission(
+        &self,
+        request: &InferenceRequest,
+        admission: RequestMemoryAdmission,
+    ) -> EngineStream {
+        (**self).infer_stream_with_memory_admission(request, admission)
     }
 
     async fn warmup(&self) -> Result<(), EngineError> {
@@ -1246,6 +1370,39 @@ mod tests {
         assert_eq!(decoded_metadata.priority, Some(0));
         assert_eq!(decoded_metadata.max_new_tokens, Some(32));
         assert_eq!(decoded_metadata.auth_token, None);
+    }
+
+    #[test]
+    fn request_memory_admission_is_one_shot_and_guard_owns_lease() {
+        struct DropMarker(Arc<std::sync::atomic::AtomicUsize>);
+
+        impl Drop for DropMarker {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let acquisitions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let releases = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let admission = RequestMemoryAdmission::new({
+            let acquisitions = Arc::clone(&acquisitions);
+            let releases = Arc::clone(&releases);
+            move || {
+                acquisitions.fetch_add(1, Ordering::SeqCst);
+                Ok(DropMarker(Arc::clone(&releases)))
+            }
+        });
+
+        let guard = admission
+            .acquire()
+            .expect("first acquisition should succeed");
+        assert_eq!(acquisitions.load(Ordering::SeqCst), 1);
+        assert_eq!(releases.load(Ordering::SeqCst), 0);
+        assert!(admission.acquire().is_err());
+        assert_eq!(acquisitions.load(Ordering::SeqCst), 1);
+
+        drop(guard);
+        assert_eq!(releases.load(Ordering::SeqCst), 1);
     }
 
     #[test]

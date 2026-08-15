@@ -2,14 +2,14 @@
 mod tests {
     use super::super::{
         default_sampling_params, extract_bos_token, extract_tag, load_model_runtime_config,
-        LLMBackend, ModelRuntimeConfig,
+        planned_host_kv_backing_bytes, LLMBackend, ModelRuntimeConfig,
     };
     use crate::prompt_adapter::ChatPromptTemplate;
     use crate::sequence::{FinishReason, SequenceGroupOutput};
     use futures::StreamExt;
     use kapsl_engine_api::{
         BinaryTensorPacket, Engine, InferenceRequest, MemoryAllocationClass, MemoryDomain,
-        TensorDtype,
+        RequestMetadata, TensorDtype,
     };
     use serde_json::json;
     use std::fs;
@@ -25,6 +25,45 @@ mod tests {
         ));
         fs::create_dir_all(&dir).expect("create temp dir");
         dir
+    }
+
+    fn priority_request(priority: Option<u8>) -> InferenceRequest {
+        InferenceRequest {
+            input: BinaryTensorPacket {
+                shape: vec![1, 1],
+                dtype: TensorDtype::Utf8,
+                data: b"x".to_vec(),
+            },
+            additional_inputs: Vec::new(),
+            session_id: None,
+            metadata: priority.map(|priority| RequestMetadata {
+                priority: Some(priority),
+                ..RequestMetadata::default()
+            }),
+            cancellation: None,
+        }
+    }
+
+    #[test]
+    fn onnx_sequence_priority_inverts_engine_metadata_ordering() {
+        assert_eq!(LLMBackend::sequence_priority(&priority_request(None)), 0);
+        assert_eq!(
+            LLMBackend::sequence_priority(&priority_request(Some(0))),
+            u8::MAX,
+        );
+        assert_eq!(
+            LLMBackend::sequence_priority(&priority_request(Some(1))),
+            u8::MAX - 1,
+        );
+        assert!(
+            LLMBackend::sequence_priority(&priority_request(Some(0)))
+                > LLMBackend::sequence_priority(&priority_request(Some(1)))
+        );
+    }
+
+    #[test]
+    fn onnx_backend_advertises_internal_priority_support() {
+        assert!(LLMBackend::new().batching_policy().supports_priority);
     }
 
     #[test]
@@ -144,6 +183,83 @@ mod tests {
             kv_allocation(backend.actual_memory()).domain,
             MemoryDomain::Cuda { device_id: 2 }
         );
+    }
+
+    #[test]
+    fn paged_host_backing_is_present_in_the_preload_plan() {
+        let root = make_temp_dir("paged_memory_plan");
+        let model_path = root.join("model.onnx");
+        fs::write(&model_path, vec![0u8; 128]).expect("model file");
+        fs::write(
+            root.join("config.json"),
+            json!({
+                "num_hidden_layers": 2,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 2,
+                "head_dim": 4,
+                "max_position_embeddings": 64
+            })
+            .to_string(),
+        )
+        .expect("config");
+        fs::write(
+            root.join("metadata.json"),
+            json!({
+                "metadata": { "llm": { "kv_cache": {
+                    "mode": "paged",
+                    "block_size": 8,
+                    "total_blocks": 4
+                }}}
+            })
+            .to_string(),
+        )
+        .expect("metadata");
+
+        // 4 blocks * 8 tokens * (2 layers * 2 heads * 4 dim * K/V * f16).
+        assert_eq!(planned_host_kv_backing_bytes(&model_path, None), 2_048);
+        let backend = LLMBackend::new();
+        let report = backend.planned_memory(&model_path).unwrap();
+        assert!(report.allocations.iter().any(|allocation| {
+            allocation.domain == MemoryDomain::Host
+                && allocation.class == MemoryAllocationClass::KvCache
+                && allocation.bytes == 2_048
+        }));
+    }
+
+    #[test]
+    fn device_kv_request_admits_cuda_and_host_fallback_together() {
+        let backend = LLMBackend::with_device("cuda".to_string(), 2).with_env_allocators(true);
+        {
+            let mut metrics = backend.metrics.lock().unwrap();
+            metrics.kv_cache_device_resident = true;
+            metrics.kv_cache_request_reservation_bytes = 4096;
+            metrics.kv_cache_host_fallback_reservation_bytes = 4096;
+        }
+        let request = InferenceRequest {
+            input: BinaryTensorPacket {
+                shape: vec![1, 1],
+                dtype: TensorDtype::Utf8,
+                data: b"hello".to_vec(),
+            },
+            additional_inputs: Vec::new(),
+            session_id: None,
+            metadata: None,
+            cancellation: None,
+        };
+        let report = backend.planned_request_memory(&request);
+        let kv: Vec<_> = report
+            .allocations
+            .iter()
+            .filter(|allocation| allocation.class == MemoryAllocationClass::KvCache)
+            .collect();
+        assert_eq!(kv.len(), 2);
+        assert!(kv
+            .iter()
+            .any(|allocation| allocation.domain == MemoryDomain::Cuda { device_id: 2 }));
+        assert!(kv
+            .iter()
+            .any(|allocation| allocation.domain == MemoryDomain::Host));
+        assert!(kv.iter().all(|allocation| allocation.bytes == 4096));
     }
 
     #[test]

@@ -20,10 +20,10 @@
 //!
 //! # Integration
 //!
-//! The global scheduler is *advisory*: it computes per-engine budgets and
-//! signals preemption requests, but the actual scheduling loop remains inside
-//! each [`LLMScheduler`].  This keeps the change surface minimal while
-//! providing the coordination layer needed for T1 parity.
+//! The global scheduler computes per-engine budgets and routes executable
+//! preemption commands.  Each [`LLMEngine`] services commands in its scheduling
+//! loop, releases the corresponding physical KV entries, and reports the
+//! result so block-cap loans can be tracked and restored.
 //!
 //! ```no_run
 //! use kapsl_llm::block_manager::new_shared_allocator;
@@ -55,7 +55,9 @@
 //! // budgets[1].max_tokens ≈ 5461  (2/3 of 8192)
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 /// Maximum times a single engine may be selected as a preemption donor per
 /// scheduling round. Prevents a greedy engine from repeatedly draining one
@@ -136,6 +138,22 @@ pub struct PreemptionResult {
     pub blocks_freed: usize,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct EnginePreemptionState {
+    /// Least-important running tier. Larger values are more important in the
+    /// ONNX sequence scheduler, so this is the first tier a donor may evict.
+    lowest_running_priority: Option<u8>,
+    /// Blocks held by that tier and therefore safe to advertise atomically.
+    freeable_blocks: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PreemptionLoan {
+    donor_engine_id: u32,
+    borrower_engine_id: u32,
+    blocks: usize,
+}
+
 /// Internal per-engine state tracked by the global scheduler.
 #[derive(Debug)]
 struct EngineState {
@@ -188,6 +206,19 @@ pub struct GlobalKvScheduler {
     /// How many times each engine has been a preemption donor in the current
     /// round. Reset by [`reset_preemption_round`] at the start of each round.
     preemption_donations_this_round: HashMap<u32, usize>,
+    /// Latest donor state published by each live engine loop.
+    preemption_states: HashMap<u32, EnginePreemptionState>,
+    /// Routed commands waiting for the selected donor engine to execute them.
+    pending_preemptions: HashMap<u32, VecDeque<PreemptionRequest>>,
+    /// Requester -> donor while a command is queued or executing. This keeps a
+    /// blocked engine's fast loop from enqueuing the same reclaim repeatedly.
+    pending_requesters: HashMap<u32, u32>,
+    /// Live per-engine block caps supplied by the runtime. Successful
+    /// preemption transfers cap from donor to borrower for the lifetime of the
+    /// borrower's in-flight high-priority work, preventing the donor from
+    /// immediately reacquiring the blocks it just released.
+    block_caps: HashMap<u32, Arc<AtomicUsize>>,
+    preemption_loans: Vec<PreemptionLoan>,
     /// Monotonic counter bumped on every *change* to any engine's health.
     /// The runtime polls this to know when to recompute KV block caps so a
     /// degraded/dead engine's quota is reclaimed for healthy engines.
@@ -205,6 +236,11 @@ impl GlobalKvScheduler {
             reserved_tokens: HashMap::new(),
             inflight: HashMap::new(),
             preemption_donations_this_round: HashMap::new(),
+            preemption_states: HashMap::new(),
+            pending_preemptions: HashMap::new(),
+            pending_requesters: HashMap::new(),
+            block_caps: HashMap::new(),
+            preemption_loans: Vec::new(),
             health_epoch: 0,
         }
     }
@@ -241,10 +277,12 @@ impl GlobalKvScheduler {
 
     /// Deregister an engine (e.g. after it is unloaded).
     pub fn deregister(&mut self, engine_id: u32) {
+        self.clear_preemption_state_for(engine_id);
         self.engines.remove(&engine_id);
         self.engine_order.retain(|&id| id != engine_id);
         self.reserved_tokens.remove(&engine_id);
         self.inflight.remove(&engine_id);
+        self.block_caps.remove(&engine_id);
     }
 
     /// Mark an engine as active or idle for the coming round.
@@ -271,6 +309,9 @@ impl GlobalKvScheduler {
                 // reports (e.g. a circuit breaker re-reporting Degraded each
                 // failed step) don't trigger needless cap rebalancing.
                 self.health_epoch = self.health_epoch.wrapping_add(1);
+                if health != EngineHealth::Healthy {
+                    self.clear_preemption_state_for(engine_id);
+                }
             }
         }
     }
@@ -499,7 +540,17 @@ impl GlobalKvScheduler {
             *c = c.saturating_sub(1);
             if *c == 0 {
                 self.set_active(engine_id, false);
+                self.restore_preemption_loans_for(engine_id);
             }
+        }
+    }
+
+    /// Attach the runtime-owned live block cap for an engine. Registration is
+    /// idempotent and intentionally separate from [`EngineHandle`] so existing
+    /// embedders that do not use shared physical blocks remain source-compatible.
+    pub fn register_block_cap(&mut self, engine_id: u32, cap: Arc<AtomicUsize>) {
+        if self.engines.contains_key(&engine_id) {
+            self.block_caps.insert(engine_id, cap);
         }
     }
 
@@ -516,8 +567,9 @@ impl GlobalKvScheduler {
     /// many blocks it could theoretically free if its scheduler evicts its
     /// lowest-priority groups.
     ///
-    /// The caller is responsible for actually invoking preemption on the donor
-    /// engine's `LLMScheduler` (via `try_preempt_for_blocks`).
+    /// This lower-level selector does not enqueue work. Production callers use
+    /// [`request_preemption`](Self::request_preemption), which retains an
+    /// executable command for the selected donor engine.
     pub fn find_preemption_donor(
         &mut self,
         request: &PreemptionRequest,
@@ -569,6 +621,196 @@ impl GlobalKvScheduler {
             *self.preemption_donations_this_round.entry(id).or_insert(0) += 1;
         }
         donor
+    }
+
+    /// Publish the concrete reclaimable state observed by one engine's live
+    /// scheduling loop. Stale or unregistered engines are ignored.
+    pub fn report_preemption_state(
+        &mut self,
+        engine_id: u32,
+        lowest_running_priority: Option<u8>,
+        freeable_blocks: usize,
+    ) {
+        if self
+            .engines
+            .get(&engine_id)
+            .is_none_or(|state| state.health != EngineHealth::Healthy)
+        {
+            self.preemption_states.remove(&engine_id);
+            return;
+        }
+        self.preemption_states.insert(
+            engine_id,
+            EnginePreemptionState {
+                lowest_running_priority,
+                freeable_blocks,
+            },
+        );
+    }
+
+    /// Select a donor from live engine reports and enqueue an executable
+    /// preemption command for its scheduling loop.
+    ///
+    /// Returning a donor now means more than an advisory choice: the command is
+    /// retained until that donor calls [`take_preemption_requests`]. Duplicate
+    /// pressure reports from the same requester are coalesced while the first
+    /// command is in flight.
+    pub fn request_preemption(&mut self, request: PreemptionRequest) -> Option<u32> {
+        if let Some(donor) = self
+            .pending_requesters
+            .get(&request.requesting_engine_id)
+            .copied()
+        {
+            return Some(donor);
+        }
+
+        let priorities = self
+            .preemption_states
+            .iter()
+            .filter_map(|(&engine_id, state)| {
+                state
+                    .lowest_running_priority
+                    .map(|priority| (engine_id, priority))
+            })
+            .collect::<HashMap<_, _>>();
+        let freeable = self
+            .preemption_states
+            .iter()
+            .map(|(&engine_id, state)| (engine_id, state.freeable_blocks))
+            .collect::<HashMap<_, _>>();
+        let donor = self.find_preemption_donor(&request, &priorities, &freeable)?;
+        self.pending_preemptions
+            .entry(donor)
+            .or_default()
+            .push_back(request.clone());
+        self.pending_requesters
+            .insert(request.requesting_engine_id, donor);
+        Some(donor)
+    }
+
+    /// Drain the commands routed to `donor_engine_id`. The caller must report
+    /// each result through [`finish_preemption`] after touching its scheduler.
+    pub fn take_preemption_requests(&mut self, donor_engine_id: u32) -> Vec<PreemptionRequest> {
+        self.pending_preemptions
+            .remove(&donor_engine_id)
+            .map(VecDeque::into_iter)
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    /// Complete one routed command and release its de-duplication slot.
+    pub fn finish_preemption(&mut self, result: PreemptionResult, requesting_engine_id: u32) {
+        if self.pending_requesters.get(&requesting_engine_id).copied()
+            == Some(result.donor_engine_id)
+        {
+            self.pending_requesters.remove(&requesting_engine_id);
+        }
+        // The borrower may have been cancelled after routing but before the
+        // donor serviced its command. Only establish a loan while admitted work
+        // is still alive; otherwise the donor's released blocks simply remain
+        // available in the shared pool under its existing cap.
+        let borrower_is_live = self
+            .inflight
+            .get(&requesting_engine_id)
+            .copied()
+            .unwrap_or(0)
+            > 0
+            && self
+                .engines
+                .get(&requesting_engine_id)
+                .is_some_and(|state| state.health == EngineHealth::Healthy);
+        if result.blocks_freed > 0 && borrower_is_live {
+            if let (Some(donor), Some(borrower)) = (
+                self.block_caps.get(&result.donor_engine_id),
+                self.block_caps.get(&requesting_engine_id),
+            ) {
+                // Never create more borrower cap than was actually removed
+                // from the donor. This matters when a health rebalance changes
+                // the donor cap between selection and completion.
+                let donor_cap = donor
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                        Some(current.saturating_sub(result.blocks_freed))
+                    })
+                    .unwrap_or_else(|current| current);
+                let transferred = donor_cap.min(result.blocks_freed);
+                if transferred > 0 {
+                    borrower.fetch_add(transferred, Ordering::AcqRel);
+                    self.preemption_loans.push(PreemptionLoan {
+                        donor_engine_id: result.donor_engine_id,
+                        borrower_engine_id: requesting_engine_id,
+                        blocks: transferred,
+                    });
+                }
+            }
+        }
+        if self.pending_requesters.is_empty() {
+            self.reset_preemption_round();
+        }
+    }
+
+    fn restore_preemption_loans_for(&mut self, borrower_engine_id: u32) {
+        let loans: Vec<_> = self
+            .preemption_loans
+            .iter()
+            .copied()
+            .filter(|loan| loan.borrower_engine_id == borrower_engine_id)
+            .collect();
+        if loans.is_empty() {
+            return;
+        }
+        for loan in &loans {
+            if let Some(borrower) = self.block_caps.get(&borrower_engine_id) {
+                borrower
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                        Some(current.saturating_sub(loan.blocks))
+                    })
+                    .ok();
+            }
+            if let Some(donor) = self.block_caps.get(&loan.donor_engine_id) {
+                donor.fetch_add(loan.blocks, Ordering::AcqRel);
+            }
+        }
+        self.preemption_loans
+            .retain(|loan| loan.borrower_engine_id != borrower_engine_id);
+    }
+
+    /// Cancel queued work and settle every temporary cap transfer touching one
+    /// engine. Used by unload and health isolation so no command or loan can
+    /// outlive either endpoint.
+    fn clear_preemption_state_for(&mut self, engine_id: u32) {
+        self.restore_preemption_loans_for(engine_id);
+
+        // If this engine was a donor, remove its outstanding loans from the
+        // borrowers. The donor side is intentionally not restored: unload drops
+        // that cap, while a health rebalance will replace it from policy.
+        let orphaned = self
+            .preemption_loans
+            .iter()
+            .copied()
+            .filter(|loan| loan.donor_engine_id == engine_id)
+            .collect::<Vec<_>>();
+        for loan in &orphaned {
+            if let Some(borrower) = self.block_caps.get(&loan.borrower_engine_id) {
+                borrower
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                        Some(current.saturating_sub(loan.blocks))
+                    })
+                    .ok();
+            }
+        }
+        self.preemption_loans
+            .retain(|loan| loan.donor_engine_id != engine_id);
+
+        self.preemption_states.remove(&engine_id);
+        self.pending_preemptions.remove(&engine_id);
+        for queue in self.pending_preemptions.values_mut() {
+            queue.retain(|request| request.requesting_engine_id != engine_id);
+        }
+        self.pending_preemptions
+            .retain(|_, queue| !queue.is_empty());
+        self.pending_requesters
+            .retain(|requester, donor| *requester != engine_id && *donor != engine_id);
     }
 
     /// Reset per-engine preemption donation counts for the new scheduling round.
@@ -826,5 +1068,134 @@ mod global_scheduler_tests {
         // Reset clears the cap for the next round.
         sched.reset_preemption_round();
         assert!(sched.preemption_donations_this_round.is_empty());
+    }
+
+    #[test]
+    fn routed_preemption_is_executable_deduplicated_and_cap_scoped() {
+        let mut sched = make_scheduler(1000, &[(0, 1, true), (1, 1, true)]);
+        let requester_cap = Arc::new(AtomicUsize::new(10));
+        let donor_cap = Arc::new(AtomicUsize::new(10));
+        sched.register_block_cap(0, requester_cap.clone());
+        sched.register_block_cap(1, donor_cap.clone());
+        assert!(sched.try_reserve_tokens(0, 1));
+
+        sched.report_preemption_state(1, Some(1), 8);
+        let request = PreemptionRequest {
+            requesting_engine_id: 0,
+            blocks_needed: 6,
+            request_priority: 9,
+        };
+        assert_eq!(sched.request_preemption(request.clone()), Some(1));
+        // A fast requester loop cannot enqueue the same command repeatedly.
+        assert_eq!(sched.request_preemption(request.clone()), Some(1));
+
+        let commands = sched.take_preemption_requests(1);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].blocks_needed, 6);
+        assert!(sched.take_preemption_requests(1).is_empty());
+
+        sched.finish_preemption(
+            PreemptionResult {
+                donor_engine_id: 1,
+                blocks_freed: 6,
+            },
+            0,
+        );
+        assert_eq!(requester_cap.load(Ordering::Acquire), 16);
+        assert_eq!(donor_cap.load(Ordering::Acquire), 4);
+
+        // The loan is returned when the borrower's last admitted request ends.
+        sched.complete_tokens(0, 1);
+        assert_eq!(requester_cap.load(Ordering::Acquire), 10);
+        assert_eq!(donor_cap.load(Ordering::Acquire), 10);
+    }
+
+    #[test]
+    fn routed_preemption_never_targets_equal_priority_work() {
+        let mut sched = make_scheduler(1000, &[(0, 1, true), (1, 1, true)]);
+        sched.report_preemption_state(1, Some(5), 20);
+        assert_eq!(
+            sched.request_preemption(PreemptionRequest {
+                requesting_engine_id: 0,
+                blocks_needed: 4,
+                request_priority: 5,
+            }),
+            None,
+        );
+        assert!(sched.take_preemption_requests(1).is_empty());
+    }
+
+    #[test]
+    fn cancelled_borrower_cannot_leave_a_cap_loan() {
+        let mut sched = make_scheduler(1000, &[(0, 1, true), (1, 1, true)]);
+        let requester_cap = Arc::new(AtomicUsize::new(10));
+        let donor_cap = Arc::new(AtomicUsize::new(10));
+        sched.register_block_cap(0, requester_cap.clone());
+        sched.register_block_cap(1, donor_cap.clone());
+        assert!(sched.try_reserve_tokens(0, 1));
+        sched.report_preemption_state(1, Some(1), 8);
+        assert_eq!(
+            sched.request_preemption(PreemptionRequest {
+                requesting_engine_id: 0,
+                blocks_needed: 6,
+                request_priority: 9,
+            }),
+            Some(1),
+        );
+        assert_eq!(sched.take_preemption_requests(1).len(), 1);
+
+        // Cancellation releases the admission guard before the donor reports.
+        sched.complete_tokens(0, 1);
+        sched.finish_preemption(
+            PreemptionResult {
+                donor_engine_id: 1,
+                blocks_freed: 6,
+            },
+            0,
+        );
+
+        assert_eq!(requester_cap.load(Ordering::Acquire), 10);
+        assert_eq!(donor_cap.load(Ordering::Acquire), 10);
+        assert!(sched.preemption_loans.is_empty());
+    }
+
+    #[test]
+    fn cap_loan_is_clamped_to_the_donors_live_cap() {
+        let mut sched = make_scheduler(1000, &[(0, 1, true), (1, 1, true)]);
+        let requester_cap = Arc::new(AtomicUsize::new(10));
+        let donor_cap = Arc::new(AtomicUsize::new(3));
+        sched.register_block_cap(0, requester_cap.clone());
+        sched.register_block_cap(1, donor_cap.clone());
+        assert!(sched.try_reserve_tokens(0, 1));
+
+        sched.finish_preemption(
+            PreemptionResult {
+                donor_engine_id: 1,
+                blocks_freed: 6,
+            },
+            0,
+        );
+        assert_eq!(requester_cap.load(Ordering::Acquire), 13);
+        assert_eq!(donor_cap.load(Ordering::Acquire), 0);
+
+        sched.complete_tokens(0, 1);
+        assert_eq!(requester_cap.load(Ordering::Acquire), 10);
+        assert_eq!(donor_cap.load(Ordering::Acquire), 3);
+    }
+
+    #[test]
+    fn deregistered_requester_is_removed_from_donor_queue() {
+        let mut sched = make_scheduler(1000, &[(0, 1, true), (1, 1, true)]);
+        sched.report_preemption_state(1, Some(1), 8);
+        assert_eq!(
+            sched.request_preemption(PreemptionRequest {
+                requesting_engine_id: 0,
+                blocks_needed: 6,
+                request_priority: 9,
+            }),
+            Some(1),
+        );
+        sched.deregister(0);
+        assert!(sched.take_preemption_requests(1).is_empty());
     }
 }

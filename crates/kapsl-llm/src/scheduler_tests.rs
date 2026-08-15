@@ -27,6 +27,15 @@ mod tests {
         )
     }
 
+    fn make_group_with_id(request_id: &str, sequence_id: u64, prompt_len: usize) -> SequenceGroup {
+        let mut group = make_group(prompt_len);
+        group.request_id = request_id.to_string();
+        let sequence = group.sequences.remove(&0).expect("default sequence");
+        sequence.lock().unwrap().sequence_id = sequence_id;
+        group.sequences.insert(sequence_id, sequence);
+        group
+    }
+
     #[test]
     fn schedule_moves_waiting_to_running_and_allocates_blocks() {
         let config = SchedulerConfig {
@@ -129,5 +138,85 @@ mod tests {
             .collect();
         // Descending priority, FIFO within a tier: mid_a before mid_b.
         assert_eq!(order, vec!["high", "mid_a", "mid_b", "low"]);
+    }
+
+    #[test]
+    fn higher_priority_waiter_preempts_lower_priority_kv_and_resets_cursor() {
+        let config = SchedulerConfig {
+            max_num_batched_tokens: 64,
+            max_num_seqs: 4,
+            max_paddings: 0,
+        };
+        let block_manager = BlockManager::new(2, 1, 0);
+        let mut scheduler = LLMScheduler::new(config, block_manager);
+
+        let mut low = make_group_with_id("low", 10, 1);
+        low.priority = 1;
+        scheduler.add_sequence_group(low);
+        let _ = scheduler.schedule();
+        scheduler
+            .running_queue
+            .front()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .sequences
+            .get(&10)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .kv_cached_len = 1;
+
+        let mut high = make_group_with_id("high", 20, 2);
+        high.priority = 9;
+        scheduler.add_sequence_group(high);
+        let output = scheduler.schedule();
+
+        assert_eq!(output.preempted_sequence_ids, vec![10]);
+        assert!(output.preemption_request.is_none());
+        assert!(output
+            .scheduled_seq_groups
+            .iter()
+            .any(|group| group.lock().unwrap().request_id == "high"));
+        let swapped = scheduler.swapped_queue.front().expect("swapped low group");
+        let swapped = swapped.lock().unwrap();
+        assert_eq!(swapped.request_id, "low");
+        assert_eq!(
+            swapped
+                .sequences
+                .get(&10)
+                .unwrap()
+                .lock()
+                .unwrap()
+                .kv_cached_len,
+            0,
+        );
+    }
+
+    #[test]
+    fn equal_priority_work_is_not_a_preemption_victim() {
+        let config = SchedulerConfig {
+            max_num_batched_tokens: 64,
+            max_num_seqs: 4,
+            max_paddings: 0,
+        };
+        let block_manager = BlockManager::new(2, 1, 0);
+        let mut scheduler = LLMScheduler::new(config, block_manager);
+
+        let mut running = make_group_with_id("running", 10, 1);
+        running.priority = 5;
+        scheduler.add_sequence_group(running);
+        let _ = scheduler.schedule();
+
+        let mut waiting = make_group_with_id("waiting", 20, 2);
+        waiting.priority = 5;
+        scheduler.add_sequence_group(waiting);
+        let output = scheduler.schedule();
+
+        assert!(output.preempted_sequence_ids.is_empty());
+        let pressure = output.preemption_request.expect("cross-engine pressure");
+        assert_eq!(pressure.blocks_needed, 1);
+        assert_eq!(pressure.request_priority, 5);
+        assert!(scheduler.swapped_queue.is_empty());
     }
 }

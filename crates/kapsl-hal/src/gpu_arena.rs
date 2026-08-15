@@ -653,7 +653,10 @@ static NEXT_DEVICE_POOL_ID: AtomicU64 = AtomicU64::new(1);
 pub struct GpuDevicePool {
     pool_id: u64,
     device: Arc<CudaDevice>,
-    storage: UnsafeCell<CudaSlice<u8>>,
+    // Kept optional so Drop can release the cudaMallocAsync allocation before
+    // trimming CUDA's default memory pool. CudaSlice::drop alone returns the
+    // range to that pool, but the driver is free to retain the physical pages.
+    storage: UnsafeCell<Option<CudaSlice<u8>>>,
     allocator: Mutex<AlignedRangeAllocator>,
     policy: Mutex<PoolPolicy>,
 }
@@ -690,7 +693,7 @@ impl GpuDevicePool {
         Ok(Self {
             pool_id: NEXT_DEVICE_POOL_ID.fetch_add(1, Ordering::Relaxed),
             device,
-            storage: UnsafeCell::new(storage),
+            storage: UnsafeCell::new(Some(storage)),
             allocator: Mutex::new(AlignedRangeAllocator::new(capacity_bytes)),
             policy: Mutex::new(PoolPolicy::new(capacity_bytes)),
         })
@@ -834,7 +837,9 @@ impl GpuDevicePool {
     }
 
     pub fn base_ptr(&self) -> *mut std::ffi::c_void {
-        let storage = unsafe { &*self.storage.get() };
+        let storage = unsafe { &*self.storage.get() }
+            .as_ref()
+            .expect("live GPU device pool storage");
         *storage.device_ptr() as *mut std::ffi::c_void
     }
 
@@ -844,7 +849,9 @@ impl GpuDevicePool {
     }
 
     pub fn capacity_bytes(&self) -> usize {
-        let storage = unsafe { &*self.storage.get() };
+        let storage = unsafe { &*self.storage.get() }
+            .as_ref()
+            .expect("live GPU device pool storage");
         storage.len()
     }
 
@@ -853,7 +860,9 @@ impl GpuDevicePool {
     }
 
     fn f16_storage(&self) -> CudaView<'_, half::f16> {
-        let storage = unsafe { &*self.storage.get() };
+        let storage = unsafe { &*self.storage.get() }
+            .as_ref()
+            .expect("live GPU device pool storage");
         // CUDA allocations are sufficiently aligned for f16; a trailing odd
         // byte, if any, is intentionally not exposed through the typed view.
         unsafe { storage.transmute(storage.len() / std::mem::size_of::<half::f16>()) }
@@ -864,9 +873,73 @@ impl GpuDevicePool {
     /// The caller must write only extents allocated to it. Multiple mutable
     /// views may coexist because ownership is enforced by the range allocator.
     unsafe fn f16_storage_mut(&self) -> CudaViewMut<'_, half::f16> {
-        let storage = unsafe { &mut *self.storage.get() };
+        let storage = unsafe { &mut *self.storage.get() }
+            .as_mut()
+            .expect("live GPU device pool storage");
         let len = storage.len() / std::mem::size_of::<half::f16>();
         unsafe { storage.transmute_mut(len) }.expect("f16 view fits device pool")
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for GpuDevicePool {
+    fn drop(&mut self) {
+        let capacity = unsafe { &mut *self.storage.get() }
+            .take()
+            .map(|storage| {
+                let capacity = storage.len();
+                // On memory-pool-capable devices this enqueues cudaFreeAsync.
+                drop(storage);
+                capacity
+            })
+            .unwrap_or(0);
+
+        if capacity == 0 {
+            return;
+        }
+        if let Err(error) = self.device.synchronize() {
+            log::warn!(
+                "GPU device pool released {} bytes but could not synchronize before trimming CUDA's default memory pool: {}",
+                capacity,
+                error
+            );
+            return;
+        }
+
+        let memory_pools_supported = self
+            .device
+            .attribute(
+                cudarc::driver::sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED,
+            )
+            .map(|supported| supported > 0)
+            .unwrap_or(false);
+        if !memory_pools_supported {
+            log::info!(
+                "GPU device pool backing released: {} MiB",
+                capacity / (1024 * 1024)
+            );
+            return;
+        }
+
+        let trim_result = unsafe {
+            use cudarc::driver::sys;
+
+            let mut default_pool = std::ptr::null_mut();
+            sys::lib()
+                .cuDeviceGetDefaultMemPool(&mut default_pool, *self.device.cu_device())
+                .result()
+                .and_then(|()| sys::lib().cuMemPoolTrimTo(default_pool, 0).result())
+        };
+        match trim_result {
+            Ok(()) => log::info!(
+                "GPU device pool backing released and CUDA default memory pool trimmed: {} MiB",
+                capacity / (1024 * 1024)
+            ),
+            Err(error) => log::warn!(
+                "GPU device pool backing released, but CUDA default memory pool trim failed: {}",
+                error
+            ),
+        }
     }
 }
 

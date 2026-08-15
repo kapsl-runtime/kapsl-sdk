@@ -42,7 +42,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use crate::global_scheduler::{EngineHealth, GlobalKvScheduler};
+use crate::global_scheduler::{
+    EngineHealth, GlobalKvScheduler, PreemptionRequest, PreemptionResult,
+};
 use futures::FutureExt;
 use tokenizers::Tokenizer;
 use tokio::sync::mpsc;
@@ -105,6 +107,38 @@ impl EngineHealthReporter {
             scheduler: self.scheduler.clone(),
             engine_id: self.engine_id,
         }
+    }
+
+    fn report_preemption_state(&self, lowest_running_priority: Option<u8>, freeable_blocks: usize) {
+        self.scheduler.lock().report_preemption_state(
+            self.engine_id,
+            lowest_running_priority,
+            freeable_blocks,
+        );
+    }
+
+    fn route_preemption(&self, blocks_needed: usize, request_priority: u8) -> Option<u32> {
+        self.scheduler.lock().request_preemption(PreemptionRequest {
+            requesting_engine_id: self.engine_id,
+            blocks_needed,
+            request_priority,
+        })
+    }
+
+    fn take_preemption_requests(&self) -> Vec<PreemptionRequest> {
+        self.scheduler
+            .lock()
+            .take_preemption_requests(self.engine_id)
+    }
+
+    fn finish_preemption(&self, request: &PreemptionRequest, blocks_freed: usize) {
+        self.scheduler.lock().finish_preemption(
+            PreemptionResult {
+                donor_engine_id: self.engine_id,
+                blocks_freed,
+            },
+            request.requesting_engine_id,
+        );
     }
 }
 
@@ -1770,9 +1804,7 @@ impl LLMEngine {
                         }
                     }
                     if let Some(v) = kv.get("dense_free_list_cap").and_then(|v| v.as_u64()) {
-                        if v > 0 {
-                            kv_cache_config.dense_free_list_cap = v as usize;
-                        }
+                        kv_cache_config.dense_free_list_cap = v as usize;
                     }
                     if let Some(bits) = kv.get("tq_compression_bits").and_then(|v| v.as_u64()) {
                         if (2..=4).contains(&bits) {
@@ -1989,9 +2021,7 @@ impl LLMEngine {
         }
         if let Some(v) = env_var_alias("KAPSL_LLM_KV_FREE_LIST_CAP", "KAPSL_LLM_KV_FREE_LIST_CAP") {
             if let Ok(parsed) = v.parse::<usize>() {
-                if parsed > 0 {
-                    kv_cache_config.dense_free_list_cap = parsed;
-                }
+                kv_cache_config.dense_free_list_cap = parsed;
             }
         }
         if let Some(v) = env_var_alias(
@@ -2889,6 +2919,7 @@ impl LLMEngine {
         &mut self,
         sequence_id: u64,
         tokens: &[u32],
+        priority: u8,
     ) -> Result<usize, KvCacheError> {
         if self.device_kv_enabled {
             if let Some(sequence) = self.device_kv_cache.get(&sequence_id) {
@@ -2900,7 +2931,15 @@ impl LLMEngine {
             // host cache fallback until device-side slicing is available.
             Ok(0)
         } else {
-            self.kv_cache.allocate_sequence(sequence_id, tokens)
+            let cached = self.kv_cache.allocate_sequence(sequence_id, tokens)?;
+            self.kv_cache.set_sequence_priority(sequence_id, priority);
+            Ok(cached)
+        }
+    }
+
+    fn set_persistent_kv_priority(&mut self, sequence_id: u64, priority: u8) {
+        if !self.device_kv_enabled {
+            self.kv_cache.set_sequence_priority(sequence_id, priority);
         }
     }
 
@@ -2960,12 +2999,25 @@ impl LLMEngine {
     }
 
     fn update_kv_cache_metrics(&self) {
+        let host_stats = self.kv_cache.stats();
         if self.device_kv_enabled {
             let (used, capacity, sequences) = self.device_kv_usage();
             let mut metrics = self.metrics.lock().unwrap();
             metrics.kv_cache_device_resident = true;
             metrics.kv_cache_bytes_used = used;
-            metrics.kv_cache_bytes_capacity = capacity;
+            metrics.kv_cache_bytes_capacity = capacity.saturating_add(host_stats.bytes_capacity);
+            metrics.kv_cache_host_bytes_retained = host_stats.bytes_capacity;
+            metrics.kv_cache_device_bytes_retained = used;
+            metrics.kv_cache_request_reservation_bytes = self
+                .max_seq_len
+                .saturating_mul(self.device_kv_bytes_per_token());
+            metrics.kv_cache_host_fallback_reservation_bytes =
+                if host_stats.mode == KvCacheMode::Dense {
+                    self.max_seq_len
+                        .saturating_mul(self.kv_bytes_per_token().unwrap_or(0))
+                } else {
+                    0
+                };
             metrics.kv_cache_blocks_total = 0;
             metrics.kv_cache_blocks_free = 0;
             metrics.kv_cache_sequences = sequences;
@@ -2977,11 +3029,20 @@ impl LLMEngine {
             metrics.kv_cache_prefix_reuse_tokens_saved = 0;
             return;
         }
-        let stats = self.kv_cache.stats();
+        let stats = host_stats;
         let mut metrics = self.metrics.lock().unwrap();
         metrics.kv_cache_device_resident = false;
         metrics.kv_cache_bytes_used = stats.bytes_used;
         metrics.kv_cache_bytes_capacity = stats.bytes_capacity;
+        metrics.kv_cache_host_bytes_retained = stats.bytes_capacity;
+        metrics.kv_cache_device_bytes_retained = 0;
+        metrics.kv_cache_request_reservation_bytes = if stats.mode == KvCacheMode::Dense {
+            self.max_seq_len
+                .saturating_mul(self.kv_bytes_per_token().unwrap_or(0))
+        } else {
+            0
+        };
+        metrics.kv_cache_host_fallback_reservation_bytes = 0;
         metrics.kv_cache_blocks_total = stats.blocks_total;
         metrics.kv_cache_blocks_free = stats.blocks_free;
         metrics.kv_cache_sequences = stats.sequences;
@@ -3129,10 +3190,97 @@ impl LLMEngine {
         Ok(())
     }
 
+    fn release_preempted_kv_sequences(&mut self, sequence_ids: &[u64]) {
+        if !self.use_kv_cache || sequence_ids.is_empty() {
+            return;
+        }
+        let mut released = HashSet::with_capacity(sequence_ids.len());
+        for &sequence_id in sequence_ids {
+            if released.insert(sequence_id) {
+                self.remove_persistent_kv_sequence(sequence_id);
+            }
+        }
+        self.update_kv_cache_metrics();
+    }
+
+    fn ensure_scheduled_kv_sequences(
+        &mut self,
+        groups: &[Arc<Mutex<SequenceGroup>>],
+    ) -> Result<(), EngineError> {
+        if !self.use_kv_cache {
+            return Ok(());
+        }
+
+        let mut missing = Vec::new();
+        for group_arc in groups {
+            let group = group_arc.lock().unwrap();
+            let priority = group.priority;
+            for (&sequence_id, sequence_arc) in &group.sequences {
+                if self.persistent_kv_has_sequence(sequence_id) {
+                    self.set_persistent_kv_priority(sequence_id, priority);
+                    continue;
+                }
+                let tokens = {
+                    let sequence = sequence_arc.lock().unwrap();
+                    let mut tokens = sequence.prompt_token_ids.clone();
+                    tokens.extend_from_slice(&sequence.output_token_ids);
+                    tokens
+                };
+                missing.push((sequence_id, sequence_arc.clone(), priority, tokens));
+            }
+        }
+
+        for (sequence_id, sequence_arc, priority, tokens) in missing {
+            let cached = self
+                .allocate_persistent_kv_sequence(sequence_id, &tokens, priority)
+                .map_err(|error| EngineError::resource_exhausted(error.to_string()))?;
+            sequence_arc.lock().unwrap().kv_cached_len = cached;
+        }
+        Ok(())
+    }
+
+    fn report_preemption_state(&self) {
+        let Some(reporter) = self.health_reporter.as_ref() else {
+            return;
+        };
+        let (priority, blocks) = self.scheduler.preemption_state();
+        reporter.report_preemption_state(priority, blocks);
+    }
+
+    fn service_global_preemptions(&mut self) {
+        let Some(reporter) = self
+            .health_reporter
+            .as_ref()
+            .map(EngineHealthReporter::clone_handle)
+        else {
+            return;
+        };
+        for request in reporter.take_preemption_requests() {
+            let outcome = self
+                .scheduler
+                .preempt_lower_priority(request.blocks_needed, request.request_priority);
+            self.release_preempted_kv_sequences(&outcome.sequence_ids);
+            if outcome.blocks_freed > 0 {
+                log::info!(
+                    "[kv-preemption] engine {} released {} blocks for engine {} (priority {})",
+                    reporter.engine_id,
+                    outcome.blocks_freed,
+                    request.requesting_engine_id,
+                    request.request_priority,
+                );
+            }
+            reporter.finish_preemption(&request, outcome.blocks_freed);
+        }
+        self.report_preemption_state();
+    }
+
     pub async fn run_loop(&mut self) {
         loop {
             // Heartbeat for the watchdog: record that the loop is alive this tick.
             self.heartbeat.store(now_millis(), Ordering::Relaxed);
+            // Execute commands selected by the cross-engine arbiter before this
+            // engine can reacquire any donated blocks in its own schedule pass.
+            self.service_global_preemptions();
 
             // Circuit breaker: when open, fail fast until the cooldown elapses,
             // then let a single half-open trial batch through.
@@ -3251,7 +3399,8 @@ impl LLMEngine {
 
                     if self.use_kv_cache && !self.persistent_kv_has_sequence(seq_id) {
                         // Pass token_ids for prefix matching
-                        match self.allocate_persistent_kv_sequence(seq_id, &token_ids) {
+                        match self.allocate_persistent_kv_sequence(seq_id, &token_ids, req.priority)
+                        {
                             Ok(cached_len) => {
                                 // If we reused KV cache, we should update the sequence state
                                 // so that the next step skips these tokens.
@@ -3269,6 +3418,7 @@ impl LLMEngine {
                             }
                         }
                     }
+                    self.set_persistent_kv_priority(seq_id, req.priority);
 
                     req.sequences.clear();
                     req.sequences.insert(seq_id, existing_seq_arc);
@@ -3319,7 +3469,7 @@ impl LLMEngine {
                         .insert(session_key.clone(), req_seq_arc.clone());
                 }
                 if self.use_kv_cache {
-                    match self.allocate_persistent_kv_sequence(seq_id, &token_ids) {
+                    match self.allocate_persistent_kv_sequence(seq_id, &token_ids, req.priority) {
                         Ok(cached_len) => {
                             let mut seq = req_seq_arc.lock().unwrap();
                             seq.kv_cached_len = cached_len;
@@ -3370,8 +3520,35 @@ impl LLMEngine {
             }
 
             let outputs = self.scheduler.schedule();
+            self.release_preempted_kv_sequences(&outputs.preempted_sequence_ids);
+            self.report_preemption_state();
+            if let (Some(reporter), Some(request)) =
+                (self.health_reporter.as_ref(), outputs.preemption_request)
+            {
+                if let Some(donor) =
+                    reporter.route_preemption(request.blocks_needed, request.request_priority)
+                {
+                    log::debug!(
+                        "[kv-preemption] engine {} requested {} blocks from engine {} (priority {})",
+                        reporter.engine_id,
+                        request.blocks_needed,
+                        donor,
+                        request.request_priority,
+                    );
+                }
+            }
             if outputs.scheduled_seq_groups.is_empty() {
                 tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                continue;
+            }
+
+            if let Err(error) = self.ensure_scheduled_kv_sequences(&outputs.scheduled_seq_groups) {
+                self.fail_groups_with_error(&outputs.scheduled_seq_groups, &error);
+                let finished = self.scheduler.free_finished_sequences();
+                for sequence_id in finished {
+                    self.remove_persistent_kv_sequence(sequence_id);
+                }
+                self.update_kv_cache_metrics();
                 continue;
             }
 

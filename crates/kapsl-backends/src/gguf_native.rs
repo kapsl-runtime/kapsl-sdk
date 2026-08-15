@@ -45,6 +45,7 @@ mod inner {
         PrefillAttnParams, RmsNormParams,
     };
     use kapsl_kernels::cuda_quant_kernels::{launch_q4_k_gemv, launch_q8_0_gemv, QuantGemvParams};
+    use kapsl_loader::gguf_loader::GgufFile;
     use kapsl_loader::weights::DType;
     use kapsl_loader::{load_gguf_weights, ModelConfig, TensorData};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -277,6 +278,21 @@ mod inner {
         num_layers
             .saturating_mul(max_sequences.max(1))
             .saturating_mul(blocks_per_sequence.max(1))
+    }
+
+    fn planned_kv_bytes(model_path: &Path) -> Result<usize, EngineError> {
+        let file = GgufFile::open(model_path)
+            .map_err(|error| EngineError::backend(format!("read GGUF metadata: {error}")))?;
+        let config = file
+            .extract_config()
+            .map_err(|error| EngineError::backend(format!("read GGUF config: {error}")))?;
+        let block_size = 16usize;
+        Ok(kv_pool_block_count(&config, block_size)
+            .saturating_mul(2)
+            .saturating_mul(config.num_kv_heads())
+            .saturating_mul(block_size)
+            .saturating_mul(config.head_dim())
+            .saturating_mul(std::mem::size_of::<f16>()))
     }
 
     // ── Session state ─────────────────────────────────────────────────────────
@@ -1994,6 +2010,7 @@ mod inner {
             let bytes = std::fs::metadata(model_path)
                 .map_err(|e| EngineError::backend(format!("stat GGUF model: {e}")))?
                 .len() as usize;
+            let kv_bytes = planned_kv_bytes(model_path)?;
             let source = if self.device_pool.is_some() {
                 EngineMemoryAllocationSource::RuntimeManaged
             } else {
@@ -2026,7 +2043,11 @@ mod inner {
                         },
                         class: EngineMemoryAllocationClass::KvCache,
                         source,
-                        bytes: 0,
+                        bytes: if self.device_pool.is_some() {
+                            0
+                        } else {
+                            kv_bytes
+                        },
                     },
                     EngineMemoryAllocation {
                         allocation_id: format!("{}:block-table", self.external_allocation_id),
@@ -2266,14 +2287,37 @@ mod inner {
                 device_id: self.device_id as usize,
             };
             let Some((pool, owner)) = self.device_pool.as_ref() else {
+                let kv_bytes = self
+                    .pool_slot
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|handle| handle.pool.capacity_bytes())
+                    .unwrap_or(0);
                 return MemoryReport {
-                    allocations: vec![EngineMemoryAllocation {
-                        allocation_id: self.external_allocation_id.clone(),
-                        domain,
-                        class: EngineMemoryAllocationClass::PersistentWeights,
-                        source: EngineMemoryAllocationSource::BackendManaged,
-                        bytes,
-                    }],
+                    allocations: vec![
+                        EngineMemoryAllocation {
+                            allocation_id: self.external_allocation_id.clone(),
+                            domain: domain.clone(),
+                            class: EngineMemoryAllocationClass::PersistentWeights,
+                            source: EngineMemoryAllocationSource::BackendManaged,
+                            bytes,
+                        },
+                        EngineMemoryAllocation {
+                            allocation_id: format!("{}:scratch", self.external_allocation_id),
+                            domain: domain.clone(),
+                            class: EngineMemoryAllocationClass::TransientWorkspace,
+                            source: EngineMemoryAllocationSource::BackendManaged,
+                            bytes: (bytes / 8).max(256 * 1024 * 1024),
+                        },
+                        EngineMemoryAllocation {
+                            allocation_id: format!("{}:kv", self.external_allocation_id),
+                            domain,
+                            class: EngineMemoryAllocationClass::KvCache,
+                            source: EngineMemoryAllocationSource::BackendManaged,
+                            bytes: kv_bytes,
+                        },
+                    ],
                 };
             };
             let rows = [
@@ -2311,6 +2355,43 @@ mod inner {
                         },
                     )
                     .collect(),
+            }
+        }
+
+        fn planned_request_memory(&self, request: &InferenceRequest) -> MemoryReport {
+            if self.device_pool.is_none() {
+                return MemoryReport::default();
+            }
+            let guard = self.inner.lock().unwrap();
+            let Some(inner) = guard.as_ref() else {
+                return MemoryReport::default();
+            };
+            // UTF-8 bytes plus BOS are a conservative upper bound for the
+            // tokenizer's prompt tokens without mutating tokenizer state.
+            let prompt_tokens = request.input.data.len().saturating_add(1);
+            let max_new_tokens = request
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.max_new_tokens)
+                .unwrap_or(512) as usize;
+            let token_blocks = prompt_tokens
+                .saturating_add(max_new_tokens)
+                .div_ceil(inner.block_pool.block_size());
+            let blocks = inner
+                .config
+                .num_hidden_layers
+                .saturating_mul(token_blocks)
+                .min(inner.pool_cap.load(Ordering::Acquire));
+            MemoryReport {
+                allocations: vec![EngineMemoryAllocation {
+                    allocation_id: format!("{}:request-kv", self.external_allocation_id),
+                    domain: EngineMemoryDomain::Cuda {
+                        device_id: self.device_id as usize,
+                    },
+                    class: EngineMemoryAllocationClass::KvCache,
+                    source: EngineMemoryAllocationSource::RuntimeManaged,
+                    bytes: blocks.saturating_mul(inner.block_pool.bytes_per_block()),
+                }],
             }
         }
 

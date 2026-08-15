@@ -5,7 +5,7 @@ use kapsl_engine_api::{
     BatchingPolicy, BinaryTensorPacket, Engine, EngineError, EngineMetrics, EngineModelInfo,
     EngineStream, ExternalDeviceMemory, ExternalDeviceMemoryReport, InferenceRequest,
     MemoryAllocation, MemoryAllocationClass, MemoryAllocationSource, MemoryDomain, MemoryReport,
-    TensorDtype,
+    RequestMemoryAdmission, RequestMemoryAdmissionGuard, TensorDtype,
 };
 use std::collections::VecDeque;
 use std::num::NonZeroU32;
@@ -400,6 +400,51 @@ fn estimate_kv_bytes_per_cell(model: &LlamaModel) -> usize {
         * n_head_kv
         * (head_dim_k + head_dim_v)
         * std::mem::size_of::<u16>()
+}
+
+#[cfg(feature = "gguf")]
+fn planned_gguf_kv_bytes(model_path: &Path) -> Result<usize, EngineError> {
+    let file = kapsl_loader::gguf_loader::GgufFile::open(model_path)
+        .map_err(|error| EngineError::backend(format!("read GGUF metadata: {error}")))?;
+    let config = file
+        .extract_config()
+        .map_err(|error| EngineError::backend(format!("read GGUF config: {error}")))?;
+    let ctx_per_sequence = n_ctx_per_seq()
+        .min(config.max_position_embeddings as u32)
+        .max(1) as usize;
+    let bytes_per_cell = config
+        .num_hidden_layers
+        .max(1)
+        .saturating_mul(config.num_kv_heads().max(1))
+        .saturating_mul(config.head_dim().max(1))
+        .saturating_mul(2)
+        .saturating_mul(std::mem::size_of::<u16>());
+    Ok(max_concurrent()
+        .max(1)
+        .saturating_mul(ctx_per_sequence)
+        .saturating_mul(bytes_per_cell))
+}
+
+#[cfg(any(feature = "gguf-cuda-shared-kv", all(test, feature = "gguf")))]
+fn planned_gguf_request_kv_bytes(
+    prompt_tokens: usize,
+    max_new_tokens: usize,
+    ctx_per_seq: usize,
+    block_size: usize,
+    kv_bytes_per_cell: usize,
+) -> usize {
+    if ctx_per_seq == 0 || block_size == 0 || kv_bytes_per_cell == 0 {
+        return 0;
+    }
+
+    let requested_tokens = prompt_tokens
+        .saturating_add(max_new_tokens)
+        .min(ctx_per_seq);
+    let reserved_tokens = requested_tokens
+        .div_ceil(block_size)
+        .saturating_mul(block_size)
+        .min(ctx_per_seq.div_ceil(block_size).saturating_mul(block_size));
+    reserved_tokens.saturating_mul(kv_bytes_per_cell)
 }
 
 #[cfg(feature = "gguf-cuda-shared-kv")]
@@ -798,7 +843,7 @@ fn classify_shared_kv_support(
 /// memory regardless of which KV backend feature is enabled, so callers that
 /// need to reason about their memory shape (e.g. KV metrics) need this
 /// outside the shared-KV-only code paths too.
-#[cfg(feature = "gguf")]
+#[cfg(any(feature = "gguf", test))]
 fn gguf_uses_state_space_memory(has_key: impl Fn(&str) -> bool) -> bool {
     has_key("ssm.state_size") || has_key("ssm.conv_kernel") || has_key("wkv.head_size")
 }
@@ -1331,6 +1376,10 @@ struct GgufRequest {
     priority: u8,
     /// Client session key, used for SSM session resume-state snapshots.
     session_id: Option<String>,
+    /// Runtime authority hook. It remains unacquired while this request waits
+    /// in the priority queue and is consumed only after a sequence ID is
+    /// assigned.
+    memory_admission: Option<RequestMemoryAdmission>,
     response: GgufResponse,
 }
 
@@ -1504,6 +1553,7 @@ struct PendingPrefill {
     max_tokens: i32,
     min_tokens: i32,
     session_id: Option<String>,
+    memory_guard: Option<RequestMemoryAdmissionGuard>,
     response: GgufResponse,
     copies: Vec<PendingPrefillCopy>,
 }
@@ -1514,6 +1564,7 @@ struct PendingPrefillCopy {
     max_tokens: i32,
     min_tokens: i32,
     session_id: Option<String>,
+    memory_guard: Option<RequestMemoryAdmissionGuard>,
     response: GgufResponse,
 }
 
@@ -1540,6 +1591,9 @@ struct ActiveSeq {
     /// generation) — the recurrent state at any instant covers exactly these.
     /// Only tracked while the SSM state cache is on; empty otherwise.
     absorbed: Vec<LlamaToken>,
+    /// Held until `release_sequence_slot` has synchronously cleared this
+    /// sequence's KV ownership.
+    _memory_guard: Option<RequestMemoryAdmissionGuard>,
 }
 
 #[cfg(feature = "gguf")]
@@ -1633,7 +1687,7 @@ fn record_gguf_token_metrics(
     }
 }
 
-#[cfg(feature = "gguf-cuda-shared-kv")]
+#[cfg(feature = "gguf")]
 fn record_gguf_decode_work_metrics(
     metrics: &Arc<Mutex<EngineMetrics>>,
     steps: u64,
@@ -3041,6 +3095,10 @@ struct GgufInner {
     request_tx: std_mpsc::Sender<GgufRequest>,
     scheduler_thread: Option<std::thread::JoinHandle<()>>,
     max_concurrent: usize,
+    #[cfg(feature = "gguf-cuda-shared-kv")]
+    ctx_per_seq: usize,
+    #[cfg(feature = "gguf-cuda-shared-kv")]
+    kv_bytes_per_cell: usize,
 }
 
 impl GgufBackend {
@@ -3134,19 +3192,21 @@ impl GgufBackend {
     }
 
     fn max_new_tokens(request: &InferenceRequest) -> i32 {
-        request
+        let value = request
             .metadata
             .as_ref()
             .and_then(|m| m.max_new_tokens)
-            .unwrap_or(512) as i32
+            .unwrap_or(512);
+        i32::try_from(value).unwrap_or(i32::MAX)
     }
 
     fn min_new_tokens(request: &InferenceRequest) -> i32 {
-        request
+        let value = request
             .metadata
             .as_ref()
             .and_then(|m| m.min_new_tokens)
-            .unwrap_or(0) as i32
+            .unwrap_or(0);
+        i32::try_from(value).unwrap_or(i32::MAX)
     }
 
     /// Resolved scheduling priority (0 = latency-critical, higher = lower). The
@@ -3165,6 +3225,120 @@ impl GgufBackend {
 impl Default for GgufBackend {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(feature = "gguf")]
+impl GgufBackend {
+    fn infer_with_optional_memory_admission(
+        &self,
+        request: &InferenceRequest,
+        memory_admission: Option<RequestMemoryAdmission>,
+    ) -> Result<BinaryTensorPacket, EngineError> {
+        let inner = self.inner.as_ref().ok_or(EngineError::ModelNotLoaded)?;
+        let prompt = gguf_prepare_prompt(&inner.weights.model, Self::extract_prompt(request)?)?;
+        let tokens = inner
+            .weights
+            .model
+            .str_to_token(&prompt, AddBos::Always)
+            .map_err(|e| EngineError::backend(format!("tokenization failed: {e}")))?;
+        let (resp_tx, resp_rx) = std_mpsc::channel::<Result<Vec<u8>, EngineError>>();
+
+        inner
+            .request_tx
+            .send(GgufRequest {
+                tokens,
+                max_tokens: Self::max_new_tokens(request),
+                min_tokens: Self::min_new_tokens(request),
+                priority: Self::priority(request),
+                session_id: request.session_id.clone(),
+                memory_admission,
+                response: GgufResponse::Final(resp_tx),
+            })
+            .map_err(|_| EngineError::backend("gguf scheduler disconnected"))?;
+
+        let data = match resp_rx.recv() {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(EngineError::backend(
+                    "gguf scheduler disconnected before producing a response",
+                ));
+            }
+        };
+        let len = data.len() as i64;
+        BinaryTensorPacket::new(vec![1, len], TensorDtype::Uint8, data)
+            .map_err(|e| EngineError::backend(format!("Failed to build output packet: {e}")))
+    }
+
+    fn infer_stream_with_optional_memory_admission(
+        &self,
+        request: &InferenceRequest,
+        memory_admission: Option<RequestMemoryAdmission>,
+    ) -> EngineStream {
+        let inner = match self.inner.as_ref() {
+            Some(i) => i,
+            None => {
+                return Box::pin(stream! {
+                    yield Err(EngineError::ModelNotLoaded);
+                });
+            }
+        };
+
+        let prompt = match Self::extract_prompt(request)
+            .and_then(|prompt| gguf_prepare_prompt(&inner.weights.model, prompt))
+        {
+            Ok(prompt) => prompt,
+            Err(e) => {
+                return Box::pin(stream! { yield Err(e); });
+            }
+        };
+        let tokens = match inner.weights.model.str_to_token(&prompt, AddBos::Always) {
+            Ok(tokens) => tokens,
+            Err(e) => {
+                return Box::pin(stream! {
+                    yield Err(EngineError::backend(format!("tokenization failed: {e}")));
+                });
+            }
+        };
+
+        let (resp_tx, resp_rx) = std_mpsc::channel::<Result<Vec<u8>, EngineError>>();
+
+        if inner
+            .request_tx
+            .send(GgufRequest {
+                tokens,
+                max_tokens: Self::max_new_tokens(request),
+                min_tokens: Self::min_new_tokens(request),
+                priority: Self::priority(request),
+                session_id: request.session_id.clone(),
+                memory_admission,
+                response: GgufResponse::Stream(resp_tx),
+            })
+            .is_err()
+        {
+            return Box::pin(stream! {
+                yield Err(EngineError::backend("gguf scheduler disconnected"));
+            });
+        }
+
+        // Bridge blocking std::mpsc → async tokio channel.
+        let (tok_tx, mut tok_rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, EngineError>>(64);
+        std::thread::spawn(move || {
+            for piece in resp_rx {
+                if tok_tx.blocking_send(piece).is_err() {
+                    break;
+                }
+            }
+        });
+
+        Box::pin(stream! {
+            while let Some(result) = tok_rx.recv().await {
+                let data = result?;
+                let len = data.len() as i64;
+                yield BinaryTensorPacket::new(vec![1, len], TensorDtype::Uint8, data)
+                    .map_err(|e| EngineError::backend(format!("Output packet error: {e}")));
+            }
+        })
     }
 }
 
@@ -3237,6 +3411,7 @@ fn finish_or_activate_prefilled_sequence(
     suppress_eos_sampler: bool,
     session_id: Option<String>,
     absorbed: Vec<LlamaToken>,
+    memory_guard: Option<RequestMemoryAdmissionGuard>,
 ) {
     let mut output = Vec::with_capacity((max_tokens.max(0) as usize).saturating_mul(4));
     let mut stop_filter = GgufStopFilter::new();
@@ -3295,6 +3470,7 @@ fn finish_or_activate_prefilled_sequence(
             error: None,
             session_id,
             absorbed,
+            _memory_guard: memory_guard,
         });
     }
 }
@@ -3317,6 +3493,7 @@ fn coalesce_exact_prompt_copies(pref: &mut PendingPrefill, pending: &mut VecDequ
                 max_tokens: candidate.max_tokens,
                 min_tokens: candidate.min_tokens,
                 session_id: candidate.session_id,
+                memory_guard: candidate.memory_guard,
                 response: candidate.response,
             });
         } else {
@@ -3533,6 +3710,17 @@ fn run_scheduler(
                 available_ids.push(seq_id);
                 continue;
             }
+            let memory_guard = match req.memory_admission.as_ref() {
+                Some(admission) => match admission.acquire() {
+                    Ok(guard) => Some(guard),
+                    Err(error) => {
+                        req.response.send_error(error);
+                        available_ids.push(seq_id);
+                        continue;
+                    }
+                },
+                None => None,
+            };
             if !samplers.set_for_sequence(&mut ctx, seq_id, req.min_tokens > 0) {
                 req.response
                     .send_error(EngineError::backend("failed to install sampler"));
@@ -3569,6 +3757,7 @@ fn run_scheduler(
                 max_tokens: req.max_tokens,
                 min_tokens: req.min_tokens,
                 session_id: req.session_id,
+                memory_guard,
                 response: req.response,
                 copies: Vec::new(),
             });
@@ -3753,6 +3942,7 @@ fn run_scheduler(
             update_gguf_metrics(&metrics, config, &waiting, &pending, &active, 0);
             continue;
         }
+        record_gguf_decode_work_metrics(&metrics, 1, batch.n_tokens().max(0) as u64);
 
         for pref in partial_prefills.drain(..) {
             // Prefill pauses exactly on chunk boundaries, which is where
@@ -3881,6 +4071,7 @@ fn run_scheduler(
                 suppress_eos_sampler,
                 pref.session_id.take(),
                 leader_absorbed,
+                pref.memory_guard.take(),
             );
 
             for copy in ready_copies {
@@ -3910,6 +4101,7 @@ fn run_scheduler(
                     copy_suppress_eos_sampler,
                     copy.session_id,
                     absorbed_for_copies.clone(),
+                    copy.memory_guard,
                 );
             }
         }
@@ -4074,9 +4266,19 @@ impl Engine for GgufBackend {
             ],
         };
         #[cfg(feature = "gguf-cuda-shared-kv")]
-        let runtime_kv = self.device_pool.is_some();
+        let runtime_kv =
+            self.device_pool.is_some() && !gguf_env_is_truthy("KAPSL_GGUF_DISABLE_SHARED_KV");
         #[cfg(not(feature = "gguf-cuda-shared-kv"))]
         let runtime_kv = false;
+        // A runtime-owned shared pool materializes KV blocks on demand and the
+        // request lease accounts for them while the request is alive. Native
+        // llama.cpp KV is fixed context backing and must still be admitted at
+        // model load.
+        let kv_bytes = if runtime_kv {
+            0
+        } else {
+            planned_gguf_kv_bytes(model_path)?
+        };
         report.push(MemoryAllocation {
             allocation_id: format!("gguf-kv:{}", gguf_model_key(model_path).display()),
             domain: MemoryDomain::Cuda {
@@ -4088,7 +4290,7 @@ impl Engine for GgufBackend {
             } else {
                 MemoryAllocationSource::BackendManaged
             },
-            bytes: 0,
+            bytes: kv_bytes,
         });
         Ok(report)
     }
@@ -4213,19 +4415,6 @@ impl Engine for GgufBackend {
                         .saturating_mul(block_size)
                         .saturating_mul(head_dim)
                         .saturating_mul(std::mem::size_of::<half::f16>());
-                    let required_bytes = requested_blocks.saturating_mul(bytes_per_block);
-                    let current_quota = device_pool.owner_quota(*owner);
-                    device_pool
-                        .set_owner_quota(
-                            *owner,
-                            required_bytes,
-                            current_quota.max_bytes.max(required_bytes),
-                        )
-                        .map_err(|e| {
-                            EngineError::backend(format!(
-                                "shared KV capacity guarantee admission failed: {e}"
-                            ))
-                        })?;
                     let pool = Arc::new(
                         GpuBlockPool::from_device_pool(
                             Arc::clone(device_pool),
@@ -4237,13 +4426,25 @@ impl Engine for GgufBackend {
                         )
                         .map_err(|e| EngineError::backend(format!("shared KV view: {e}")))?,
                     );
-                    if pool.total_blocks() < requested_blocks {
+                    if pool.total_blocks() < n_layers {
                         return Err(EngineError::backend(format!(
-                            "shared KV capacity admission failed: requested {requested_blocks} blocks for context={} concurrency={}, but only {} blocks are guaranteed",
-                            config.ctx_per_seq,
-                            config.max_concurrent,
-                            pool.total_blocks()
+                            "shared KV pool has {} blocks, but at least {n_layers} are required to hold one logical token across all layers",
+                            pool.total_blocks(),
                         )));
+                    }
+                    if pool.total_blocks() < requested_blocks {
+                        let blocks_per_full_sequence = requested_blocks
+                            .div_ceil(config.max_concurrent.max(1))
+                            .max(n_layers);
+                        log::info!(
+                            "[gguf] elastic shared-KV view: physical_cap={} blocks ({} MiB), configured_ceiling={} blocks for {}x{} tokens; full-context equivalents={} and request admission controls live usage",
+                            pool.total_blocks(),
+                            pool.total_blocks().saturating_mul(bytes_per_block) / (1024 * 1024),
+                            requested_blocks,
+                            config.max_concurrent,
+                            config.ctx_per_seq,
+                            pool.total_blocks() / blocks_per_full_sequence,
+                        );
                     }
                     let handle = GpuPoolHandle::private(pool);
                     *slot = Some(handle.clone());
@@ -4392,6 +4593,10 @@ impl Engine for GgufBackend {
             request_tx: tx,
             scheduler_thread: Some(scheduler_thread),
             max_concurrent: config.max_concurrent,
+            #[cfg(feature = "gguf-cuda-shared-kv")]
+            ctx_per_seq: config.ctx_per_seq as usize,
+            #[cfg(feature = "gguf-cuda-shared-kv")]
+            kv_bytes_per_cell: config.kv_bytes_per_cell,
         });
         Ok(())
     }
@@ -4456,119 +4661,127 @@ impl Engine for GgufBackend {
                 == GgufKvPath::SharedKv.as_u8();
         #[cfg(not(feature = "gguf-cuda-shared-kv"))]
         let runtime_kv = false;
+        #[cfg(feature = "gguf-cuda-shared-kv")]
+        let runtime_kv_bytes = self
+            .device_pool
+            .as_ref()
+            .map(|(pool, owner)| {
+                pool.owner_usage_bytes(owner.with_class(PoolAllocationClass::KvCache))
+            })
+            .unwrap_or(metrics.kv_cache_bytes_used);
+        #[cfg(not(feature = "gguf-cuda-shared-kv"))]
+        let runtime_kv_bytes = metrics.kv_cache_bytes_used;
         report.push(MemoryAllocation {
             allocation_id: "gguf:active-kv".to_string(),
-            domain: fallback_domain,
+            domain: if runtime_kv {
+                MemoryDomain::Cuda {
+                    device_id: self.device_id,
+                }
+            } else {
+                fallback_domain
+            },
             class: MemoryAllocationClass::KvCache,
             source: if runtime_kv {
                 MemoryAllocationSource::RuntimeManaged
             } else {
                 MemoryAllocationSource::BackendManaged
             },
-            bytes: metrics.kv_cache_bytes_used,
+            // llama.cpp's native context owns fixed backing capacity. The
+            // runtime shared pool allocates blocks elastically, so report its
+            // exact owner usage and let the load lease reconcile to zero.
+            bytes: if runtime_kv {
+                runtime_kv_bytes
+            } else {
+                metrics.kv_cache_bytes_capacity
+            },
         });
         report
     }
 
-    fn infer(&self, request: &InferenceRequest) -> Result<BinaryTensorPacket, EngineError> {
-        let inner = self.inner.as_ref().ok_or(EngineError::ModelNotLoaded)?;
-        let prompt = gguf_prepare_prompt(&inner.weights.model, Self::extract_prompt(request)?)?;
-        let tokens = inner
-            .weights
-            .model
-            .str_to_token(&prompt, AddBos::Always)
-            .map_err(|e| EngineError::backend(format!("tokenization failed: {e}")))?;
-        let (resp_tx, resp_rx) = std_mpsc::channel::<Result<Vec<u8>, EngineError>>();
-
-        inner
-            .request_tx
-            .send(GgufRequest {
-                tokens,
-                max_tokens: Self::max_new_tokens(request),
-                min_tokens: Self::min_new_tokens(request),
-                priority: Self::priority(request),
-                session_id: request.session_id.clone(),
-                response: GgufResponse::Final(resp_tx),
-            })
-            .map_err(|_| EngineError::backend("gguf scheduler disconnected"))?;
-
-        let data = match resp_rx.recv() {
-            Ok(result) => result?,
-            Err(_) => {
-                return Err(EngineError::backend(
-                    "gguf scheduler disconnected before producing a response",
-                ));
+    fn planned_request_memory(&self, request: &InferenceRequest) -> MemoryReport {
+        #[cfg(feature = "gguf-cuda-shared-kv")]
+        {
+            if self.device_pool.is_none()
+                || self.kv_path.load(std::sync::atomic::Ordering::Acquire)
+                    != GgufKvPath::SharedKv.as_u8()
+            {
+                return MemoryReport::default();
             }
-        };
-        let len = data.len() as i64;
-        BinaryTensorPacket::new(vec![1, len], TensorDtype::Uint8, data)
-            .map_err(|e| EngineError::backend(format!("Failed to build output packet: {e}")))
+            let Some(handle) = self.pool_slot.lock().unwrap().clone() else {
+                return MemoryReport::default();
+            };
+            let Some(inner) = self.inner.as_ref() else {
+                return MemoryReport::default();
+            };
+            // Use the actual tokenizer because a chat template can add tokens
+            // that are absent from the request bytes. If estimation fails, use
+            // a full per-sequence context so admission remains conservative.
+            let prompt_tokens = Self::extract_prompt(request)
+                .and_then(|prompt| gguf_prepare_prompt(&inner.weights.model, prompt))
+                .and_then(|prompt| {
+                    inner
+                        .weights
+                        .model
+                        .str_to_token(&prompt, AddBos::Always)
+                        .map(|tokens| tokens.len())
+                        .map_err(|error| {
+                            EngineError::backend(format!("tokenization failed: {error}"))
+                        })
+                })
+                .unwrap_or(inner.ctx_per_seq);
+            let bytes = planned_gguf_request_kv_bytes(
+                prompt_tokens,
+                request
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.max_new_tokens)
+                    .unwrap_or(512) as usize,
+                inner.ctx_per_seq,
+                handle.pool.block_size(),
+                inner.kv_bytes_per_cell,
+            );
+            return MemoryReport {
+                allocations: vec![MemoryAllocation {
+                    allocation_id: "gguf:request-kv".to_string(),
+                    domain: MemoryDomain::Cuda {
+                        device_id: self.device_id,
+                    },
+                    class: MemoryAllocationClass::KvCache,
+                    source: MemoryAllocationSource::RuntimeManaged,
+                    bytes,
+                }],
+            };
+        }
+
+        #[cfg(not(feature = "gguf-cuda-shared-kv"))]
+        {
+            let _ = request;
+            MemoryReport::default()
+        }
+    }
+
+    fn infer(&self, request: &InferenceRequest) -> Result<BinaryTensorPacket, EngineError> {
+        self.infer_with_optional_memory_admission(request, None)
+    }
+
+    fn infer_with_memory_admission(
+        &self,
+        request: &InferenceRequest,
+        admission: RequestMemoryAdmission,
+    ) -> Result<BinaryTensorPacket, EngineError> {
+        self.infer_with_optional_memory_admission(request, Some(admission))
     }
 
     fn infer_stream(&self, request: &InferenceRequest) -> EngineStream {
-        let inner = match self.inner.as_ref() {
-            Some(i) => i,
-            None => {
-                return Box::pin(stream! {
-                    yield Err(EngineError::ModelNotLoaded);
-                });
-            }
-        };
+        self.infer_stream_with_optional_memory_admission(request, None)
+    }
 
-        let prompt = match Self::extract_prompt(request)
-            .and_then(|prompt| gguf_prepare_prompt(&inner.weights.model, prompt))
-        {
-            Ok(prompt) => prompt,
-            Err(e) => {
-                return Box::pin(stream! { yield Err(e); });
-            }
-        };
-        let tokens = match inner.weights.model.str_to_token(&prompt, AddBos::Always) {
-            Ok(tokens) => tokens,
-            Err(e) => {
-                return Box::pin(stream! {
-                    yield Err(EngineError::backend(format!("tokenization failed: {e}")));
-                });
-            }
-        };
-
-        let (resp_tx, resp_rx) = std_mpsc::channel::<Result<Vec<u8>, EngineError>>();
-
-        if inner
-            .request_tx
-            .send(GgufRequest {
-                tokens,
-                max_tokens: Self::max_new_tokens(request),
-                min_tokens: Self::min_new_tokens(request),
-                priority: Self::priority(request),
-                session_id: request.session_id.clone(),
-                response: GgufResponse::Stream(resp_tx),
-            })
-            .is_err()
-        {
-            return Box::pin(stream! {
-                yield Err(EngineError::backend("gguf scheduler disconnected"));
-            });
-        }
-
-        // Bridge blocking std::mpsc → async tokio channel.
-        let (tok_tx, mut tok_rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, EngineError>>(64);
-        std::thread::spawn(move || {
-            for piece in resp_rx {
-                if tok_tx.blocking_send(piece).is_err() {
-                    break;
-                }
-            }
-        });
-
-        Box::pin(stream! {
-            while let Some(result) = tok_rx.recv().await {
-                let data = result?;
-                let len = data.len() as i64;
-                yield BinaryTensorPacket::new(vec![1, len], TensorDtype::Uint8, data)
-                    .map_err(|e| EngineError::backend(format!("Output packet error: {e}")));
-            }
-        })
+    fn infer_stream_with_memory_admission(
+        &self,
+        request: &InferenceRequest,
+        admission: RequestMemoryAdmission,
+    ) -> EngineStream {
+        self.infer_stream_with_optional_memory_admission(request, Some(admission))
     }
 
     fn unload(&mut self) {
@@ -4786,7 +4999,7 @@ impl Engine for GgufBackend {
 
 #[cfg(all(test, feature = "gguf"))]
 mod tests {
-    use super::{highest_priority_index, GgufServingConfig};
+    use super::{highest_priority_index, planned_gguf_request_kv_bytes, GgufServingConfig};
     use std::time::Duration;
 
     #[test]
@@ -4839,6 +5052,34 @@ mod tests {
 
         assert_eq!(config.total_ctx(), 32_768);
         assert_eq!(config.n_batch(), 136);
+    }
+
+    #[test]
+    fn shared_kv_request_plan_reserves_one_sequence_not_all_slots() {
+        // Qwen2.5-0.5B: 24 layers, 2 KV heads, 64-dim K/V in f16.
+        let bytes_per_cell = 24 * 2 * (64 + 64) * std::mem::size_of::<u16>();
+        let one_full_context = 2048 * bytes_per_cell;
+        let planned = planned_gguf_request_kv_bytes(0, 2048, 2048, 16, bytes_per_cell);
+
+        assert_eq!(planned, one_full_context);
+        assert_eq!(one_full_context, 24 * 1024 * 1024);
+        assert_ne!(planned, 32 * one_full_context);
+    }
+
+    #[test]
+    fn shared_kv_request_plan_rounds_blocks_and_exposes_pool_overflow() {
+        let bytes_per_cell = 12_288;
+
+        assert_eq!(
+            planned_gguf_request_kv_bytes(17, 1, 2048, 16, bytes_per_cell),
+            32 * bytes_per_cell,
+        );
+        // Do not clamp an oversized request to the physical pool: returning
+        // the true requirement lets runtime admission reject it before decode.
+        assert_eq!(
+            planned_gguf_request_kv_bytes(2048, 512, 2048, 16, bytes_per_cell),
+            2048 * bytes_per_cell,
+        );
     }
 
     // ── shared-KV architecture guard (classify_shared_kv_support) ──────────────

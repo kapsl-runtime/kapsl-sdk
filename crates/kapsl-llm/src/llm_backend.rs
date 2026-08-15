@@ -101,6 +101,109 @@ fn default_sampling_params() -> SamplingParams {
     }
 }
 
+/// Estimate KV bytes that are physically materialized while the model loads.
+/// Dense/device KV stays request-elastic; paged host KV owns its full backing
+/// vectors immediately, so it must appear in the pre-load authority plan.
+fn planned_host_kv_backing_bytes(model_path: &Path, block_cap: Option<usize>) -> usize {
+    const DEFAULT_LAYERS: usize = 32;
+    const DEFAULT_HEADS: usize = 32;
+    const DEFAULT_HEAD_DIM: usize = 128;
+    const DEFAULT_MAX_SEQ_LEN: usize = 4096;
+
+    let model_config =
+        find_model_asset(model_path, "config.json").and_then(|path| read_json(&path));
+    let metadata = read_json(&find_model_root(model_path).join("metadata.json"));
+    let llm = metadata
+        .as_ref()
+        .and_then(|value| value.get("metadata"))
+        .and_then(|value| value.get("llm"));
+    let kv = llm.and_then(|value| value.get("kv_cache"));
+
+    let from_json = |value: Option<&Value>, keys: &[&str]| {
+        keys.iter().find_map(|key| {
+            value
+                .and_then(|value| value.get(*key))
+                .and_then(Value::as_u64)
+                .filter(|value| *value > 0)
+                .map(|value| value as usize)
+        })
+    };
+    let layers = from_json(llm, &["num_layers"])
+        .or_else(|| from_json(model_config.as_ref(), &["num_hidden_layers", "n_layer"]))
+        .unwrap_or(DEFAULT_LAYERS);
+    let attention_heads = from_json(model_config.as_ref(), &["num_attention_heads", "n_head"])
+        .unwrap_or(DEFAULT_HEADS);
+    let kv_heads = from_json(llm, &["num_kv_heads", "num_key_value_heads"])
+        .or_else(|| {
+            from_json(
+                model_config.as_ref(),
+                &["num_key_value_heads", "num_attention_heads", "n_head"],
+            )
+        })
+        .unwrap_or(attention_heads);
+    let head_dim = from_json(llm, &["head_dim"])
+        .or_else(|| from_json(model_config.as_ref(), &["head_dim"]))
+        .or_else(|| {
+            from_json(model_config.as_ref(), &["hidden_size", "n_embd"])
+                .map(|hidden| hidden / attention_heads.max(1))
+        })
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_HEAD_DIM);
+    let max_seq_len = from_json(llm, &["max_sequence_length", "max_seq_len"])
+        .or_else(|| {
+            from_json(
+                model_config.as_ref(),
+                &["max_position_embeddings", "n_positions"],
+            )
+        })
+        .unwrap_or(DEFAULT_MAX_SEQ_LEN);
+
+    let env_usize = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+    };
+    let mode = std::env::var("KAPSL_LLM_KV_CACHE_MODE")
+        .ok()
+        .or_else(|| {
+            kv.and_then(|value| value.get("mode"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "dense".to_string());
+    let block_size = env_usize("KAPSL_LLM_KV_CACHE_BLOCK_SIZE")
+        .or_else(|| from_json(kv, &["block_size"]))
+        .unwrap_or(16);
+    let total_blocks = env_usize("KAPSL_LLM_KV_CACHE_TOTAL_BLOCKS")
+        .or_else(|| from_json(kv, &["total_blocks"]))
+        .unwrap_or(2048);
+    let total_blocks = block_cap
+        .filter(|cap| *cap > 0)
+        .map_or(total_blocks, |cap| total_blocks.min(cap));
+    let dense_free_list_cap = env_usize("KAPSL_LLM_KV_FREE_LIST_CAP")
+        .or_else(|| {
+            kv.and_then(|value| value.get("dense_free_list_cap"))
+                .and_then(Value::as_u64)
+                .map(|value| value as usize)
+        })
+        .unwrap_or(0);
+    let bytes_per_token = layers
+        .saturating_mul(kv_heads)
+        .saturating_mul(head_dim)
+        .saturating_mul(2)
+        .saturating_mul(std::mem::size_of::<half::f16>());
+
+    if mode.eq_ignore_ascii_case("paged") {
+        total_blocks
+            .saturating_mul(block_size)
+            .saturating_mul(bytes_per_token)
+    } else {
+        dense_free_list_cap
+            .saturating_mul(max_seq_len)
+            .saturating_mul(bytes_per_token)
+    }
+}
+
 fn read_json(path: &Path) -> Option<Value> {
     let content = fs::read_to_string(path).ok()?;
     serde_json::from_str(&content).ok()
@@ -475,6 +578,19 @@ impl Drop for GlobalTokenGuard {
 }
 
 impl LLMBackend {
+    /// Translate the engine metadata convention (smaller values are more
+    /// important) into the ONNX sequence scheduler convention (larger values
+    /// are more important). Unstamped direct SDK calls retain the historical
+    /// normal-priority value of zero.
+    fn sequence_priority(request: &InferenceRequest) -> u8 {
+        request
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.priority)
+            .map(|priority| u8::MAX.saturating_sub(priority))
+            .unwrap_or(0)
+    }
+
     pub fn new() -> Self {
         Self {
             request_tx: RwLock::new(None),
@@ -554,6 +670,11 @@ impl LLMBackend {
     /// that the effective block limit tracks the live fleet without an engine
     /// restart.
     pub fn with_live_kv_cap(mut self, cap: Arc<AtomicUsize>) -> Self {
+        if let Some(scheduler) = self.global_scheduler.as_ref() {
+            scheduler
+                .lock()
+                .register_block_cap(self.engine_id, cap.clone());
+        }
         self.live_kv_cap = Some(cap);
         self
     }
@@ -572,6 +693,13 @@ impl LLMBackend {
     ) -> Self {
         self.global_scheduler = Some(scheduler);
         self.engine_id = engine_id;
+        if let (Some(scheduler), Some(cap)) =
+            (self.global_scheduler.as_ref(), self.live_kv_cap.as_ref())
+        {
+            scheduler
+                .lock()
+                .register_block_cap(self.engine_id, cap.clone());
+        }
         self
     }
 
@@ -666,6 +794,7 @@ impl Engine for LLMBackend {
             MemoryAllocationClass::ModelSession,
             model_bytes,
         );
+        let host_kv_backing = planned_host_kv_backing_bytes(model_path, self.kv_blocks_cap);
         let devices = self.cuda_device_ids();
         if devices.is_empty() {
             report.push(MemoryAllocation {
@@ -680,7 +809,7 @@ impl Engine for LLMBackend {
                 domain: MemoryDomain::Host,
                 class: MemoryAllocationClass::KvCache,
                 source: MemoryAllocationSource::BackendManaged,
-                bytes: 0,
+                bytes: host_kv_backing,
             });
             return Ok(report);
         }
@@ -721,6 +850,15 @@ impl Engine for LLMBackend {
                     MemoryAllocationSource::BackendManaged
                 },
                 bytes: 0,
+            });
+        }
+        if host_kv_backing > 0 {
+            report.push(MemoryAllocation {
+                allocation_id: format!("{}:host-kv", self.external_allocation_id),
+                domain: MemoryDomain::Host,
+                class: MemoryAllocationClass::KvCache,
+                source: MemoryAllocationSource::BackendManaged,
+                bytes: host_kv_backing,
             });
         }
         Ok(report)
@@ -828,28 +966,26 @@ impl Engine for LLMBackend {
         }
 
         let metrics = self.metrics.lock().unwrap();
-        let kv_bytes = metrics.kv_cache_bytes_used;
-        let kv_is_device_resident = metrics.kv_cache_device_resident;
-        let kv_domain = if kv_is_device_resident {
-            devices
-                .first()
-                .copied()
-                .map(|device_id| MemoryDomain::Cuda { device_id })
-                .unwrap_or(MemoryDomain::Host)
-        } else {
-            MemoryDomain::Host
-        };
-        report.push(MemoryAllocation {
-            allocation_id: format!("{}:kv", self.external_allocation_id),
-            domain: kv_domain,
-            class: MemoryAllocationClass::KvCache,
-            source: if kv_is_device_resident {
-                MemoryAllocationSource::RuntimeManaged
-            } else {
-                MemoryAllocationSource::BackendManaged
-            },
-            bytes: kv_bytes,
-        });
+        if metrics.kv_cache_host_bytes_retained > 0 || !metrics.kv_cache_device_resident {
+            report.push(MemoryAllocation {
+                allocation_id: format!("{}:host-kv", self.external_allocation_id),
+                domain: MemoryDomain::Host,
+                class: MemoryAllocationClass::KvCache,
+                source: MemoryAllocationSource::BackendManaged,
+                bytes: metrics.kv_cache_host_bytes_retained,
+            });
+        }
+        if metrics.kv_cache_device_resident {
+            if let Some(device_id) = devices.first().copied() {
+                report.push(MemoryAllocation {
+                    allocation_id: format!("{}:kv", self.external_allocation_id),
+                    domain: MemoryDomain::Cuda { device_id },
+                    class: MemoryAllocationClass::KvCache,
+                    source: MemoryAllocationSource::RuntimeManaged,
+                    bytes: metrics.kv_cache_device_bytes_retained,
+                });
+            }
+        }
         report
     }
 
@@ -887,6 +1023,39 @@ impl Engine for LLMBackend {
                 },
                 bytes,
             });
+        }
+        let metrics = self.metrics.lock().unwrap();
+        let kv_bytes = metrics.kv_cache_request_reservation_bytes;
+        if kv_bytes > 0 {
+            if metrics.kv_cache_device_resident {
+                if let Some(device_id) = self.cuda_device_ids().first().copied() {
+                    report.push(MemoryAllocation {
+                        allocation_id: "request:cuda-kv".to_string(),
+                        domain: MemoryDomain::Cuda { device_id },
+                        class: MemoryAllocationClass::KvCache,
+                        source: MemoryAllocationSource::RuntimeManaged,
+                        bytes: kv_bytes,
+                    });
+                    // Device-to-host fallback briefly holds both copies. Admit
+                    // the destination up front so migration never allocates
+                    // ungoverned host KV after a provider failure.
+                    report.push(MemoryAllocation {
+                        allocation_id: "request:host-kv-fallback".to_string(),
+                        domain: MemoryDomain::Host,
+                        class: MemoryAllocationClass::KvCache,
+                        source: MemoryAllocationSource::BackendManaged,
+                        bytes: metrics.kv_cache_host_fallback_reservation_bytes,
+                    });
+                }
+            } else {
+                report.push(MemoryAllocation {
+                    allocation_id: "request:host-kv".to_string(),
+                    domain: MemoryDomain::Host,
+                    class: MemoryAllocationClass::KvCache,
+                    source: MemoryAllocationSource::BackendManaged,
+                    bytes: kv_bytes,
+                });
+            }
         }
         report
     }
@@ -1223,7 +1392,7 @@ impl Engine for LLMBackend {
             estimated_tokens
         };
 
-        let seq_group = SequenceGroup::new(
+        let mut seq_group = SequenceGroup::new(
             request_id,
             request.session_id.clone(),
             prompt,
@@ -1232,6 +1401,7 @@ impl Engine for LLMBackend {
             cancellation.clone(),
             response_tx,
         );
+        seq_group.priority = Self::sequence_priority(request);
 
         // Hard admission gate: reserve against the global budget.  If the budget
         // is exhausted we reject immediately rather than queuing silently.
@@ -1396,7 +1566,10 @@ impl Engine for LLMBackend {
     }
 
     fn batching_policy(&self) -> BatchingPolicy {
-        BatchingPolicy::continuous(1)
+        // The outer scheduler stamps its resolved queue priority into request
+        // metadata; `infer_stream` translates it into the ONNX sequence and KV
+        // eviction ordering above.
+        BatchingPolicy::continuous(1).with_priority_support()
     }
 
     fn health_check(&self) -> Result<(), EngineError> {

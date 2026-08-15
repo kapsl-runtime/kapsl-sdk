@@ -6,6 +6,18 @@ pub struct LLMMetrics {
     pub kv_cache_device_resident: bool,
     pub kv_cache_bytes_used: usize,
     pub kv_cache_bytes_capacity: usize,
+    /// Physical host KV bytes retained by the fallback cache, including its
+    /// free-list/backing storage.
+    pub kv_cache_host_bytes_retained: usize,
+    /// Physical CUDA KV bytes currently retained in provider values.
+    pub kv_cache_device_bytes_retained: usize,
+    /// Conservative authority reservation required before one new sequence
+    /// can allocate or grow KV state.
+    pub kv_cache_request_reservation_bytes: usize,
+    /// Additional host bytes needed if a device-resident sequence migrates to
+    /// the fallback cache. Paged backing is preleased at model load, so only a
+    /// dense fallback needs a request-lifetime reservation here.
+    pub kv_cache_host_fallback_reservation_bytes: usize,
     pub kv_cache_blocks_total: usize,
     pub kv_cache_blocks_free: usize,
     pub kv_cache_sequences: usize,
