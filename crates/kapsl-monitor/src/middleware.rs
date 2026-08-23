@@ -3,6 +3,7 @@ use futures::Stream;
 use kapsl_engine_api::Engine;
 use kapsl_engine_api::{
     BatchingPolicy, BinaryTensorPacket, EngineError, EngineModelInfo, InferenceRequest,
+    KvBackendCapabilities, KvTopology,
 };
 use std::collections::VecDeque;
 use std::pin::Pin;
@@ -262,6 +263,14 @@ impl<E: Engine> MonitoringMiddleware<E> {
 
 #[async_trait]
 impl<E: Engine> Engine for MonitoringMiddleware<E> {
+    fn kv_capabilities(&self) -> KvBackendCapabilities {
+        self.inner.kv_capabilities()
+    }
+
+    fn kv_topology(&self) -> Option<KvTopology> {
+        self.inner.kv_topology()
+    }
+
     fn planned_memory(
         &self,
         model_path: &std::path::Path,
@@ -486,6 +495,10 @@ mod tests {
 
     #[async_trait]
     impl Engine for MockEngine {
+        fn kv_capabilities(&self) -> KvBackendCapabilities {
+            KvBackendCapabilities::opaque_connected()
+        }
+
         fn planned_memory(
             &self,
             _model_path: &std::path::Path,
@@ -597,6 +610,10 @@ mod tests {
             11
         );
         assert_eq!(middleware.actual_memory().allocations[0].bytes, 22);
+        assert_eq!(
+            middleware.kv_capabilities(),
+            KvBackendCapabilities::opaque_connected()
+        );
         assert_eq!(
             middleware.planned_request_memory(&request).allocations[0].bytes,
             33

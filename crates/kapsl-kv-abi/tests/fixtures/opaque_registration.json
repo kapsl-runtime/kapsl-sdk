@@ -1,0 +1,39 @@
+{
+  "participant_id": "vllm-0",
+  "backend": "vllm",
+  "model_fingerprint": "sha256:model",
+  "capabilities": {
+    "abi_version": {
+      "major": 1,
+      "minor": 0
+    },
+    "tier": "kv_connected",
+    "metadata_mode": "opaque",
+    "ownership": "backend",
+    "features": [
+      "capacity_leasing"
+    ],
+    "transports": [
+      {
+        "kind": "backend_opaque"
+      }
+    ]
+  },
+  "capacity_model": {
+    "groups": [
+      {
+        "group_id": "vllm.group.0",
+        "pool_id": "vllm.pool.0",
+        "allocation_granularity_tokens": 16,
+        "bytes_per_allocation": 1048576,
+        "memory_domains": [
+          {
+            "kind": "cuda",
+            "device_id": 0
+          }
+        ],
+        "max_allocations": 1024
+      }
+    ]
+  }
+}

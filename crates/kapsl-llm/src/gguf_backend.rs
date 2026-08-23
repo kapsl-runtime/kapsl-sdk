@@ -7,6 +7,14 @@ use kapsl_engine_api::{
     MemoryAllocation, MemoryAllocationClass, MemoryAllocationSource, MemoryDomain, MemoryReport,
     RequestMemoryAdmission, RequestMemoryAdmissionGuard, TensorDtype,
 };
+#[cfg(feature = "gguf-cuda-shared-kv")]
+use kapsl_kv_abi::KvFeature;
+use kapsl_kv_abi::{KvBackendCapabilities, KvTopology};
+#[cfg(any(feature = "gguf-cuda-shared-kv", test))]
+use kapsl_kv_abi::{
+    KvCacheGeometry, KvCacheGroup, KvCachePolicy, KvElementType, KvLayerId, KvShard,
+    KvTensorLayout, KAPSL_KV_ABI_VERSION,
+};
 use std::collections::VecDeque;
 use std::num::NonZeroU32;
 use std::path::Path;
@@ -509,6 +517,8 @@ fn gguf_shared_kv_block_count(
 struct GgufWindowedKvConfig {
     /// Ring capacity, in blocks, for every sliding-window layer.
     window_blocks: usize,
+    /// Logical attention window reported through the backend-neutral topology.
+    window_tokens: u32,
     /// Per-layer flag: `true` = SWA layer (ring-mapped), `false` = full attention.
     swa_layers: Vec<bool>,
 }
@@ -598,8 +608,71 @@ fn gguf_windowed_kv_config(
     );
     Some(GgufWindowedKvConfig {
         window_blocks,
+        window_tokens: n_swa as u32,
         swa_layers,
     })
+}
+
+/// Translate llama.cpp's current shared-pool geometry into Kapsl's neutral KV
+/// topology. Other adapters can describe heterogeneous cache groups without
+/// adopting the fork's uniform raw-pointer descriptor.
+#[cfg(any(feature = "gguf-cuda-shared-kv", test))]
+fn gguf_shared_kv_topology(
+    model_fingerprint: u64,
+    n_layers: usize,
+    block_size_tokens: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    sliding_window: Option<(&[bool], u32)>,
+) -> KvTopology {
+    let geometry = KvCacheGeometry::PagedAttention {
+        block_size_tokens: block_size_tokens as u32,
+        kv_heads: kv_heads as u32,
+        key_head_dim: head_dim as u32,
+        value_head_dim: head_dim as u32,
+        element_type: KvElementType::F16,
+        layout: KvTensorLayout::BlockKvHeadTokenDim,
+    };
+    let mut full_layers = Vec::new();
+    let mut windowed_layers = Vec::new();
+    for layer in 0..n_layers {
+        let is_windowed = sliding_window
+            .and_then(|(layers, _)| layers.get(layer))
+            .copied()
+            .unwrap_or(false);
+        if is_windowed {
+            windowed_layers.push(KvLayerId::indexed(layer as u32));
+        } else {
+            full_layers.push(KvLayerId::indexed(layer as u32));
+        }
+    }
+
+    let mut cache_groups = Vec::with_capacity(2);
+    if !full_layers.is_empty() {
+        cache_groups.push(KvCacheGroup {
+            group_id: "attention.full".to_string(),
+            layers: full_layers,
+            geometry: geometry.clone(),
+            policy: KvCachePolicy::FullAttention,
+        });
+    }
+    if !windowed_layers.is_empty() {
+        cache_groups.push(KvCacheGroup {
+            group_id: "attention.sliding_window".to_string(),
+            layers: windowed_layers,
+            geometry,
+            policy: KvCachePolicy::SlidingWindow {
+                window_tokens: sliding_window.map(|(_, tokens)| tokens).unwrap_or(1),
+            },
+        });
+    }
+
+    KvTopology {
+        abi_version: KAPSL_KV_ABI_VERSION,
+        model_fingerprint: format!("llama-gguf:{model_fingerprint:016x}"),
+        shard: KvShard::default(),
+        cache_groups,
+    }
 }
 
 // ─── Shared model weights cache ───────────────────────────────────────────────
@@ -1761,6 +1834,7 @@ struct CpuEvictedState {
 struct GgufSharedKvPool {
     state: Box<GgufSharedKvPoolState>,
     desc: Box<llama_kapsl_kv_pool_desc>,
+    topology: KvTopology,
 }
 
 #[cfg(feature = "gguf-cuda-shared-kv")]
@@ -1908,6 +1982,17 @@ impl GgufSharedKvPool {
         let block_size = handle.pool.block_size().max(1);
         let max_blocks_per_seq = ctx_per_seq.div_ceil(block_size).max(1);
         let has_prefix = prefix_cache.is_some();
+        let topology = gguf_shared_kv_topology(
+            model_fingerprint,
+            n_layers,
+            block_size,
+            handle.pool.num_kv_heads(),
+            handle.pool.head_dim(),
+            windowed
+                .as_ref()
+                .map(|config| (config.swa_layers.as_slice(), config.window_tokens)),
+        );
+        debug_assert!(topology.validate().is_ok());
         // Combined block table geometry for multi-sequence batching.
         let n_seq_slots = max_concurrent.max(1);
         let block_table_seq_stride = n_layers * max_blocks_per_seq;
@@ -1977,7 +2062,11 @@ impl GgufSharedKvPool {
             promote_prefix: None, // handled via promote_if_pending() from Rust
             needs_restore: Some(gguf_kapsl_kv_needs_restore),
         });
-        let kv_pool = Self { state, desc };
+        let kv_pool = Self {
+            state,
+            desc,
+            topology,
+        };
         gguf_global_kv_scheduler()
             .lock()
             .unwrap()
@@ -3103,6 +3192,11 @@ pub struct GgufBackend {
     /// Active KV path, set during `load()`. Read lock-free via `active_kv_path`.
     #[cfg(feature = "gguf-cuda-shared-kv")]
     kv_path: Arc<std::sync::atomic::AtomicU8>,
+    /// Backend-neutral contract for the active KV path.
+    #[cfg(feature = "gguf-cuda-shared-kv")]
+    kv_capabilities: KvBackendCapabilities,
+    #[cfg(feature = "gguf-cuda-shared-kv")]
+    kv_topology: Option<KvTopology>,
 }
 
 #[cfg(feature = "gguf")]
@@ -3132,6 +3226,10 @@ impl GgufBackend {
             kv_path: Arc::new(std::sync::atomic::AtomicU8::new(
                 GgufKvPath::Unloaded.as_u8(),
             )),
+            #[cfg(feature = "gguf-cuda-shared-kv")]
+            kv_capabilities: KvBackendCapabilities::unmanaged(),
+            #[cfg(feature = "gguf-cuda-shared-kv")]
+            kv_topology: None,
         }
     }
 
@@ -3154,6 +3252,8 @@ impl GgufBackend {
             kv_path: Arc::new(std::sync::atomic::AtomicU8::new(
                 GgufKvPath::Unloaded.as_u8(),
             )),
+            kv_capabilities: KvBackendCapabilities::unmanaged(),
+            kv_topology: None,
         }
     }
 
@@ -4255,6 +4355,24 @@ fn run_scheduler(
 #[cfg(feature = "gguf")]
 #[async_trait]
 impl Engine for GgufBackend {
+    fn kv_capabilities(&self) -> KvBackendCapabilities {
+        #[cfg(feature = "gguf-cuda-shared-kv")]
+        {
+            return self.kv_capabilities.clone();
+        }
+        #[cfg(not(feature = "gguf-cuda-shared-kv"))]
+        KvBackendCapabilities::unmanaged()
+    }
+
+    fn kv_topology(&self) -> Option<KvTopology> {
+        #[cfg(feature = "gguf-cuda-shared-kv")]
+        {
+            return self.kv_topology.clone();
+        }
+        #[cfg(not(feature = "gguf-cuda-shared-kv"))]
+        None
+    }
+
     fn planned_memory(&self, model_path: &Path) -> Result<MemoryReport, EngineError> {
         let bytes = std::fs::metadata(model_path)
             .map_err(|error| EngineError::backend(format!("stat GGUF model: {error}")))?
@@ -4392,6 +4510,8 @@ impl Engine for GgufBackend {
                 GgufKvPath::Native.as_u8(),
                 std::sync::atomic::Ordering::Relaxed,
             );
+            self.kv_capabilities = KvBackendCapabilities::unmanaged();
+            self.kv_topology = None;
             None
         } else {
             let n_layers = weights.model.n_layer().max(1) as usize;
@@ -4516,6 +4636,7 @@ impl Engine for GgufBackend {
                     use std::collections::hash_map::DefaultHasher;
                     use std::hash::{Hash, Hasher};
                     let mut h = DefaultHasher::new();
+                    weights.allocation_id.hash(&mut h);
                     n_layers.hash(&mut h);
                     n_head_kv.hash(&mut h);
                     head_dim.hash(&mut h);
@@ -4556,7 +4677,7 @@ impl Engine for GgufBackend {
                 log::info!(
                     "[gguf] kv_path=shared-kv Kapsl paged external KV pool active on device {effective_device_id}"
                 );
-                Some(GgufSharedKvPool::new(
+                let pool = GgufSharedKvPool::new(
                     handle,
                     self.metrics.clone(),
                     effective_device_id,
@@ -4566,7 +4687,20 @@ impl Engine for GgufBackend {
                     prefix_cache,
                     model_fingerprint,
                     windowed,
-                ))
+                );
+                let mut capabilities = KvBackendCapabilities::in_process_shared_pool()
+                    .with_feature(KvFeature::Eviction)
+                    .with_feature(KvFeature::Restore);
+                if pool.state.prefix_cache.is_some() {
+                    capabilities = capabilities.with_feature(KvFeature::PrefixLookup);
+                }
+                if pool.topology.cache_groups.len() > 1 {
+                    capabilities = capabilities.with_feature(KvFeature::MultipleCacheGroups);
+                }
+                debug_assert!(capabilities.validate().is_ok());
+                self.kv_capabilities = capabilities;
+                self.kv_topology = Some(pool.topology.clone());
+                Some(pool)
             }
         };
         if let Ok(mut snapshot) = self.metrics.lock() {
@@ -4600,9 +4734,27 @@ impl Engine for GgufBackend {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 let _ = scheduler_thread.join();
+                #[cfg(feature = "gguf-cuda-shared-kv")]
+                {
+                    self.kv_path.store(
+                        GgufKvPath::Unloaded.as_u8(),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    self.kv_capabilities = KvBackendCapabilities::unmanaged();
+                    self.kv_topology = None;
+                }
                 return Err(EngineError::backend(error));
             }
             Err(error) => {
+                #[cfg(feature = "gguf-cuda-shared-kv")]
+                {
+                    self.kv_path.store(
+                        GgufKvPath::Unloaded.as_u8(),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    self.kv_capabilities = KvBackendCapabilities::unmanaged();
+                    self.kv_topology = None;
+                }
                 return Err(EngineError::backend(format!(
                     "GGUF scheduler did not become ready: {error}"
                 )));
@@ -4830,6 +4982,15 @@ impl Engine for GgufBackend {
         if let Ok(mut metrics) = self.metrics.lock() {
             *metrics = EngineMetrics::new();
         }
+        #[cfg(feature = "gguf-cuda-shared-kv")]
+        {
+            self.kv_path.store(
+                GgufKvPath::Unloaded.as_u8(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            self.kv_capabilities = KvBackendCapabilities::unmanaged();
+            self.kv_topology = None;
+        }
         log::info!("[gguf] Backend unloaded");
     }
 
@@ -5027,9 +5188,10 @@ impl Engine for GgufBackend {
 #[cfg(all(test, feature = "gguf"))]
 mod tests {
     use super::{
-        gguf_cross_session_prefix_cache_opt_in, highest_priority_index,
+        gguf_cross_session_prefix_cache_opt_in, gguf_shared_kv_topology, highest_priority_index,
         planned_gguf_request_kv_bytes, GgufServingConfig,
     };
+    use kapsl_kv_abi::KvCachePolicy;
     use std::time::Duration;
 
     #[test]
@@ -5126,6 +5288,30 @@ mod tests {
         assert_eq!(
             planned_gguf_request_kv_bytes(2048, 512, 2048, 16, bytes_per_cell),
             2048 * bytes_per_cell,
+        );
+    }
+
+    #[test]
+    fn shared_kv_bridge_reports_backend_neutral_cache_groups() {
+        let swa_layers = [false, true, false, true];
+        let topology = gguf_shared_kv_topology(
+            0x1234,
+            swa_layers.len(),
+            16,
+            8,
+            128,
+            Some((&swa_layers, 4096)),
+        );
+
+        topology.validate().expect("valid neutral topology");
+        assert_eq!(topology.model_fingerprint, "llama-gguf:0000000000001234");
+        assert_eq!(topology.cache_groups.len(), 2);
+        assert_eq!(topology.cache_groups[0].layers.len(), 2);
+        assert_eq!(
+            topology.cache_groups[1].policy,
+            KvCachePolicy::SlidingWindow {
+                window_tokens: 4096
+            }
         );
     }
 
