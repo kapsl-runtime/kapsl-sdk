@@ -10,7 +10,7 @@ from copy import deepcopy
 from collections.abc import Sequence
 from typing import Any, Mapping
 
-ABI_VERSION: dict[str, int] = {"major": 1, "minor": 0}
+ABI_VERSION: dict[str, int] = {"major": 1, "minor": 1}
 
 
 class ContractValidationError(ValueError):
@@ -199,7 +199,49 @@ def validate_lease(lease: Mapping[str, Any]) -> dict[str, Any]:
         blocks = group.get("blocks", [])
         if not isinstance(blocks, list):
             raise ContractValidationError("lease blocks must be a list")
+        for raw_block in blocks:
+            block = _mapping(raw_block, "lease block")
+            if block.get("kind") == "runtime_pool":
+                _nonempty(block.get("pool_id"), "lease block pool_id")
+                _nonnegative_int(block.get("block_index"), "block_index")
+                _positive_int(block.get("generation"), "generation")
+            elif block.get("kind") in {"backend_opaque", "transport"}:
+                # Opaque/transfer handles are interpreted by their negotiated
+                # backend transport; their complete Rust-side validation still
+                # runs at the coordinator boundary.
+                continue
+            else:
+                raise ContractValidationError("unknown lease block handle kind")
     return deepcopy(dict(lease))
+
+
+def validate_registration_receipt(
+    receipt: Mapping[str, Any], participant_id: str
+) -> dict[str, Any]:
+    if receipt.get("participant_id") != _nonempty(participant_id, "participant_id"):
+        raise ContractValidationError(
+            "registration receipt participant_id does not match registration"
+        )
+    _positive_int(receipt.get("participant_epoch"), "participant_epoch")
+    pools = receipt.get("shared_pools", [])
+    if not isinstance(pools, list):
+        raise ContractValidationError("shared_pools must be a list")
+    for raw_pool in pools:
+        pool = _mapping(raw_pool, "shared pool")
+        _nonempty(pool.get("binding_id"), "binding_id")
+        _nonempty(pool.get("capacity_pool_id"), "capacity_pool_id")
+        _positive_int(pool.get("generation"), "generation")
+        _positive_int(pool.get("block_count"), "block_count")
+        _positive_int(pool.get("bytes_per_block"), "bytes_per_block")
+        _nonempty(pool.get("descriptor"), "descriptor")
+        group_ids = pool.get("group_ids")
+        if not isinstance(group_ids, list) or not group_ids:
+            raise ContractValidationError("shared pool group_ids must be non-empty")
+        for group_id in group_ids:
+            _nonempty(group_id, "shared pool group_id")
+        _mapping(pool.get("memory_domain"), "shared pool memory_domain")
+        _mapping(pool.get("transport"), "shared pool transport")
+    return deepcopy(dict(receipt))
 
 
 def make_envelope(request_id: str, operation: str, **payload: Any) -> dict[str, Any]:

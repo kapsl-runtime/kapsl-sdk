@@ -13,6 +13,7 @@ from .contract import (
     ContractValidationError,
     make_envelope,
     validate_lease,
+    validate_registration_receipt,
     validate_registration,
     validate_reserve_request,
     validate_response,
@@ -56,10 +57,24 @@ class KapslKvControlClient:
         self.max_frame_bytes = max_frame_bytes
         self._request_id_factory = request_id_factory or (lambda: uuid.uuid4().hex)
 
-    def register(self, registration: Mapping[str, Any]) -> None:
+    def register(self, registration: Mapping[str, Any]) -> dict[str, Any]:
         validate_registration(registration)
         response = self._rpc("register", registration=dict(registration))
-        self._expect(response, {"registered", "ack"})
+        self._expect(response, {"registered"})
+        try:
+            receipt = validate_registration_receipt(
+                _as_mapping(response.get("receipt"), "receipt"),
+                self.participant_id,
+            )
+            if receipt.get("shared_pools"):
+                raise ContractValidationError(
+                    "opaque vLLM registration cannot receive shared-pool bindings"
+                )
+            return receipt
+        except ContractValidationError as error:
+            raise KapslKvControlError(
+                f"invalid registration receipt: {error}"
+            ) from error
 
     def reserve(self, request: Mapping[str, Any]) -> dict[str, Any]:
         validate_reserve_request(request)
@@ -104,12 +119,16 @@ class KapslKvControlClient:
         )
         self._expect(response, {"ack"})
 
-    def release(self, lease_id: str) -> None:
-        response = self._rpc(
-            "release",
-            participant_id=self.participant_id,
-            lease_id=_required(lease_id, "lease_id"),
-        )
+    def release(
+        self, lease_id: str, *, completion: Mapping[str, Any] | None = None
+    ) -> None:
+        payload: dict[str, Any] = {
+            "participant_id": self.participant_id,
+            "lease_id": _required(lease_id, "lease_id"),
+        }
+        if completion is not None:
+            payload["completion"] = dict(completion)
+        response = self._rpc("release", **payload)
         self._expect(response, {"ack"})
 
     def _rpc(self, operation: str, **payload: Any) -> dict[str, Any]:

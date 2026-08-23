@@ -66,6 +66,25 @@ The `kapsl-kv-abi` crate owns the backend-neutral semantic contract:
 - transport-neutral block handles;
 - newline-delimited JSON control envelopes for out-of-process connectors.
 
+ABI 1.1 adds the first out-of-process `shared_pool` ownership boundary:
+
+- registration returns an epoch-bound receipt containing one isolated physical
+  binding for every logical pool and memory domain;
+- leases name runtime pool bindings, block indices, and generations rather
+  than serializing process-local pointers;
+- a shared-pool release must prove the backend has synchronized access before
+  blocks can be recycled;
+- a lease that expires without that proof is quarantined, not returned to the
+  allocator;
+- transport-specific provisioners retain the actual allocation and must zero
+  each assigned block before publishing its handle.
+
+The runtime does not export its process-wide CUDA allocator backing: doing so
+would grant one external worker access to allocations belonging to other
+models. A CUDA IPC or NIXL provider must create an isolated exportable binding
+for the participant. Until such a provider is configured, an external
+`shared_pool` registration fails closed.
+
 Structured topology is deliberately not modeled after the current llama.cpp C
 descriptor. A model may advertise several cache groups with different
 geometries, so hybrid attention/SSM backends do not inherit llama.cpp's uniform
@@ -101,8 +120,12 @@ memory authority as built-in backends, and expiring leases are reclaimed when
 their connector heartbeat stops. The socket is an admission/lifecycle control
 plane; it does not turn opaque backend memory into a shared pool.
 
-The next vLLM phase is a worker data plane using layer-wise CUDA IPC or NIXL.
-Only after attention can consume runtime-owned blocks should it advertise
+The ABI and runtime now contain the isolated pool-receipt, block-allocation,
+generation, synchronized-release, and expiry-quarantine state machine. The
+production listener still has no CUDA IPC/NIXL provisioner, and the vLLM
+package remains opaque. The next vLLM phase is a small worker allocation hook
+that imports the receipt's bindings and makes vLLM's KV tensors alias them.
+Only after attention consumes those runtime-owned blocks should it advertise
 `shared_pool` and `direct_attention_access`.
 
 ### TGI and other engines

@@ -21,6 +21,14 @@ shared-pool access. Those require worker-side CUDA/NIXL integration and will
 graduate the connector toward `shared_pool`; silently pretending that a no-op
 connector has those features would defeat Kapsl's product boundary.
 
+The control client already understands ABI 1.1 registration receipts. Kapsl's
+runtime-side shared-pool state machine can issue isolated, generation-checked
+block handles, but this connector intentionally rejects physical bindings
+while registered in opaque mode. Enabling shared mode requires a vLLM worker
+allocation hook that imports those bindings before vLLM constructs its KV
+tensors; the existing transfer connector callbacks do not replace that
+allocation by themselves.
+
 ## Install and configure
 
 Install this package in the same environment as vLLM, then configure vLLM's

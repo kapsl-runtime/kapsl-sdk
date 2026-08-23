@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
 /// Version implemented by this crate.
-pub const KAPSL_KV_ABI_VERSION: KvAbiVersion = KvAbiVersion::new(1, 0);
+pub const KAPSL_KV_ABI_VERSION: KvAbiVersion = KvAbiVersion::new(1, 1);
 
 /// Semantic version of the KV participant contract.
 ///
@@ -161,6 +161,21 @@ impl KvBackendCapabilities {
                 KvFeature::DirectAttentionAccess,
             ]),
             transports: BTreeSet::from([KvTransport::InProcess]),
+        }
+    }
+
+    /// Out-of-process backend that imports isolated runtime-owned CUDA pools.
+    pub fn cuda_ipc_shared_pool() -> Self {
+        Self {
+            abi_version: KAPSL_KV_ABI_VERSION,
+            tier: KvIntegrationTier::SharedPool,
+            metadata_mode: KvMetadataMode::Structured,
+            ownership: KvCacheOwnership::KapslRuntime,
+            features: BTreeSet::from([
+                KvFeature::CapacityLeasing,
+                KvFeature::DirectAttentionAccess,
+            ]),
+            transports: BTreeSet::from([KvTransport::CudaIpc]),
         }
     }
 
@@ -654,7 +669,11 @@ impl KvLease {
 
 fn validate_block_handle(handle: &KvBlockHandle) -> Result<(), KvContractError> {
     let valid = match handle {
-        KvBlockHandle::RuntimePool { pool_id, .. } => !pool_id.trim().is_empty(),
+        KvBlockHandle::RuntimePool {
+            pool_id,
+            generation,
+            ..
+        } => !pool_id.trim().is_empty() && *generation != 0,
         KvBlockHandle::BackendOpaque { namespace, handle } => {
             !namespace.trim().is_empty() && !handle.trim().is_empty()
         }
@@ -825,7 +844,9 @@ pub struct KvCapacityGroup {
     /// once per domain, which models tensor-parallel workers with one allocator
     /// pool on each device without exposing their backend-private block IDs.
     pub memory_domains: Vec<KvMemoryDomain>,
-    /// Optional current ceiling advertised by a backend-owned allocator.
+    /// Current ceiling advertised by a backend-owned allocator, or the maximum
+    /// block count requested from a runtime-owned shared-pool provisioner.
+    /// Required for `shared_pool` registrations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_allocations: Option<u64>,
 }
@@ -953,6 +974,177 @@ impl KvCapacityModel {
     }
 }
 
+/// One isolated runtime-owned pool mapping offered to a shared-pool
+/// participant. `binding_id` identifies one physical replica (for example one
+/// tensor-parallel CUDA device), while `capacity_pool_id` refers back to the
+/// participant's logical capacity model.
+///
+/// The transport descriptor is opaque to the control plane. For CUDA IPC it
+/// is the base64-encoded `CUipcMemHandle`; it must refer only to this
+/// participant's allocation, never to a process-wide allocator backing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KvSharedPoolDescriptor {
+    pub binding_id: String,
+    pub capacity_pool_id: String,
+    pub generation: u64,
+    pub group_ids: Vec<String>,
+    pub memory_domain: KvMemoryDomain,
+    pub block_count: u64,
+    pub bytes_per_block: u64,
+    pub transport: KvTransport,
+    pub descriptor: String,
+}
+
+impl KvSharedPoolDescriptor {
+    pub fn validate(&self) -> Result<(), KvContractError> {
+        let group_ids = self
+            .group_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        if self.binding_id.trim().is_empty()
+            || self.capacity_pool_id.trim().is_empty()
+            || self.generation == 0
+            || self.group_ids.is_empty()
+            || group_ids.len() != self.group_ids.len()
+            || group_ids.iter().any(|group_id| group_id.trim().is_empty())
+            || self.block_count == 0
+            || self.bytes_per_block == 0
+            || self.descriptor.trim().is_empty()
+            || !self.transport.is_direct()
+        {
+            return Err(KvContractError::invalid_capabilities(
+                "shared-pool bindings require unique IDs, non-zero geometry, and a direct transport descriptor",
+            ));
+        }
+        self.memory_domain.validate()
+    }
+}
+
+/// Coordinator-issued registration result. The participant epoch changes
+/// whenever a registration is replaced, preventing an adapter from silently
+/// reusing pool handles from an older runtime-owned allocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KvRegistrationReceipt {
+    pub participant_id: String,
+    pub participant_epoch: u64,
+    #[serde(default)]
+    pub shared_pools: Vec<KvSharedPoolDescriptor>,
+}
+
+impl KvRegistrationReceipt {
+    pub fn opaque(participant_id: impl Into<String>, participant_epoch: u64) -> Self {
+        Self {
+            participant_id: participant_id.into(),
+            participant_epoch,
+            shared_pools: Vec::new(),
+        }
+    }
+
+    /// Validate a runtime receipt against the participant request that caused
+    /// it. Every logical pool/group/domain tuple must have exactly one physical
+    /// binding, and a runtime may provision no more than the advertised cap.
+    pub fn validate_for(
+        &self,
+        registration: &KvParticipantRegistration,
+    ) -> Result<(), KvContractError> {
+        registration.validate()?;
+        if self.participant_id != registration.participant_id || self.participant_epoch == 0 {
+            return Err(KvContractError::invalid_capabilities(
+                "registration receipt participant and epoch must match the live registration",
+            ));
+        }
+
+        if registration.capabilities.tier != KvIntegrationTier::SharedPool {
+            if !self.shared_pools.is_empty() {
+                return Err(KvContractError::invalid_capabilities(
+                    "only shared_pool participants may receive physical pool bindings",
+                ));
+            }
+            return Ok(());
+        }
+        if self.shared_pools.is_empty() {
+            return Err(KvContractError::invalid_capabilities(
+                "shared_pool registration requires at least one physical pool binding",
+            ));
+        }
+
+        let groups = registration
+            .capacity_model
+            .groups
+            .iter()
+            .map(|group| (group.group_id.as_str(), group))
+            .collect::<BTreeMap<_, _>>();
+        let mut expected = BTreeSet::new();
+        for group in &registration.capacity_model.groups {
+            for domain in &group.memory_domains {
+                expected.insert((group.pool_id.as_str(), group.group_id.as_str(), domain));
+            }
+        }
+
+        let mut binding_ids = BTreeSet::new();
+        let mut pool_block_counts = BTreeMap::<&str, u64>::new();
+        for binding in &self.shared_pools {
+            binding.validate()?;
+            if !binding_ids.insert(binding.binding_id.as_str()) {
+                return Err(KvContractError::invalid_capabilities(
+                    "shared-pool binding IDs must be unique",
+                ));
+            }
+            if !registration
+                .capabilities
+                .transports
+                .contains(&binding.transport)
+            {
+                return Err(KvContractError::invalid_capabilities(format!(
+                    "shared-pool binding '{}' uses an unadvertised transport",
+                    binding.binding_id
+                )));
+            }
+            if pool_block_counts
+                .insert(binding.capacity_pool_id.as_str(), binding.block_count)
+                .is_some_and(|existing| existing != binding.block_count)
+            {
+                return Err(KvContractError::invalid_capabilities(format!(
+                    "replicas of shared pool '{}' must expose the same block count",
+                    binding.capacity_pool_id
+                )));
+            }
+            for group_id in &binding.group_ids {
+                let group = groups.get(group_id.as_str()).ok_or_else(|| {
+                    KvContractError::invalid_capabilities(format!(
+                        "shared-pool binding '{}' references unknown group '{}'",
+                        binding.binding_id, group_id
+                    ))
+                })?;
+                if group.pool_id != binding.capacity_pool_id
+                    || group.bytes_per_allocation != binding.bytes_per_block
+                    || group
+                        .max_allocations
+                        .is_none_or(|maximum| binding.block_count > maximum)
+                    || !group.memory_domains.contains(&binding.memory_domain)
+                    || !expected.remove(&(
+                        group.pool_id.as_str(),
+                        group.group_id.as_str(),
+                        &binding.memory_domain,
+                    ))
+                {
+                    return Err(KvContractError::invalid_capabilities(format!(
+                        "shared-pool binding '{}' does not match group '{}' capacity and placement",
+                        binding.binding_id, group_id
+                    )));
+                }
+            }
+        }
+        if !expected.is_empty() {
+            return Err(KvContractError::invalid_capabilities(
+                "registration receipt does not bind every shared-pool group and memory domain",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Registration document exchanged when a backend joins a Kapsl runtime.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KvParticipantRegistration {
@@ -985,6 +1177,27 @@ impl KvParticipantRegistration {
             return Err(KvContractError::invalid_capabilities(
                 "unmanaged endpoints do not register as KV participants",
             ));
+        }
+        if self.capabilities.tier == KvIntegrationTier::SharedPool {
+            let mut pools = BTreeMap::<&str, (u64, u64)>::new();
+            for group in &self.capacity_model.groups {
+                let maximum = group.max_allocations.ok_or_else(|| {
+                    KvContractError::invalid_capabilities(format!(
+                        "shared-pool capacity group '{}' requires max_allocations",
+                        group.group_id
+                    ))
+                })?;
+                let shape = (group.bytes_per_allocation, maximum);
+                if pools
+                    .insert(group.pool_id.as_str(), shape)
+                    .is_some_and(|existing| existing != shape)
+                {
+                    return Err(KvContractError::invalid_capabilities(format!(
+                        "shared-pool groups aliasing '{}' must use the same physical block size and count",
+                        group.pool_id
+                    )));
+                }
+            }
         }
         if let Some(topology) = &self.topology {
             topology.validate()?;
@@ -1039,6 +1252,41 @@ impl KvParticipantRegistration {
     }
 }
 
+/// Proof that a backend has stopped accessing a shared-pool lease before its
+/// physical blocks are made available to another sequence. Opaque leases do
+/// not require a completion value. A transport fence is negotiated for future
+/// asynchronous release paths; coordinators may reject fence kinds they cannot
+/// wait on safely.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum KvReleaseCompletion {
+    BackendSynchronized,
+    TransportFence {
+        transport: KvTransport,
+        descriptor: String,
+    },
+}
+
+impl KvReleaseCompletion {
+    pub fn validate(&self) -> Result<(), KvContractError> {
+        match self {
+            Self::BackendSynchronized => Ok(()),
+            Self::TransportFence {
+                transport,
+                descriptor,
+            } if transport.is_direct()
+                && !descriptor.trim().is_empty()
+                && !matches!(transport, KvTransport::InProcess) =>
+            {
+                Ok(())
+            }
+            Self::TransportFence { .. } => Err(KvContractError::invalid_request(
+                "release fences require a non-empty out-of-process direct transport descriptor",
+            )),
+        }
+    }
+}
+
 /// One newline-delimited JSON request sent from a backend adapter to Kapsl's
 /// KV coordinator. The envelope keeps version negotiation and correlation
 /// independent of the transport (Unix socket, TCP, or an in-process codec).
@@ -1074,6 +1322,8 @@ pub enum KvControlRequest {
     Release {
         participant_id: String,
         lease_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        completion: Option<KvReleaseCompletion>,
     },
 }
 
@@ -1098,16 +1348,28 @@ impl KvControlRequest {
             Self::Touch {
                 participant_id,
                 lease_id,
-            }
-            | Self::Release {
-                participant_id,
-                lease_id,
             } => {
                 validate_participant_id(participant_id)?;
                 if lease_id.trim().is_empty() {
                     return Err(KvContractError::invalid_request(
                         "lease_id must not be empty",
                     ));
+                }
+                Ok(())
+            }
+            Self::Release {
+                participant_id,
+                lease_id,
+                completion,
+            } => {
+                validate_participant_id(participant_id)?;
+                if lease_id.trim().is_empty() {
+                    return Err(KvContractError::invalid_request(
+                        "lease_id must not be empty",
+                    ));
+                }
+                if let Some(completion) = completion {
+                    completion.validate()?;
                 }
                 Ok(())
             }
@@ -1137,7 +1399,7 @@ pub struct KvControlResponseEnvelope {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "result")]
 pub enum KvControlResponse {
-    Registered,
+    Registered { receipt: KvRegistrationReceipt },
     Lease { lease: KvLease },
     Ack,
     Error { error: KvContractError },
@@ -1166,7 +1428,7 @@ pub fn dispatch_control_request(
         match envelope.request {
             KvControlRequest::Register { registration } => coordinator
                 .register(&registration)
-                .map(|()| KvControlResponse::Registered),
+                .map(|receipt| KvControlResponse::Registered { receipt }),
             KvControlRequest::Reserve {
                 participant_id,
                 request,
@@ -1191,8 +1453,9 @@ pub fn dispatch_control_request(
             KvControlRequest::Release {
                 participant_id,
                 lease_id,
+                completion,
             } => coordinator
-                .release(&participant_id, &lease_id)
+                .release(&participant_id, &lease_id, completion.as_ref())
                 .map(|()| KvControlResponse::Ack),
         }
     }
@@ -1209,7 +1472,10 @@ pub fn dispatch_control_request(
 /// authority. Out-of-process adapters call the same operations through the
 /// control envelopes above.
 pub trait KvCoordinator: Send + Sync {
-    fn register(&self, registration: &KvParticipantRegistration) -> Result<(), KvContractError>;
+    fn register(
+        &self,
+        registration: &KvParticipantRegistration,
+    ) -> Result<KvRegistrationReceipt, KvContractError>;
 
     fn reserve(
         &self,
@@ -1230,7 +1496,12 @@ pub trait KvCoordinator: Send + Sync {
     /// each lease separately.
     fn heartbeat(&self, participant_id: &str) -> Result<(), KvContractError>;
 
-    fn release(&self, participant_id: &str, lease_id: &str) -> Result<(), KvContractError>;
+    fn release(
+        &self,
+        participant_id: &str,
+        lease_id: &str,
+        completion: Option<&KvReleaseCompletion>,
+    ) -> Result<(), KvContractError>;
 }
 
 /// Runtime-facing contract implemented by a deep KV backend adapter.
@@ -1563,7 +1834,7 @@ mod tests {
                         allocation_granularity_tokens: 16,
                         bytes_per_allocation: 4096,
                         memory_domains: cuda_domains(),
-                        max_allocations: None,
+                        max_allocations: Some(1024),
                     },
                     KvCapacityGroup {
                         group_id: "swa".to_string(),
@@ -1571,7 +1842,7 @@ mod tests {
                         allocation_granularity_tokens: 16,
                         bytes_per_allocation: 4096,
                         memory_domains: cuda_domains(),
-                        max_allocations: None,
+                        max_allocations: Some(1024),
                     },
                 ],
             },
@@ -1583,6 +1854,87 @@ mod tests {
             .features
             .insert(KvFeature::MultipleCacheGroups);
         assert!(registration.validate().is_ok());
+    }
+
+    #[test]
+    fn shared_pool_receipt_covers_every_runtime_owned_binding() {
+        let registration = KvParticipantRegistration {
+            participant_id: "vllm-worker-0".to_string(),
+            backend: "vllm".to_string(),
+            model_fingerprint: "model".to_string(),
+            capabilities: KvBackendCapabilities::cuda_ipc_shared_pool(),
+            capacity_model: KvCapacityModel {
+                groups: vec![KvCapacityGroup {
+                    group_id: "attention".to_string(),
+                    pool_id: "kv-pool".to_string(),
+                    allocation_granularity_tokens: 16,
+                    bytes_per_allocation: 4096,
+                    memory_domains: cuda_domains(),
+                    max_allocations: Some(64),
+                }],
+            },
+            topology: Some(KvTopology {
+                abi_version: KAPSL_KV_ABI_VERSION,
+                model_fingerprint: "model".to_string(),
+                shard: KvShard::default(),
+                cache_groups: vec![attention_group(
+                    "attention",
+                    &[0, 1],
+                    KvCachePolicy::FullAttention,
+                )],
+            }),
+        };
+        registration.validate().expect("valid shared registration");
+
+        let receipt = KvRegistrationReceipt {
+            participant_id: registration.participant_id.clone(),
+            participant_epoch: 7,
+            shared_pools: vec![KvSharedPoolDescriptor {
+                binding_id: "runtime-binding-0".to_string(),
+                capacity_pool_id: "kv-pool".to_string(),
+                generation: 11,
+                group_ids: vec!["attention".to_string()],
+                memory_domain: KvMemoryDomain::Cuda { device_id: 0 },
+                block_count: 64,
+                bytes_per_block: 4096,
+                transport: KvTransport::CudaIpc,
+                descriptor: "base64-cuda-ipc-handle".to_string(),
+            }],
+        };
+        receipt
+            .validate_for(&registration)
+            .expect("receipt covers the registration");
+
+        let mut oversized = receipt.clone();
+        oversized.shared_pools[0].block_count = 65;
+        assert!(matches!(
+            oversized.validate_for(&registration),
+            Err(KvContractError::InvalidCapabilities { .. })
+        ));
+
+        let mut missing = receipt;
+        missing.shared_pools.clear();
+        assert!(matches!(
+            missing.validate_for(&registration),
+            Err(KvContractError::InvalidCapabilities { .. })
+        ));
+    }
+
+    #[test]
+    fn release_completion_rejects_opaque_or_empty_fences() {
+        assert!(KvReleaseCompletion::BackendSynchronized.validate().is_ok());
+        assert!(KvReleaseCompletion::TransportFence {
+            transport: KvTransport::CudaIpc,
+            descriptor: "event-handle".to_string(),
+        }
+        .validate()
+        .is_ok());
+        assert!(KvReleaseCompletion::TransportFence {
+            transport: KvTransport::BackendOpaque,
+            descriptor: String::new(),
+        }
+        .validate()
+        .is_err());
     }
 
     #[test]

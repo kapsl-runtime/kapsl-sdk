@@ -73,7 +73,15 @@ class FakeCoordinator:
                 },
             }
         if request["operation"] == "register":
-            return {**base, "result": "registered"}
+            return {
+                **base,
+                "result": "registered",
+                "receipt": {
+                    "participant_id": request["registration"]["participant_id"],
+                    "participant_epoch": 1,
+                    "shared_pools": [],
+                },
+            }
         if request["operation"] == "reserve":
             reserve = request["request"]
             return {
@@ -107,9 +115,10 @@ class ClientTests(unittest.TestCase):
                 request_id_factory=lambda: next(request_ids),
             )
 
-            client.register(
+            receipt = client.register(
                 opaque_registration("vllm-0", "sha256:model", CAPACITY_GROUPS)
             )
+            self.assertEqual(receipt["participant_epoch"], 1)
             lease = client.reserve(
                 make_reserve_request(
                     request_id="request-1",
