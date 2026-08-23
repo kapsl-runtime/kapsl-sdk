@@ -182,6 +182,22 @@ fn gguf_exact_prompt_kv_reuse() -> bool {
         .unwrap_or(GGUF_EXACT_PROMPT_KV_REUSE_DEFAULT)
 }
 
+#[cfg(any(feature = "gguf-cuda-shared-kv", test))]
+fn gguf_cross_session_prefix_cache_opt_in(value: Option<&str>) -> bool {
+    value
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            matches!(value.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(feature = "gguf-cuda-shared-kv")]
+fn gguf_allow_cross_session_prefix_cache() -> bool {
+    let value = std::env::var("KAPSL_GGUF_ALLOW_CROSS_SESSION_PREFIX_CACHE").ok();
+    gguf_cross_session_prefix_cache_opt_in(value.as_deref())
+}
+
 #[cfg(feature = "gguf")]
 fn gguf_timing_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -4506,22 +4522,33 @@ impl Engine for GgufBackend {
                     head_dim_v.hash(&mut h);
                     h.finish()
                 };
-                // Build a prefix block cache sized at 1/4 of the pool's logical capacity.
-                let prefix_cache_cap = {
+                // Prefix entries hold live GPU blocks and are keyed only by
+                // model/token hashes. Until an authenticated security domain is
+                // propagated into that key, cross-session reuse is disabled by
+                // default. Trusted single-tenant deployments can opt in.
+                let prefix_cache = if gguf_allow_cross_session_prefix_cache() {
                     let pool_blocks = handle.pool.total_blocks();
                     let env_cap = std::env::var("KAPSL_GGUF_PREFIX_CACHE_BLOCKS")
                         .ok()
                         .and_then(|v| v.parse::<usize>().ok())
                         .filter(|&v| v > 0);
-                    env_cap.unwrap_or_else(|| (pool_blocks / n_layers / 4).max(1))
+                    let capacity = env_cap.unwrap_or_else(|| (pool_blocks / n_layers / 4).max(1));
+                    log::warn!(
+                        "[gguf] Cross-session prefix KV reuse explicitly enabled: capacity={} logical positions; use only within one trusted security domain",
+                        capacity
+                    );
+                    Some(Arc::new(Mutex::new(PrefixBlockCache::new(capacity))))
+                } else {
+                    if std::env::var_os("KAPSL_GGUF_PREFIX_CACHE_BLOCKS").is_some() {
+                        log::warn!(
+                            "[gguf] KAPSL_GGUF_PREFIX_CACHE_BLOCKS ignored because cross-session prefix reuse is disabled; set KAPSL_GGUF_ALLOW_CROSS_SESSION_PREFIX_CACHE=1 only for a trusted single-tenant deployment"
+                        );
+                    }
+                    log::info!(
+                        "[gguf] Cross-session prefix KV reuse disabled for session isolation"
+                    );
+                    None
                 };
-                let prefix_cache = Some(Arc::new(Mutex::new(PrefixBlockCache::new(
-                    prefix_cache_cap,
-                ))));
-                log::info!(
-                    "[gguf] Prefix KV cache enabled: capacity={} logical positions",
-                    prefix_cache_cap
-                );
                 self.kv_path.store(
                     GgufKvPath::SharedKv.as_u8(),
                     std::sync::atomic::Ordering::Relaxed,
@@ -4999,7 +5026,10 @@ impl Engine for GgufBackend {
 
 #[cfg(all(test, feature = "gguf"))]
 mod tests {
-    use super::{highest_priority_index, planned_gguf_request_kv_bytes, GgufServingConfig};
+    use super::{
+        gguf_cross_session_prefix_cache_opt_in, highest_priority_index,
+        planned_gguf_request_kv_bytes, GgufServingConfig,
+    };
     use std::time::Duration;
 
     #[test]
@@ -5020,6 +5050,23 @@ mod tests {
 
         // All equal → front (pure FIFO fallback).
         assert_eq!(highest_priority_index([5u8, 5, 5]), Some(0));
+    }
+
+    #[test]
+    fn cross_session_prefix_cache_requires_explicit_opt_in() {
+        for disabled in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("no"),
+            Some("off"),
+        ] {
+            assert!(!gguf_cross_session_prefix_cache_opt_in(disabled));
+        }
+        for enabled in [Some("1"), Some("true"), Some("YES"), Some(" on ")] {
+            assert!(gguf_cross_session_prefix_cache_opt_in(enabled));
+        }
     }
 
     fn test_config(

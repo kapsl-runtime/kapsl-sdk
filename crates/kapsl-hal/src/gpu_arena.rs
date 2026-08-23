@@ -18,8 +18,8 @@
 
 #[cfg(feature = "cuda")]
 use cudarc::driver::{
-    CudaDevice, CudaSlice, CudaView, CudaViewMut, DevicePtr, DevicePtrMut, DeviceRepr, DeviceSlice,
-    ValidAsZeroBits,
+    result, CudaDevice, CudaSlice, CudaView, CudaViewMut, DevicePtr, DevicePtrMut, DeviceRepr,
+    DeviceSlice, ValidAsZeroBits,
 };
 #[cfg(feature = "cuda")]
 use std::cell::{Cell, UnsafeCell};
@@ -726,7 +726,33 @@ impl GpuDevicePool {
                 available: allocator.free_bytes(),
             })?;
         policy.account_alloc(owner, bytes);
+
+        // KV extents can move between sessions, models, and replicas while the
+        // process stays alive. Clear them synchronously before publishing the
+        // new ownership so stale cache contents can never be observed through
+        // a newly allocated block or an external raw pointer.
+        if owner.class() == PoolAllocationClass::KvCache {
+            if let Err(error) = self.zero_allocation_sync(&allocation) {
+                allocator
+                    .free(&allocation)
+                    .expect("fresh allocation must remain live during rollback");
+                policy.account_free(owner, bytes);
+                return Err(error);
+            }
+        }
         Ok(allocation)
+    }
+
+    fn zero_allocation_sync(&self, allocation: &GpuAllocation) -> Result<(), ArenaError> {
+        self.device.bind_to_thread()?;
+        let device_ptr =
+            self.allocation_ptr(allocation) as usize as cudarc::driver::sys::CUdeviceptr;
+        // SAFETY: `allocation` is still live in this pool, its full byte range
+        // is exclusively owned by the allocating caller, and an all-zero bit
+        // pattern is valid for KV storage. The synchronous driver operation
+        // completes before the allocation is returned to its new owner.
+        unsafe { result::memset_d8_sync(device_ptr, 0, allocation.bytes())? };
+        Ok(())
     }
 
     pub fn free(&self, allocation: GpuAllocation) -> Result<(), ArenaError> {
@@ -2187,6 +2213,35 @@ mod tests {
         let downloaded = pool.download_block(b).unwrap();
         assert!(downloaded.iter().all(|&x| x == f16::ZERO));
         pool.free_block(b);
+    }
+
+    #[test]
+    fn recycled_block_is_zeroed_before_new_owner_can_read_it() {
+        let device = CudaDevice::new(0).expect("CUDA device 0 required for these tests");
+        let block_bytes = 2 * 2 * 4 * 8 * std::mem::size_of::<f16>();
+        let device_pool = Arc::new(GpuDevicePool::new(device, block_bytes).unwrap());
+        let first_owner = PoolOwner::native(1, 0, PoolAllocationClass::KvCache);
+        let second_owner = PoolOwner::native(2, 0, PoolAllocationClass::KvCache);
+        let first =
+            GpuKvPoolView::from_device_pool(Arc::clone(&device_pool), first_owner, 1, 4, 2, 8)
+                .unwrap();
+        let second =
+            GpuKvPoolView::from_device_pool(device_pool, second_owner, 1, 4, 2, 8).unwrap();
+        let half_block = first.num_kv_heads() * first.block_size() * first.head_dim();
+        let secrets = vec![f16::ONE; half_block];
+
+        let old_block = first.alloc_block().unwrap();
+        first.upload_block(old_block, &secrets, &secrets).unwrap();
+        first.free_block(old_block);
+
+        let recycled_block = second.alloc_block().unwrap();
+        assert_eq!(recycled_block, old_block);
+        assert!(second
+            .download_block(recycled_block)
+            .unwrap()
+            .iter()
+            .all(|&value| value == f16::ZERO));
+        second.free_block(recycled_block);
     }
 
     #[test]
