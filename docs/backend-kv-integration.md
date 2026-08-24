@@ -87,6 +87,24 @@ aggregate capacity, but lease block arrays remain empty because backend block
 tables select the indices. This avoids pretending that two independent block
 allocators can safely choose identical IDs.
 
+ABI 1.3 adds an external attachment gate. Registration now means
+**provisioned**, not usable. Registration declares an exact adapter/backend
+profile, which the runtime checks against its deployment allowlist before it
+allocates or exports memory. Each worker then imports its receipt binding,
+constructs backend-native cache tensors, and repeats that profile with exact
+layer views as bounded offsets inside the binding. The runtime checks the epoch,
+byte size, topology coverage, and parallel shard.
+Only after every binding is attached can the scheduler activate the participant;
+reservations fail before activation. Detach is a separate synchronized action
+and cannot race a live lease. Raw process-local pointers never enter the wire
+contract.
+
+Attachment evidence prevents accidental partial wiring, but it is not by itself
+proof that a backend attention kernel dereferenced those tensors. A profile is
+eligible for a deployment allowlist only after the hardware conformance suite
+performs causal backend-native KV write and attention-read probes. See
+[`backend-kv-conformance.md`](backend-kv-conformance.md).
+
 The runtime does not export its process-wide CUDA allocator backing: doing so
 would grant one external worker access to allocations belonging to other
 models. A CUDA IPC or NIXL provider must create an isolated exportable binding
@@ -131,7 +149,10 @@ On Linux CUDA builds, the runtime listener also installs an isolated CUDA IPC
 provisioner. The connector's opt-in `shared_pool` mode registers structured
 topology, imports the receipt's device binding in each worker, and substitutes
 that backing at vLLM's packed raw-allocation seam before attention tensors are
-created. Attention therefore reads and writes Kapsl-owned memory directly.
+created. Workers report those exact aliases; the scheduler cannot obtain a
+request lease until every binding is attached and runtime activation succeeds.
+Only vLLM builds that pass the backend-native GPU probes may be placed on the
+runtime's shared-pool profile allowlist.
 vLLM remains responsible for its native block IDs, while Kapsl owns physical
 capacity and request-level admission. The compatibility hook is deliberately
 narrow and signature-checked because it tracks an experimental upstream API.

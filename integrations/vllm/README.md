@@ -3,9 +3,14 @@
 This is an out-of-tree vLLM V1 KV connector. It proves the backend adapter
 boundary without carrying a vLLM fork.
 
-Status: the package supports an opaque admission mode and an opt-in Linux CUDA
-shared-pool mode. Both fail closed unless they can register with Kapsl Runtime
-and obtain a lease before vLLM allocation.
+Status: the package supports an opaque admission mode and an experimental,
+opt-in Linux CUDA shared-pool mode. Both fail closed unless they can register
+with Kapsl Runtime and obtain a lease before vLLM allocation. A shared-pool
+participant additionally cannot activate until every worker proves that its
+registered KV tensors alias its Kapsl binding and its exact adapter/backend
+profile is allowlisted by the deployment. The profile is declared during
+registration so an unapproved build is rejected before CUDA memory is
+provisioned, then repeated in worker attachment evidence.
 
 The default `opaque` mode implements Kapsl's **KV-connected opaque** tier:
 
@@ -26,7 +31,7 @@ The opt-in `shared_pool` mode implements the first direct-attention data plane:
 - vLLM keeps its native block allocator and block tables, while Kapsl grants
   aggregate request capacity through participant-managed leases.
 
-This is ABI 1.2's `participant_managed` shared-pool mode. Empty block arrays in
+This is ABI 1.3's `participant_managed` shared-pool mode. Empty block arrays in
 its request leases are intentional: vLLM selects native block indices, while
 Kapsl owns the physical allocation and the total capacity budget. Opaque mode
 does **not** advertise shared-pool access. Neither mode currently advertises
@@ -82,11 +87,17 @@ Start Kapsl Runtime with the matching listener and TTL:
 ```bash
 kapsl run \
   --kv-control-socket /run/kapsl/kv-control.sock \
-  --kv-control-lease-ttl-ms 30000
+  --kv-control-lease-ttl-ms 30000 \
+  --kv-shared-pool-profile \
+    'kapsl-vllm-connector,0.4.0,<vllm-version>,vllm-v1-packed-cuda-ipc'
 ```
 
 Create `/run/kapsl` with ownership suitable for the runtime user first. The
 runtime creates the socket with mode `0600`; the transport is local-only.
+The profile tuple must match the installed vLLM version exactly and should be
+configured only after that build passes the GPU conformance matrix. Without an
+allowlisted profile, opaque participants continue to work but `shared_pool`
+registration fails closed.
 
 `kapsl_control_endpoint`, `kapsl_model_fingerprint`, and
 `kapsl_memory_domains` are required. Device IDs are CUDA ordinals in Kapsl
@@ -118,8 +129,24 @@ supports CUDA, packed vLLM KV tensors, tensor parallelism on one host, and no
 pipeline/data/decode-context parallel partitions or vLLM sleep mode. The Kapsl
 wire contract and client have no vLLM dependency.
 
+The shared-pool startup lifecycle is `register -> attach every worker ->
+activate -> reserve`. `register_kv_caches` verifies the complete layer set,
+storage base, imported byte size, and every tensor's bounded byte span before
+the worker sends attachment evidence. The scheduler's first admission attempts
+activation; if any rank did not attach, no request lease is issued. The wire ABI
+also defines synchronized detach, but this connector does not send it until
+vLLM exposes a teardown callback that guarantees every model-owned KV view has
+been destroyed. A crash or ambiguous teardown intentionally retains the
+exported backing instead of risking a use-after-free.
+
 ## Test
 
 ```bash
 PYTHONPATH=src python -m unittest discover -s tests -v
 ```
+
+These host tests cover the wire contract, activation ordering, and exact tensor
+alias/span checks. Production certification additionally requires the
+backend-native CUDA attention probes in
+[`../../docs/backend-kv-conformance.md`](../../docs/backend-kv-conformance.md);
+passing only the host tests is not sufficient reason to allowlist a profile.

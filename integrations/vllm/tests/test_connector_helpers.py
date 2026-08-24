@@ -16,6 +16,27 @@ from kapsl_vllm_connector.connector import (
 
 
 class ConnectorHelperTests(unittest.TestCase):
+    def test_scheduler_activates_shared_pool_once_before_admission(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.epochs: list[int] = []
+
+            def activate(self, epoch: int) -> None:
+                self.epochs.append(epoch)
+
+        connector = KapslConnectorV1.__new__(KapslConnectorV1)
+        connector._mode = "shared_pool"
+        connector._shared_active = False
+        connector._activation_lock = threading.Lock()
+        connector._participant_epoch = 7
+        connector._participant_id = "vllm:test"
+        connector._client = FakeClient()
+
+        connector._ensure_shared_active()
+        connector._ensure_shared_active()
+
+        self.assertEqual(connector._client.epochs, [7])
+
     def test_shared_pool_rejects_vllm_sleep_mode(self) -> None:
         config = SimpleNamespace(
             parallel_config=SimpleNamespace(),

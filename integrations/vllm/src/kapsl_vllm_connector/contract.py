@@ -10,7 +10,7 @@ from copy import deepcopy
 from collections.abc import Sequence
 from typing import Any, Mapping
 
-ABI_VERSION: dict[str, int] = {"major": 1, "minor": 2}
+ABI_VERSION: dict[str, int] = {"major": 1, "minor": 3}
 
 
 class ContractValidationError(ValueError):
@@ -55,6 +55,7 @@ def shared_pool_capabilities() -> dict[str, Any]:
         "features": [
             "capacity_leasing",
             "direct_attention_access",
+            "external_pool_attachment",
             "participant_block_selection",
         ],
         "transports": [{"kind": "cuda_ipc"}],
@@ -85,6 +86,7 @@ def shared_pool_registration(
     model_fingerprint: str,
     capacity_groups: Sequence[Mapping[str, Any]],
     topology: Mapping[str, Any],
+    profile: Mapping[str, Any],
     *,
     backend: str = "vllm",
 ) -> dict[str, Any]:
@@ -97,6 +99,7 @@ def shared_pool_registration(
         "model_fingerprint": _nonempty(model_fingerprint, "model_fingerprint"),
         "capabilities": capabilities,
         "capacity_model": {"groups": [dict(group) for group in capacity_groups]},
+        "adapter_profile": dict(profile),
         "topology": deepcopy(dict(topology)),
     }
     validate_registration(registration)
@@ -128,18 +131,29 @@ def validate_registration(registration: Mapping[str, Any]) -> None:
             raise ContractValidationError("backend_opaque transport is required")
         if "topology" in registration:
             raise ContractValidationError("opaque registrations cannot include a topology")
+        if "adapter_profile" in registration:
+            raise ContractValidationError(
+                "opaque registrations cannot include an adapter_profile"
+            )
     elif tier == "shared_pool":
         if capabilities.get("metadata_mode") != "structured":
             raise ContractValidationError("shared_pool vLLM requires structured metadata")
         if capabilities.get("ownership") != "kapsl_runtime":
             raise ContractValidationError("shared_pool KV must be Kapsl owned")
-        required = {"direct_attention_access", "participant_block_selection"}
+        required = {
+            "direct_attention_access",
+            "external_pool_attachment",
+            "participant_block_selection",
+        }
         if not required.issubset(features):
             raise ContractValidationError(
-                "shared_pool requires direct attention and participant block selection"
+                "shared_pool requires direct attention, attachment, and participant block selection"
             )
         if {"kind": "cuda_ipc"} not in transports:
             raise ContractValidationError("shared_pool vLLM requires cuda_ipc")
+        _validate_adapter_profile(
+            _mapping(registration.get("adapter_profile"), "adapter profile")
+        )
     else:
         raise ContractValidationError("vLLM connector has an unsupported KV tier")
 
@@ -399,6 +413,128 @@ def validate_registration_receipt(
         _mapping(pool.get("memory_domain"), "shared pool memory_domain")
         _mapping(pool.get("transport"), "shared pool transport")
     return deepcopy(dict(receipt))
+
+
+def make_shared_pool_attachment(
+    *,
+    participant_epoch: int,
+    binding_id: str,
+    shard: Mapping[str, Any],
+    profile: Mapping[str, Any],
+    imported_bytes: int,
+    views: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    attachment = {
+        "participant_epoch": participant_epoch,
+        "binding_id": binding_id,
+        "shard": dict(shard),
+        "profile": dict(profile),
+        "imported_bytes": imported_bytes,
+        "views": [dict(view) for view in views],
+    }
+    validate_shared_pool_attachment(attachment)
+    return attachment
+
+
+def validate_shared_pool_attachment(attachment: Mapping[str, Any]) -> None:
+    _positive_int(attachment.get("participant_epoch"), "participant_epoch")
+    _nonempty(attachment.get("binding_id"), "binding_id")
+    _positive_int(attachment.get("imported_bytes"), "imported_bytes")
+    shard = _mapping(attachment.get("shard"), "attachment shard")
+    tp_rank = _nonnegative_int(
+        shard.get("tensor_parallel_rank"), "tensor_parallel_rank"
+    )
+    tp_world = _positive_int(
+        shard.get("tensor_parallel_world_size"), "tensor_parallel_world_size"
+    )
+    pp_rank = _nonnegative_int(
+        shard.get("pipeline_parallel_rank"), "pipeline_parallel_rank"
+    )
+    pp_world = _positive_int(
+        shard.get("pipeline_parallel_world_size"), "pipeline_parallel_world_size"
+    )
+    if tp_rank >= tp_world or pp_rank >= pp_world:
+        raise ContractValidationError("attachment shard rank is outside its world size")
+    _validate_adapter_profile(
+        _mapping(attachment.get("profile"), "adapter profile")
+    )
+    views = attachment.get("views")
+    if not isinstance(views, list) or not views:
+        raise ContractValidationError("attachment views must be a non-empty list")
+    layers: set[tuple[str, int]] = set()
+    imported_bytes = int(attachment["imported_bytes"])
+    for raw_view in views:
+        view = _mapping(raw_view, "attachment view")
+        group_id = _nonempty(view.get("group_id"), "attachment view group_id")
+        layer = _mapping(view.get("layer"), "attachment view layer")
+        layer_index = _nonnegative_int(layer.get("index"), "attachment layer index")
+        if layer.get("name") is not None:
+            _nonempty(layer["name"], "attachment layer name")
+        if (group_id, layer_index) in layers:
+            raise ContractValidationError(
+                "attachment group/layer pairs must be unique"
+            )
+        layers.add((group_id, layer_index))
+        offset = _nonnegative_int(view.get("offset_bytes"), "attachment offset")
+        length = _positive_int(view.get("length_bytes"), "attachment length")
+        if offset + length > imported_bytes:
+            raise ContractValidationError("attachment view exceeds imported bytes")
+
+
+def _validate_adapter_profile(profile: Mapping[str, Any]) -> None:
+    for field in (
+        "adapter_id",
+        "adapter_version",
+        "backend_version",
+        "profile_id",
+    ):
+        _nonempty(profile.get(field), f"adapter profile {field}")
+
+
+def make_shared_pool_detach_request(
+    *,
+    participant_epoch: int,
+    binding_ids: Sequence[str],
+    shard: Mapping[str, Any],
+) -> dict[str, Any]:
+    request = {
+        "participant_epoch": participant_epoch,
+        "binding_ids": list(binding_ids),
+        "shard": dict(shard),
+        "completion": {"kind": "backend_synchronized"},
+    }
+    validate_shared_pool_detach_request(request)
+    return request
+
+
+def validate_shared_pool_detach_request(request: Mapping[str, Any]) -> None:
+    _positive_int(request.get("participant_epoch"), "participant_epoch")
+    binding_ids = request.get("binding_ids")
+    if not isinstance(binding_ids, list) or not binding_ids:
+        raise ContractValidationError("detach binding_ids must be a non-empty list")
+    normalized = [_nonempty(value, "detach binding_id") for value in binding_ids]
+    if len(set(normalized)) != len(normalized):
+        raise ContractValidationError("detach binding_ids must be unique")
+    shard = _mapping(request.get("shard"), "detach shard")
+    tp_rank = _nonnegative_int(
+        shard.get("tensor_parallel_rank"), "tensor_parallel_rank"
+    )
+    tp_world = _positive_int(
+        shard.get("tensor_parallel_world_size"), "tensor_parallel_world_size"
+    )
+    pp_rank = _nonnegative_int(
+        shard.get("pipeline_parallel_rank"), "pipeline_parallel_rank"
+    )
+    pp_world = _positive_int(
+        shard.get("pipeline_parallel_world_size"), "pipeline_parallel_world_size"
+    )
+    if tp_rank >= tp_world or pp_rank >= pp_world:
+        raise ContractValidationError("detach shard rank is outside its world size")
+    completion = _mapping(request.get("completion"), "detach completion")
+    if completion.get("kind") != "backend_synchronized":
+        raise ContractValidationError(
+            "initial shared-pool detach requires backend_synchronized completion"
+        )
 
 
 def make_envelope(request_id: str, operation: str, **payload: Any) -> dict[str, Any]:

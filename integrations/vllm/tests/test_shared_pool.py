@@ -43,6 +43,63 @@ def _binding(device_id: int, **overrides: object) -> dict[str, object]:
 
 
 class SharedPoolTests(unittest.TestCase):
+    def test_attachment_views_prove_tensor_storage_aliases_the_import(self) -> None:
+        class FakeStorage:
+            def __init__(self, pointer: int, size: int) -> None:
+                self.pointer = pointer
+                self.size = size
+
+            def data_ptr(self) -> int:
+                return self.pointer
+
+            def nbytes(self) -> int:
+                return self.size
+
+        class FakeTensor:
+            def __init__(self, storage: FakeStorage, pointer: int) -> None:
+                self._storage = storage
+                self._pointer = pointer
+                self.shape = (2, 2)
+
+            def untyped_storage(self) -> FakeStorage:
+                return self._storage
+
+            def data_ptr(self) -> int:
+                return self._pointer
+
+            @staticmethod
+            def stride() -> tuple[int, int]:
+                return (2, 1)
+
+            @staticmethod
+            def element_size() -> int:
+                return 4
+
+        imported = FakeStorage(1000, 128)
+        hook = VllmSharedPoolHook.__new__(VllmSharedPoolHook)
+        hook._expected_bytes = 128
+        hook._used = True
+        hook._layer_identity = {"layer.0": ("vllm.group.0", 0)}
+        hook._buffer = SimpleNamespace(
+            tensor=SimpleNamespace(untyped_storage=lambda: imported)
+        )
+
+        self.assertEqual(
+            hook.attachment_views({"layer.0": FakeTensor(imported, 1016)}),
+            [
+                {
+                    "group_id": "vllm.group.0",
+                    "layer": {"index": 0, "name": "layer.0"},
+                    "offset_bytes": 16,
+                    "length_bytes": 16,
+                }
+            ],
+        )
+        with self.assertRaisesRegex(SharedPoolImportError, "does not alias"):
+            hook.attachment_views(
+                {"layer.0": FakeTensor(FakeStorage(2000, 128), 2016)}
+            )
+
     def test_backing_geometry_matches_vllm_packed_allocation(self) -> None:
         self.assertEqual(vllm_backing_geometry(_config()), (128, 4, 32))
 

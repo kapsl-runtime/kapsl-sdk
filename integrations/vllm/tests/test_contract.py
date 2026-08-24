@@ -3,8 +3,10 @@ import json
 from pathlib import Path
 
 from kapsl_vllm_connector.contract import (
+    ABI_VERSION,
     ContractValidationError,
     make_reserve_request,
+    make_shared_pool_attachment,
     opaque_registration,
     shared_pool_registration,
     validate_registration,
@@ -23,7 +25,7 @@ CAPACITY_GROUPS = [
 ]
 
 TOPOLOGY = {
-    "abi_version": {"major": 1, "minor": 2},
+    "abi_version": dict(ABI_VERSION),
     "model_fingerprint": "sha256:model",
     "shard": {
         "tensor_parallel_rank": 0,
@@ -49,8 +51,38 @@ TOPOLOGY = {
     ],
 }
 
+PROFILE = {
+    "adapter_id": "kapsl-vllm-connector",
+    "adapter_version": "0.4.0",
+    "backend_version": "test-vllm",
+    "profile_id": "vllm-v1-packed-cuda-ipc",
+}
+
 
 class ContractTests(unittest.TestCase):
+    def test_shared_attachment_rejects_views_outside_the_imported_pool(self) -> None:
+        with self.assertRaisesRegex(ContractValidationError, "exceeds"):
+            make_shared_pool_attachment(
+                participant_epoch=1,
+                binding_id="binding-0",
+                shard=TOPOLOGY["shard"],
+                profile={
+                    "adapter_id": "kapsl-vllm-connector",
+                    "adapter_version": "0.4.0",
+                    "backend_version": "test-vllm",
+                    "profile_id": "vllm-v1-packed-cuda-ipc",
+                },
+                imported_bytes=128,
+                views=[
+                    {
+                        "group_id": "vllm.group.0",
+                        "layer": {"index": 0, "name": "model.layers.0.attn"},
+                        "offset_bytes": 64,
+                        "length_bytes": 128,
+                    }
+                ],
+            )
+
     def test_opaque_registration_matches_rust_wire_shape(self) -> None:
         registration = opaque_registration("vllm-0", "sha256:model", CAPACITY_GROUPS)
         fixture = json.loads(
@@ -98,7 +130,7 @@ class ContractTests(unittest.TestCase):
 
     def test_shared_pool_registration_declares_runtime_ownership(self) -> None:
         registration = shared_pool_registration(
-            "vllm-0", "sha256:model", CAPACITY_GROUPS, TOPOLOGY
+            "vllm-0", "sha256:model", CAPACITY_GROUPS, TOPOLOGY, PROFILE
         )
 
         self.assertEqual(registration["capabilities"]["tier"], "shared_pool")
@@ -112,7 +144,13 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(
             registration["capabilities"]["transports"], [{"kind": "cuda_ipc"}]
         )
+        self.assertEqual(registration["adapter_profile"], PROFILE)
         validate_registration(registration)
+
+        missing_profile = dict(registration)
+        missing_profile.pop("adapter_profile")
+        with self.assertRaisesRegex(ContractValidationError, "adapter profile"):
+            validate_registration(missing_profile)
 
     def test_shared_pool_topology_and_capacity_groups_must_match(self) -> None:
         topology = dict(TOPOLOGY)
@@ -121,7 +159,7 @@ class ContractTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ContractValidationError, "same groups"):
             shared_pool_registration(
-                "vllm-0", "sha256:model", CAPACITY_GROUPS, topology
+                "vllm-0", "sha256:model", CAPACITY_GROUPS, topology, PROFILE
             )
 
 

@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
 /// Version implemented by this crate.
-pub const KAPSL_KV_ABI_VERSION: KvAbiVersion = KvAbiVersion::new(1, 2);
+pub const KAPSL_KV_ABI_VERSION: KvAbiVersion = KvAbiVersion::new(1, 3);
 
 /// Semantic version of the KV participant contract.
 ///
@@ -95,6 +95,9 @@ pub enum KvFeature {
     /// physical pool. Kapsl still owns the allocation and aggregate admission,
     /// but lease responses do not prescribe backend block-table indices.
     ParticipantBlockSelection,
+    /// An out-of-process shared-pool participant reports imported tensor views
+    /// and must be activated before Kapsl grants request leases.
+    ExternalPoolAttachment,
 }
 
 /// Data-plane mechanism used to identify or transfer KV blocks.
@@ -178,6 +181,7 @@ impl KvBackendCapabilities {
             features: BTreeSet::from([
                 KvFeature::CapacityLeasing,
                 KvFeature::DirectAttentionAccess,
+                KvFeature::ExternalPoolAttachment,
             ]),
             transports: BTreeSet::from([KvTransport::CudaIpc]),
         }
@@ -208,6 +212,14 @@ impl KvBackendCapabilities {
         {
             return Err(KvContractError::invalid_capabilities(
                 "participant block selection is valid only for shared-pool backends",
+            ));
+        }
+
+        if self.features.contains(&KvFeature::ExternalPoolAttachment)
+            && self.tier != KvIntegrationTier::SharedPool
+        {
+            return Err(KvContractError::invalid_capabilities(
+                "external pool attachment is valid only for shared-pool backends",
             ));
         }
 
@@ -1023,6 +1035,133 @@ pub struct KvSharedPoolDescriptor {
     pub descriptor: String,
 }
 
+/// Exact backend and adapter combination claiming a shared-pool attachment.
+/// A deployment may allowlist profiles that passed its conformance matrix.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct KvAdapterProfile {
+    pub adapter_id: String,
+    pub adapter_version: String,
+    pub backend_version: String,
+    pub profile_id: String,
+}
+
+impl KvAdapterProfile {
+    pub fn validate(&self) -> Result<(), KvContractError> {
+        if self.adapter_id.trim().is_empty()
+            || self.adapter_version.trim().is_empty()
+            || self.backend_version.trim().is_empty()
+            || self.profile_id.trim().is_empty()
+        {
+            return Err(KvContractError::invalid_request(
+                "adapter profile identity fields must not be empty",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// One backend tensor view expressed as offsets inside an imported binding.
+/// Raw process-local pointers are deliberately excluded from the wire format.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KvAttachmentView {
+    pub group_id: String,
+    pub layer: KvLayerId,
+    pub offset_bytes: u64,
+    pub length_bytes: u64,
+}
+
+impl KvAttachmentView {
+    fn validate(&self) -> Result<(), KvContractError> {
+        if self.group_id.trim().is_empty()
+            || self
+                .layer
+                .name
+                .as_ref()
+                .is_some_and(|name| name.trim().is_empty())
+            || self.length_bytes == 0
+            || self.offset_bytes.checked_add(self.length_bytes).is_none()
+        {
+            return Err(KvContractError::invalid_request(
+                "attachment views require a group, valid layer, and bounded non-zero byte range",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Evidence reported after one worker has imported a provisioned binding and
+/// constructed its backend-native KV tensor views.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KvSharedPoolAttachment {
+    pub participant_epoch: u64,
+    pub binding_id: String,
+    pub shard: KvShard,
+    pub profile: KvAdapterProfile,
+    pub imported_bytes: u64,
+    pub views: Vec<KvAttachmentView>,
+}
+
+impl KvSharedPoolAttachment {
+    pub fn validate(&self) -> Result<(), KvContractError> {
+        if self.participant_epoch == 0
+            || self.binding_id.trim().is_empty()
+            || self.imported_bytes == 0
+            || self.views.is_empty()
+        {
+            return Err(KvContractError::invalid_request(
+                "shared-pool attachment requires an epoch, binding, imported size, and tensor views",
+            ));
+        }
+        validate_shard(self.shard)?;
+        self.profile.validate()?;
+        let mut layers = BTreeSet::new();
+        for view in &self.views {
+            view.validate()?;
+            if view.offset_bytes + view.length_bytes > self.imported_bytes {
+                return Err(KvContractError::invalid_request(
+                    "attachment tensor view exceeds the imported binding",
+                ));
+            }
+            if !layers.insert((view.group_id.as_str(), view.layer.index)) {
+                return Err(KvContractError::invalid_request(
+                    "attachment tensor views must identify unique group/layer pairs",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Clean worker detach after its backend has stopped using the imported pool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KvSharedPoolDetachRequest {
+    pub participant_epoch: u64,
+    pub binding_ids: Vec<String>,
+    pub shard: KvShard,
+    pub completion: KvReleaseCompletion,
+}
+
+impl KvSharedPoolDetachRequest {
+    pub fn validate(&self) -> Result<(), KvContractError> {
+        if self.participant_epoch == 0 || self.binding_ids.is_empty() {
+            return Err(KvContractError::invalid_request(
+                "shared-pool detach requires an epoch and at least one binding",
+            ));
+        }
+        validate_shard(self.shard)?;
+        self.completion.validate()?;
+        let mut binding_ids = BTreeSet::new();
+        if self.binding_ids.iter().any(|binding_id| {
+            binding_id.trim().is_empty() || !binding_ids.insert(binding_id.as_str())
+        }) {
+            return Err(KvContractError::invalid_request(
+                "detach binding IDs must be non-empty and unique",
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl KvSharedPoolDescriptor {
     pub fn validate(&self) -> Result<(), KvContractError> {
         let group_ids = self
@@ -1196,6 +1335,10 @@ pub struct KvParticipantRegistration {
     pub model_fingerprint: String,
     pub capabilities: KvBackendCapabilities,
     pub capacity_model: KvCapacityModel,
+    /// Exact build/profile identity checked before an external shared pool is
+    /// provisioned, then repeated in each worker attachment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter_profile: Option<KvAdapterProfile>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topology: Option<KvTopology>,
 }
@@ -1218,7 +1361,36 @@ impl KvParticipantRegistration {
                 "unmanaged endpoints do not register as KV participants",
             ));
         }
+        if let Some(profile) = &self.adapter_profile {
+            profile.validate()?;
+        }
+        if self.capabilities.tier != KvIntegrationTier::SharedPool && self.adapter_profile.is_some()
+        {
+            return Err(KvContractError::invalid_capabilities(
+                "adapter_profile is valid only for shared-pool participants",
+            ));
+        }
         if self.capabilities.tier == KvIntegrationTier::SharedPool {
+            let has_external_transport = self
+                .capabilities
+                .transports
+                .iter()
+                .any(|transport| !matches!(transport, KvTransport::InProcess));
+            if has_external_transport
+                && !self
+                    .capabilities
+                    .features
+                    .contains(&KvFeature::ExternalPoolAttachment)
+            {
+                return Err(KvContractError::invalid_capabilities(
+                    "out-of-process shared pools require the external_pool_attachment feature",
+                ));
+            }
+            if has_external_transport && self.adapter_profile.is_none() {
+                return Err(KvContractError::invalid_capabilities(
+                    "out-of-process shared pools require an adapter_profile before provisioning",
+                ));
+            }
             let mut pools = BTreeMap::<&str, (u64, u64)>::new();
             for group in &self.capacity_model.groups {
                 let maximum = group.max_allocations.ok_or_else(|| {
@@ -1344,6 +1516,14 @@ pub enum KvControlRequest {
     Register {
         registration: KvParticipantRegistration,
     },
+    Attach {
+        participant_id: String,
+        attachment: KvSharedPoolAttachment,
+    },
+    Activate {
+        participant_id: String,
+        participant_epoch: u64,
+    },
     Reserve {
         participant_id: String,
         request: KvReserveRequest,
@@ -1365,12 +1545,35 @@ pub enum KvControlRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         completion: Option<KvReleaseCompletion>,
     },
+    Detach {
+        participant_id: String,
+        request: KvSharedPoolDetachRequest,
+    },
 }
 
 impl KvControlRequest {
     pub fn validate(&self) -> Result<(), KvContractError> {
         match self {
             Self::Register { registration } => registration.validate(),
+            Self::Attach {
+                participant_id,
+                attachment,
+            } => {
+                validate_participant_id(participant_id)?;
+                attachment.validate()
+            }
+            Self::Activate {
+                participant_id,
+                participant_epoch,
+            } => {
+                validate_participant_id(participant_id)?;
+                if *participant_epoch == 0 {
+                    return Err(KvContractError::invalid_request(
+                        "participant_epoch must be non-zero",
+                    ));
+                }
+                Ok(())
+            }
             Self::Reserve {
                 participant_id,
                 request,
@@ -1414,6 +1617,13 @@ impl KvControlRequest {
                 Ok(())
             }
             Self::Heartbeat { participant_id } => validate_participant_id(participant_id),
+            Self::Detach {
+                participant_id,
+                request,
+            } => {
+                validate_participant_id(participant_id)?;
+                request.validate()
+            }
         }
     }
 }
@@ -1469,6 +1679,18 @@ pub fn dispatch_control_request(
             KvControlRequest::Register { registration } => coordinator
                 .register(&registration)
                 .map(|receipt| KvControlResponse::Registered { receipt }),
+            KvControlRequest::Attach {
+                participant_id,
+                attachment,
+            } => coordinator
+                .attach(&participant_id, &attachment)
+                .map(|()| KvControlResponse::Ack),
+            KvControlRequest::Activate {
+                participant_id,
+                participant_epoch,
+            } => coordinator
+                .activate(&participant_id, participant_epoch)
+                .map(|()| KvControlResponse::Ack),
             KvControlRequest::Reserve {
                 participant_id,
                 request,
@@ -1497,6 +1719,12 @@ pub fn dispatch_control_request(
             } => coordinator
                 .release(&participant_id, &lease_id, completion.as_ref())
                 .map(|()| KvControlResponse::Ack),
+            KvControlRequest::Detach {
+                participant_id,
+                request,
+            } => coordinator
+                .detach(&participant_id, &request)
+                .map(|()| KvControlResponse::Ack),
         }
     }
     .unwrap_or_else(|error| KvControlResponse::Error { error });
@@ -1516,6 +1744,22 @@ pub trait KvCoordinator: Send + Sync {
         &self,
         registration: &KvParticipantRegistration,
     ) -> Result<KvRegistrationReceipt, KvContractError>;
+
+    fn attach(
+        &self,
+        _participant_id: &str,
+        _attachment: &KvSharedPoolAttachment,
+    ) -> Result<(), KvContractError> {
+        Err(KvContractError::unsupported("attach_shared_pool"))
+    }
+
+    fn activate(
+        &self,
+        _participant_id: &str,
+        _participant_epoch: u64,
+    ) -> Result<(), KvContractError> {
+        Err(KvContractError::unsupported("activate_shared_pool"))
+    }
 
     fn reserve(
         &self,
@@ -1542,6 +1786,14 @@ pub trait KvCoordinator: Send + Sync {
         lease_id: &str,
         completion: Option<&KvReleaseCompletion>,
     ) -> Result<(), KvContractError>;
+
+    fn detach(
+        &self,
+        _participant_id: &str,
+        _request: &KvSharedPoolDetachRequest,
+    ) -> Result<(), KvContractError> {
+        Err(KvContractError::unsupported("detach_shared_pool"))
+    }
 }
 
 /// Runtime-facing contract implemented by a deep KV backend adapter.
@@ -1886,6 +2138,7 @@ mod tests {
                     },
                 ],
             },
+            adapter_profile: None,
             topology: Some(topology),
         };
         assert!(registration.validate().is_err());
@@ -1913,6 +2166,12 @@ mod tests {
                     max_allocations: Some(64),
                 }],
             },
+            adapter_profile: Some(KvAdapterProfile {
+                adapter_id: "kapsl-test-adapter".to_string(),
+                adapter_version: "1.0.0".to_string(),
+                backend_version: "test-backend-1".to_string(),
+                profile_id: "test-cuda-ipc-v1".to_string(),
+            }),
             topology: Some(KvTopology {
                 abi_version: KAPSL_KV_ABI_VERSION,
                 model_fingerprint: "model".to_string(),
@@ -1925,6 +2184,12 @@ mod tests {
             }),
         };
         registration.validate().expect("valid shared registration");
+        let mut missing_profile = registration.clone();
+        missing_profile.adapter_profile = None;
+        assert!(matches!(
+            missing_profile.validate(),
+            Err(KvContractError::InvalidCapabilities { .. })
+        ));
 
         let receipt = KvRegistrationReceipt {
             participant_id: registration.participant_id.clone(),
@@ -1995,6 +2260,70 @@ mod tests {
     }
 
     #[test]
+    fn attachment_evidence_is_bounded_and_pointer_free_on_the_wire() {
+        let attachment = KvSharedPoolAttachment {
+            participant_epoch: 7,
+            binding_id: "binding-0".to_string(),
+            shard: KvShard::default(),
+            profile: KvAdapterProfile {
+                adapter_id: "kapsl-vllm-connector".to_string(),
+                adapter_version: "0.4.0".to_string(),
+                backend_version: "test-vllm".to_string(),
+                profile_id: "vllm-v1-packed-cuda-ipc".to_string(),
+            },
+            imported_bytes: 4096,
+            views: vec![KvAttachmentView {
+                group_id: "vllm.group.0".to_string(),
+                layer: KvLayerId {
+                    index: 0,
+                    name: Some("model.layers.0.attn".to_string()),
+                },
+                offset_bytes: 128,
+                length_bytes: 1024,
+            }],
+        };
+        attachment.validate().expect("valid attachment evidence");
+        let envelope = KvControlRequestEnvelope {
+            abi_version: KAPSL_KV_ABI_VERSION,
+            request_id: "rpc-attach".to_string(),
+            request: KvControlRequest::Attach {
+                participant_id: "vllm-0".to_string(),
+                attachment,
+            },
+        };
+        let value = serde_json::to_value(envelope).expect("serialize attachment");
+        assert_eq!(value["operation"], "attach");
+        assert_eq!(value["attachment"]["views"][0]["offset_bytes"], 128);
+        assert!(!value.to_string().contains("pointer"));
+    }
+
+    #[test]
+    fn attachment_view_cannot_extend_past_the_imported_binding() {
+        let attachment = KvSharedPoolAttachment {
+            participant_epoch: 1,
+            binding_id: "binding-0".to_string(),
+            shard: KvShard::default(),
+            profile: KvAdapterProfile {
+                adapter_id: "adapter".to_string(),
+                adapter_version: "1".to_string(),
+                backend_version: "1".to_string(),
+                profile_id: "profile".to_string(),
+            },
+            imported_bytes: 64,
+            views: vec![KvAttachmentView {
+                group_id: "group-0".to_string(),
+                layer: KvLayerId::indexed(0),
+                offset_bytes: 32,
+                length_bytes: 64,
+            }],
+        };
+        assert!(matches!(
+            attachment.validate(),
+            Err(KvContractError::InvalidRequest { .. })
+        ));
+    }
+
+    #[test]
     fn control_envelope_has_stable_flat_json_shape() {
         let envelope = KvControlRequestEnvelope {
             abi_version: KAPSL_KV_ABI_VERSION,
@@ -2033,6 +2362,7 @@ mod tests {
                     max_allocations: Some(1024),
                 }],
             },
+            adapter_profile: None,
             topology: None,
         };
         registration.validate().expect("valid registration");

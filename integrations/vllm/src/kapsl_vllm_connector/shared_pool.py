@@ -85,7 +85,7 @@ def select_cuda_binding(
         binding = candidates[0]
     else:
         if global_rank is None:
-            global_rank = _distributed_rank()
+            global_rank = vllm_distributed_rank()
         if rank_device_map is None:
             raise SharedPoolImportError(
                 "multiple CUDA bindings require kapsl_rank_device_map"
@@ -126,7 +126,7 @@ def select_cuda_binding(
     return binding
 
 
-def _distributed_rank() -> int:
+def vllm_distributed_rank() -> int:
     try:
         import torch
 
@@ -349,6 +349,21 @@ class VllmSharedPoolHook:
     def __init__(self, binding: Mapping[str, Any], kv_cache_config: Any) -> None:
         allocation_bytes, _, _ = vllm_backing_geometry(kv_cache_config)
         self._expected_bytes = allocation_bytes
+        self._binding_id = str(binding["binding_id"])
+        self._layer_identity: dict[str, tuple[str, int]] = {}
+        next_layer_index = 0
+        for group_index, group in enumerate(kv_cache_config.kv_cache_groups):
+            for layer_name in group.layer_names:
+                name = str(layer_name)
+                if name in self._layer_identity:
+                    raise SharedPoolImportError(
+                        f"vLLM KV layer {name!r} appears in more than one cache group"
+                    )
+                self._layer_identity[name] = (
+                    f"vllm.group.{group_index}",
+                    next_layer_index,
+                )
+                next_layer_index += 1
         self._buffer = CudaIpcBuffer(str(binding["descriptor"]), allocation_bytes)
         self._used = False
         self._patches: list[tuple[Any, Any]] = []
@@ -476,6 +491,65 @@ class VllmSharedPoolHook:
     def used(self) -> bool:
         return self._used
 
+    @property
+    def binding_id(self) -> str:
+        return self._binding_id
+
+    @property
+    def imported_bytes(self) -> int:
+        return self._expected_bytes
+
+    def attachment_views(self, kv_caches: Mapping[str, Any]) -> list[dict[str, Any]]:
+        """Prove every registered vLLM KV tensor aliases the imported storage."""
+
+        if not self._used:
+            raise SharedPoolImportError(
+                "vLLM cannot attach before consuming the imported KV allocation"
+            )
+        raw = self._buffer.tensor
+        if raw is None:
+            raise SharedPoolImportError("CUDA IPC mapping was released before attachment")
+        expected_layers = set(self._layer_identity)
+        actual_layers = set(kv_caches)
+        if actual_layers != expected_layers:
+            missing = sorted(expected_layers - actual_layers)
+            unexpected = sorted(actual_layers - expected_layers)
+            raise SharedPoolImportError(
+                "vLLM registered KV layers that differ from the negotiated topology: "
+                f"missing={missing}, unexpected={unexpected}"
+            )
+
+        raw_storage = raw.untyped_storage()
+        raw_base = int(raw_storage.data_ptr())
+        if int(raw_storage.nbytes()) != self._expected_bytes:
+            raise SharedPoolImportError(
+                "imported CUDA storage size changed before attachment"
+            )
+        views: list[dict[str, Any]] = []
+        for layer_name in sorted(expected_layers, key=lambda name: self._layer_identity[name][1]):
+            tensor = kv_caches[layer_name]
+            storage = tensor.untyped_storage()
+            if int(storage.data_ptr()) != raw_base:
+                raise SharedPoolImportError(
+                    f"vLLM KV tensor {layer_name!r} does not alias the imported CUDA storage"
+                )
+            offset_bytes = int(tensor.data_ptr()) - raw_base
+            length_bytes = _tensor_span_bytes(tensor)
+            if offset_bytes < 0 or offset_bytes + length_bytes > self._expected_bytes:
+                raise SharedPoolImportError(
+                    f"vLLM KV tensor {layer_name!r} extends outside the imported allocation"
+                )
+            group_id, layer_index = self._layer_identity[layer_name]
+            views.append(
+                {
+                    "group_id": group_id,
+                    "layer": {"index": layer_index, "name": layer_name},
+                    "offset_bytes": offset_bytes,
+                    "length_bytes": length_bytes,
+                }
+            )
+        return views
+
     def shutdown(self) -> None:
         replacement = getattr(self, "_replacement", None)
         for module, original in reversed(getattr(self, "_patches", [])):
@@ -485,3 +559,17 @@ class VllmSharedPoolHook:
         buffer = getattr(self, "_buffer", None)
         if buffer is not None:
             buffer.release()
+
+
+def _tensor_span_bytes(tensor: Any) -> int:
+    shape = tuple(int(value) for value in tensor.shape)
+    strides = tuple(int(value) for value in tensor.stride())
+    if not shape or len(shape) != len(strides) or any(size <= 0 for size in shape):
+        raise SharedPoolImportError("vLLM KV tensors must have a non-empty shape")
+    if any(stride < 0 for stride in strides):
+        raise SharedPoolImportError("negative-stride vLLM KV tensors are unsupported")
+    element_size = int(tensor.element_size())
+    if element_size <= 0:
+        raise SharedPoolImportError("vLLM KV tensor element size must be positive")
+    final_element = sum((size - 1) * stride for size, stride in zip(shape, strides))
+    return (final_element + 1) * element_size

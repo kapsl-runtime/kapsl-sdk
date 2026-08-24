@@ -17,6 +17,8 @@ from .contract import (
     validate_registration,
     validate_reserve_request,
     validate_response,
+    validate_shared_pool_attachment,
+    validate_shared_pool_detach_request,
 )
 
 
@@ -96,6 +98,25 @@ class KapslKvControlClient:
         except ContractValidationError as error:
             raise KapslKvControlError(f"invalid lease response: {error}") from error
 
+    def attach(self, attachment: Mapping[str, Any]) -> None:
+        validate_shared_pool_attachment(attachment)
+        response = self._rpc(
+            "attach",
+            participant_id=self.participant_id,
+            attachment=dict(attachment),
+        )
+        self._expect(response, {"ack"})
+
+    def activate(self, participant_epoch: int) -> None:
+        if participant_epoch <= 0:
+            raise ValueError("participant_epoch must be positive")
+        response = self._rpc(
+            "activate",
+            participant_id=self.participant_id,
+            participant_epoch=int(participant_epoch),
+        )
+        self._expect(response, {"ack"})
+
     def commit(self, lease_id: str, computed_tokens: int) -> None:
         if not lease_id.strip():
             raise ValueError("lease_id must not be empty")
@@ -136,6 +157,15 @@ class KapslKvControlClient:
         if completion is not None:
             payload["completion"] = dict(completion)
         response = self._rpc("release", **payload)
+        self._expect(response, {"ack"})
+
+    def detach(self, request: Mapping[str, Any]) -> None:
+        validate_shared_pool_detach_request(request)
+        response = self._rpc(
+            "detach",
+            participant_id=self.participant_id,
+            request=dict(request),
+        )
         self._expect(response, {"ack"})
 
     def _rpc(self, operation: str, **payload: Any) -> dict[str, Any]:

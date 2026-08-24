@@ -6,11 +6,13 @@ import logging
 import threading
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from importlib import metadata
 from typing import TYPE_CHECKING, Any
 
 from .client import KapslKvControlClient, KapslKvControlError
 from .contract import (
     ABI_VERSION,
+    make_shared_pool_attachment,
     make_reserve_request,
     opaque_registration,
     shared_pool_registration,
@@ -20,6 +22,7 @@ from .shared_pool import (
     VllmSharedPoolHook,
     select_cuda_binding,
     vllm_backing_geometry,
+    vllm_distributed_rank,
 )
 
 if TYPE_CHECKING:
@@ -57,6 +60,8 @@ else:
 
 
 logger = logging.getLogger(__name__)
+ADAPTER_VERSION = "0.4.0"
+ADAPTER_PROFILE_ID = "vllm-v1-packed-cuda-ipc"
 
 
 @dataclass
@@ -146,16 +151,25 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
             shared_pool=self._mode == "shared_pool",
         )
         self._group_ids = [group["group_id"] for group in self._capacity_groups]
+        shared_topology = (
+            _vllm_topology(
+                kv_cache_config,
+                model_fingerprint,
+                tensor_parallel_world_size=tensor_parallel_size,
+            )
+            if self._mode == "shared_pool"
+            else None
+        )
+        shared_profile = (
+            _vllm_adapter_profile() if self._mode == "shared_pool" else None
+        )
         registration = (
             shared_pool_registration(
                 self._participant_id,
                 model_fingerprint,
                 self._capacity_groups,
-                _vllm_topology(
-                    kv_cache_config,
-                    model_fingerprint,
-                    tensor_parallel_world_size=tensor_parallel_size,
-                ),
+                shared_topology,
+                shared_profile,
                 backend="vllm",
             )
             if self._mode == "shared_pool"
@@ -179,6 +193,12 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
         self._heartbeat_stop = threading.Event()
         self._heartbeat_thread: threading.Thread | None = None
         self._shared_pool_hook: VllmSharedPoolHook | None = None
+        self._participant_epoch: int | None = None
+        self._shared_shard: dict[str, int] | None = None
+        self._shared_profile: dict[str, str] | None = shared_profile
+        self._shared_attached = False
+        self._shared_active = False
+        self._activation_lock = threading.Lock()
         if self._is_scheduler or self._mode == "shared_pool":
             self._client = KapslKvControlClient(
                 endpoint,
@@ -186,15 +206,24 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
                 timeout_seconds=timeout_ms / 1000.0,
             )
             receipt = self._client.register(registration)
+            self._participant_epoch = int(receipt["participant_epoch"])
             if self._mode == "shared_pool" and not self._is_scheduler:
+                global_rank = (
+                    0 if tensor_parallel_size == 1 else vllm_distributed_rank()
+                )
                 binding = select_cuda_binding(
                     receipt,
                     kv_cache_config,
                     rank_device_map,
+                    global_rank=global_rank,
                 )
                 self._shared_pool_hook = VllmSharedPoolHook(
                     binding, kv_cache_config
                 )
+                if shared_topology is None:
+                    raise AssertionError("shared topology was not constructed")
+                self._shared_shard = dict(shared_topology["shard"])
+                self._shared_shard["tensor_parallel_rank"] = global_rank
             logger.info(
                 "registered Kapsl KV participant %s in %s mode (%s role)",
                 self._participant_id,
@@ -215,6 +244,7 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
         if not self._is_scheduler:
             return
         self._raise_if_control_failed()
+        self._ensure_shared_active()
         request_id = _request_id(request)
         with self._lease_lock:
             if request_id in self._leases:
@@ -321,18 +351,38 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
         return None
 
     def register_kv_caches(self, kv_caches: dict[str, "torch.Tensor"]) -> None:
-        del kv_caches
-        if (
-            self._mode == "shared_pool"
-            and not self._is_scheduler
-            and (
-                self._shared_pool_hook is None
-                or not self._shared_pool_hook.used
-            )
-        ):
+        if self._mode != "shared_pool" or self._is_scheduler:
+            return
+        if self._shared_attached:
+            return
+        hook = self._shared_pool_hook
+        if hook is None or not hook.used:
             raise SharedPoolImportError(
                 "vLLM registered KV tensors without consuming the Kapsl CUDA IPC pool"
             )
+        if (
+            self._participant_epoch is None
+            or self._shared_shard is None
+            or self._shared_profile is None
+        ):
+            raise SharedPoolImportError(
+                "shared-pool registration state is incomplete before attachment"
+            )
+        attachment = make_shared_pool_attachment(
+            participant_epoch=self._participant_epoch,
+            binding_id=hook.binding_id,
+            shard=self._shared_shard,
+            profile=self._shared_profile,
+            imported_bytes=hook.imported_bytes,
+            views=hook.attachment_views(kv_caches),
+        )
+        self._control_client().attach(attachment)
+        self._shared_attached = True
+        logger.info(
+            "attached Kapsl shared KV binding %s for participant %s",
+            hook.binding_id,
+            self._participant_id,
+        )
 
     def shutdown(self) -> None:
         if self._shared_pool_hook is not None:
@@ -373,6 +423,24 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
                 )
                 return
 
+    def _ensure_shared_active(self) -> None:
+        if self._mode != "shared_pool" or self._shared_active:
+            return
+        with self._activation_lock:
+            if self._shared_active:
+                return
+            if self._participant_epoch is None:
+                raise SharedPoolImportError(
+                    "shared-pool participant has no registration epoch"
+                )
+            self._control_client().activate(self._participant_epoch)
+            self._shared_active = True
+            logger.info(
+                "activated Kapsl shared KV participant %s epoch=%s",
+                self._participant_id,
+                self._participant_epoch,
+            )
+
     def _raise_if_control_failed(self) -> None:
         with self._lease_lock:
             failure = self._control_failure
@@ -384,7 +452,7 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
 
     def _control_client(self) -> KapslKvControlClient:
         if self._client is None:
-            raise RuntimeError("KV control operations are scheduler-side only")
+            raise RuntimeError("KV control client is not initialized for this connector role")
         return self._client
 
 
@@ -427,6 +495,30 @@ def _validate_shared_pool_execution(vllm_config: Any) -> None:
             "vLLM shared_pool does not yet support sleep mode because the "
             "Kapsl-owned CUDA allocation must remain exported"
         )
+
+
+def _vllm_adapter_profile() -> dict[str, str]:
+    try:
+        backend_version = metadata.version("vllm")
+    except metadata.PackageNotFoundError:
+        try:
+            import vllm
+
+            backend_version = str(getattr(vllm, "__version__", "")).strip()
+        except ImportError as error:
+            raise SharedPoolImportError(
+                "cannot identify the vLLM build for shared-pool attachment"
+            ) from error
+    if not backend_version:
+        raise SharedPoolImportError(
+            "cannot identify the vLLM build for shared-pool attachment"
+        )
+    return {
+        "adapter_id": "kapsl-vllm-connector",
+        "adapter_version": ADAPTER_VERSION,
+        "backend_version": backend_version,
+        "profile_id": ADAPTER_PROFILE_ID,
+    }
 
 
 def _request_id(request: Any) -> str:

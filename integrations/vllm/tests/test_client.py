@@ -12,6 +12,8 @@ from kapsl_vllm_connector.client import KapslKvControlClient, KapslKvControlErro
 from kapsl_vllm_connector.contract import (
     ABI_VERSION,
     make_reserve_request,
+    make_shared_pool_attachment,
+    make_shared_pool_detach_request,
     opaque_registration,
     shared_pool_registration,
 )
@@ -52,6 +54,13 @@ TOPOLOGY = {
             "policy": {"kind": "full_attention"},
         }
     ],
+}
+
+PROFILE = {
+    "adapter_id": "kapsl-vllm-connector",
+    "adapter_version": "0.4.0",
+    "backend_version": "test-vllm",
+    "profile_id": "vllm-v1-packed-cuda-ipc",
 }
 
 
@@ -230,7 +239,11 @@ class ClientTests(unittest.TestCase):
 
             receipt = client.register(
                 shared_pool_registration(
-                    "vllm-shared", "sha256:model", CAPACITY_GROUPS, TOPOLOGY
+                    "vllm-shared",
+                    "sha256:model",
+                    CAPACITY_GROUPS,
+                    TOPOLOGY,
+                    PROFILE,
                 )
             )
             server.join()
@@ -238,6 +251,64 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(
                 receipt["shared_pools"][0]["allocation_mode"],
                 "participant_managed",
+            )
+
+    def test_shared_attachment_activation_and_detach_use_flat_envelopes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            socket_path = Path(directory) / "kv.sock"
+            server = FakeCoordinator(socket_path, 4)
+            server.start()
+            request_ids = iter(f"rpc-shared-{index}" for index in range(4))
+            client = KapslKvControlClient(
+                f"unix://{socket_path}",
+                "vllm-shared",
+                request_id_factory=lambda: next(request_ids),
+            )
+            receipt = client.register(
+                shared_pool_registration(
+                    "vllm-shared",
+                    "sha256:model",
+                    CAPACITY_GROUPS,
+                    TOPOLOGY,
+                    PROFILE,
+                )
+            )
+            attachment = make_shared_pool_attachment(
+                participant_epoch=receipt["participant_epoch"],
+                binding_id="binding-0",
+                shard=TOPOLOGY["shard"],
+                profile=PROFILE,
+                imported_bytes=1024 * 1_048_576,
+                views=[
+                    {
+                        "group_id": "vllm.group.0",
+                        "layer": {"index": 0, "name": "layer.0"},
+                        "offset_bytes": 0,
+                        "length_bytes": 1024 * 1_048_576,
+                    }
+                ],
+            )
+            client.attach(attachment)
+            client.activate(receipt["participant_epoch"])
+            client.detach(
+                make_shared_pool_detach_request(
+                    participant_epoch=receipt["participant_epoch"],
+                    binding_ids=["binding-0"],
+                    shard=TOPOLOGY["shard"],
+                )
+            )
+            server.join()
+
+            self.assertEqual(
+                [request["operation"] for request in server.requests],
+                ["register", "attach", "activate", "detach"],
+            )
+            self.assertEqual(
+                server.requests[0]["registration"]["adapter_profile"], PROFILE
+            )
+            self.assertEqual(
+                server.requests[1]["attachment"]["profile"]["profile_id"],
+                "vllm-v1-packed-cuda-ipc",
             )
 
 
