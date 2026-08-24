@@ -26,21 +26,20 @@ fn is_case_and_whitespace_insensitive() {
 }
 
 #[test]
-fn unknown_frameworks_fall_through_to_onnx_forward() {
-    // Preserves the legacy `else` arm: pytorch/tensorflow/unknown -> stateless ONNX.
+fn unknown_frameworks_fail_closed() {
     assert_eq!(
         EngineKind::from_framework("pytorch"),
-        EngineKind::OnnxForward
+        EngineKind::Unsupported
     );
     assert_eq!(
         EngineKind::from_framework("tensorflow"),
-        EngineKind::OnnxForward
+        EngineKind::Unsupported
     );
     assert_eq!(
         EngineKind::from_framework("totally-made-up"),
-        EngineKind::OnnxForward
+        EngineKind::Unsupported
     );
-    assert_eq!(EngineKind::from_framework(""), EngineKind::OnnxForward);
+    assert_eq!(EngineKind::from_framework(""), EngineKind::Unsupported);
 }
 
 #[test]
@@ -61,6 +60,7 @@ fn predicate_helpers() {
     assert!(EngineKind::OnnxForward.uses_onnx_session());
     assert!(!EngineKind::GgufGenerate.uses_onnx_session());
     assert!(!EngineKind::Native.uses_onnx_session());
+    assert!(!EngineKind::Unsupported.uses_onnx_session());
 }
 
 /// Build a manifest from the axes under test (model_file controls the
@@ -165,6 +165,7 @@ fn all_current_cells_are_implemented() {
     ] {
         assert!(kind.is_implemented(), "{kind:?} should have a backend");
     }
+    assert!(!EngineKind::Unsupported.is_implemented());
     assert!(EngineKind::OnnxClassify.uses_onnx_session());
 }
 
@@ -188,6 +189,44 @@ fn validate_accepts_legacy_manifests() {
     assert!(
         EngineKind::validate(&mk("safetensors", None, None, None, "model.safetensors")).is_ok()
     );
+}
+
+#[test]
+fn validate_rejects_unsupported_legacy_frameworks_before_onnx_dispatch() {
+    for (framework, model_file) in [
+        ("pytorch", "model.pt"),
+        ("tensorflow", "saved_model.pb"),
+        ("totally-made-up", "model.onnx"),
+        ("", "model.onnx"),
+    ] {
+        let err = EngineKind::validate(&mk(framework, None, None, None, model_file))
+            .expect_err("unsupported framework must fail closed");
+        assert!(err.contains("unsupported framework"), "unexpected: {err}");
+    }
+}
+
+#[test]
+fn validate_rejects_non_onnx_weight_extensions() {
+    for model_file in ["model.pt", "model.pth", "saved_model.pb", "model.bin"] {
+        let err = EngineKind::validate(&mk("onnx", None, None, None, model_file))
+            .expect_err("unsupported extension must not reach ONNX Runtime");
+        assert!(
+            err.contains("will not pass") || err.contains("unsupported extension"),
+            "unexpected: {err}"
+        );
+    }
+}
+
+#[test]
+fn explicit_converted_format_can_override_source_framework_label() {
+    assert!(EngineKind::validate(&mk(
+        "pytorch",
+        Some("onnx"),
+        Some("opaque"),
+        Some("forward"),
+        "converted.onnx"
+    ))
+    .is_ok());
 }
 
 #[test]

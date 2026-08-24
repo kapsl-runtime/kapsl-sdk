@@ -4,6 +4,8 @@
 > profile now enables `gguf-cuda-shared-kv`. The explicit `gguf-cuda` feature
 > remains the static-KV rollback. The milestones below retain the original
 > rollout context and should not be read as the current feature-selection state.
+> The backend-neutral contract and fork exit strategy now live in
+> [Backend-neutral KV Integration](./backend-kv-integration.md).
 
 This is the integration contract for making llama.cpp use Kapsl's GPU-wide KV
 pool instead of allocating a private, fixed-size KV cache per context.

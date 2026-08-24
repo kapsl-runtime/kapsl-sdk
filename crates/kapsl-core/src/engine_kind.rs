@@ -8,10 +8,11 @@
 //! generative. [`EngineKind`] is the single place that interprets `framework`;
 //! every dispatch site classifies through it instead of comparing strings.
 //!
-//! This is intentionally **behavior-preserving** over the legacy mapping: any
-//! unrecognized framework resolves to [`EngineKind::OnnxForward`], exactly as the
-//! old `else` arm fell through to a stateless ONNX session. Richer validation
-//! (e.g. rejecting an `llm` tag on a GGUF file) is layered on top separately.
+//! Dispatch is fail-closed: an unrecognized framework or model-file extension
+//! resolves to [`EngineKind::Unsupported`] and validation rejects it before a
+//! backend is constructed. In particular, PyTorch and TensorFlow weights must
+//! never be handed to ONNX Runtime merely because an old string-dispatch `else`
+//! arm used to select the ONNX backend.
 
 use crate::loader::Manifest;
 
@@ -32,7 +33,7 @@ pub enum EngineKind {
     /// Legacy framework: `"native"` / `"safetensors"`.
     Native,
     /// A plain ONNX graph run as a single stateless forward pass (tensors in,
-    /// tensors out). Legacy framework: `"onnx"` (and anything unrecognized).
+    /// tensors out). Legacy framework: `"onnx"`.
     OnnxForward,
     /// ONNX encoder run for embeddings (forward pass + pooling). Selected by
     /// `format=onnx`, `task=embed`.
@@ -49,20 +50,23 @@ pub enum EngineKind {
     /// `format=onnx`, `task=transcribe`. Encoder-decoder ASR (Whisper) is out of
     /// scope: it is an autoregressive decode loop, not a single forward pass.
     OnnxTranscribe,
+    /// A manifest that does not identify a supported model format/backend.
+    /// Validation rejects this kind before allocation or backend construction.
+    Unsupported,
 }
 
 impl EngineKind {
     /// Classify a raw `framework` string. Case- and whitespace-insensitive.
     ///
-    /// Unrecognized values map to [`EngineKind::OnnxForward`] to preserve the
-    /// legacy fall-through behavior (`onnx`, `pytorch`, `tensorflow`, and any
-    /// unknown tag all went to the stateless ONNX path).
+    /// Only explicit legacy values are classified. Unknown values fail closed
+    /// as [`EngineKind::Unsupported`] instead of falling through to ONNX.
     pub fn from_framework(framework: &str) -> Self {
         match framework.trim().to_ascii_lowercase().as_str() {
             "gguf" => Self::GgufGenerate,
             "llm" => Self::OnnxGenerate,
             "native" | "safetensors" => Self::Native,
-            _ => Self::OnnxForward,
+            "onnx" => Self::OnnxForward,
+            _ => Self::Unsupported,
         }
     }
 
@@ -82,8 +86,7 @@ impl EngineKind {
         match format.as_str() {
             "gguf" => Self::GgufGenerate,
             "safetensors" => Self::Native,
-            // onnx (and anything else) dispatches on the requested task.
-            _ => match task.as_str() {
+            "onnx" => match task.as_str() {
                 "generate" => Self::OnnxGenerate,
                 "embed" => Self::OnnxEmbed,
                 "classify" => Self::OnnxClassify,
@@ -91,6 +94,7 @@ impl EngineKind {
                 "transcribe" => Self::OnnxTranscribe,
                 _ => Self::OnnxForward,
             },
+            _ => Self::Unsupported,
         }
     }
 
@@ -114,20 +118,30 @@ impl EngineKind {
         let model_type = effective_model_type(manifest);
         let task = effective_task(manifest);
 
+        if Self::resolve(manifest) == Self::Unsupported {
+            return Err(format!(
+                "unsupported framework `{}`: no explicit supported model format was declared; \
+                 expected legacy framework `onnx`, `llm`, `gguf`, `native`, or `safetensors`, \
+                 or set format to one of {:?}. PyTorch/TensorFlow weights are not ONNX models \
+                 and must be exported before packaging",
+                manifest.framework.trim(),
+                VALID_FORMATS
+            ));
+        }
+
         // The declared format must not contradict the model file's extension.
-        if let Some(ext_format) = format_from_model_file(&manifest.model_file) {
-            if ext_format != format {
-                return Err(format!(
-                    "model_file `{}` is a {} model but the package resolves to format `{}` \
-                     (framework={:?}, format={:?}); set format/framework to `{}`",
-                    manifest.model_file,
-                    ext_format,
-                    format,
-                    manifest.framework,
-                    manifest.format,
-                    ext_format
-                ));
-            }
+        let ext_format = format_from_model_file(&manifest.model_file)?;
+        if ext_format != format {
+            return Err(format!(
+                "model_file `{}` is a {} model but the package resolves to format `{}` \
+                 (framework={:?}, format={:?}); set format/framework to `{}`",
+                manifest.model_file,
+                ext_format,
+                format,
+                manifest.framework,
+                manifest.format,
+                ext_format
+            ));
         }
 
         // Task must be valid for the model type.
@@ -206,6 +220,7 @@ impl EngineKind {
             | Self::OnnxClassify
             | Self::OnnxDetect
             | Self::OnnxTranscribe => true,
+            Self::Unsupported => false,
         }
     }
 
@@ -220,6 +235,7 @@ impl EngineKind {
             Self::OnnxClassify => "onnx-classify",
             Self::OnnxDetect => "onnx-detect",
             Self::OnnxTranscribe => "onnx-transcribe",
+            Self::Unsupported => "unsupported",
         }
     }
 }
@@ -273,11 +289,13 @@ pub fn effective_format(manifest: &Manifest) -> String {
     if let Some(f) = norm(&manifest.format) {
         return f;
     }
-    match manifest.framework.trim().to_ascii_lowercase().as_str() {
+    let framework = manifest.framework.trim().to_ascii_lowercase();
+    match framework.as_str() {
         "gguf" => "gguf",
         "native" | "safetensors" => "safetensors",
-        // "llm", "onnx", and anything unknown are ONNX-format (or treated as such).
-        _ => "onnx",
+        "llm" | "onnx" => "onnx",
+        // Preserve the unknown value so resolution/validation can fail closed.
+        _ => framework.as_str(),
     }
     .to_string()
 }
@@ -314,18 +332,36 @@ pub fn effective_task(manifest: &Manifest) -> String {
     .to_string()
 }
 
-/// Confident format implied by a model file's extension, if recognized.
-fn format_from_model_file(model_file: &str) -> Option<&'static str> {
+/// Format implied by the primary model file's extension.
+///
+/// A primary model with any other extension is rejected here so it cannot be
+/// routed into ONNX Runtime based only on a manifest fallback.
+fn format_from_model_file(model_file: &str) -> Result<&'static str, String> {
     let ext = std::path::Path::new(model_file)
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
     match ext.as_str() {
-        "gguf" => Some("gguf"),
-        "onnx" => Some("onnx"),
-        "safetensors" => Some("safetensors"),
-        _ => None,
+        "gguf" => Ok("gguf"),
+        "onnx" => Ok("onnx"),
+        "safetensors" => Ok("safetensors"),
+        "pt" | "pth" => Err(format!(
+            "model_file `{model_file}` is a PyTorch weight file, but this runtime has no \
+             PyTorch serving backend. It will not pass PyTorch bytes to ONNX Runtime; \
+             export the model to ONNX, GGUF, or a supported SafeTensors deployment first"
+        )),
+        "pb" => Err(format!(
+            "model_file `{model_file}` is a TensorFlow protobuf, but this runtime has no \
+             TensorFlow serving backend. It will not pass TensorFlow bytes to ONNX Runtime; \
+             export the model to ONNX first"
+        )),
+        "" => Err(format!(
+            "model_file `{model_file}` has no extension; expected `.onnx`, `.gguf`, or `.safetensors`"
+        )),
+        other => Err(format!(
+            "model_file `{model_file}` has unsupported extension `.{other}`; expected `.onnx`, `.gguf`, or `.safetensors`"
+        )),
     }
 }
 

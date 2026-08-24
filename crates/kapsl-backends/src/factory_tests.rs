@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod tests {
-    use super::super::BackendFactory;
+    use super::super::{BackendFactory, OnnxRuntimeTuning};
+    use kapsl_core::loader::Manifest;
     use kapsl_core::HardwareRequirements;
     use kapsl_hal::device::{Device, DeviceBackend, DeviceInfo};
 
@@ -65,6 +66,60 @@ mod tests {
                 },
             ],
         }
+    }
+
+    fn manifest(framework: &str, model_file: &str) -> Manifest {
+        Manifest {
+            project_name: "test-model".to_string(),
+            framework: framework.to_string(),
+            version: "1.0.0".to_string(),
+            created_at: String::new(),
+            model_file: model_file.to_string(),
+            format: None,
+            model_type: None,
+            task: None,
+            metadata: None,
+            hardware_requirements: HardwareRequirements::default(),
+            cron_jobs: Vec::new(),
+        }
+    }
+
+    fn best_backend_error(manifest: &Manifest) -> String {
+        match BackendFactory::create_best_backend_with_tuning(
+            manifest,
+            &mock_device_info(),
+            &OnnxRuntimeTuning::default(),
+        ) {
+            Ok(_) => panic!("backend creation unexpectedly succeeded"),
+            Err(error) => error,
+        }
+    }
+
+    #[test]
+    fn unsupported_framework_never_reaches_onnx_factory() {
+        let error = best_backend_error(&manifest("pytorch", "model.pt"));
+        assert!(
+            error.contains("invalid model contract"),
+            "unexpected: {error}"
+        );
+        assert!(
+            error.contains("unsupported framework"),
+            "unexpected: {error}"
+        );
+    }
+
+    #[cfg(not(feature = "native"))]
+    #[test]
+    fn safetensors_without_native_feature_never_falls_back_to_onnx() {
+        let error = best_backend_error(&manifest("safetensors", "model.safetensors"));
+        assert!(
+            error.contains("without the `native` feature"),
+            "unexpected: {error}"
+        );
+        assert!(
+            error.contains("Refusing to pass SafeTensors"),
+            "unexpected: {error}"
+        );
     }
 
     #[test]

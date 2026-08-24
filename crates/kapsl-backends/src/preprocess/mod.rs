@@ -32,7 +32,7 @@ mod vision_tests;
 use async_trait::async_trait;
 use kapsl_engine_api::{
     BatchingPolicy, BinaryTensorPacket, Engine, EngineError, EngineMetrics, EngineModelInfo,
-    EngineStream, InferenceRequest, NamedTensor,
+    EngineStream, InferenceRequest, KvBackendCapabilities, KvTopology, NamedTensor,
 };
 use std::path::Path;
 
@@ -104,6 +104,14 @@ impl PreprocessBackend {
 
 #[async_trait]
 impl Engine for PreprocessBackend {
+    fn kv_capabilities(&self) -> KvBackendCapabilities {
+        self.inner.kv_capabilities()
+    }
+
+    fn kv_topology(&self) -> Option<KvTopology> {
+        self.inner.kv_topology()
+    }
+
     fn planned_external_device_memory(
         &self,
         model_path: &Path,
