@@ -5,6 +5,9 @@ from types import SimpleNamespace
 from kapsl_vllm_connector.client import KapslKvControlError
 from kapsl_vllm_connector.connector import (
     KapslConnectorV1,
+    _validate_shared_pool_execution,
+    _validated_shared_rank_device_map,
+    _vllm_topology,
     _request_computed_tokens,
     _request_priority,
     _request_token_capacity,
@@ -13,6 +16,15 @@ from kapsl_vllm_connector.connector import (
 
 
 class ConnectorHelperTests(unittest.TestCase):
+    def test_shared_pool_rejects_vllm_sleep_mode(self) -> None:
+        config = SimpleNamespace(
+            parallel_config=SimpleNamespace(),
+            model_config=SimpleNamespace(enable_sleep_mode=True),
+        )
+
+        with self.assertRaisesRegex(ValueError, "sleep mode"):
+            _validate_shared_pool_execution(config)
+
     def test_capacity_includes_prompt_and_generation_ceiling(self) -> None:
         request = SimpleNamespace(
             prompt_token_ids=[1, 2, 3],
@@ -79,6 +91,71 @@ class ConnectorHelperTests(unittest.TestCase):
                 },
             ],
         )
+
+    def test_shared_capacity_uses_the_exact_packed_backing_stride(self) -> None:
+        spec = SimpleNamespace(
+            block_size=16,
+            page_size_bytes=1024,
+            num_kv_heads=4,
+            head_size=64,
+            head_size_v=64,
+            dtype="float16",
+            sliding_window=None,
+            attention_chunk_size=None,
+        )
+        config = SimpleNamespace(
+            num_blocks=32,
+            kv_cache_layout="BHLNC",
+            kv_cache_tensors=[
+                SimpleNamespace(
+                    size=32 * 8192,
+                    layers=["model.layers.0.attn", "model.layers.1.attn"],
+                )
+            ],
+            kv_cache_groups=[
+                SimpleNamespace(
+                    layer_names=["model.layers.0.attn", "model.layers.1.attn"],
+                    kv_cache_spec=spec,
+                )
+            ],
+        )
+
+        groups = _vllm_capacity_groups(
+            config,
+            [{"kind": "cuda", "device_id": 0}],
+            shared_pool=True,
+        )
+        self.assertEqual(groups[0]["bytes_per_allocation"], 8192)
+        topology = _vllm_topology(config, "sha256:model")
+        self.assertEqual(
+            topology["cache_groups"][0]["geometry"]["layout"]["layout_id"],
+            "vllm:BHLNC",
+        )
+        self.assertEqual(len(topology["cache_groups"][0]["layers"]), 2)
+
+    def test_shared_rank_map_must_cover_exact_tensor_parallel_domains(self) -> None:
+        config = SimpleNamespace(
+            kv_connector_extra_config={"kapsl_rank_device_map": {"0": 0, "1": 2}}
+        )
+        domains = [
+            {"kind": "cuda", "device_id": 0},
+            {"kind": "cuda", "device_id": 2},
+        ]
+
+        self.assertEqual(
+            _validated_shared_rank_device_map(config, domains, 2),
+            {0: 0, 1: 2},
+        )
+        with self.assertRaisesRegex(ValueError, "exactly match"):
+            _validated_shared_rank_device_map(
+                SimpleNamespace(
+                    kv_connector_extra_config={
+                        "kapsl_rank_device_map": {"0": 0, "1": 1}
+                    }
+                ),
+                domains,
+                2,
+            )
 
     def test_heartbeat_failure_is_a_fail_closed_scheduler_error(self) -> None:
         connector = KapslConnectorV1.__new__(KapslConnectorV1)

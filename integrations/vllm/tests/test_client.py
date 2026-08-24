@@ -9,7 +9,12 @@ from pathlib import Path
 from typing import Any
 
 from kapsl_vllm_connector.client import KapslKvControlClient, KapslKvControlError
-from kapsl_vllm_connector.contract import ABI_VERSION, make_reserve_request, opaque_registration
+from kapsl_vllm_connector.contract import (
+    ABI_VERSION,
+    make_reserve_request,
+    opaque_registration,
+    shared_pool_registration,
+)
 
 CAPACITY_GROUPS = [
     {
@@ -21,6 +26,33 @@ CAPACITY_GROUPS = [
         "max_allocations": 1024,
     }
 ]
+
+TOPOLOGY = {
+    "abi_version": dict(ABI_VERSION),
+    "model_fingerprint": "sha256:model",
+    "shard": {
+        "tensor_parallel_rank": 0,
+        "tensor_parallel_world_size": 1,
+        "pipeline_parallel_rank": 0,
+        "pipeline_parallel_world_size": 1,
+    },
+    "cache_groups": [
+        {
+            "group_id": "vllm.group.0",
+            "layers": [{"index": 0, "name": "layer.0"}],
+            "geometry": {
+                "kind": "paged_attention",
+                "block_size_tokens": 16,
+                "kv_heads": 8,
+                "key_head_dim": 128,
+                "value_head_dim": 128,
+                "element_type": "f16",
+                "layout": {"kind": "backend_native", "layout_id": "vllm:packed"},
+            },
+            "policy": {"kind": "full_attention"},
+        }
+    ],
+}
 
 
 class FakeCoordinator:
@@ -73,13 +105,33 @@ class FakeCoordinator:
                 },
             }
         if request["operation"] == "register":
+            shared = (
+                request["registration"]["capabilities"]["tier"] == "shared_pool"
+            )
             return {
                 **base,
                 "result": "registered",
                 "receipt": {
                     "participant_id": request["registration"]["participant_id"],
                     "participant_epoch": 1,
-                    "shared_pools": [],
+                    "shared_pools": (
+                        [
+                            {
+                                "binding_id": "binding-0",
+                                "capacity_pool_id": "vllm.pool.0",
+                                "generation": 1,
+                                "group_ids": ["vllm.group.0"],
+                                "memory_domain": {"kind": "cuda", "device_id": 0},
+                                "block_count": 1024,
+                                "bytes_per_block": 1_048_576,
+                                "allocation_mode": "participant_managed",
+                                "transport": {"kind": "cuda_ipc"},
+                                "descriptor": "ipc-handle",
+                            }
+                        ]
+                        if shared
+                        else []
+                    ),
                 },
             }
         if request["operation"] == "reserve":
@@ -164,6 +216,29 @@ class ClientTests(unittest.TestCase):
 
             self.assertEqual(caught.exception.kind, "capacity_exhausted")
             self.assertIn("budget exhausted", str(caught.exception))
+
+    def test_shared_registration_requires_and_accepts_physical_bindings(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            socket_path = Path(directory) / "kv.sock"
+            server = FakeCoordinator(socket_path, 1)
+            server.start()
+            client = KapslKvControlClient(
+                f"unix://{socket_path}",
+                "vllm-shared",
+                request_id_factory=lambda: "rpc-shared",
+            )
+
+            receipt = client.register(
+                shared_pool_registration(
+                    "vllm-shared", "sha256:model", CAPACITY_GROUPS, TOPOLOGY
+                )
+            )
+            server.join()
+
+            self.assertEqual(
+                receipt["shared_pools"][0]["allocation_mode"],
+                "participant_managed",
+            )
 
 
 def _read_line(connection: socket.socket) -> bytes:

@@ -66,7 +66,7 @@ The `kapsl-kv-abi` crate owns the backend-neutral semantic contract:
 - transport-neutral block handles;
 - newline-delimited JSON control envelopes for out-of-process connectors.
 
-ABI 1.1 adds the first out-of-process `shared_pool` ownership boundary:
+ABI 1.1 added the first out-of-process `shared_pool` ownership boundary:
 
 - registration returns an epoch-bound receipt containing one isolated physical
   binding for every logical pool and memory domain;
@@ -78,6 +78,14 @@ ABI 1.1 adds the first out-of-process `shared_pool` ownership boundary:
   allocator;
 - transport-specific provisioners retain the actual allocation and must zero
   each assigned block before publishing its handle.
+
+ABI 1.2 adds explicit block-selection ownership. `runtime_leased` pools publish
+generation-checked physical indices and require a synchronized release fence.
+`participant_managed` pools let a backend such as vLLM keep its proven native
+block allocator: Kapsl owns and exports the backing allocation and grants
+aggregate capacity, but lease block arrays remain empty because backend block
+tables select the indices. This avoids pretending that two independent block
+allocators can safely choose identical IDs.
 
 The runtime does not export its process-wide CUDA allocator backing: doing so
 would grant one external worker access to allocations belonging to other
@@ -108,25 +116,26 @@ the main product advantage.
 
 ### vLLM
 
-`integrations/vllm` is an out-of-tree `KVConnectorBase_V1` package. Its first
-phase registers as `kv_connected` with opaque metadata and obtains a Kapsl
-capacity lease from vLLM's one-shot `on_new_request` hook. It reports no external
-prefix hits and performs no KV copies, so it cannot accidentally skip compute
-for data it did not restore.
+`integrations/vllm` is an out-of-tree `KVConnectorBase_V1` package. Its default
+mode registers as `kv_connected` with opaque metadata and obtains a Kapsl
+capacity lease from vLLM's one-shot `on_new_request` hook. It reports no
+external prefix hits and performs no KV copies, so it cannot accidentally skip
+compute for data it did not restore.
 
 Kapsl Runtime exposes the matching local Unix control listener with
 `--kv-control-socket`. Participant reservations enter the same process-wide
 memory authority as built-in backends, and expiring leases are reclaimed when
-their connector heartbeat stops. The socket is an admission/lifecycle control
-plane; it does not turn opaque backend memory into a shared pool.
+their connector heartbeat stops.
 
-The ABI and runtime now contain the isolated pool-receipt, block-allocation,
-generation, synchronized-release, and expiry-quarantine state machine. The
-production listener still has no CUDA IPC/NIXL provisioner, and the vLLM
-package remains opaque. The next vLLM phase is a small worker allocation hook
-that imports the receipt's bindings and makes vLLM's KV tensors alias them.
-Only after attention consumes those runtime-owned blocks should it advertise
-`shared_pool` and `direct_attention_access`.
+On Linux CUDA builds, the runtime listener also installs an isolated CUDA IPC
+provisioner. The connector's opt-in `shared_pool` mode registers structured
+topology, imports the receipt's device binding in each worker, and substitutes
+that backing at vLLM's packed raw-allocation seam before attention tensors are
+created. Attention therefore reads and writes Kapsl-owned memory directly.
+vLLM remains responsible for its native block IDs, while Kapsl owns physical
+capacity and request-level admission. The compatibility hook is deliberately
+narrow and signature-checked because it tracks an experimental upstream API.
+Prefix restore/offload and pipeline-parallel partitions remain later phases.
 
 ### TGI and other engines
 

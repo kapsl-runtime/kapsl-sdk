@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
 /// Version implemented by this crate.
-pub const KAPSL_KV_ABI_VERSION: KvAbiVersion = KvAbiVersion::new(1, 1);
+pub const KAPSL_KV_ABI_VERSION: KvAbiVersion = KvAbiVersion::new(1, 2);
 
 /// Semantic version of the KV participant contract.
 ///
@@ -91,6 +91,10 @@ pub enum KvFeature {
     AsyncTransfer,
     LayerwiseTransfer,
     DirectAttentionAccess,
+    /// The participant suballocates logical blocks inside a runtime-owned
+    /// physical pool. Kapsl still owns the allocation and aggregate admission,
+    /// but lease responses do not prescribe backend block-table indices.
+    ParticipantBlockSelection,
 }
 
 /// Data-plane mechanism used to identify or transfer KV blocks.
@@ -195,6 +199,16 @@ impl KvBackendCapabilities {
                 host: KAPSL_KV_ABI_VERSION,
                 participant: self.abi_version,
             });
+        }
+
+        if self
+            .features
+            .contains(&KvFeature::ParticipantBlockSelection)
+            && self.tier != KvIntegrationTier::SharedPool
+        {
+            return Err(KvContractError::invalid_capabilities(
+                "participant block selection is valid only for shared-pool backends",
+            ));
         }
 
         match self.tier {
@@ -982,6 +996,18 @@ impl KvCapacityModel {
 /// The transport descriptor is opaque to the control plane. For CUDA IPC it
 /// is the base64-encoded `CUipcMemHandle`; it must refer only to this
 /// participant's allocation, never to a process-wide allocator backing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KvSharedPoolAllocationMode {
+    /// Kapsl selects physical indices and returns generation-checked block
+    /// handles in each lease.
+    #[default]
+    RuntimeLeased,
+    /// The participant selects physical indices using its native allocator;
+    /// Kapsl leases aggregate capacity and returns no physical block handles.
+    ParticipantManaged,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KvSharedPoolDescriptor {
     pub binding_id: String,
@@ -991,6 +1017,8 @@ pub struct KvSharedPoolDescriptor {
     pub memory_domain: KvMemoryDomain,
     pub block_count: u64,
     pub bytes_per_block: u64,
+    #[serde(default)]
+    pub allocation_mode: KvSharedPoolAllocationMode,
     pub transport: KvTransport,
     pub descriptor: String,
 }
@@ -1084,6 +1112,10 @@ impl KvRegistrationReceipt {
 
         let mut binding_ids = BTreeSet::new();
         let mut pool_block_counts = BTreeMap::<&str, u64>::new();
+        let participant_managed = registration
+            .capabilities
+            .features
+            .contains(&KvFeature::ParticipantBlockSelection);
         for binding in &self.shared_pools {
             binding.validate()?;
             if !binding_ids.insert(binding.binding_id.as_str()) {
@@ -1098,6 +1130,14 @@ impl KvRegistrationReceipt {
             {
                 return Err(KvContractError::invalid_capabilities(format!(
                     "shared-pool binding '{}' uses an unadvertised transport",
+                    binding.binding_id
+                )));
+            }
+            if (binding.allocation_mode == KvSharedPoolAllocationMode::ParticipantManaged)
+                != participant_managed
+            {
+                return Err(KvContractError::invalid_capabilities(format!(
+                    "shared-pool binding '{}' allocation mode does not match participant block-selection capabilities",
                     binding.binding_id
                 )));
             }
@@ -1897,6 +1937,7 @@ mod tests {
                 memory_domain: KvMemoryDomain::Cuda { device_id: 0 },
                 block_count: 64,
                 bytes_per_block: 4096,
+                allocation_mode: KvSharedPoolAllocationMode::RuntimeLeased,
                 transport: KvTransport::CudaIpc,
                 descriptor: "base64-cuda-ipc-handle".to_string(),
             }],
@@ -1911,6 +1952,22 @@ mod tests {
             oversized.validate_for(&registration),
             Err(KvContractError::InvalidCapabilities { .. })
         ));
+
+        let mut participant_managed_registration = registration.clone();
+        participant_managed_registration
+            .capabilities
+            .features
+            .insert(KvFeature::ParticipantBlockSelection);
+        assert!(matches!(
+            receipt.validate_for(&participant_managed_registration),
+            Err(KvContractError::InvalidCapabilities { .. })
+        ));
+        let mut participant_managed_receipt = receipt.clone();
+        participant_managed_receipt.shared_pools[0].allocation_mode =
+            KvSharedPoolAllocationMode::ParticipantManaged;
+        participant_managed_receipt
+            .validate_for(&participant_managed_registration)
+            .expect("participant-managed mode matches its advertised feature");
 
         let mut missing = receipt;
         missing.shared_pools.clear();

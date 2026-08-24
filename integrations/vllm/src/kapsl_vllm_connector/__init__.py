@@ -2,7 +2,7 @@
 
 from .client import KapslKvControlClient, KapslKvControlError
 from .connector import KapslConnectorV1
-from .contract import ABI_VERSION, opaque_registration
+from .contract import ABI_VERSION, opaque_registration, shared_pool_registration
 
 __all__ = [
     "ABI_VERSION",
@@ -10,4 +10,5 @@ __all__ = [
     "KapslKvControlClient",
     "KapslKvControlError",
     "opaque_registration",
+    "shared_pool_registration",
 ]

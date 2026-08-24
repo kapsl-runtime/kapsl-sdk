@@ -9,14 +9,25 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from .client import KapslKvControlClient, KapslKvControlError
-from .contract import make_reserve_request, opaque_registration
+from .contract import (
+    ABI_VERSION,
+    make_reserve_request,
+    opaque_registration,
+    shared_pool_registration,
+)
+from .shared_pool import (
+    SharedPoolImportError,
+    VllmSharedPoolHook,
+    select_cuda_binding,
+    vllm_backing_geometry,
+)
 
 if TYPE_CHECKING:
     import torch
     from vllm.forward_context import ForwardContext
     from vllm.v1.attention.backend import AttentionMetadata
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
-    from vllm.v1.core.kv_cache_interface import KVCacheConfig
+    from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.request import Request
 
@@ -54,7 +65,7 @@ class KapslConnectorMetadata(KVConnectorMetadata):
 
 
 class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
-    """KV-connected, opaque vLLM participant.
+    """KV-connected vLLM participant with optional Kapsl-owned backing.
 
     This connector lets Kapsl admit and lease logical KV capacity before vLLM
     allocates request blocks. It intentionally reports zero external prefix
@@ -99,10 +110,62 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
         role_name = getattr(role, "name", str(role)).lower()
         self._is_scheduler = role_name == "scheduler"
         engine_id = str(getattr(self._kv_transfer_config, "engine_id", "engine"))
-        self._participant_id = f"{participant_base}:{engine_id}:{role_name}"
+        self._mode = str(
+            _extra(self._kv_transfer_config, "kapsl_kv_mode", "opaque")
+        ).strip().lower()
+        if self._mode not in {"opaque", "shared_pool"}:
+            raise ValueError("kapsl_kv_mode must be 'opaque' or 'shared_pool'")
+        parallel_config = getattr(vllm_config, "parallel_config", None)
+        tensor_parallel_size = int(
+            getattr(parallel_config, "tensor_parallel_size", 1) or 1
+        )
+        if self._mode == "shared_pool":
+            _validate_shared_pool_execution(vllm_config)
+        self._participant_id = (
+            f"{participant_base}:{engine_id}"
+            if self._mode == "shared_pool"
+            else f"{participant_base}:{engine_id}:{role_name}"
+        )
         memory_domains = _required_memory_domains(self._kv_transfer_config)
-        self._capacity_groups = _vllm_capacity_groups(kv_cache_config, memory_domains)
+        if self._mode == "shared_pool" and any(
+            domain.get("kind") != "cuda" for domain in memory_domains
+        ):
+            raise ValueError("vLLM shared_pool currently supports CUDA domains only")
+        rank_device_map = (
+            _validated_shared_rank_device_map(
+                self._kv_transfer_config,
+                memory_domains,
+                tensor_parallel_size,
+            )
+            if self._mode == "shared_pool"
+            else None
+        )
+        self._capacity_groups = _vllm_capacity_groups(
+            kv_cache_config,
+            memory_domains,
+            shared_pool=self._mode == "shared_pool",
+        )
         self._group_ids = [group["group_id"] for group in self._capacity_groups]
+        registration = (
+            shared_pool_registration(
+                self._participant_id,
+                model_fingerprint,
+                self._capacity_groups,
+                _vllm_topology(
+                    kv_cache_config,
+                    model_fingerprint,
+                    tensor_parallel_world_size=tensor_parallel_size,
+                ),
+                backend="vllm",
+            )
+            if self._mode == "shared_pool"
+            else opaque_registration(
+                self._participant_id,
+                model_fingerprint,
+                self._capacity_groups,
+                backend="vllm",
+            )
+        )
         timeout_ms = int(_extra(self._kv_transfer_config, "kapsl_timeout_ms", 2000))
         self._lease_ttl_ms = int(
             _extra(self._kv_transfer_config, "kapsl_lease_ttl_ms", 30_000)
@@ -115,24 +178,30 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
         self._control_failure: KapslKvControlError | None = None
         self._heartbeat_stop = threading.Event()
         self._heartbeat_thread: threading.Thread | None = None
-        if self._is_scheduler:
+        self._shared_pool_hook: VllmSharedPoolHook | None = None
+        if self._is_scheduler or self._mode == "shared_pool":
             self._client = KapslKvControlClient(
                 endpoint,
                 self._participant_id,
                 timeout_seconds=timeout_ms / 1000.0,
             )
-            self._client.register(
-                opaque_registration(
-                    self._participant_id,
-                    model_fingerprint,
-                    self._capacity_groups,
-                    backend="vllm",
+            receipt = self._client.register(registration)
+            if self._mode == "shared_pool" and not self._is_scheduler:
+                binding = select_cuda_binding(
+                    receipt,
+                    kv_cache_config,
+                    rank_device_map,
                 )
-            )
+                self._shared_pool_hook = VllmSharedPoolHook(
+                    binding, kv_cache_config
+                )
             logger.info(
-                "registered Kapsl KV participant %s as kv_connected/opaque",
+                "registered Kapsl KV participant %s in %s mode (%s role)",
                 self._participant_id,
+                self._mode,
+                role_name,
             )
+        if self._is_scheduler:
             self._heartbeat_thread = threading.Thread(
                 target=self._heartbeat_loop,
                 name=f"kapsl-kv-heartbeat-{engine_id}",
@@ -251,7 +320,24 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
     def wait_for_save(self) -> None:
         return None
 
+    def register_kv_caches(self, kv_caches: dict[str, "torch.Tensor"]) -> None:
+        del kv_caches
+        if (
+            self._mode == "shared_pool"
+            and not self._is_scheduler
+            and (
+                self._shared_pool_hook is None
+                or not self._shared_pool_hook.used
+            )
+        ):
+            raise SharedPoolImportError(
+                "vLLM registered KV tensors without consuming the Kapsl CUDA IPC pool"
+            )
+
     def shutdown(self) -> None:
+        if self._shared_pool_hook is not None:
+            self._shared_pool_hook.shutdown()
+            self._shared_pool_hook = None
         if not self._is_scheduler:
             return
         self._heartbeat_stop.set()
@@ -317,6 +403,32 @@ def _required_extra(config: Any, key: str) -> str:
     return value
 
 
+def _validate_shared_pool_execution(vllm_config: Any) -> None:
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    unsupported_parallelism = {
+        name: int(getattr(parallel_config, name, 1) or 1)
+        for name in (
+            "pipeline_parallel_size",
+            "data_parallel_size",
+            "decode_context_parallel_size",
+        )
+    }
+    enabled = [
+        name for name, size in unsupported_parallelism.items() if size != 1
+    ]
+    if enabled:
+        raise ValueError(
+            "vLLM shared_pool does not yet support " + ", ".join(enabled)
+        )
+
+    model_config = getattr(vllm_config, "model_config", None)
+    if bool(getattr(model_config, "enable_sleep_mode", False)):
+        raise ValueError(
+            "vLLM shared_pool does not yet support sleep mode because the "
+            "Kapsl-owned CUDA allocation must remain exported"
+        )
+
+
 def _request_id(request: Any) -> str:
     value = str(getattr(request, "request_id", "")).strip()
     if not value:
@@ -364,6 +476,8 @@ def _required_memory_domains(config: Any) -> list[dict[str, Any]]:
 def _vllm_capacity_groups(
     kv_cache_config: Any,
     memory_domains: Sequence[Mapping[str, Any]],
+    *,
+    shared_pool: bool = False,
 ) -> list[dict[str, Any]]:
     """Extract byte-accounting hints without exposing vLLM block handles."""
 
@@ -394,10 +508,16 @@ def _vllm_capacity_groups(
             raise ValueError(f"vLLM KV cache group {index} has invalid page accounting")
         group_shapes.append((block_size, group_bytes))
 
-    # vLLM HMA groups alias one backing block pool; the allocator uses the
-    # largest group as the physical block stride. A shared pool ID tells Kapsl
-    # to charge the maximum reservation rather than summing every group.
-    pool_stride = max(group_bytes for _, group_bytes in group_shapes)
+    # Modern packed layouts publish the exact shared allocation size. Opaque
+    # compatibility keeps the page-derived fallback for older vLLM releases.
+    if shared_pool:
+        _, configured_blocks, pool_stride = vllm_backing_geometry(kv_cache_config)
+        if configured_blocks != max_allocations:
+            raise AssertionError("vLLM backing geometry changed during extraction")
+    else:
+        # vLLM HMA groups alias one backing block pool; a shared pool ID tells
+        # Kapsl to charge the maximum reservation rather than summing groups.
+        pool_stride = max(group_bytes for _, group_bytes in group_shapes)
     capacity_groups: list[dict[str, Any]] = []
     for index, (block_size, _) in enumerate(group_shapes):
         capacity_groups.append(
@@ -411,3 +531,164 @@ def _vllm_capacity_groups(
             }
         )
     return capacity_groups
+
+
+def _vllm_topology(
+    kv_cache_config: Any,
+    model_fingerprint: str,
+    *,
+    tensor_parallel_world_size: int = 1,
+) -> dict[str, Any]:
+    """Translate supported vLLM attention specs into ABI topology metadata."""
+
+    layout_id = str(
+        getattr(kv_cache_config, "kv_cache_layout", None) or "packed"
+    ).strip()
+    cache_groups: list[dict[str, Any]] = []
+    next_layer_index = 0
+    for group_index, group in enumerate(kv_cache_config.kv_cache_groups):
+        layer_names = list(getattr(group, "layer_names", None) or [])
+        if not layer_names:
+            raise ValueError(f"vLLM KV cache group {group_index} has no layers")
+        spec = getattr(group, "kv_cache_spec", None)
+        per_layer_specs = getattr(spec, "kv_cache_specs", None)
+        if isinstance(per_layer_specs, Mapping):
+            spec = per_layer_specs.get(layer_names[0])
+        if spec is None:
+            raise ValueError(f"vLLM KV cache group {group_index} has no usable spec")
+
+        block_size = int(getattr(spec, "block_size", 0) or 0)
+        kv_heads = int(
+            getattr(spec, "num_kv_heads", None)
+            or getattr(spec, "num_heads", 0)
+            or 0
+        )
+        key_head_dim = int(getattr(spec, "head_size", 0) or 0)
+        value_head_dim = int(
+            getattr(spec, "head_size_v", None) or key_head_dim
+        )
+        if min(block_size, kv_heads, key_head_dim, value_head_dim) <= 0:
+            raise ValueError(
+                f"vLLM KV cache group {group_index} is not a supported attention spec"
+            )
+        attention_chunk = getattr(spec, "attention_chunk_size", None)
+        if attention_chunk is not None:
+            raise ValueError(
+                "vLLM shared_pool does not yet support chunked-local attention"
+            )
+        sliding_window = getattr(spec, "sliding_window", None)
+        policy = (
+            {"kind": "sliding_window", "window_tokens": int(sliding_window)}
+            if sliding_window is not None
+            else {"kind": "full_attention"}
+        )
+        layers = [
+            {"index": next_layer_index + offset, "name": str(layer_name)}
+            for offset, layer_name in enumerate(layer_names)
+        ]
+        next_layer_index += len(layers)
+        cache_groups.append(
+            {
+                "group_id": f"vllm.group.{group_index}",
+                "layers": layers,
+                "geometry": {
+                    "kind": "paged_attention",
+                    "block_size_tokens": block_size,
+                    "kv_heads": kv_heads,
+                    "key_head_dim": key_head_dim,
+                    "value_head_dim": value_head_dim,
+                    "element_type": _element_type(getattr(spec, "dtype", None)),
+                    "layout": {
+                        "kind": "backend_native",
+                        "layout_id": f"vllm:{layout_id}",
+                    },
+                },
+                "policy": policy,
+            }
+        )
+    return {
+        "abi_version": dict(ABI_VERSION),
+        "model_fingerprint": model_fingerprint,
+        # One registration describes the collective vLLM engine. Physical TP
+        # replicas are enumerated by capacity_model.memory_domains.
+        "shard": {
+            "tensor_parallel_rank": 0,
+            "tensor_parallel_world_size": tensor_parallel_world_size,
+            "pipeline_parallel_rank": 0,
+            "pipeline_parallel_world_size": 1,
+        },
+        "cache_groups": cache_groups,
+    }
+
+
+def _element_type(dtype: Any) -> str | dict[str, Any]:
+    name = str(dtype).lower().removeprefix("torch.")
+    known = {
+        "float16": "f16",
+        "half": "f16",
+        "bfloat16": "bf16",
+        "float32": "f32",
+        "float": "f32",
+        "int8": "i8",
+        "float8_e4m3fn": "fp8_e4m3",
+        "float8_e4m3fnuz": "fp8_e4m3",
+    }
+    if name in known:
+        return known[name]
+    if not name or name == "none":
+        raise ValueError("vLLM shared_pool KV dtype is unavailable")
+    return {"custom": {"name": name}}
+
+
+def _rank_device_map(config: Any) -> dict[int, int] | None:
+    raw_map = _extra(config, "kapsl_rank_device_map", None)
+    if raw_map is None:
+        return None
+    if not isinstance(raw_map, Mapping):
+        raise ValueError("kapsl_rank_device_map must be an object")
+    result: dict[int, int] = {}
+    for raw_rank, raw_device_id in raw_map.items():
+        try:
+            rank = int(raw_rank)
+            device_id = int(raw_device_id)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "kapsl_rank_device_map keys and values must be integers"
+            ) from error
+        if rank < 0 or device_id < 0:
+            raise ValueError("kapsl_rank_device_map values cannot be negative")
+        result[rank] = device_id
+    if not result:
+        raise ValueError("kapsl_rank_device_map must not be empty")
+    return result
+
+
+def _validated_shared_rank_device_map(
+    config: Any,
+    memory_domains: Sequence[Mapping[str, Any]],
+    tensor_parallel_size: int,
+) -> dict[int, int] | None:
+    if tensor_parallel_size <= 0:
+        raise ValueError("vLLM tensor_parallel_size must be positive")
+    device_ids = [int(domain.get("device_id", -1)) for domain in memory_domains]
+    if len(device_ids) != tensor_parallel_size or len(set(device_ids)) != len(device_ids):
+        raise ValueError(
+            "vLLM shared_pool requires exactly one distinct CUDA domain per tensor-parallel rank"
+        )
+    rank_device_map = _rank_device_map(config)
+    if rank_device_map is None:
+        if tensor_parallel_size == 1:
+            return None
+        raise ValueError(
+            "tensor-parallel shared_pool requires kapsl_rank_device_map"
+        )
+    expected_ranks = set(range(tensor_parallel_size))
+    if set(rank_device_map) != expected_ranks:
+        raise ValueError(
+            "kapsl_rank_device_map must contain every tensor-parallel global rank exactly once"
+        )
+    if set(rank_device_map.values()) != set(device_ids):
+        raise ValueError(
+            "kapsl_rank_device_map devices must exactly match kapsl_memory_domains"
+        )
+    return rank_device_map

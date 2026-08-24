@@ -10,7 +10,7 @@ from copy import deepcopy
 from collections.abc import Sequence
 from typing import Any, Mapping
 
-ABI_VERSION: dict[str, int] = {"major": 1, "minor": 1}
+ABI_VERSION: dict[str, int] = {"major": 1, "minor": 2}
 
 
 class ContractValidationError(ValueError):
@@ -44,6 +44,23 @@ def opaque_capabilities() -> dict[str, Any]:
     }
 
 
+def shared_pool_capabilities() -> dict[str, Any]:
+    """Kapsl-owned CUDA pool with block selection left to vLLM."""
+
+    return {
+        "abi_version": abi_version(),
+        "tier": "shared_pool",
+        "metadata_mode": "structured",
+        "ownership": "kapsl_runtime",
+        "features": [
+            "capacity_leasing",
+            "direct_attention_access",
+            "participant_block_selection",
+        ],
+        "transports": [{"kind": "cuda_ipc"}],
+    }
+
+
 def opaque_registration(
     participant_id: str,
     model_fingerprint: str,
@@ -63,25 +80,69 @@ def opaque_registration(
     return registration
 
 
+def shared_pool_registration(
+    participant_id: str,
+    model_fingerprint: str,
+    capacity_groups: Sequence[Mapping[str, Any]],
+    topology: Mapping[str, Any],
+    *,
+    backend: str = "vllm",
+) -> dict[str, Any]:
+    capabilities = shared_pool_capabilities()
+    if len(capacity_groups) > 1:
+        capabilities["features"].append("multiple_cache_groups")
+    registration = {
+        "participant_id": _nonempty(participant_id, "participant_id"),
+        "backend": _nonempty(backend, "backend"),
+        "model_fingerprint": _nonempty(model_fingerprint, "model_fingerprint"),
+        "capabilities": capabilities,
+        "capacity_model": {"groups": [dict(group) for group in capacity_groups]},
+        "topology": deepcopy(dict(topology)),
+    }
+    validate_registration(registration)
+    return registration
+
+
 def validate_registration(registration: Mapping[str, Any]) -> None:
     _nonempty(registration.get("participant_id"), "participant_id")
     _nonempty(registration.get("backend"), "backend")
-    _nonempty(registration.get("model_fingerprint"), "model_fingerprint")
+    model_fingerprint = _nonempty(
+        registration.get("model_fingerprint"), "model_fingerprint"
+    )
     capabilities = _mapping(registration.get("capabilities"), "capabilities")
     if not accepts_version(_mapping(capabilities.get("abi_version"), "abi_version")):
         raise ContractValidationError("unsupported capability ABI version")
-    if capabilities.get("tier") != "kv_connected":
-        raise ContractValidationError("vLLM connector must advertise kv_connected")
-    if capabilities.get("metadata_mode") != "opaque":
-        raise ContractValidationError("vLLM connector must advertise opaque metadata")
-    if capabilities.get("ownership") != "backend":
-        raise ContractValidationError("opaque vLLM KV must remain backend owned")
-    if "capacity_leasing" not in capabilities.get("features", []):
+    features = capabilities.get("features")
+    transports = capabilities.get("transports")
+    if not isinstance(features, list) or not isinstance(transports, list):
+        raise ContractValidationError("capability features and transports must be lists")
+    if "capacity_leasing" not in features:
         raise ContractValidationError("capacity_leasing feature is required")
-    if {"kind": "backend_opaque"} not in capabilities.get("transports", []):
-        raise ContractValidationError("backend_opaque transport is required")
-    if "topology" in registration:
-        raise ContractValidationError("opaque registrations cannot include a topology")
+    tier = capabilities.get("tier")
+    if tier == "kv_connected":
+        if capabilities.get("metadata_mode") != "opaque":
+            raise ContractValidationError("kv_connected vLLM must use opaque metadata")
+        if capabilities.get("ownership") != "backend":
+            raise ContractValidationError("opaque vLLM KV must remain backend owned")
+        if {"kind": "backend_opaque"} not in transports:
+            raise ContractValidationError("backend_opaque transport is required")
+        if "topology" in registration:
+            raise ContractValidationError("opaque registrations cannot include a topology")
+    elif tier == "shared_pool":
+        if capabilities.get("metadata_mode") != "structured":
+            raise ContractValidationError("shared_pool vLLM requires structured metadata")
+        if capabilities.get("ownership") != "kapsl_runtime":
+            raise ContractValidationError("shared_pool KV must be Kapsl owned")
+        required = {"direct_attention_access", "participant_block_selection"}
+        if not required.issubset(features):
+            raise ContractValidationError(
+                "shared_pool requires direct attention and participant block selection"
+            )
+        if {"kind": "cuda_ipc"} not in transports:
+            raise ContractValidationError("shared_pool vLLM requires cuda_ipc")
+    else:
+        raise ContractValidationError("vLLM connector has an unsupported KV tier")
+
     capacity_model = _mapping(registration.get("capacity_model"), "capacity_model")
     groups = capacity_model.get("groups")
     if not isinstance(groups, list) or not groups:
@@ -134,6 +195,97 @@ def validate_registration(registration: Mapping[str, Any]) -> None:
             )
         if group.get("max_allocations") is not None:
             _positive_int(group["max_allocations"], "max_allocations")
+        elif tier == "shared_pool":
+            raise ContractValidationError("shared_pool groups require max_allocations")
+
+    if tier == "shared_pool":
+        topology = _mapping(registration.get("topology"), "topology")
+        _validate_topology(topology, model_fingerprint, seen, capabilities)
+
+
+def _validate_topology(
+    topology: Mapping[str, Any],
+    model_fingerprint: str,
+    capacity_group_ids: set[str],
+    capabilities: Mapping[str, Any],
+) -> None:
+    topology_version = _mapping(topology.get("abi_version"), "topology abi_version")
+    if not accepts_version(topology_version):
+        raise ContractValidationError("unsupported topology ABI version")
+    if dict(topology_version) != dict(
+        _mapping(capabilities.get("abi_version"), "capability ABI version")
+    ):
+        raise ContractValidationError("topology and capability ABI versions must match")
+    if topology.get("model_fingerprint") != model_fingerprint:
+        raise ContractValidationError("topology model fingerprint must match registration")
+    shard = _mapping(topology.get("shard", {}), "topology shard")
+    tp_world = _positive_int(
+        shard.get("tensor_parallel_world_size", 1), "tensor_parallel_world_size"
+    )
+    pp_world = _positive_int(
+        shard.get("pipeline_parallel_world_size", 1), "pipeline_parallel_world_size"
+    )
+    tp_rank = _nonnegative_int(
+        shard.get("tensor_parallel_rank", 0), "tensor_parallel_rank"
+    )
+    pp_rank = _nonnegative_int(
+        shard.get("pipeline_parallel_rank", 0), "pipeline_parallel_rank"
+    )
+    if tp_rank >= tp_world or pp_rank >= pp_world:
+        raise ContractValidationError("topology shard rank is outside its world size")
+
+    cache_groups = topology.get("cache_groups")
+    if not isinstance(cache_groups, list) or not cache_groups:
+        raise ContractValidationError("topology cache_groups must be non-empty")
+    if len(cache_groups) > 1 and "multiple_cache_groups" not in capabilities.get(
+        "features", []
+    ):
+        raise ContractValidationError("multiple topology groups require a capability")
+    topology_ids: set[str] = set()
+    for raw_group in cache_groups:
+        group = _mapping(raw_group, "topology cache group")
+        group_id = _nonempty(group.get("group_id"), "topology group_id")
+        if group_id in topology_ids:
+            raise ContractValidationError("topology cache group IDs must be unique")
+        topology_ids.add(group_id)
+        layers = group.get("layers")
+        if not isinstance(layers, list) or not layers:
+            raise ContractValidationError("topology cache group layers must be non-empty")
+        layer_indices: set[int] = set()
+        for raw_layer in layers:
+            layer = _mapping(raw_layer, "topology layer")
+            index = _nonnegative_int(layer.get("index"), "topology layer index")
+            if index in layer_indices:
+                raise ContractValidationError("topology layer indices must be unique")
+            layer_indices.add(index)
+            if layer.get("name") is not None:
+                _nonempty(layer["name"], "topology layer name")
+        geometry = _mapping(group.get("geometry"), "topology geometry")
+        if geometry.get("kind") != "paged_attention":
+            raise ContractValidationError(
+                "initial vLLM shared_pool support requires paged_attention geometry"
+            )
+        for field in (
+            "block_size_tokens",
+            "kv_heads",
+            "key_head_dim",
+            "value_head_dim",
+        ):
+            _positive_int(geometry.get(field), f"topology geometry {field}")
+        element_type = geometry.get("element_type")
+        if not isinstance(element_type, (str, Mapping)):
+            raise ContractValidationError("topology element_type is invalid")
+        layout = _mapping(geometry.get("layout"), "topology layout")
+        _nonempty(layout.get("kind"), "topology layout kind")
+        policy = _mapping(group.get("policy"), "topology policy")
+        if policy.get("kind") not in {"full_attention", "sliding_window"}:
+            raise ContractValidationError("unsupported vLLM cache policy")
+        if policy.get("kind") == "sliding_window":
+            _positive_int(policy.get("window_tokens"), "sliding window tokens")
+    if topology_ids != capacity_group_ids:
+        raise ContractValidationError(
+            "topology and capacity model must describe the same groups"
+        )
 
 
 def make_reserve_request(
@@ -233,6 +385,11 @@ def validate_registration_receipt(
         _positive_int(pool.get("generation"), "generation")
         _positive_int(pool.get("block_count"), "block_count")
         _positive_int(pool.get("bytes_per_block"), "bytes_per_block")
+        if pool.get("allocation_mode", "runtime_leased") not in {
+            "runtime_leased",
+            "participant_managed",
+        }:
+            raise ContractValidationError("unknown shared pool allocation_mode")
         _nonempty(pool.get("descriptor"), "descriptor")
         group_ids = pool.get("group_ids")
         if not isinstance(group_ids, list) or not group_ids:

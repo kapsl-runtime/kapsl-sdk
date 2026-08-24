@@ -5,7 +5,7 @@
   "capabilities": {
     "abi_version": {
       "major": 1,
-      "minor": 1
+      "minor": 2
     },
     "tier": "kv_connected",
     "metadata_mode": "opaque",

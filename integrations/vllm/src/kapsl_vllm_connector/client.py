@@ -66,7 +66,14 @@ class KapslKvControlClient:
                 _as_mapping(response.get("receipt"), "receipt"),
                 self.participant_id,
             )
-            if receipt.get("shared_pools"):
+            tier = _as_mapping(
+                registration.get("capabilities"), "capabilities"
+            ).get("tier")
+            if tier == "shared_pool" and not receipt.get("shared_pools"):
+                raise ContractValidationError(
+                    "shared_pool vLLM registration received no physical bindings"
+                )
+            if tier != "shared_pool" and receipt.get("shared_pools"):
                 raise ContractValidationError(
                     "opaque vLLM registration cannot receive shared-pool bindings"
                 )
