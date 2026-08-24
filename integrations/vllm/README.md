@@ -8,9 +8,11 @@ opt-in Linux CUDA shared-pool mode. Both fail closed unless they can register
 with Kapsl Runtime and obtain a lease before vLLM allocation. A shared-pool
 participant additionally cannot activate until every worker proves that its
 registered KV tensors alias its Kapsl binding and its exact adapter/backend
-profile is allowlisted by the deployment. The profile is declared during
-registration so an unapproved build is rejected before CUDA memory is
-provisioned, then repeated in worker attachment evidence.
+profile is allowlisted by the deployment. The first certifiable profile pins
+vLLM's `FLASH_ATTN` implementation; automatic backend selection is rejected in
+shared mode because it could choose a reader that was never tested. The profile
+is declared during registration so an unapproved build is rejected before CUDA
+memory is provisioned, then repeated in worker attachment evidence.
 
 The default `opaque` mode implements Kapsl's **KV-connected opaque** tier:
 
@@ -82,6 +84,11 @@ To make vLLM consume Kapsl-owned CUDA memory directly, select `shared_pool`:
 }
 ```
 
+The vLLM engine configuration must also select `FLASH_ATTN` explicitly. A
+different backend (including FlashInfer or Triton attention), automatic
+selection, or a per-cache-kind override needs a separate profile and native
+probe before it can use `shared_pool`.
+
 Start Kapsl Runtime with the matching listener and TTL:
 
 ```bash
@@ -89,7 +96,7 @@ kapsl run \
   --kv-control-socket /run/kapsl/kv-control.sock \
   --kv-control-lease-ttl-ms 30000 \
   --kv-shared-pool-profile \
-    'kapsl-vllm-connector,0.4.0,<vllm-version>,vllm-v1-packed-cuda-ipc'
+    'kapsl-vllm-connector,0.5.0,<vllm-version>,vllm-v1-packed-cuda-ipc/flash-attn'
 ```
 
 Create `/run/kapsl` with ownership suitable for the runtime user first. The
@@ -150,3 +157,39 @@ alias/span checks. Production certification additionally requires the
 backend-native CUDA attention probes in
 [`../../docs/backend-kv-conformance.md`](../../docs/backend-kv-conformance.md);
 passing only the host tests is not sufficient reason to allowlist a profile.
+
+## Linux/CUDA certification
+
+Run Kapsl Runtime with the exact profile provisionally allowlisted only inside
+an isolated certification job, then execute:
+
+```bash
+kapsl-vllm-flash-attn-probe \
+  --endpoint unix:///run/kapsl/kv-control.sock \
+  --devices 0,1 \
+  --adapter-build-id sha256:<adapter-wheel-digest> \
+  --backend-build-id sha256:<vllm-wheel-digest> \
+  --runtime-build-id sha256:<runtime-binary-digest> \
+  --report artifacts/vllm-kv-report.json \
+  --allowlist-output artifacts/allowlist-profile.txt
+```
+
+The process launches one worker per listed CUDA ordinal. Every worker imports
+its Kapsl binding through the production allocator hook while the normal
+`torch.zeros` KV path is poisoned. It then runs vLLM's native
+`reshape_and_cache_flash` writer and paged `flash_attn_varlen_func` reader,
+checks per-block guards, compares prefill and two decode steps with a reference,
+mutates Kapsl-owned V storage and requires a causal output change, overwrites a
+reused block, and reads the maximum block index. Rank zero also checks
+pre-attachment activation, lease heartbeat renewal, cancellation, capacity
+exhaustion, live-lease detach rejection, and post-deactivation admission
+rejection. All CUDA work is fenced and all tensor views are destroyed before
+detach.
+
+The report is always retained. `allowlist-profile.txt` is removed before the
+run and recreated only if all six gates pass on every rank. The engine repo's
+opt-in **vLLM Shared-Pool Conformance** workflow builds and hashes the runtime,
+installs an exact vLLM wheel, runs host contract tests, enables synchronous CUDA
+error reporting, executes this probe, and uploads both artifacts. The generated
+tuple is still operator authorization rather than remote attestation; review
+the report and matrix before deploying it.

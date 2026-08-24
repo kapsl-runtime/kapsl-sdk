@@ -55,16 +55,23 @@ remains part of the deployment trust boundary.
 The ordinary SDK suite runs without vLLM or CUDA and checks serialization,
 fail-closed state transitions, topology coverage, and tensor alias/span logic.
 A hardware job must run the backend-specific write/read/lifecycle driver under
-CUDA error checking for every supported matrix entry. Results should retain:
+CUDA error checking for every supported matrix entry. An allowlist artifact
+must be absent unless every gate and every declared rank passes. Results retain:
 
 - the exact four-field profile tuple and backend package/build digest;
 - Kapsl Runtime, GPU, driver, CUDA, and framework versions;
 - dtype, cache geometry, attention implementation, and parallel topology;
 - per-gate pass/fail results and logs.
 
-vLLM's current profile is `vllm-v1-packed-cuda-ipc`: the out-of-tree hook owns
-the allocation seam and startup attachment checks. It must remain experimental
-until its backend-native GPU job passes gates 3–6. llama.cpp needs the same
-tests against an upstream external-buffer hook before the maintained fork can be
-removed. TGI remains `unmanaged_endpoint` until its serving engine offers a
-safe allocator hook and passes this matrix.
+vLLM's first profile is
+`vllm-v1-packed-cuda-ipc/flash-attn`: the out-of-tree hook owns the allocation
+seam and startup attachment checks, and shared mode requires explicit
+`FLASH_ATTN` selection. The `kapsl-vllm-flash-attn-probe` command runs all six
+gates through the real runtime provisioner and vLLM native writer/reader; the
+engine repository provides an opt-in multi-GPU workflow around it. A profile
+remains experimental for a matrix entry until that job emits its report and
+allowlist artifact. FlashInfer, Triton attention, MLA, quantized KV, and other
+layouts require distinct profiles and drivers rather than inheriting this
+result. llama.cpp needs the same tests against an upstream external-buffer hook
+before the maintained fork can be removed. TGI remains `unmanaged_endpoint`
+until its serving engine offers a safe allocator hook and passes this matrix.

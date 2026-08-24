@@ -310,6 +310,7 @@ class CudaIpcBuffer:
         imported = _ManagedImport(
             driver, pointer, allocation_bytes, torch_device_id
         )
+        self._managed_address = imported.address
         with _LIVE_IMPORTS_LOCK:
             _LIVE_IMPORTS[imported.address] = imported
 
@@ -335,6 +336,13 @@ class CudaIpcBuffer:
         # Per-layer views may retain the storage after this base reference is
         # gone. PyTorch invokes the DLPack deleter when the last view dies.
         self.tensor = None
+
+    @property
+    def mapping_open(self) -> bool:
+        """Whether a tensor view still keeps this CUDA IPC mapping alive."""
+
+        with _LIVE_IMPORTS_LOCK:
+            return self._managed_address in _LIVE_IMPORTS
 
 
 class VllmSharedPoolHook:

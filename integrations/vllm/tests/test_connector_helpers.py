@@ -1,10 +1,13 @@
 import unittest
 import threading
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from kapsl_vllm_connector.client import KapslKvControlError
 from kapsl_vllm_connector.connector import (
+    ADAPTER_PROFILE_ID,
     KapslConnectorV1,
+    _vllm_adapter_profile,
     _validate_shared_pool_execution,
     _validated_shared_rank_device_map,
     _vllm_topology,
@@ -45,6 +48,40 @@ class ConnectorHelperTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "sleep mode"):
             _validate_shared_pool_execution(config)
+
+    def test_shared_pool_requires_explicit_flash_attention_profile(self) -> None:
+        base = {
+            "parallel_config": SimpleNamespace(),
+            "model_config": SimpleNamespace(enable_sleep_mode=False),
+        }
+        with self.assertRaisesRegex(ValueError, "explicitly selected FLASH_ATTN"):
+            _validate_shared_pool_execution(SimpleNamespace(**base))
+        with self.assertRaisesRegex(ValueError, "explicitly selected FLASH_ATTN"):
+            _validate_shared_pool_execution(
+                SimpleNamespace(
+                    **base,
+                    attention_config=SimpleNamespace(
+                        backend=SimpleNamespace(name="FLASHINFER"),
+                        backend_per_kind={},
+                    ),
+                )
+            )
+
+        config = SimpleNamespace(
+            **base,
+            attention_config=SimpleNamespace(
+                backend=SimpleNamespace(name="FLASH_ATTN"),
+                backend_per_kind={},
+            ),
+        )
+        _validate_shared_pool_execution(config)
+        with patch(
+            "kapsl_vllm_connector.connector.metadata.version",
+            return_value="0.test",
+        ):
+            profile = _vllm_adapter_profile(config)
+        self.assertEqual(profile["profile_id"], ADAPTER_PROFILE_ID)
+        self.assertEqual(profile["backend_version"], "0.test")
 
     def test_capacity_includes_prompt_and_generation_ceiling(self) -> None:
         request = SimpleNamespace(

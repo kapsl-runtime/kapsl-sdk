@@ -60,8 +60,8 @@ else:
 
 
 logger = logging.getLogger(__name__)
-ADAPTER_VERSION = "0.4.0"
-ADAPTER_PROFILE_ID = "vllm-v1-packed-cuda-ipc"
+ADAPTER_VERSION = "0.5.0"
+ADAPTER_PROFILE_ID = "vllm-v1-packed-cuda-ipc/flash-attn"
 
 
 @dataclass
@@ -161,7 +161,9 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
             else None
         )
         shared_profile = (
-            _vllm_adapter_profile() if self._mode == "shared_pool" else None
+            _vllm_adapter_profile(vllm_config)
+            if self._mode == "shared_pool"
+            else None
         )
         registration = (
             shared_pool_registration(
@@ -496,8 +498,28 @@ def _validate_shared_pool_execution(vllm_config: Any) -> None:
             "Kapsl-owned CUDA allocation must remain exported"
         )
 
+    attention_config = getattr(vllm_config, "attention_config", None)
+    backend = getattr(attention_config, "backend", None)
+    backend_name = str(getattr(backend, "name", backend or "")).strip().upper()
+    if backend_name != "FLASH_ATTN":
+        raise ValueError(
+            "vLLM shared_pool currently requires the explicitly selected "
+            "FLASH_ATTN backend; automatic or different attention backends "
+            "need their own conformance profile"
+        )
+    backend_per_kind = getattr(attention_config, "backend_per_kind", None) or {}
+    if backend_per_kind:
+        raise ValueError(
+            "vLLM shared_pool does not yet support per-cache-kind attention "
+            "backend overrides"
+        )
 
-def _vllm_adapter_profile() -> dict[str, str]:
+
+def _vllm_adapter_profile(vllm_config: Any) -> dict[str, str]:
+    # Keep the production profile coupled to the same constraints exercised by
+    # the hardware probe.  A generic "vLLM" profile would accidentally allow a
+    # build to switch from FlashAttention to another reader at startup.
+    _validate_shared_pool_execution(vllm_config)
     try:
         backend_version = metadata.version("vllm")
     except metadata.PackageNotFoundError:
