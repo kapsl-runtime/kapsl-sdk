@@ -7,6 +7,7 @@ from kapsl_vllm_connector.client import KapslKvControlError
 from kapsl_vllm_connector.connector import (
     ADAPTER_PROFILE_ID,
     KapslConnectorV1,
+    _element_type,
     _vllm_adapter_profile,
     _validate_shared_pool_execution,
     _validated_shared_rank_device_map,
@@ -189,7 +190,19 @@ class ConnectorHelperTests(unittest.TestCase):
             topology["cache_groups"][0]["geometry"]["layout"]["layout_id"],
             "vllm:BHLNC",
         )
+        self.assertEqual(
+            topology["cache_groups"][0]["geometry"]["element_type"],
+            {"kind": "f16"},
+        )
         self.assertEqual(len(topology["cache_groups"][0]["layers"]), 2)
+
+    def test_element_types_use_the_rust_internally_tagged_shape(self) -> None:
+        self.assertEqual(_element_type("torch.float16"), {"kind": "f16"})
+        self.assertEqual(_element_type("bfloat16"), {"kind": "bf16"})
+        self.assertEqual(
+            _element_type("vendor_float6"),
+            {"kind": "custom", "name": "vendor_float6"},
+        )
 
     def test_shared_rank_map_must_cover_exact_tensor_parallel_domains(self) -> None:
         config = SimpleNamespace(

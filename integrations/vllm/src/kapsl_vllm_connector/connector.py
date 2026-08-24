@@ -735,7 +735,7 @@ def _vllm_topology(
     }
 
 
-def _element_type(dtype: Any) -> str | dict[str, Any]:
+def _element_type(dtype: Any) -> dict[str, Any]:
     name = str(dtype).lower().removeprefix("torch.")
     known = {
         "float16": "f16",
@@ -748,10 +748,10 @@ def _element_type(dtype: Any) -> str | dict[str, Any]:
         "float8_e4m3fnuz": "fp8_e4m3",
     }
     if name in known:
-        return known[name]
+        return {"kind": known[name]}
     if not name or name == "none":
         raise ValueError("vLLM shared_pool KV dtype is unavailable")
-    return {"custom": {"name": name}}
+    return {"kind": "custom", "name": name}
 
 
 def _rank_device_map(config: Any) -> dict[int, int] | None:

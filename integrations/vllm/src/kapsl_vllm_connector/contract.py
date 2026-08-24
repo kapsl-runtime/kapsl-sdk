@@ -286,9 +286,20 @@ def _validate_topology(
             "value_head_dim",
         ):
             _positive_int(geometry.get(field), f"topology geometry {field}")
-        element_type = geometry.get("element_type")
-        if not isinstance(element_type, (str, Mapping)):
-            raise ContractValidationError("topology element_type is invalid")
+        element_type = _mapping(
+            geometry.get("element_type"), "topology element_type"
+        )
+        element_kind = _nonempty(
+            element_type.get("kind"), "topology element_type kind"
+        )
+        if element_kind == "custom":
+            _nonempty(
+                element_type.get("name"), "topology element_type custom name"
+            )
+        elif element_kind not in {"f16", "bf16", "f32", "i8", "fp8_e4m3"}:
+            raise ContractValidationError(
+                f"unsupported topology element_type kind {element_kind!r}"
+            )
         layout = _mapping(geometry.get("layout"), "topology layout")
         _nonempty(layout.get("kind"), "topology layout kind")
         policy = _mapping(group.get("policy"), "topology policy")

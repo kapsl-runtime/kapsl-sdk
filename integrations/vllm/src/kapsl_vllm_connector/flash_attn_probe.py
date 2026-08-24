@@ -956,7 +956,9 @@ def _registration(
                     "kv_heads": geometry.num_kv_heads,
                     "key_head_dim": geometry.head_size,
                     "value_head_dim": geometry.head_size,
-                    "element_type": "f16" if geometry.dtype == "float16" else "bf16",
+                    "element_type": {
+                        "kind": "f16" if geometry.dtype == "float16" else "bf16"
+                    },
                     "layout": {
                         "kind": "backend_native",
                         "layout_id": "vllm:LBNHC",

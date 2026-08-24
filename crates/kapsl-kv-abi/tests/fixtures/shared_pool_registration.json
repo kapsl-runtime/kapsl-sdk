@@ -1,0 +1,89 @@
+{
+  "participant_id": "vllm-0",
+  "backend": "vllm",
+  "model_fingerprint": "sha256:model",
+  "capabilities": {
+    "abi_version": {
+      "major": 1,
+      "minor": 3
+    },
+    "tier": "shared_pool",
+    "metadata_mode": "structured",
+    "ownership": "kapsl_runtime",
+    "features": [
+      "capacity_leasing",
+      "direct_attention_access",
+      "external_pool_attachment",
+      "participant_block_selection"
+    ],
+    "transports": [
+      {
+        "kind": "cuda_ipc"
+      }
+    ]
+  },
+  "capacity_model": {
+    "groups": [
+      {
+        "group_id": "vllm.group.0",
+        "pool_id": "vllm.pool.0",
+        "allocation_granularity_tokens": 16,
+        "bytes_per_allocation": 1048576,
+        "memory_domains": [
+          {
+            "kind": "cuda",
+            "device_id": 0
+          }
+        ],
+        "max_allocations": 1024
+      }
+    ]
+  },
+  "adapter_profile": {
+    "adapter_id": "kapsl-vllm-connector",
+    "adapter_version": "0.4.0",
+    "backend_version": "test-vllm",
+    "profile_id": "vllm-v1-packed-cuda-ipc"
+  },
+  "topology": {
+    "abi_version": {
+      "major": 1,
+      "minor": 3
+    },
+    "model_fingerprint": "sha256:model",
+    "shard": {
+      "tensor_parallel_rank": 0,
+      "tensor_parallel_world_size": 1,
+      "pipeline_parallel_rank": 0,
+      "pipeline_parallel_world_size": 1
+    },
+    "cache_groups": [
+      {
+        "group_id": "vllm.group.0",
+        "layers": [
+          {
+            "index": 0,
+            "name": "model.layers.0.attn"
+          }
+        ],
+        "geometry": {
+          "kind": "paged_attention",
+          "block_size_tokens": 16,
+          "kv_heads": 8,
+          "key_head_dim": 128,
+          "value_head_dim": 128,
+          "element_type": {
+            "kind": "f16"
+          },
+          "layout": {
+            "kind": "backend_native",
+            "layout_id": "vllm:packed"
+          }
+        },
+        "policy": {
+          "kind": "full_attention"
+        }
+      }
+    ]
+  }
+}

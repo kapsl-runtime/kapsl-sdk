@@ -1,5 +1,6 @@
-import unittest
 import json
+import unittest
+from copy import deepcopy
 from pathlib import Path
 
 from kapsl_vllm_connector.contract import (
@@ -43,7 +44,7 @@ TOPOLOGY = {
                 "kv_heads": 8,
                 "key_head_dim": 128,
                 "value_head_dim": 128,
-                "element_type": "f16",
+                "element_type": {"kind": "f16"},
                 "layout": {"kind": "backend_native", "layout_id": "vllm:packed"},
             },
             "policy": {"kind": "full_attention"},
@@ -132,7 +133,18 @@ class ContractTests(unittest.TestCase):
         registration = shared_pool_registration(
             "vllm-0", "sha256:model", CAPACITY_GROUPS, TOPOLOGY, PROFILE
         )
+        fixture = json.loads(
+            (
+                Path(__file__).resolve().parents[3]
+                / "crates"
+                / "kapsl-kv-abi"
+                / "tests"
+                / "fixtures"
+                / "shared_pool_registration.json"
+            ).read_text(encoding="utf-8")
+        )
 
+        self.assertEqual(registration, fixture)
         self.assertEqual(registration["capabilities"]["tier"], "shared_pool")
         self.assertEqual(
             registration["capabilities"]["ownership"], "kapsl_runtime"
@@ -161,6 +173,26 @@ class ContractTests(unittest.TestCase):
             shared_pool_registration(
                 "vllm-0", "sha256:model", CAPACITY_GROUPS, topology, PROFILE
             )
+
+    def test_shared_pool_rejects_non_rust_element_type_shapes(self) -> None:
+        for invalid in (
+            "f16",
+            {"kind": "unknown"},
+            {"kind": "custom", "name": " "},
+        ):
+            with self.subTest(element_type=invalid):
+                topology = deepcopy(TOPOLOGY)
+                topology["cache_groups"][0]["geometry"]["element_type"] = invalid
+                with self.assertRaisesRegex(
+                    ContractValidationError, "topology element_type"
+                ):
+                    shared_pool_registration(
+                        "vllm-0",
+                        "sha256:model",
+                        CAPACITY_GROUPS,
+                        topology,
+                        PROFILE,
+                    )
 
 
 if __name__ == "__main__":

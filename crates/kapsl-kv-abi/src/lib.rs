@@ -2372,4 +2372,21 @@ mod tests {
                 .expect("valid connector fixture");
         assert_eq!(serde_json::to_value(registration).unwrap(), fixture);
     }
+
+    #[test]
+    fn shared_pool_registration_accepts_out_of_tree_connector_fixture() {
+        let fixture: KvParticipantRegistration = serde_json::from_str(include_str!(
+            "../tests/fixtures/shared_pool_registration.json"
+        ))
+        .expect("connector fixture must use the Rust wire shape");
+
+        fixture.validate().expect("valid shared-pool registration");
+        let topology = fixture.topology.expect("shared-pool topology");
+        let KvCacheGeometry::PagedAttention { element_type, .. } =
+            &topology.cache_groups[0].geometry
+        else {
+            panic!("fixture must contain paged-attention geometry");
+        };
+        assert_eq!(element_type, &KvElementType::F16);
+    }
 }

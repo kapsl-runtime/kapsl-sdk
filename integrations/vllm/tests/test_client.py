@@ -48,7 +48,7 @@ TOPOLOGY = {
                 "kv_heads": 8,
                 "key_head_dim": 128,
                 "value_head_dim": 128,
-                "element_type": "f16",
+                "element_type": {"kind": "f16"},
                 "layout": {"kind": "backend_native", "layout_id": "vllm:packed"},
             },
             "policy": {"kind": "full_attention"},

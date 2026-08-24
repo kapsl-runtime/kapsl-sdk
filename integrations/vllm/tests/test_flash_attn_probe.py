@@ -53,6 +53,12 @@ class FlashAttentionProbeHostTests(unittest.TestCase):
             registration["topology"]["shard"]["tensor_parallel_world_size"],
             2,
         )
+        self.assertEqual(
+            registration["topology"]["cache_groups"][0]["geometry"][
+                "element_type"
+            ],
+            {"kind": "f16"},
+        )
 
     def test_aggregate_requires_every_physical_binding(self) -> None:
         ranks = [
