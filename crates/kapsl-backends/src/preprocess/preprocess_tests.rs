@@ -4,7 +4,7 @@ use super::{PreprocessBackend, Preprocessor};
 use async_trait::async_trait;
 use kapsl_engine_api::{
     BinaryTensorPacket, Engine, EngineError, EngineMetrics, EngineStream, InferenceRequest,
-    NamedTensor, TensorDtype,
+    KvBackendCapabilities, NamedTensor, TensorDtype,
 };
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -45,6 +45,10 @@ struct CapturingEngine {
 
 #[async_trait]
 impl Engine for CapturingEngine {
+    fn kv_capabilities(&self) -> KvBackendCapabilities {
+        KvBackendCapabilities::opaque_connected()
+    }
+
     async fn load(&mut self, _model_path: &Path) -> Result<(), EngineError> {
         Ok(())
     }
@@ -107,5 +111,20 @@ fn wrapper_injects_derived_input_and_replaces_stale_client_value() {
     assert_eq!(
         i64::from_le_bytes(length.data.as_slice().try_into().unwrap()),
         7
+    );
+}
+
+#[test]
+fn wrapper_preserves_kv_integration_capabilities() {
+    let backend = PreprocessBackend::new(
+        Box::new(CapturingEngine {
+            seen: Arc::new(Mutex::new(None)),
+        }),
+        Box::new(DerivingPreprocessor),
+    );
+
+    assert_eq!(
+        backend.kv_capabilities(),
+        KvBackendCapabilities::opaque_connected()
     );
 }

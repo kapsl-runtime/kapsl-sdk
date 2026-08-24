@@ -34,6 +34,14 @@ impl OnnxClassifyBackend {
 
 #[async_trait]
 impl Engine for OnnxClassifyBackend {
+    fn kv_capabilities(&self) -> kapsl_engine_api::KvBackendCapabilities {
+        self.inner.kv_capabilities()
+    }
+
+    fn kv_topology(&self) -> Option<kapsl_engine_api::KvTopology> {
+        self.inner.kv_topology()
+    }
+
     fn planned_external_device_memory(
         &self,
         model_path: &Path,

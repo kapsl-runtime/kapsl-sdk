@@ -4,6 +4,8 @@
 > profile now enables `gguf-cuda-shared-kv`. The explicit `gguf-cuda` feature
 > remains the static-KV rollback. The milestones below retain the original
 > rollout context and should not be read as the current feature-selection state.
+> The backend-neutral contract and fork exit strategy now live in
+> [Backend-neutral KV Integration](./backend-kv-integration.md).
 
 This is the integration contract for making llama.cpp use Kapsl's GPU-wide KV
 pool instead of allocating a private, fixed-size KV cache per context.
@@ -155,6 +157,16 @@ Phase 1 should support only:
 
 Kapsl remains responsible for reserve, release, migration, prefix cache policy,
 and CPU offload. The fork only reads and writes the physical blocks it is given.
+
+### Session isolation
+
+Runtime-owned KV allocations are synchronously zeroed before ownership is
+published, so a recycled physical extent does not expose the previous owner's
+cache contents. Cross-session prefix reuse is disabled by default because its
+live blocks are keyed by model and token hashes rather than an authenticated
+security domain. A trusted single-tenant deployment may explicitly opt in with
+`KAPSL_GGUF_ALLOW_CROSS_SESSION_PREFIX_CACHE=1` and optionally size it with
+`KAPSL_GGUF_PREFIX_CACHE_BLOCKS`.
 
 ## Kapsl Runtime Work
 

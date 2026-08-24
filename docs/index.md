@@ -36,3 +36,4 @@ Use `kapsl-sdk` when your Python service or tool needs to:
 | [TTS & Voices](./tts-voices.md) | Kokoro TTS and bundled voice embeddings |
 | [API Reference](./api-reference.md) | Full method signatures and parameters |
 | [llama.cpp Shared KV Fork](./llama-cpp-shared-kv-fork.md) | Fork plan for llama.cpp + Kapsl GPU-wide KV pooling |
+| [Backend-neutral KV Integration](./backend-kv-integration.md) | KV tiers, opaque mode, shared-pool contract, and adapter strategy |

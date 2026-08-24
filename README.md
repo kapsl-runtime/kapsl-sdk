@@ -70,6 +70,7 @@ client = KapslClient(api_token="your-token")
 - [Inference](./docs/inference.md)
 - [Streaming](./docs/streaming.md)
 - [Authentication](./docs/authentication.md)
+- [Backend-neutral KV Integration](./docs/backend-kv-integration.md)
 
 ## Requirements
 

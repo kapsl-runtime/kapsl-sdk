@@ -11,6 +11,8 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
+pub use kapsl_kv_abi::{KvBackendCapabilities, KvIntegrationTier, KvMetadataMode, KvTopology};
+
 #[derive(Error, Debug)]
 pub enum EngineError {
     #[error("Backend error: {message}")]
@@ -938,6 +940,21 @@ impl BatchingPolicy {
 
 #[async_trait]
 pub trait Engine: Send + Sync {
+    /// Report how deeply this backend participates in Kapsl's KV memory plane.
+    ///
+    /// The default is deliberately conservative: ordinary inference backends
+    /// and OpenAI-compatible endpoints are routable but remain unmanaged until
+    /// they implement the versioned KV participant contract.
+    fn kv_capabilities(&self) -> KvBackendCapabilities {
+        KvBackendCapabilities::unmanaged()
+    }
+
+    /// Report the loaded model's cache-group topology when structured KV
+    /// metadata is available. Opaque and unmanaged backends return `None`.
+    fn kv_topology(&self) -> Option<KvTopology> {
+        None
+    }
+
     /// Report memory expected during `load` across every memory domain.
     ///
     /// Legacy backends automatically map their external CUDA report into this
@@ -1128,6 +1145,14 @@ pub trait Engine: Send + Sync {
 
 #[async_trait]
 impl Engine for Box<dyn Engine> {
+    fn kv_capabilities(&self) -> KvBackendCapabilities {
+        (**self).kv_capabilities()
+    }
+
+    fn kv_topology(&self) -> Option<KvTopology> {
+        (**self).kv_topology()
+    }
+
     fn planned_memory(&self, model_path: &std::path::Path) -> Result<MemoryReport, EngineError> {
         (**self).planned_memory(model_path)
     }
@@ -1346,6 +1371,13 @@ mod tests {
         assert_eq!(continuous.mode, BatchingMode::Continuous);
         assert_eq!(continuous.max_requests, 1);
         assert!(continuous.supports_priority);
+    }
+
+    #[test]
+    fn default_kv_capabilities_are_explicitly_unmanaged() {
+        let capabilities = KvBackendCapabilities::default();
+        assert_eq!(capabilities.tier, KvIntegrationTier::UnmanagedEndpoint);
+        assert!(capabilities.validate().is_ok());
     }
 
     #[test]

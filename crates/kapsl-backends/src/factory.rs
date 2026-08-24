@@ -68,6 +68,28 @@ fn unimplemented_engine_error(kind: EngineKind) -> String {
     )
 }
 
+/// Resolve and validate the model contract before any provider-specific path is
+/// considered. This is the final fail-closed boundary protecting ONNX Runtime:
+/// unsupported formats and SafeTensors without the native backend must never
+/// reach the generic ONNX fallback below.
+fn resolve_dispatch_engine_kind(manifest: &Manifest) -> Result<EngineKind, String> {
+    EngineKind::validate(manifest).map_err(|error| format!("invalid model contract: {error}"))?;
+    let kind = EngineKind::resolve(manifest);
+    if !kind.is_implemented() {
+        return Err(unimplemented_engine_error(kind));
+    }
+    #[cfg(not(feature = "native"))]
+    if kind == EngineKind::Native {
+        return Err(
+            "SafeTensors selected the native model backend, but this binary was compiled without \
+             the `native` feature. Refusing to pass SafeTensors weights to ONNX Runtime; use a \
+             native-enabled binary or an explicitly configured external serving backend"
+                .to_string(),
+        );
+    }
+    Ok(kind)
+}
+
 /// Read a boolean knob from `metadata.<section>.<key>`, defaulting to `default`.
 fn manifest_metadata_bool(manifest: &Manifest, section: &str, key: &str, default: bool) -> bool {
     manifest
@@ -313,7 +335,7 @@ impl BackendFactory {
         tuning: &OnnxRuntimeTuning,
         memory_owner: Option<(u32, u32)>,
     ) -> Result<Box<dyn Engine>, String> {
-        let engine_kind = EngineKind::resolve(manifest);
+        let engine_kind = resolve_dispatch_engine_kind(manifest)?;
 
         // GGUF: prefer native CUDA kernels when gguf-native feature is compiled in.
         #[cfg(feature = "gguf-native")]
@@ -502,7 +524,7 @@ impl BackendFactory {
         tuning: &OnnxRuntimeTuning,
         memory_owner: Option<(u32, u32)>,
     ) -> Result<Box<dyn Engine>, String> {
-        let engine_kind = EngineKind::resolve(manifest);
+        let engine_kind = resolve_dispatch_engine_kind(manifest)?;
 
         // Native safetensors: route to custom CUDA kernel backend
         #[cfg(feature = "native")]

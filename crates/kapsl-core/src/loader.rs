@@ -138,6 +138,11 @@ pub enum LoaderError {
         model_file: String,
     },
     #[error(
+        "unsupported raw model format `{extension}` for {}; expected `.onnx`, `.gguf`, or `.safetensors`",
+        path.display()
+    )]
+    UnsupportedRawModelFormat { path: PathBuf, extension: String },
+    #[error(
         "insufficient disk space for model cache at {} (required_copy={}B available={}B reserved_free={}B cache_usage={}B cache_limit={})",
         cache_root.display(),
         required_copy_bytes,
@@ -247,7 +252,16 @@ impl PackageLoader {
             "gguf" => "gguf",
             "onnx" => "onnx",
             "safetensors" => "safetensors",
-            _ => "onnx",
+            _ => {
+                return Err(LoaderError::UnsupportedRawModelFormat {
+                    path: model_path.to_path_buf(),
+                    extension: if ext.is_empty() {
+                        "<none>".to_string()
+                    } else {
+                        format!(".{ext}")
+                    },
+                });
+            }
         };
 
         let model_file_name = model_path
