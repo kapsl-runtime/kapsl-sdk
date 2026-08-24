@@ -120,6 +120,29 @@ mod tests {
     }
 
     #[test]
+    fn raw_loader_rejects_formats_that_are_not_runtime_backends() {
+        for name in ["model.pt", "model.pth", "saved_model.pb", "model.bin"] {
+            let result = PackageLoader::from_raw_file(Path::new(name));
+            assert!(
+                matches!(result, Err(LoaderError::UnsupportedRawModelFormat { .. })),
+                "{name} must fail before it can be treated as ONNX"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_loader_classifies_only_supported_extensions() {
+        for (name, framework) in [
+            ("model.onnx", "onnx"),
+            ("model.gguf", "gguf"),
+            ("model.safetensors", "safetensors"),
+        ] {
+            let loader = PackageLoader::from_raw_file(Path::new(name)).expect("supported format");
+            assert_eq!(loader.manifest.framework, framework);
+        }
+    }
+
+    #[test]
     fn test_load_missing_manifest() {
         let (_temp_dir, package_path) = build_package(vec![("model.onnx", vec![0u8])]);
 
