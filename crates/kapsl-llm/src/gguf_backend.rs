@@ -10,7 +10,7 @@ use kapsl_engine_api::{
 #[cfg(feature = "gguf-cuda-shared-kv")]
 use kapsl_kv_abi::KvFeature;
 use kapsl_kv_abi::{KvBackendCapabilities, KvTopology};
-#[cfg(any(feature = "gguf-cuda-shared-kv", test))]
+#[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv", test))]
 use kapsl_kv_abi::{
     KvCacheGeometry, KvCacheGroup, KvCachePolicy, KvElementType, KvLayerId, KvShard,
     KvTensorLayout, KAPSL_KV_ABI_VERSION,
@@ -51,7 +51,7 @@ use llama_cpp_2::{
 };
 #[cfg(feature = "gguf")]
 use llama_cpp_sys_2::LLAMA_FLASH_ATTN_TYPE_AUTO;
-#[cfg(feature = "gguf-cuda-shared-kv")]
+#[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
 use llama_cpp_sys_2::{llama_kapsl_kv_pool_desc, LLAMA_KAPSL_KV_DTYPE_F16};
 
 // ─── Configuration ────────────────────────────────────────────────────────────
@@ -449,7 +449,11 @@ fn planned_gguf_kv_bytes(model_path: &Path) -> Result<usize, EngineError> {
         .saturating_mul(bytes_per_cell))
 }
 
-#[cfg(any(feature = "gguf-cuda-shared-kv", all(test, feature = "gguf")))]
+#[cfg(any(
+    feature = "gguf-cuda-shared-kv",
+    feature = "gguf-external-kv",
+    all(test, feature = "gguf")
+))]
 fn planned_gguf_request_kv_bytes(
     prompt_tokens: usize,
     max_new_tokens: usize,
@@ -497,6 +501,28 @@ fn gguf_shared_kv_block_count(
         None => n_layers.saturating_mul(blocks_per_seq),
     };
     per_seq_blocks
+        .saturating_mul(config.max_concurrent.max(1))
+        .max(n_layers)
+}
+
+#[cfg(feature = "gguf-external-kv")]
+fn gguf_external_kv_block_count(
+    n_layers: usize,
+    config: GgufServingConfig,
+    block_size: usize,
+) -> usize {
+    if let Some(blocks) = std::env::var("KAPSL_GGUF_CUDA_SHARED_KV_POOL_BLOCKS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|blocks| *blocks > 0)
+    {
+        return blocks.max(n_layers);
+    }
+    let blocks_per_sequence = (config.ctx_per_seq as usize)
+        .div_ceil(block_size.max(1))
+        .max(1);
+    n_layers
+        .saturating_mul(blocks_per_sequence)
         .saturating_mul(config.max_concurrent.max(1))
         .max(n_layers)
 }
@@ -616,7 +642,7 @@ fn gguf_windowed_kv_config(
 /// Translate llama.cpp's current shared-pool geometry into Kapsl's neutral KV
 /// topology. Other adapters can describe heterogeneous cache groups without
 /// adopting the fork's uniform raw-pointer descriptor.
-#[cfg(any(feature = "gguf-cuda-shared-kv", test))]
+#[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv", test))]
 fn gguf_shared_kv_topology(
     model_fingerprint: u64,
     n_layers: usize,
@@ -792,7 +818,7 @@ fn gguf_env_is_truthy(name: &str) -> bool {
 /// wasting the allocation. We detect those here, before the pool is built, via
 /// architecture-scoped GGUF metadata so the model runs correctly on the native
 /// path rather than crashing or producing a mislabeled benchmark.
-#[cfg(feature = "gguf-cuda-shared-kv")]
+#[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
 fn gguf_shared_kv_disable_reason(model: &LlamaModel) -> Option<String> {
     // Operator override — this is the real wiring for the flag the benchmark
     // scripts already pass (previously a no-op read by nothing).
@@ -843,7 +869,7 @@ fn gguf_shared_kv_disable_reason(model: &LlamaModel) -> Option<String> {
 /// the same structure. Cohere2 (and other SWA families) are excluded — cohere2's
 /// NoPE global-attention layers degenerate on the paged path, and the rest are
 /// not yet eval-checked. Extend this as more families are verified.
-#[cfg(any(feature = "gguf-cuda-shared-kv", test))]
+#[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv", test))]
 fn swa_shared_kv_arch_verified(arch: &str) -> bool {
     matches!(arch, "gemma2" | "gemma3" | "gemma3n" | "gemma4")
 }
@@ -858,7 +884,7 @@ fn swa_shared_kv_arch_verified(arch: &str) -> bool {
 /// gated by `KAPSL_GGUF_ENABLE_SWA_SHARED_KV`); `has_key`/`pos_int` look up
 /// architecture-scoped GGUF metadata (already prefixed with `<arch>.` by the
 /// caller) — presence, and positive-integer value, respectively.
-#[cfg(any(feature = "gguf-cuda-shared-kv", test))]
+#[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv", test))]
 fn classify_shared_kv_support(
     arch: &str,
     n_swa: u32,
@@ -1835,6 +1861,186 @@ struct GgufSharedKvPool {
     state: Box<GgufSharedKvPoolState>,
     desc: Box<llama_kapsl_kv_pool_desc>,
     topology: KvTopology,
+}
+
+/// Uniform GGUF KV geometry requested from an allocator outside this crate.
+///
+/// This Rust value is used only inside one native backend-pack dylib. The
+/// process boundary remains the versioned C callback table owned by Kapsl core.
+#[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
+#[derive(Clone, Copy, Debug)]
+pub struct GgufExternalKvPoolGeometry {
+    pub device_id: usize,
+    pub requested_blocks: usize,
+    pub block_size_tokens: usize,
+    pub num_layers: usize,
+    pub num_kv_heads: usize,
+    pub key_head_dim: usize,
+    pub value_head_dim: usize,
+    pub max_sequences: usize,
+    pub max_blocks_per_sequence: usize,
+    pub model_fingerprint: u64,
+}
+
+/// A raw llama.cpp pool descriptor whose storage and allocation authority live
+/// outside `kapsl-llm`. The opaque guard owns any adapter state and is dropped
+/// only after the llama context has stopped using the descriptor.
+#[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
+pub struct GgufExternalKvPool {
+    desc: Box<llama_kapsl_kv_pool_desc>,
+    topology: KvTopology,
+    usage_bytes: Arc<dyn Fn() -> usize + Send + Sync>,
+    _guard: Box<dyn Send>,
+}
+
+#[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
+unsafe impl Send for GgufExternalKvPool {}
+
+#[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
+impl GgufExternalKvPool {
+    /// Adopt an externally-owned raw descriptor.
+    ///
+    /// # Safety
+    ///
+    /// `desc` and every callback/context it references must remain valid until
+    /// `guard` is dropped. Device storage must match `geometry`, and callbacks
+    /// must enforce exclusive ownership for every physical block they publish.
+    pub unsafe fn from_raw(
+        geometry: GgufExternalKvPoolGeometry,
+        desc: llama_kapsl_kv_pool_desc,
+        guard: Box<dyn Send>,
+        usage_bytes: Arc<dyn Fn() -> usize + Send + Sync>,
+    ) -> Result<Self, String> {
+        if desc.device_id as usize != geometry.device_id
+            || desc.block_size as usize != geometry.block_size_tokens
+            || desc.num_kv_heads as usize != geometry.num_kv_heads
+            || desc.head_dim as usize != geometry.key_head_dim
+            || geometry.key_head_dim != geometry.value_head_dim
+            || desc.n_layers as usize != geometry.num_layers
+            || desc.max_blocks_per_seq as usize != geometry.max_blocks_per_sequence
+            || desc.n_seq_slots as usize != geometry.max_sequences
+            || desc.model_fingerprint != geometry.model_fingerprint
+        {
+            return Err(
+                "external GGUF KV descriptor does not match requested geometry".to_string(),
+            );
+        }
+        if desc.dtype != LLAMA_KAPSL_KV_DTYPE_F16
+            || desc.device_base.is_null()
+            || desc.block_table_device.is_null()
+            || desc.num_blocks == 0
+            || (desc.num_blocks as usize) < geometry.num_layers
+            || desc.block_table_layer_stride != desc.max_blocks_per_seq
+            || desc.block_table_seq_stride != desc.n_layers.saturating_mul(desc.max_blocks_per_seq)
+            || desc.reserve.is_none()
+            || desc.release.is_none()
+        {
+            return Err("external GGUF KV descriptor is incomplete or incompatible".to_string());
+        }
+        if geometry.max_sequences > 1 && (desc.reserve_seq.is_none() || desc.commit_seq.is_none()) {
+            return Err("external GGUF KV descriptor lacks multi-sequence callbacks".to_string());
+        }
+        let topology = gguf_shared_kv_topology(
+            geometry.model_fingerprint,
+            geometry.num_layers,
+            geometry.block_size_tokens,
+            geometry.num_kv_heads,
+            geometry.key_head_dim,
+            None,
+        );
+        topology
+            .validate()
+            .map_err(|error| format!("external GGUF KV topology: {error}"))?;
+        Ok(Self {
+            desc: Box::new(desc),
+            topology,
+            usage_bytes,
+            _guard: guard,
+        })
+    }
+
+    fn desc_ptr(&mut self) -> *mut llama_kapsl_kv_pool_desc {
+        (&mut *self.desc) as *mut llama_kapsl_kv_pool_desc
+    }
+}
+
+#[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
+pub type GgufExternalKvPoolFactory =
+    Arc<dyn Fn(GgufExternalKvPoolGeometry) -> Result<GgufExternalKvPool, String> + Send + Sync>;
+
+#[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
+enum GgufActiveKvPool {
+    #[cfg(feature = "gguf-cuda-shared-kv")]
+    Runtime(GgufSharedKvPool),
+    External(GgufExternalKvPool),
+}
+
+#[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
+impl GgufActiveKvPool {
+    fn desc_ptr(&mut self) -> *mut llama_kapsl_kv_pool_desc {
+        match self {
+            #[cfg(feature = "gguf-cuda-shared-kv")]
+            Self::Runtime(pool) => pool.desc_ptr(),
+            Self::External(pool) => pool.desc_ptr(),
+        }
+    }
+
+    fn log_attachment(&self) {
+        match self {
+            #[cfg(feature = "gguf-cuda-shared-kv")]
+            Self::Runtime(pool) => log::info!(
+                "[gguf] Kapsl shared KV pool attached (blocks={}, block_size={}, max_blocks_per_seq={})",
+                pool.state.handle.pool.total_blocks(),
+                pool.state.handle.pool.block_size(),
+                pool.state.max_blocks_per_seq
+            ),
+            Self::External(pool) => log::info!(
+                "[gguf] Kapsl external runtime-owned shared KV pool attached (blocks={}, block_size={}, max_blocks_per_seq={})",
+                pool.desc.num_blocks,
+                pool.desc.block_size,
+                pool.desc.max_blocks_per_seq
+            ),
+        }
+    }
+
+    fn promote_if_pending(&mut self) {
+        #[cfg(feature = "gguf-cuda-shared-kv")]
+        if let Self::Runtime(pool) = self {
+            pool.promote_if_pending();
+        }
+    }
+
+    fn on_idle(&mut self) {
+        #[cfg(not(feature = "gguf-cuda-shared-kv"))]
+        let _ = self;
+        #[cfg(feature = "gguf-cuda-shared-kv")]
+        {
+            let Self::Runtime(pool) = self else {
+                return;
+            };
+            if pool.state.evict_when_idle {
+                pool.evict_to_cpu();
+            }
+            let kv_heads = pool.state.handle.pool.num_kv_heads();
+            let head_dim = pool.state.handle.pool.head_dim();
+            let device_id = pool.desc.device_id as usize;
+            let sched = gguf_global_kv_scheduler().lock().unwrap();
+            log::debug!(
+            "[gguf] idle: device {} pressure={:.2} free_blocks={} ({}h×{}d), cross-device registered=[{}]",
+            device_id,
+            sched.device_pressure(device_id),
+            sched.device_free_blocks(device_id, kv_heads, head_dim),
+            kv_heads,
+            head_dim,
+            sched
+                .registered_devices()
+                .iter()
+                .map(|device| device.to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        }
+    }
 }
 
 #[cfg(feature = "gguf-cuda-shared-kv")]
@@ -3148,7 +3354,7 @@ unsafe extern "C" fn gguf_kapsl_kv_touch(
 /// Recorded at load time so diagnostics and benchmarks can report the real path
 /// instead of inferring it from build features or env vars (which can be wrong:
 /// shared-KV silently falls back to native for unsupported architectures).
-#[cfg(feature = "gguf-cuda-shared-kv")]
+#[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GgufKvPath {
     /// Not yet loaded.
@@ -3159,7 +3365,7 @@ pub enum GgufKvPath {
     Native,
 }
 
-#[cfg(feature = "gguf-cuda-shared-kv")]
+#[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
 impl GgufKvPath {
     /// Stable lowercase label for logs, info endpoints, and benchmark output.
     pub fn as_str(self) -> &'static str {
@@ -3189,13 +3395,22 @@ pub struct GgufBackend {
     /// Runtime-owned backing pool. Geometry is not known until `load()`.
     #[cfg(feature = "gguf-cuda-shared-kv")]
     device_pool: Option<(Arc<GpuDevicePool>, PoolOwner)>,
+    /// Factory used by a native backend pack to bridge Kapsl core's C
+    /// callbacks into the llama.cpp raw descriptor. It is never sent across
+    /// the dynamic-library boundary.
+    #[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
+    external_kv_factory: Option<GgufExternalKvPoolFactory>,
+    #[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
+    external_kv_usage: Option<Arc<dyn Fn() -> usize + Send + Sync>>,
+    #[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
+    shared_kv_block_size: usize,
     /// Active KV path, set during `load()`. Read lock-free via `active_kv_path`.
-    #[cfg(feature = "gguf-cuda-shared-kv")]
+    #[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
     kv_path: Arc<std::sync::atomic::AtomicU8>,
     /// Backend-neutral contract for the active KV path.
-    #[cfg(feature = "gguf-cuda-shared-kv")]
+    #[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
     kv_capabilities: KvBackendCapabilities,
-    #[cfg(feature = "gguf-cuda-shared-kv")]
+    #[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
     kv_topology: Option<KvTopology>,
 }
 
@@ -3205,9 +3420,9 @@ struct GgufInner {
     request_tx: std_mpsc::Sender<GgufRequest>,
     scheduler_thread: Option<std::thread::JoinHandle<()>>,
     max_concurrent: usize,
-    #[cfg(feature = "gguf-cuda-shared-kv")]
+    #[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
     ctx_per_seq: usize,
-    #[cfg(feature = "gguf-cuda-shared-kv")]
+    #[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
     kv_bytes_per_cell: usize,
 }
 
@@ -3222,13 +3437,19 @@ impl GgufBackend {
             pool_slot: Arc::new(Mutex::new(None)),
             #[cfg(feature = "gguf-cuda-shared-kv")]
             device_pool: None,
-            #[cfg(feature = "gguf-cuda-shared-kv")]
+            #[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
+            external_kv_factory: None,
+            #[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
+            external_kv_usage: None,
+            #[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
+            shared_kv_block_size: 16,
+            #[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
             kv_path: Arc::new(std::sync::atomic::AtomicU8::new(
                 GgufKvPath::Unloaded.as_u8(),
             )),
-            #[cfg(feature = "gguf-cuda-shared-kv")]
+            #[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
             kv_capabilities: KvBackendCapabilities::unmanaged(),
-            #[cfg(feature = "gguf-cuda-shared-kv")]
+            #[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
             kv_topology: None,
         }
     }
@@ -3249,6 +3470,9 @@ impl GgufBackend {
             device_id,
             pool_slot: Arc::new(Mutex::new(handle)),
             device_pool: None,
+            external_kv_factory: None,
+            external_kv_usage: None,
+            shared_kv_block_size: 16,
             kv_path: Arc::new(std::sync::atomic::AtomicU8::new(
                 GgufKvPath::Unloaded.as_u8(),
             )),
@@ -3284,6 +3508,16 @@ impl GgufBackend {
         backend
     }
 
+    /// Construct a CUDA GGUF backend that must attach the externally supplied
+    /// runtime-owned KV pool. Unsupported geometry fails model load instead of
+    /// silently allocating llama.cpp native KV.
+    #[cfg(feature = "gguf-external-kv")]
+    pub fn new_cuda_external_kv_pool(device_id: usize, factory: GgufExternalKvPoolFactory) -> Self {
+        let mut backend = Self::new_on_device(device_id);
+        backend.external_kv_factory = Some(factory);
+        backend
+    }
+
     #[cfg(feature = "gguf-cuda-shared-kv")]
     pub fn with_pool_handle(self, handle: GpuPoolHandle) -> Self {
         *self.pool_slot.lock().unwrap() = Some(handle);
@@ -3300,6 +3534,31 @@ impl GgufBackend {
             .lock()
             .map(|m| m.clone())
             .unwrap_or_else(|_| EngineMetrics::new())
+    }
+
+    #[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
+    fn runtime_owned_kv_configured(&self) -> bool {
+        if self.external_kv_factory.is_some() {
+            return true;
+        }
+        #[cfg(feature = "gguf-cuda-shared-kv")]
+        {
+            return self.device_pool.is_some();
+        }
+        #[cfg(not(feature = "gguf-cuda-shared-kv"))]
+        false
+    }
+
+    #[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
+    fn runtime_kv_usage_bytes(&self) -> Option<usize> {
+        if let Some(usage) = self.external_kv_usage.as_ref() {
+            return Some(usage());
+        }
+        #[cfg(feature = "gguf-cuda-shared-kv")]
+        if let Some((pool, owner)) = self.device_pool.as_ref() {
+            return Some(pool.owner_usage_bytes(owner.with_class(PoolAllocationClass::KvCache)));
+        }
+        None
     }
 
     fn extract_prompt(request: &InferenceRequest) -> Result<String, EngineError> {
@@ -3690,11 +3949,12 @@ fn run_scheduler(
     config: GgufServingConfig,
     metrics: Arc<Mutex<EngineMetrics>>,
     ready_tx: std_mpsc::SyncSender<Result<(), String>>,
-    #[cfg(feature = "gguf-cuda-shared-kv")] mut shared_kv_pool: Option<GgufSharedKvPool>,
+    #[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
+    mut shared_kv_pool: Option<GgufActiveKvPool>,
 ) {
     #[allow(unused_mut)]
     let mut config = config;
-    #[cfg(feature = "gguf-cuda-shared-kv")]
+    #[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
     if shared_kv_pool.is_some() && config.exact_prompt_kv_reuse {
         log::warn!("[gguf] exact prompt KV reuse is unsupported by shared-KV; disabling it");
         config.exact_prompt_kv_reuse = false;
@@ -3718,15 +3978,10 @@ fn run_scheduler(
         .with_n_seq_max(config.max_concurrent as u32)
         .with_offload_kqv(true)
         .with_flash_attention_policy(LLAMA_FLASH_ATTN_TYPE_AUTO);
-    #[cfg(feature = "gguf-cuda-shared-kv")]
+    #[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
     if let Some(pool) = shared_kv_pool.as_mut() {
         ctx_params = unsafe { ctx_params.with_kapsl_kv_pool_raw(pool.desc_ptr(), 1) };
-        log::info!(
-            "[gguf] Kapsl shared KV pool attached (blocks={}, block_size={}, max_blocks_per_seq={})",
-            pool.state.handle.pool.total_blocks(),
-            pool.state.handle.pool.block_size(),
-            pool.state.max_blocks_per_seq
-        );
+        pool.log_attachment();
     }
 
     let mut ctx = match model.new_context(&backend, ctx_params) {
@@ -3882,31 +4137,9 @@ fn run_scheduler(
 
         // ── 3. If completely idle, block for the next request ─────────────────
         if waiting.is_empty() && pending.is_empty() && active.is_empty() {
-            #[cfg(feature = "gguf-cuda-shared-kv")]
+            #[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
             if let Some(pool) = shared_kv_pool.as_mut() {
-                if pool.state.evict_when_idle {
-                    pool.evict_to_cpu();
-                }
-                // Log cross-device pressure snapshot at debug level.
-                let kv_heads = pool.state.handle.pool.num_kv_heads();
-                let head_dim = pool.state.handle.pool.head_dim();
-                let device_id = pool.desc.device_id as usize;
-                let sched = gguf_global_kv_scheduler().lock().unwrap();
-                log::debug!(
-                    "[gguf] idle: device {} pressure={:.2} free_blocks={} ({}h×{}d), \
-                     cross-device registered=[{}]",
-                    device_id,
-                    sched.device_pressure(device_id),
-                    sched.device_free_blocks(device_id, kv_heads, head_dim),
-                    kv_heads,
-                    head_dim,
-                    sched
-                        .registered_devices()
-                        .iter()
-                        .map(|d| d.to_string())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                );
+                pool.on_idle();
             }
             match request_rx.recv() {
                 Ok(req) => waiting.push_back(req),
@@ -4085,7 +4318,7 @@ fn run_scheduler(
         }
 
         // ── 5b. Promote newly computed prefix KV blocks to cache ──────────────
-        #[cfg(feature = "gguf-cuda-shared-kv")]
+        #[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
         if let Some(pool) = shared_kv_pool.as_mut() {
             pool.promote_if_pending();
         }
@@ -4356,20 +4589,20 @@ fn run_scheduler(
 #[async_trait]
 impl Engine for GgufBackend {
     fn kv_capabilities(&self) -> KvBackendCapabilities {
-        #[cfg(feature = "gguf-cuda-shared-kv")]
+        #[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
         {
-            return self.kv_capabilities.clone();
+            self.kv_capabilities.clone()
         }
-        #[cfg(not(feature = "gguf-cuda-shared-kv"))]
+        #[cfg(not(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv")))]
         KvBackendCapabilities::unmanaged()
     }
 
     fn kv_topology(&self) -> Option<KvTopology> {
-        #[cfg(feature = "gguf-cuda-shared-kv")]
+        #[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
         {
-            return self.kv_topology.clone();
+            self.kv_topology.clone()
         }
-        #[cfg(not(feature = "gguf-cuda-shared-kv"))]
+        #[cfg(not(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv")))]
         None
     }
 
@@ -4399,10 +4632,10 @@ impl Engine for GgufBackend {
                 },
             ],
         };
-        #[cfg(feature = "gguf-cuda-shared-kv")]
-        let runtime_kv =
-            self.device_pool.is_some() && !gguf_env_is_truthy("KAPSL_GGUF_DISABLE_SHARED_KV");
-        #[cfg(not(feature = "gguf-cuda-shared-kv"))]
+        #[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
+        let runtime_kv = self.runtime_owned_kv_configured()
+            && !gguf_env_is_truthy("KAPSL_GGUF_DISABLE_SHARED_KV");
+        #[cfg(not(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv")))]
         let runtime_kv = false;
         // A runtime-owned shared pool materializes KV blocks on demand and the
         // request lease accounts for them while the request is alive. Native
@@ -4497,8 +4730,13 @@ impl Engine for GgufBackend {
         };
 
         let config = GgufServingConfig::from_model(&weights.model, weights.n_ctx_train);
-        #[cfg(feature = "gguf-cuda-shared-kv")]
+        #[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
         let shared_kv_pool = if let Some(reason) = gguf_shared_kv_disable_reason(&weights.model) {
+            if self.external_kv_factory.is_some() {
+                return Err(EngineError::backend(format!(
+                    "runtime-owned shared KV is required, but model geometry is unsupported: {reason}"
+                )));
+            }
             // Architecture/geometry the uniform shared-KV pool cannot represent
             // (or an explicit operator override): skip the pool and let
             // llama.cpp build its native KV cache for this model.
@@ -4512,6 +4750,7 @@ impl Engine for GgufBackend {
             );
             self.kv_capabilities = KvBackendCapabilities::unmanaged();
             self.kv_topology = None;
+            self.external_kv_usage = None;
             None
         } else {
             let n_layers = weights.model.n_layer().max(1) as usize;
@@ -4525,54 +4764,114 @@ impl Engine for GgufBackend {
             }
             let head_dim = head_dim_k;
             let block_size = 16usize;
-            // Windowed KV for SWA layers (Phase 2): ring-capped per-layer
-            // allocation, opt-in via KAPSL_GGUF_SWA_WINDOWED_KV. None keeps the
-            // uniform full allocation.
-            let windowed = gguf_windowed_kv_config(&weights.model, config, block_size);
-            // Auto-select the least-loaded registered device when KAPSL_GGUF_AUTO_DEVICE=1.
-            let effective_device_id = if self.device_pool.is_some() {
-                self.device_id
-            } else {
-                gguf_select_device(self.device_id, n_head_kv, head_dim)
-            };
-            if effective_device_id != self.device_id {
-                log::info!(
-                    "[gguf] auto-device: selected device {} over {} (more free {n_head_kv}h×{head_dim}d blocks)",
-                    effective_device_id, self.device_id,
-                );
+            let external_factory = self.external_kv_factory.clone();
+            if external_factory.is_some() && weights.model.n_swa() > 0 {
+                return Err(EngineError::backend(
+                    "runtime-owned shared KV ABI v1 does not expose per-layer sliding-window geometry"
+                        .to_string(),
+                ));
             }
-            let requested_blocks =
-                gguf_shared_kv_block_count(n_layers, config, block_size, windowed.as_ref());
-            let handle = {
-                let mut slot = self.pool_slot.lock().unwrap();
-                if let Some((device_pool, owner)) = self.device_pool.as_ref() {
-                    let bytes_per_block = 2usize
-                        .saturating_mul(n_head_kv)
-                        .saturating_mul(block_size)
-                        .saturating_mul(head_dim)
-                        .saturating_mul(std::mem::size_of::<half::f16>());
-                    let pool = Arc::new(
-                        GpuBlockPool::from_device_pool(
-                            Arc::clone(device_pool),
-                            *owner,
-                            requested_blocks,
-                            block_size,
-                            n_head_kv,
-                            head_dim,
-                        )
-                        .map_err(|e| EngineError::backend(format!("shared KV view: {e}")))?,
+            let model_fingerprint = {
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::{Hash, Hasher};
+                let mut h = DefaultHasher::new();
+                weights.allocation_id.hash(&mut h);
+                n_layers.hash(&mut h);
+                n_head_kv.hash(&mut h);
+                head_dim.hash(&mut h);
+                head_dim_v.hash(&mut h);
+                h.finish()
+            };
+            self.shared_kv_block_size = block_size;
+            if let Some(factory) = external_factory {
+                let effective_device_id = self.device_id;
+                let requested_blocks = gguf_external_kv_block_count(n_layers, config, block_size);
+                let max_blocks_per_sequence =
+                    (config.ctx_per_seq as usize).div_ceil(block_size).max(1);
+                let geometry = GgufExternalKvPoolGeometry {
+                    device_id: effective_device_id,
+                    requested_blocks,
+                    block_size_tokens: block_size,
+                    num_layers: n_layers,
+                    num_kv_heads: n_head_kv,
+                    key_head_dim: head_dim_k,
+                    value_head_dim: head_dim_v,
+                    max_sequences: config.max_concurrent.max(1),
+                    max_blocks_per_sequence,
+                    model_fingerprint,
+                };
+                let pool = factory(geometry).map_err(|error| {
+                    EngineError::backend(format!("attach runtime-owned shared KV: {error}"))
+                })?;
+                self.external_kv_usage = Some(Arc::clone(&pool.usage_bytes));
+                self.kv_path.store(
+                    GgufKvPath::SharedKv.as_u8(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                let capabilities = KvBackendCapabilities::in_process_shared_pool();
+                capabilities
+                    .validate()
+                    .map_err(|error| EngineError::backend(error.to_string()))?;
+                self.kv_topology = Some(pool.topology.clone());
+                self.kv_capabilities = capabilities;
+                log::info!(
+                    "[gguf] kv_path=shared-kv Kapsl C-ABI runtime-owned KV pool active on device {effective_device_id}"
+                );
+                Some(GgufActiveKvPool::External(pool))
+            } else {
+                #[cfg(feature = "gguf-cuda-shared-kv")]
+                {
+                    // Windowed KV for SWA layers (Phase 2): ring-capped per-layer
+                    // allocation, opt-in via KAPSL_GGUF_SWA_WINDOWED_KV. None keeps
+                    // the uniform full allocation.
+                    let windowed = gguf_windowed_kv_config(&weights.model, config, block_size);
+                    // Auto-select the least-loaded registered device when
+                    // KAPSL_GGUF_AUTO_DEVICE=1.
+                    let effective_device_id = if self.device_pool.is_some() {
+                        self.device_id
+                    } else {
+                        gguf_select_device(self.device_id, n_head_kv, head_dim)
+                    };
+                    if effective_device_id != self.device_id {
+                        log::info!(
+                        "[gguf] auto-device: selected device {} over {} (more free {n_head_kv}h×{head_dim}d blocks)",
+                        effective_device_id, self.device_id,
                     );
-                    if pool.total_blocks() < n_layers {
-                        return Err(EngineError::backend(format!(
+                    }
+                    let requested_blocks =
+                        gguf_shared_kv_block_count(n_layers, config, block_size, windowed.as_ref());
+                    let handle = {
+                        let mut slot = self.pool_slot.lock().unwrap();
+                        if let Some((device_pool, owner)) = self.device_pool.as_ref() {
+                            let bytes_per_block = 2usize
+                                .saturating_mul(n_head_kv)
+                                .saturating_mul(block_size)
+                                .saturating_mul(head_dim)
+                                .saturating_mul(std::mem::size_of::<half::f16>());
+                            let pool = Arc::new(
+                                GpuBlockPool::from_device_pool(
+                                    Arc::clone(device_pool),
+                                    *owner,
+                                    requested_blocks,
+                                    block_size,
+                                    n_head_kv,
+                                    head_dim,
+                                )
+                                .map_err(|e| {
+                                    EngineError::backend(format!("shared KV view: {e}"))
+                                })?,
+                            );
+                            if pool.total_blocks() < n_layers {
+                                return Err(EngineError::backend(format!(
                             "shared KV pool has {} blocks, but at least {n_layers} are required to hold one logical token across all layers",
                             pool.total_blocks(),
                         )));
-                    }
-                    if pool.total_blocks() < requested_blocks {
-                        let blocks_per_full_sequence = requested_blocks
-                            .div_ceil(config.max_concurrent.max(1))
-                            .max(n_layers);
-                        log::info!(
+                            }
+                            if pool.total_blocks() < requested_blocks {
+                                let blocks_per_full_sequence = requested_blocks
+                                    .div_ceil(config.max_concurrent.max(1))
+                                    .max(n_layers);
+                                log::info!(
                             "[gguf] elastic shared-KV view: physical_cap={} blocks ({} MiB), configured_ceiling={} blocks for {}x{} tokens; full-context equivalents={} and request admission controls live usage",
                             pool.total_blocks(),
                             pool.total_blocks().saturating_mul(bytes_per_block) / (1024 * 1024),
@@ -4581,126 +4880,128 @@ impl Engine for GgufBackend {
                             config.ctx_per_seq,
                             pool.total_blocks() / blocks_per_full_sequence,
                         );
-                    }
-                    let handle = GpuPoolHandle::private(pool);
-                    *slot = Some(handle.clone());
-                    handle
-                } else if let Some(handle) = slot.as_ref() {
-                    if handle.pool.is_compatible(n_head_kv, head_dim) {
-                        handle.clone()
-                    } else {
-                        log::warn!(
+                            }
+                            let handle = GpuPoolHandle::private(pool);
+                            *slot = Some(handle.clone());
+                            handle
+                        } else if let Some(handle) = slot.as_ref() {
+                            if handle.pool.is_compatible(n_head_kv, head_dim) {
+                                handle.clone()
+                            } else {
+                                log::warn!(
                             "[gguf] Shared KV pool geometry mismatch ({}h x {}d vs {}h x {}d); creating private pool",
                             handle.pool.num_kv_heads(),
                             handle.pool.head_dim(),
                             n_head_kv,
                             head_dim
                         );
-                        let device = CudaDevice::new(effective_device_id)
-                            .map_err(|e| EngineError::backend(format!("CUDA: {e}")))?;
-                        let pool = Arc::new(
-                            GpuBlockPool::new(
-                                device,
-                                requested_blocks,
-                                block_size,
-                                n_head_kv,
-                                head_dim,
-                            )
-                            .map_err(|e| EngineError::backend(format!("shared KV pool: {e}")))?,
-                        );
-                        let handle = GpuPoolHandle::private(pool);
-                        *slot = Some(handle.clone());
-                        handle
-                    }
-                } else {
-                    let device = CudaDevice::new(effective_device_id)
-                        .map_err(|e| EngineError::backend(format!("CUDA: {e}")))?;
-                    let pool = Arc::new(
-                        GpuBlockPool::new(
-                            device,
-                            requested_blocks,
-                            block_size,
-                            n_head_kv,
-                            head_dim,
-                        )
-                        .map_err(|e| EngineError::backend(format!("shared KV pool: {e}")))?,
-                    );
-                    let handle = GpuPoolHandle::private(pool);
-                    *slot = Some(handle.clone());
-                    handle
-                }
-            };
-            {
-                // Compute a stable model fingerprint from architecture parameters.
-                let model_fingerprint = {
-                    use std::collections::hash_map::DefaultHasher;
-                    use std::hash::{Hash, Hasher};
-                    let mut h = DefaultHasher::new();
-                    weights.allocation_id.hash(&mut h);
-                    n_layers.hash(&mut h);
-                    n_head_kv.hash(&mut h);
-                    head_dim.hash(&mut h);
-                    head_dim_v.hash(&mut h);
-                    h.finish()
-                };
-                // Prefix entries hold live GPU blocks and are keyed only by
-                // model/token hashes. Until an authenticated security domain is
-                // propagated into that key, cross-session reuse is disabled by
-                // default. Trusted single-tenant deployments can opt in.
-                let prefix_cache = if gguf_allow_cross_session_prefix_cache() {
-                    let pool_blocks = handle.pool.total_blocks();
-                    let env_cap = std::env::var("KAPSL_GGUF_PREFIX_CACHE_BLOCKS")
-                        .ok()
-                        .and_then(|v| v.parse::<usize>().ok())
-                        .filter(|&v| v > 0);
-                    let capacity = env_cap.unwrap_or_else(|| (pool_blocks / n_layers / 4).max(1));
-                    log::warn!(
+                                let device = CudaDevice::new(effective_device_id)
+                                    .map_err(|e| EngineError::backend(format!("CUDA: {e}")))?;
+                                let pool = Arc::new(
+                                    GpuBlockPool::new(
+                                        device,
+                                        requested_blocks,
+                                        block_size,
+                                        n_head_kv,
+                                        head_dim,
+                                    )
+                                    .map_err(|e| {
+                                        EngineError::backend(format!("shared KV pool: {e}"))
+                                    })?,
+                                );
+                                let handle = GpuPoolHandle::private(pool);
+                                *slot = Some(handle.clone());
+                                handle
+                            }
+                        } else {
+                            let device = CudaDevice::new(effective_device_id)
+                                .map_err(|e| EngineError::backend(format!("CUDA: {e}")))?;
+                            let pool = Arc::new(
+                                GpuBlockPool::new(
+                                    device,
+                                    requested_blocks,
+                                    block_size,
+                                    n_head_kv,
+                                    head_dim,
+                                )
+                                .map_err(|e| {
+                                    EngineError::backend(format!("shared KV pool: {e}"))
+                                })?,
+                            );
+                            let handle = GpuPoolHandle::private(pool);
+                            *slot = Some(handle.clone());
+                            handle
+                        }
+                    };
+                    {
+                        // Prefix entries hold live GPU blocks and are keyed only by
+                        // model/token hashes. Until an authenticated security domain is
+                        // propagated into that key, cross-session reuse is disabled by
+                        // default. Trusted single-tenant deployments can opt in.
+                        let prefix_cache = if gguf_allow_cross_session_prefix_cache() {
+                            let pool_blocks = handle.pool.total_blocks();
+                            let env_cap = std::env::var("KAPSL_GGUF_PREFIX_CACHE_BLOCKS")
+                                .ok()
+                                .and_then(|v| v.parse::<usize>().ok())
+                                .filter(|&v| v > 0);
+                            let capacity =
+                                env_cap.unwrap_or_else(|| (pool_blocks / n_layers / 4).max(1));
+                            log::warn!(
                         "[gguf] Cross-session prefix KV reuse explicitly enabled: capacity={} logical positions; use only within one trusted security domain",
                         capacity
                     );
-                    Some(Arc::new(Mutex::new(PrefixBlockCache::new(capacity))))
-                } else {
-                    if std::env::var_os("KAPSL_GGUF_PREFIX_CACHE_BLOCKS").is_some() {
-                        log::warn!(
+                            Some(Arc::new(Mutex::new(PrefixBlockCache::new(capacity))))
+                        } else {
+                            if std::env::var_os("KAPSL_GGUF_PREFIX_CACHE_BLOCKS").is_some() {
+                                log::warn!(
                             "[gguf] KAPSL_GGUF_PREFIX_CACHE_BLOCKS ignored because cross-session prefix reuse is disabled; set KAPSL_GGUF_ALLOW_CROSS_SESSION_PREFIX_CACHE=1 only for a trusted single-tenant deployment"
                         );
-                    }
-                    log::info!(
-                        "[gguf] Cross-session prefix KV reuse disabled for session isolation"
-                    );
-                    None
-                };
-                self.kv_path.store(
-                    GgufKvPath::SharedKv.as_u8(),
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-                log::info!(
+                            }
+                            log::info!(
+                            "[gguf] Cross-session prefix KV reuse disabled for session isolation"
+                        );
+                            None
+                        };
+                        self.kv_path.store(
+                            GgufKvPath::SharedKv.as_u8(),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        log::info!(
                     "[gguf] kv_path=shared-kv Kapsl paged external KV pool active on device {effective_device_id}"
                 );
-                let pool = GgufSharedKvPool::new(
-                    handle,
-                    self.metrics.clone(),
-                    effective_device_id,
-                    n_layers,
-                    config.ctx_per_seq as usize,
-                    config.max_concurrent,
-                    prefix_cache,
-                    model_fingerprint,
-                    windowed,
-                );
-                let mut capabilities = KvBackendCapabilities::in_process_shared_pool()
-                    .with_feature(KvFeature::Eviction)
-                    .with_feature(KvFeature::Restore);
-                if pool.state.prefix_cache.is_some() {
-                    capabilities = capabilities.with_feature(KvFeature::PrefixLookup);
+                        let pool = GgufSharedKvPool::new(
+                            handle,
+                            self.metrics.clone(),
+                            effective_device_id,
+                            n_layers,
+                            config.ctx_per_seq as usize,
+                            config.max_concurrent,
+                            prefix_cache,
+                            model_fingerprint,
+                            windowed,
+                        );
+                        let mut capabilities = KvBackendCapabilities::in_process_shared_pool()
+                            .with_feature(KvFeature::Eviction)
+                            .with_feature(KvFeature::Restore);
+                        if pool.state.prefix_cache.is_some() {
+                            capabilities = capabilities.with_feature(KvFeature::PrefixLookup);
+                        }
+                        if pool.topology.cache_groups.len() > 1 {
+                            capabilities =
+                                capabilities.with_feature(KvFeature::MultipleCacheGroups);
+                        }
+                        debug_assert!(capabilities.validate().is_ok());
+                        self.kv_capabilities = capabilities;
+                        self.kv_topology = Some(pool.topology.clone());
+                        Some(GgufActiveKvPool::Runtime(pool))
+                    }
                 }
-                if pool.topology.cache_groups.len() > 1 {
-                    capabilities = capabilities.with_feature(KvFeature::MultipleCacheGroups);
+                #[cfg(not(feature = "gguf-cuda-shared-kv"))]
+                {
+                    return Err(EngineError::backend(
+                        "runtime-owned shared KV factory is missing".to_string(),
+                    ));
                 }
-                debug_assert!(capabilities.validate().is_ok());
-                self.kv_capabilities = capabilities;
-                self.kv_topology = Some(pool.topology.clone());
-                Some(pool)
             }
         };
         if let Ok(mut snapshot) = self.metrics.lock() {
@@ -4725,7 +5026,7 @@ impl Engine for GgufBackend {
                 config,
                 metrics,
                 ready_tx,
-                #[cfg(feature = "gguf-cuda-shared-kv")]
+                #[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
                 shared_kv_pool,
             );
         });
@@ -4734,7 +5035,7 @@ impl Engine for GgufBackend {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 let _ = scheduler_thread.join();
-                #[cfg(feature = "gguf-cuda-shared-kv")]
+                #[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
                 {
                     self.kv_path.store(
                         GgufKvPath::Unloaded.as_u8(),
@@ -4742,11 +5043,12 @@ impl Engine for GgufBackend {
                     );
                     self.kv_capabilities = KvBackendCapabilities::unmanaged();
                     self.kv_topology = None;
+                    self.external_kv_usage = None;
                 }
                 return Err(EngineError::backend(error));
             }
             Err(error) => {
-                #[cfg(feature = "gguf-cuda-shared-kv")]
+                #[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
                 {
                     self.kv_path.store(
                         GgufKvPath::Unloaded.as_u8(),
@@ -4754,6 +5056,7 @@ impl Engine for GgufBackend {
                     );
                     self.kv_capabilities = KvBackendCapabilities::unmanaged();
                     self.kv_topology = None;
+                    self.external_kv_usage = None;
                 }
                 return Err(EngineError::backend(format!(
                     "GGUF scheduler did not become ready: {error}"
@@ -4772,9 +5075,9 @@ impl Engine for GgufBackend {
             request_tx: tx,
             scheduler_thread: Some(scheduler_thread),
             max_concurrent: config.max_concurrent,
-            #[cfg(feature = "gguf-cuda-shared-kv")]
+            #[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
             ctx_per_seq: config.ctx_per_seq as usize,
-            #[cfg(feature = "gguf-cuda-shared-kv")]
+            #[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
             kv_bytes_per_cell: config.kv_bytes_per_cell,
         });
         Ok(())
@@ -4834,21 +5137,16 @@ impl Engine for GgufBackend {
                 device_id: allocation.device_id,
             })
             .unwrap_or(MemoryDomain::Host);
-        #[cfg(feature = "gguf-cuda-shared-kv")]
-        let runtime_kv = self.device_pool.is_some()
-            && self.kv_path.load(std::sync::atomic::Ordering::Acquire)
-                == GgufKvPath::SharedKv.as_u8();
-        #[cfg(not(feature = "gguf-cuda-shared-kv"))]
+        #[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
+        let runtime_kv =
+            self.kv_path.load(std::sync::atomic::Ordering::Acquire) == GgufKvPath::SharedKv.as_u8();
+        #[cfg(not(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv")))]
         let runtime_kv = false;
-        #[cfg(feature = "gguf-cuda-shared-kv")]
+        #[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
         let runtime_kv_bytes = self
-            .device_pool
-            .as_ref()
-            .map(|(pool, owner)| {
-                pool.owner_usage_bytes(owner.with_class(PoolAllocationClass::KvCache))
-            })
+            .runtime_kv_usage_bytes()
             .unwrap_or(metrics.kv_cache_bytes_used);
-        #[cfg(not(feature = "gguf-cuda-shared-kv"))]
+        #[cfg(not(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv")))]
         let runtime_kv_bytes = metrics.kv_cache_bytes_used;
         report.push(MemoryAllocation {
             allocation_id: "gguf:active-kv".to_string(),
@@ -4878,17 +5176,13 @@ impl Engine for GgufBackend {
     }
 
     fn planned_request_memory(&self, request: &InferenceRequest) -> MemoryReport {
-        #[cfg(feature = "gguf-cuda-shared-kv")]
+        #[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
         {
-            if self.device_pool.is_none()
-                || self.kv_path.load(std::sync::atomic::Ordering::Acquire)
-                    != GgufKvPath::SharedKv.as_u8()
+            if self.kv_path.load(std::sync::atomic::Ordering::Acquire)
+                != GgufKvPath::SharedKv.as_u8()
             {
                 return MemoryReport::default();
             }
-            let Some(handle) = self.pool_slot.lock().unwrap().clone() else {
-                return MemoryReport::default();
-            };
             let Some(inner) = self.inner.as_ref() else {
                 return MemoryReport::default();
             };
@@ -4916,10 +5210,10 @@ impl Engine for GgufBackend {
                     .and_then(|metadata| metadata.max_new_tokens)
                     .unwrap_or(512) as usize,
                 inner.ctx_per_seq,
-                handle.pool.block_size(),
+                self.shared_kv_block_size,
                 inner.kv_bytes_per_cell,
             );
-            return MemoryReport {
+            MemoryReport {
                 allocations: vec![MemoryAllocation {
                     allocation_id: "gguf:request-kv".to_string(),
                     domain: MemoryDomain::Cuda {
@@ -4929,10 +5223,10 @@ impl Engine for GgufBackend {
                     source: MemoryAllocationSource::RuntimeManaged,
                     bytes,
                 }],
-            };
+            }
         }
 
-        #[cfg(not(feature = "gguf-cuda-shared-kv"))]
+        #[cfg(not(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv")))]
         {
             let _ = request;
             MemoryReport::default()
@@ -4982,7 +5276,7 @@ impl Engine for GgufBackend {
         if let Ok(mut metrics) = self.metrics.lock() {
             *metrics = EngineMetrics::new();
         }
-        #[cfg(feature = "gguf-cuda-shared-kv")]
+        #[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
         {
             self.kv_path.store(
                 GgufKvPath::Unloaded.as_u8(),
@@ -4990,6 +5284,7 @@ impl Engine for GgufBackend {
             );
             self.kv_capabilities = KvBackendCapabilities::unmanaged();
             self.kv_topology = None;
+            self.external_kv_usage = None;
         }
         log::info!("[gguf] Backend unloaded");
     }
@@ -5191,8 +5486,123 @@ mod tests {
         gguf_cross_session_prefix_cache_opt_in, gguf_shared_kv_topology, highest_priority_index,
         planned_gguf_request_kv_bytes, GgufServingConfig,
     };
+    #[cfg(feature = "gguf-external-kv")]
+    use super::{GgufExternalKvPool, GgufExternalKvPoolGeometry};
     use kapsl_kv_abi::KvCachePolicy;
+    #[cfg(feature = "gguf-external-kv")]
+    use llama_cpp_sys_2::{llama_kapsl_kv_pool_desc, LLAMA_KAPSL_KV_DTYPE_F16};
+    #[cfg(feature = "gguf-external-kv")]
+    use std::ffi::c_void;
+    #[cfg(feature = "gguf-external-kv")]
+    use std::sync::Arc;
     use std::time::Duration;
+
+    #[cfg(feature = "gguf-external-kv")]
+    unsafe extern "C" fn external_test_reserve(
+        _user_data: *mut c_void,
+        _session_id: u64,
+        _tokens_needed: u32,
+        _block_table_device_out: *mut *mut u32,
+        _blocks_out: *mut u32,
+    ) -> bool {
+        true
+    }
+
+    #[cfg(feature = "gguf-external-kv")]
+    unsafe extern "C" fn external_test_commit(
+        _user_data: *mut c_void,
+        _block_table_device_out: *mut *mut u32,
+    ) -> bool {
+        true
+    }
+
+    #[cfg(feature = "gguf-external-kv")]
+    unsafe extern "C" fn external_test_release(_user_data: *mut c_void, _sequence_id: u64) {}
+
+    #[cfg(feature = "gguf-external-kv")]
+    fn external_test_geometry() -> GgufExternalKvPoolGeometry {
+        GgufExternalKvPoolGeometry {
+            device_id: 2,
+            requested_blocks: 64,
+            block_size_tokens: 16,
+            num_layers: 8,
+            num_kv_heads: 4,
+            key_head_dim: 64,
+            value_head_dim: 64,
+            max_sequences: 3,
+            max_blocks_per_sequence: 32,
+            model_fingerprint: 0xA11CE,
+        }
+    }
+
+    #[cfg(feature = "gguf-external-kv")]
+    fn external_test_descriptor(geometry: GgufExternalKvPoolGeometry) -> llama_kapsl_kv_pool_desc {
+        llama_kapsl_kv_pool_desc {
+            user_data: std::ptr::dangling_mut::<c_void>(),
+            device_id: geometry.device_id as u32,
+            block_size: geometry.block_size_tokens as u32,
+            num_blocks: geometry.requested_blocks as u32,
+            num_kv_heads: geometry.num_kv_heads as u32,
+            head_dim: geometry.key_head_dim as u32,
+            dtype: LLAMA_KAPSL_KV_DTYPE_F16,
+            device_base: std::ptr::dangling_mut::<c_void>(),
+            block_table_device: std::ptr::dangling_mut::<u32>(),
+            block_table_layer_stride: geometry.max_blocks_per_sequence as u32,
+            n_layers: geometry.num_layers as u32,
+            max_blocks_per_seq: geometry.max_blocks_per_sequence as u32,
+            block_table_seq_stride: geometry
+                .num_layers
+                .saturating_mul(geometry.max_blocks_per_sequence)
+                as u32,
+            n_seq_slots: geometry.max_sequences as u32,
+            model_fingerprint: geometry.model_fingerprint,
+            reserve: Some(external_test_reserve),
+            reserve_seq: Some(external_test_reserve),
+            commit_seq: Some(external_test_commit),
+            release: Some(external_test_release),
+            touch: None,
+            reserve_prefix: None,
+            promote_prefix: None,
+            needs_restore: None,
+        }
+    }
+
+    #[cfg(feature = "gguf-external-kv")]
+    #[test]
+    fn external_kv_descriptor_accepts_exact_runtime_geometry() {
+        let geometry = external_test_geometry();
+        let descriptor = external_test_descriptor(geometry);
+        let pool = unsafe {
+            GgufExternalKvPool::from_raw(geometry, descriptor, Box::new(()), Arc::new(|| 4096))
+        }
+        .expect("valid runtime-owned descriptor");
+        assert_eq!((pool.usage_bytes)(), 4096);
+        pool.topology.validate().expect("valid derived topology");
+    }
+
+    #[cfg(feature = "gguf-external-kv")]
+    #[test]
+    fn external_kv_descriptor_rejects_geometry_or_sequence_contract_mismatch() {
+        let geometry = external_test_geometry();
+        let mut wrong_geometry = external_test_descriptor(geometry);
+        wrong_geometry.head_dim += 1;
+        assert!(unsafe {
+            GgufExternalKvPool::from_raw(geometry, wrong_geometry, Box::new(()), Arc::new(|| 0))
+        }
+        .is_err());
+
+        let mut missing_sequence_callbacks = external_test_descriptor(geometry);
+        missing_sequence_callbacks.reserve_seq = None;
+        assert!(unsafe {
+            GgufExternalKvPool::from_raw(
+                geometry,
+                missing_sequence_callbacks,
+                Box::new(()),
+                Arc::new(|| 0),
+            )
+        }
+        .is_err());
+    }
 
     #[test]
     fn highest_priority_index_prefers_lowest_value_then_earliest() {

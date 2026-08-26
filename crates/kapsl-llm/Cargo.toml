@@ -7,19 +7,19 @@ repository.workspace = true
 description = "Large language model inference with GGUF and ONNX backend support for Kapsl"
 
 [dependencies]
-kapsl-core = { version = "0.1.2", path = "../kapsl-core" }
-kapsl-engine-api = { version = "0.1.2", path = "../kapsl-engine-api" }
+kapsl-core = { version = "0.1.3", path = "../kapsl-core" }
+kapsl-engine-api = { version = "0.1.3", path = "../kapsl-engine-api" }
 kapsl-kv-abi = { version = "0.4.0", path = "../kapsl-kv-abi" }
-kapsl-quantization = { version = "0.1.2", path = "../kapsl-quantization" }
-kapsl-kernels = { version = "0.1.2", path = "../kapsl-kernels" }
-kapsl-loader = { version = "0.1.2", path = "../kapsl-loader", optional = true }
+kapsl-quantization = { version = "0.1.3", path = "../kapsl-quantization" }
+kapsl-kernels = { version = "0.1.3", path = "../kapsl-kernels" }
+kapsl-loader = { version = "0.1.3", path = "../kapsl-loader", optional = true }
 tokio = { version = "1.32", features = ["full"] }
 tracing = "0.1"
 uuid = { version = "1.4", features = ["v4"] }
 thiserror = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 log = "0.4"
-kapsl-hal = { version = "0.1.2", path = "../kapsl-hal" }
+kapsl-hal = { version = "0.1.3", path = "../kapsl-hal" }
 futures = "0.3"
 async-stream = "0.3"
 tokenizers = "0.20"
@@ -31,17 +31,21 @@ parking_lot = "0.12"
 cudarc = { version = "0.12", features = ["cuda-version-from-build-system"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
-ort = { version = "=2.0.0-rc.11", features = ["ndarray", "half", "download-binaries", "directml", "cuda", "tensorrt", "coreml", "openvino"] }
+ort = { version = "=2.0.0-rc.11", optional = true, features = ["ndarray", "half", "download-binaries", "directml", "cuda", "tensorrt", "coreml", "openvino"] }
 
 [target.'cfg(not(windows))'.dependencies]
-ort = { version = "=2.0.0-rc.11", features = ["ndarray", "half", "download-binaries", "cuda", "tensorrt", "coreml", "openvino"] }
+ort = { version = "=2.0.0-rc.11", optional = true, features = ["ndarray", "half", "download-binaries", "cuda", "tensorrt", "coreml", "openvino"] }
 
 [features]
-default = ["gguf"]
+default = ["gguf", "onnx"]
+onnx = ["dep:ort"]
 gguf = ["dep:llama-cpp-2", "dep:llama-cpp-sys-2", "dep:kapsl-loader"]
 # Opt-in CUDA acceleration for GGUF. Keep default CPU/Metal portable so Linux
 # machines without a CUDA toolkit can still build.
 gguf-cuda = ["gguf", "llama-cpp-2/cuda"]
+## Raw-descriptor provider for native packs. Allocation remains outside this
+## crate; pair with `gguf-cuda` in production.
+gguf-external-kv = ["gguf"]
 gguf-cuda-shared-kv = ["gguf-cuda", "kapsl-hal/cuda", "dep:cudarc"]
 # Attribute ORT CUDA allocations to model/replica/allocation-class scopes when
 # the runtime registers its environment allocator.
