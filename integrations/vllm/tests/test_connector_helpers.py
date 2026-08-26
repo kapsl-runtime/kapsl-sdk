@@ -156,8 +156,8 @@ class ConnectorHelperTests(unittest.TestCase):
             block_size=16,
             page_size_bytes=1024,
             num_kv_heads=4,
-            head_size=64,
-            head_size_v=64,
+            head_size=4,
+            head_size_v=4,
             dtype="float16",
             sliding_window=None,
             attention_chunk_size=None,
@@ -167,7 +167,7 @@ class ConnectorHelperTests(unittest.TestCase):
             kv_cache_layout="BHLNC",
             kv_cache_tensors=[
                 SimpleNamespace(
-                    size=32 * 8192,
+                    size=32 * 2048,
                     layers=["model.layers.0.attn", "model.layers.1.attn"],
                 )
             ],
@@ -183,9 +183,14 @@ class ConnectorHelperTests(unittest.TestCase):
             config,
             [{"kind": "cuda", "device_id": 0}],
             shared_pool=True,
+            spec_kind_classifier=lambda _spec: "full_attention",
         )
-        self.assertEqual(groups[0]["bytes_per_allocation"], 8192)
-        topology = _vllm_topology(config, "sha256:model")
+        self.assertEqual(groups[0]["bytes_per_allocation"], 2048)
+        topology = _vllm_topology(
+            config,
+            "sha256:model",
+            spec_kind_classifier=lambda _spec: "full_attention",
+        )
         self.assertEqual(
             topology["cache_groups"][0]["geometry"]["layout"]["layout_id"],
             "vllm:BHLNC",
@@ -195,6 +200,14 @@ class ConnectorHelperTests(unittest.TestCase):
             {"kind": "f16"},
         )
         self.assertEqual(len(topology["cache_groups"][0]["layers"]), 2)
+
+        spec.block_size = 16.5
+        with self.assertRaisesRegex(ValueError, "must be an integer"):
+            _vllm_topology(
+                config,
+                "sha256:model",
+                spec_kind_classifier=lambda _spec: "full_attention",
+            )
 
     def test_element_types_use_the_rust_internally_tagged_shape(self) -> None:
         self.assertEqual(_element_type("torch.float16"), {"kind": "f16"})
@@ -227,6 +240,64 @@ class ConnectorHelperTests(unittest.TestCase):
                 domains,
                 2,
             )
+
+    def test_shared_rank_map_rejects_noncanonical_and_nonintegral_values(self) -> None:
+        domains = [
+            {"kind": "cuda", "device_id": 0},
+            {"kind": "cuda", "device_id": 2},
+        ]
+        invalid_maps = (
+            ({"00": 0, "1": 2}, "canonical"),
+            ({"+0": 0, "1": 2}, "canonical"),
+            ({" 0": 0, "1": 2}, "canonical"),
+            ({0.0: 0, "1": 2}, "canonical"),
+            ({True: 0, "1": 2}, "canonical"),
+            ({"0": False, "1": 2}, "unsigned 64-bit integer"),
+            ({"0": 0.0, "1": 2}, "unsigned 64-bit integer"),
+            ({"0": "0", "1": 2}, "unsigned 64-bit integer"),
+        )
+        for rank_map, message in invalid_maps:
+            with self.subTest(rank_map=rank_map), self.assertRaisesRegex(
+                ValueError, message
+            ):
+                _validated_shared_rank_device_map(
+                    SimpleNamespace(
+                        kv_connector_extra_config={
+                            "kapsl_rank_device_map": rank_map
+                        }
+                    ),
+                    domains,
+                    2,
+                )
+
+        with self.assertRaisesRegex(ValueError, "duplicate or colliding ranks"):
+            _validated_shared_rank_device_map(
+                SimpleNamespace(
+                    kv_connector_extra_config={
+                        "kapsl_rank_device_map": {
+                            0: 0,
+                            "0": 2,
+                            1: 2,
+                        }
+                    }
+                ),
+                domains,
+                2,
+            )
+
+    def test_shared_rank_map_rejects_nonintegral_memory_domain_ids(self) -> None:
+        config = SimpleNamespace(
+            kv_connector_extra_config={"kapsl_rank_device_map": {"0": 0}}
+        )
+        for device_id in (True, 0.0, "0", None):
+            with self.subTest(device_id=device_id), self.assertRaisesRegex(
+                ValueError, "unsigned 64-bit integer"
+            ):
+                _validated_shared_rank_device_map(
+                    config,
+                    [{"kind": "cuda", "device_id": device_id}],
+                    1,
+                )
 
     def test_heartbeat_failure_is_a_fail_closed_scheduler_error(self) -> None:
         connector = KapslConnectorV1.__new__(KapslConnectorV1)

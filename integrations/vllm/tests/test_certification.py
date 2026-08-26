@@ -29,7 +29,7 @@ def _passing_report() -> dict[str, object]:
         "status": "passed",
         "profile": {
             "adapter_id": "kapsl-vllm-connector",
-            "adapter_version": "0.5.0",
+            "adapter_version": "0.6.0",
             "backend_version": "0.test",
             "profile_id": "vllm-v1-packed-cuda-ipc/flash-attn",
         },
@@ -130,7 +130,7 @@ class CertificationTests(unittest.TestCase):
 
         self.assertEqual(
             allowlist_entry(report),
-            "kapsl-vllm-connector,0.5.0,0.test,"
+            "kapsl-vllm-connector,0.6.0,0.test,"
             "vllm-v1-packed-cuda-ipc/flash-attn",
         )
 

@@ -32,7 +32,7 @@ class FlashAttentionProbeHostTests(unittest.TestCase):
         geometry = ProbeGeometry(8, 16, 2, 4, 64, "float16", 256)
         profile = {
             "adapter_id": "kapsl-vllm-connector",
-            "adapter_version": "0.5.0",
+            "adapter_version": "0.6.0",
             "backend_version": "test",
             "profile_id": "vllm-v1-packed-cuda-ipc/flash-attn",
         }
