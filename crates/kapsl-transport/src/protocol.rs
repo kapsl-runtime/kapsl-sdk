@@ -5,7 +5,10 @@
 //! IPC server, Rust clients, and language bindings share one implementation.
 
 use crate::TransportError;
-use kapsl_engine_api::{BinaryTensorPacket, InferenceRequest, NamedTensor};
+use kapsl_engine_api::{
+    BinaryTensorPacket, InferenceRequest, NamedTensor, OpenAiWireFormat, OpenAiWireRequest,
+    OpenAiWireResponse, OpenAiWireResponseHead,
+};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::io;
 use thiserror::Error;
@@ -13,19 +16,37 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Default allocation ceiling for a single peer-supplied frame payload.
 pub const DEFAULT_MAX_FRAME_PAYLOAD_BYTES: usize = 1024 * 1024 * 1024;
+/// Exact ceiling for the complete versioned OpenAI wire request envelope.
+///
+/// This includes the preamble, serialized request metadata, body, and optional
+/// transport credential so paired clients cannot accept a request that the
+/// IPC server will reject before authentication.
+pub const MAX_OPENAI_WIRE_REQUEST_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 
 pub const OP_INFER: u32 = 1;
 pub const OP_INFER_STREAM: u32 = 2;
 pub const OP_METRICS: u32 = 3;
 pub const OP_HYBRID_INFER: u32 = 4;
+pub const OP_OPENAI_WIRE: u32 = 5;
+pub const OP_OPENAI_WIRE_STREAM: u32 = 6;
+
+/// Version of the transport-only envelope carried by OpenAI wire request
+/// operation payloads. This preamble is checked before bincode deserializes the
+/// engine-facing request.
+pub const OPENAI_WIRE_TRANSPORT_VERSION: u16 = 1;
 
 pub const STATUS_OK: u32 = 0;
 pub const STATUS_ERR: u32 = 1;
 pub const STATUS_STREAM_CHUNK: u32 = 2;
 pub const STATUS_STREAM_END: u32 = 3;
+pub const STATUS_OPENAI_WIRE_HEAD: u32 = 4;
+pub const STATUS_OPENAI_WIRE_CHUNK: u32 = 5;
 
 const REQUEST_HEADER_BYTES: usize = 12;
 const RESPONSE_HEADER_BYTES: usize = 8;
+const OPENAI_WIRE_PREAMBLE_MAGIC: [u8; 4] = *b"KOWR";
+const OPENAI_WIRE_PREAMBLE_BYTES: usize =
+    OPENAI_WIRE_PREAMBLE_MAGIC.len() + std::mem::size_of::<u16>();
 
 /// Fixed 12-byte request header. Headers are encoded explicitly, not with
 /// bincode, so their wire representation cannot change with serde settings.
@@ -59,6 +80,25 @@ impl RequestFrame {
     pub fn decode_inference_request(&self) -> Result<InferenceRequest, CodecError> {
         decode_inference_request(&self.payload)
     }
+
+    pub fn decode_openai_wire_envelope(&self) -> Result<OpenAiWireTransportEnvelope, CodecError> {
+        if !matches!(self.header.op_code, OP_OPENAI_WIRE | OP_OPENAI_WIRE_STREAM) {
+            return Err(CodecError::Deserialize(format!(
+                "unexpected OpenAI wire request operation {}",
+                self.header.op_code
+            )));
+        }
+        let envelope = decode_openai_wire_transport_envelope(&self.payload)?;
+        envelope
+            .request
+            .validate(self.payload.len())
+            .map_err(|error| CodecError::Deserialize(error.to_string()))?;
+        Ok(envelope)
+    }
+
+    pub fn decode_openai_wire_request(&self) -> Result<OpenAiWireRequest, CodecError> {
+        Ok(self.decode_openai_wire_envelope()?.request)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +131,87 @@ impl ResponseFrame {
 pub enum StreamResponse {
     Chunk(BinaryTensorPacket),
     End,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenAiWireStreamFrame {
+    Head(OpenAiWireResponseHead),
+    Chunk(Vec<u8>),
+    End,
+}
+
+/// Transport-only wrapper for authenticating a wire operation. Its bincode
+/// representation follows the fixed OpenAI wire transport preamble; it is
+/// never written directly as a frame payload. The server consumes `auth_token`
+/// before dispatching `request`, whose engine-facing type cannot represent
+/// credentials.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenAiWireTransportEnvelope {
+    pub request: OpenAiWireRequest,
+    #[serde(default)]
+    pub auth_token: Option<String>,
+}
+
+impl OpenAiWireTransportEnvelope {
+    pub fn unauthenticated(request: OpenAiWireRequest) -> Self {
+        Self {
+            request,
+            auth_token: None,
+        }
+    }
+
+    pub fn authenticated(request: OpenAiWireRequest, auth_token: impl Into<String>) -> Self {
+        Self {
+            request,
+            auth_token: Some(auth_token.into()),
+        }
+    }
+}
+
+fn encode_openai_wire_transport_envelope(
+    envelope: &OpenAiWireTransportEnvelope,
+) -> Result<Vec<u8>, CodecError> {
+    let encoded = serialize_value(envelope)?;
+    let capacity = OPENAI_WIRE_PREAMBLE_BYTES
+        .checked_add(encoded.len())
+        .ok_or(CodecError::LengthOverflow {
+            size: encoded.len(),
+        })?;
+    checked_payload_len(capacity, MAX_OPENAI_WIRE_REQUEST_PAYLOAD_BYTES)?;
+    let mut payload = Vec::with_capacity(capacity);
+    payload.extend_from_slice(&OPENAI_WIRE_PREAMBLE_MAGIC);
+    payload.extend_from_slice(&OPENAI_WIRE_TRANSPORT_VERSION.to_le_bytes());
+    payload.extend_from_slice(&encoded);
+    Ok(payload)
+}
+
+fn decode_openai_wire_transport_envelope(
+    payload: &[u8],
+) -> Result<OpenAiWireTransportEnvelope, CodecError> {
+    if payload.len() < OPENAI_WIRE_PREAMBLE_BYTES {
+        return Err(CodecError::Deserialize(format!(
+            "OpenAI wire transport payload is {} bytes; preamble requires {} bytes",
+            payload.len(),
+            OPENAI_WIRE_PREAMBLE_BYTES,
+        )));
+    }
+    if payload[..OPENAI_WIRE_PREAMBLE_MAGIC.len()] != OPENAI_WIRE_PREAMBLE_MAGIC {
+        return Err(CodecError::Deserialize(
+            "OpenAI wire transport payload has an invalid preamble".to_string(),
+        ));
+    }
+    let version_offset = OPENAI_WIRE_PREAMBLE_MAGIC.len();
+    let version = u16::from_le_bytes(
+        payload[version_offset..OPENAI_WIRE_PREAMBLE_BYTES]
+            .try_into()
+            .expect("fixed OpenAI wire version slice"),
+    );
+    if version != OPENAI_WIRE_TRANSPORT_VERSION {
+        return Err(CodecError::Deserialize(format!(
+            "unsupported OpenAI wire transport version {version}; expected {OPENAI_WIRE_TRANSPORT_VERSION}",
+        )));
+    }
+    deserialize_value(&payload[OPENAI_WIRE_PREAMBLE_BYTES..])
 }
 
 #[derive(Debug, Error)]
@@ -262,6 +383,16 @@ pub mod blocking {
         Ok(())
     }
 
+    fn write_openai_wire_envelope<W: Write + ?Sized>(
+        writer: &mut W,
+        model_id: u32,
+        op_code: u32,
+        envelope: &OpenAiWireTransportEnvelope,
+    ) -> Result<(), CodecError> {
+        let payload = encode_openai_wire_transport_envelope(envelope)?;
+        write_request_bytes(writer, model_id, op_code, &payload)
+    }
+
     pub fn read_request_frame<R: Read + ?Sized>(
         reader: &mut R,
         max_payload_bytes: usize,
@@ -351,6 +482,108 @@ pub mod blocking {
         read_response_value(conn, max_payload_bytes)
     }
 
+    pub fn openai_wire_over_stream<S: Read + Write + ?Sized>(
+        conn: &mut S,
+        model_id: u32,
+        request: &OpenAiWireRequest,
+    ) -> Result<OpenAiWireResponse, CodecError> {
+        openai_wire_over_stream_with_auth(conn, model_id, request, None)
+    }
+
+    pub fn openai_wire_over_stream_authenticated<S: Read + Write + ?Sized>(
+        conn: &mut S,
+        model_id: u32,
+        request: &OpenAiWireRequest,
+        auth_token: &str,
+    ) -> Result<OpenAiWireResponse, CodecError> {
+        openai_wire_over_stream_with_auth(conn, model_id, request, Some(auth_token))
+    }
+
+    fn openai_wire_over_stream_with_auth<S: Read + Write + ?Sized>(
+        conn: &mut S,
+        model_id: u32,
+        request: &OpenAiWireRequest,
+        auth_token: Option<&str>,
+    ) -> Result<OpenAiWireResponse, CodecError> {
+        if request.format != OpenAiWireFormat::Json {
+            return Err(CodecError::Serialize(
+                "non-streaming OpenAI wire operation requires JSON format".to_string(),
+            ));
+        }
+        request
+            .validate(MAX_OPENAI_WIRE_REQUEST_PAYLOAD_BYTES)
+            .map_err(|error| CodecError::Serialize(error.to_string()))?;
+        let envelope = OpenAiWireTransportEnvelope {
+            request: request.clone(),
+            auth_token: auth_token.map(str::to_string),
+        };
+        write_openai_wire_envelope(conn, model_id, OP_OPENAI_WIRE, &envelope)?;
+        let response: OpenAiWireResponse =
+            read_response_value(conn, DEFAULT_MAX_FRAME_PAYLOAD_BYTES)?;
+        response
+            .head
+            .validate()
+            .map_err(|error| CodecError::Deserialize(error.to_string()))?;
+        Ok(response)
+    }
+
+    pub fn write_openai_wire_stream_request<W: Write + ?Sized>(
+        writer: &mut W,
+        model_id: u32,
+        request: &OpenAiWireRequest,
+    ) -> Result<(), CodecError> {
+        write_openai_wire_stream_request_with_auth(writer, model_id, request, None)
+    }
+
+    pub fn write_openai_wire_stream_request_authenticated<W: Write + ?Sized>(
+        writer: &mut W,
+        model_id: u32,
+        request: &OpenAiWireRequest,
+        auth_token: &str,
+    ) -> Result<(), CodecError> {
+        write_openai_wire_stream_request_with_auth(writer, model_id, request, Some(auth_token))
+    }
+
+    fn write_openai_wire_stream_request_with_auth<W: Write + ?Sized>(
+        writer: &mut W,
+        model_id: u32,
+        request: &OpenAiWireRequest,
+        auth_token: Option<&str>,
+    ) -> Result<(), CodecError> {
+        if request.format != OpenAiWireFormat::ServerSentEvents {
+            return Err(CodecError::Serialize(
+                "streaming OpenAI wire operation requires SSE format".to_string(),
+            ));
+        }
+        request
+            .validate(MAX_OPENAI_WIRE_REQUEST_PAYLOAD_BYTES)
+            .map_err(|error| CodecError::Serialize(error.to_string()))?;
+        let envelope = OpenAiWireTransportEnvelope {
+            request: request.clone(),
+            auth_token: auth_token.map(str::to_string),
+        };
+        write_openai_wire_envelope(writer, model_id, OP_OPENAI_WIRE_STREAM, &envelope)
+    }
+
+    pub fn read_openai_wire_stream_frame<R: Read + ?Sized>(
+        reader: &mut R,
+        max_payload_bytes: usize,
+    ) -> Result<OpenAiWireStreamFrame, CodecError> {
+        let frame = read_response_frame(reader, max_payload_bytes)?;
+        match frame.header.status {
+            STATUS_OPENAI_WIRE_HEAD => {
+                let head: OpenAiWireResponseHead = frame.deserialize()?;
+                head.validate()
+                    .map_err(|error| CodecError::Deserialize(error.to_string()))?;
+                Ok(OpenAiWireStreamFrame::Head(head))
+            }
+            STATUS_OPENAI_WIRE_CHUNK => Ok(OpenAiWireStreamFrame::Chunk(frame.payload)),
+            STATUS_STREAM_END => Ok(OpenAiWireStreamFrame::End),
+            STATUS_ERR => Err(frame.remote_error()),
+            status => Err(CodecError::UnexpectedStatus(status)),
+        }
+    }
+
     pub fn read_stream_packet<R: Read + ?Sized>(
         reader: &mut R,
         max_payload_bytes: usize,
@@ -400,6 +633,16 @@ pub mod asynchronous {
         Ok(())
     }
 
+    async fn write_openai_wire_envelope<W: AsyncWrite + Unpin + ?Sized>(
+        writer: &mut W,
+        model_id: u32,
+        op_code: u32,
+        envelope: &OpenAiWireTransportEnvelope,
+    ) -> Result<(), CodecError> {
+        let payload = encode_openai_wire_transport_envelope(envelope)?;
+        write_request_bytes(writer, model_id, op_code, &payload).await
+    }
+
     pub async fn read_request_frame<R: AsyncRead + Unpin + ?Sized>(
         reader: &mut R,
         max_payload_bytes: usize,
@@ -419,6 +662,18 @@ pub mod asynchronous {
         reader: &mut R,
         max_payload_bytes: usize,
     ) -> Result<Option<RequestFrame>, CodecError> {
+        read_request_frame_or_eof_with_operation_limits(reader, max_payload_bytes, &[]).await
+    }
+
+    /// Read a request while applying tighter pre-allocation ceilings to
+    /// selected operation codes. The fixed header is decoded first, so a
+    /// restricted operation is rejected before reserving or reading its
+    /// peer-controlled payload.
+    pub async fn read_request_frame_or_eof_with_operation_limits<R: AsyncRead + Unpin + ?Sized>(
+        reader: &mut R,
+        default_max_payload_bytes: usize,
+        operation_limits: &[(u32, usize)],
+    ) -> Result<Option<RequestFrame>, CodecError> {
         let mut header_bytes = [0; REQUEST_HEADER_BYTES];
         match reader.read(&mut header_bytes[..1]).await? {
             0 => return Ok(None),
@@ -427,6 +682,11 @@ pub mod asynchronous {
         }
         reader.read_exact(&mut header_bytes[1..]).await?;
         let header = decode_request_header(header_bytes);
+        let max_payload_bytes = operation_limits
+            .iter()
+            .find_map(|(operation, limit)| (*operation == header.op_code).then_some(*limit))
+            .unwrap_or(default_max_payload_bytes)
+            .min(default_max_payload_bytes);
         let payload_size = validate_incoming_len(header.payload_size, max_payload_bytes)?;
         let mut payload = vec![0; payload_size];
         reader.read_exact(&mut payload).await?;
@@ -514,6 +774,111 @@ pub mod asynchronous {
         read_response_value(conn, max_payload_bytes).await
     }
 
+    pub async fn openai_wire_over_stream<S: AsyncRead + AsyncWrite + Unpin + ?Sized>(
+        conn: &mut S,
+        model_id: u32,
+        request: &OpenAiWireRequest,
+    ) -> Result<OpenAiWireResponse, CodecError> {
+        openai_wire_over_stream_with_auth(conn, model_id, request, None).await
+    }
+
+    pub async fn openai_wire_over_stream_authenticated<
+        S: AsyncRead + AsyncWrite + Unpin + ?Sized,
+    >(
+        conn: &mut S,
+        model_id: u32,
+        request: &OpenAiWireRequest,
+        auth_token: &str,
+    ) -> Result<OpenAiWireResponse, CodecError> {
+        openai_wire_over_stream_with_auth(conn, model_id, request, Some(auth_token)).await
+    }
+
+    async fn openai_wire_over_stream_with_auth<S: AsyncRead + AsyncWrite + Unpin + ?Sized>(
+        conn: &mut S,
+        model_id: u32,
+        request: &OpenAiWireRequest,
+        auth_token: Option<&str>,
+    ) -> Result<OpenAiWireResponse, CodecError> {
+        if request.format != OpenAiWireFormat::Json {
+            return Err(CodecError::Serialize(
+                "non-streaming OpenAI wire operation requires JSON format".to_string(),
+            ));
+        }
+        request
+            .validate(MAX_OPENAI_WIRE_REQUEST_PAYLOAD_BYTES)
+            .map_err(|error| CodecError::Serialize(error.to_string()))?;
+        let envelope = OpenAiWireTransportEnvelope {
+            request: request.clone(),
+            auth_token: auth_token.map(str::to_string),
+        };
+        write_openai_wire_envelope(conn, model_id, OP_OPENAI_WIRE, &envelope).await?;
+        let response: OpenAiWireResponse =
+            read_response_value(conn, DEFAULT_MAX_FRAME_PAYLOAD_BYTES).await?;
+        response
+            .head
+            .validate()
+            .map_err(|error| CodecError::Deserialize(error.to_string()))?;
+        Ok(response)
+    }
+
+    pub async fn write_openai_wire_stream_request<W: AsyncWrite + Unpin + ?Sized>(
+        writer: &mut W,
+        model_id: u32,
+        request: &OpenAiWireRequest,
+    ) -> Result<(), CodecError> {
+        write_openai_wire_stream_request_with_auth(writer, model_id, request, None).await
+    }
+
+    pub async fn write_openai_wire_stream_request_authenticated<W: AsyncWrite + Unpin + ?Sized>(
+        writer: &mut W,
+        model_id: u32,
+        request: &OpenAiWireRequest,
+        auth_token: &str,
+    ) -> Result<(), CodecError> {
+        write_openai_wire_stream_request_with_auth(writer, model_id, request, Some(auth_token))
+            .await
+    }
+
+    async fn write_openai_wire_stream_request_with_auth<W: AsyncWrite + Unpin + ?Sized>(
+        writer: &mut W,
+        model_id: u32,
+        request: &OpenAiWireRequest,
+        auth_token: Option<&str>,
+    ) -> Result<(), CodecError> {
+        if request.format != OpenAiWireFormat::ServerSentEvents {
+            return Err(CodecError::Serialize(
+                "streaming OpenAI wire operation requires SSE format".to_string(),
+            ));
+        }
+        request
+            .validate(MAX_OPENAI_WIRE_REQUEST_PAYLOAD_BYTES)
+            .map_err(|error| CodecError::Serialize(error.to_string()))?;
+        let envelope = OpenAiWireTransportEnvelope {
+            request: request.clone(),
+            auth_token: auth_token.map(str::to_string),
+        };
+        write_openai_wire_envelope(writer, model_id, OP_OPENAI_WIRE_STREAM, &envelope).await
+    }
+
+    pub async fn read_openai_wire_stream_frame<R: AsyncRead + Unpin + ?Sized>(
+        reader: &mut R,
+        max_payload_bytes: usize,
+    ) -> Result<OpenAiWireStreamFrame, CodecError> {
+        let frame = read_response_frame(reader, max_payload_bytes).await?;
+        match frame.header.status {
+            STATUS_OPENAI_WIRE_HEAD => {
+                let head: OpenAiWireResponseHead = frame.deserialize()?;
+                head.validate()
+                    .map_err(|error| CodecError::Deserialize(error.to_string()))?;
+                Ok(OpenAiWireStreamFrame::Head(head))
+            }
+            STATUS_OPENAI_WIRE_CHUNK => Ok(OpenAiWireStreamFrame::Chunk(frame.payload)),
+            STATUS_STREAM_END => Ok(OpenAiWireStreamFrame::End),
+            STATUS_ERR => Err(frame.remote_error()),
+            status => Err(CodecError::UnexpectedStatus(status)),
+        }
+    }
+
     pub async fn read_stream_packet<R: AsyncRead + Unpin + ?Sized>(
         reader: &mut R,
         max_payload_bytes: usize,
@@ -547,9 +912,29 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kapsl_engine_api::TensorDtype;
+    use kapsl_engine_api::{
+        OpenAiWireEndpoint, OpenAiWireHeader, OpenAiWireHeaderName, TensorDtype,
+    };
     use std::io::Cursor;
-    use tokio::io::duplex;
+    use tokio::io::{duplex, AsyncReadExt};
+
+    // Full request frame for an unauthenticated v1 chat/SSE request with body
+    // `{}` and model ID 0x01020304. This freezes both the explicit transport
+    // preamble and the v1 bincode envelope that follows it.
+    const OPENAI_WIRE_V1_STREAM_FRAME: &[u8] = &[
+        0x04, 0x03, 0x02, 0x01, // model ID, little endian
+        0x06, 0x00, 0x00, 0x00, // OP_OPENAI_WIRE_STREAM
+        0x1d, 0x00, 0x00, 0x00, // 29-byte payload
+        b'K', b'O', b'W', b'R', // transport payload magic
+        0x01, 0x00, // outer transport version, little endian
+        0x01, 0x00, // engine-facing request version
+        0x00, 0x00, 0x00, 0x00, // ChatCompletions
+        0x01, 0x00, 0x00, 0x00, // ServerSentEvents
+        0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // body length
+        b'{', b'}', 0x00, // body, no session ID
+        0x00, // no policy metadata
+        0x00, // no transport auth token
+    ];
 
     fn packet() -> BinaryTensorPacket {
         BinaryTensorPacket {
@@ -586,6 +971,87 @@ mod tests {
     }
 
     #[test]
+    fn blocking_openai_wire_v1_request_matches_frozen_frame() {
+        let request = OpenAiWireRequest::new(
+            OpenAiWireEndpoint::ChatCompletions,
+            OpenAiWireFormat::ServerSentEvents,
+            b"{}".to_vec(),
+        );
+        let mut encoded = Vec::new();
+
+        blocking::write_openai_wire_stream_request(&mut encoded, 0x0102_0304, &request).unwrap();
+
+        assert_eq!(encoded, OPENAI_WIRE_V1_STREAM_FRAME);
+        let frame = blocking::read_request_frame(
+            &mut Cursor::new(OPENAI_WIRE_V1_STREAM_FRAME),
+            DEFAULT_MAX_FRAME_PAYLOAD_BYTES,
+        )
+        .unwrap();
+        assert_eq!(frame.decode_openai_wire_request().unwrap().body, b"{}");
+    }
+
+    #[tokio::test]
+    async fn asynchronous_openai_wire_v1_request_matches_frozen_frame() {
+        let request = OpenAiWireRequest::new(
+            OpenAiWireEndpoint::ChatCompletions,
+            OpenAiWireFormat::ServerSentEvents,
+            b"{}".to_vec(),
+        );
+        let (mut writer, mut reader) = duplex(128);
+
+        asynchronous::write_openai_wire_stream_request(&mut writer, 0x0102_0304, &request)
+            .await
+            .unwrap();
+        let mut encoded = vec![0; OPENAI_WIRE_V1_STREAM_FRAME.len()];
+        reader.read_exact(&mut encoded).await.unwrap();
+
+        assert_eq!(encoded, OPENAI_WIRE_V1_STREAM_FRAME);
+    }
+
+    #[test]
+    fn openai_wire_client_limits_the_complete_encoded_envelope() {
+        let request = OpenAiWireRequest::new(
+            OpenAiWireEndpoint::ChatCompletions,
+            OpenAiWireFormat::ServerSentEvents,
+            vec![b'x'; MAX_OPENAI_WIRE_REQUEST_PAYLOAD_BYTES],
+        );
+        let mut encoded = Vec::new();
+
+        let error = blocking::write_openai_wire_stream_request(&mut encoded, 7, &request)
+            .expect_err("the request body leaves no room for its versioned envelope");
+
+        assert!(matches!(
+            error,
+            CodecError::PayloadTooLarge { size, max }
+                if size > max && max == MAX_OPENAI_WIRE_REQUEST_PAYLOAD_BYTES
+        ));
+        assert!(encoded.is_empty());
+    }
+
+    #[test]
+    fn unknown_openai_wire_outer_version_is_rejected_before_bincode() {
+        let mut payload = OPENAI_WIRE_PREAMBLE_MAGIC.to_vec();
+        payload.extend_from_slice(&(OPENAI_WIRE_TRANSPORT_VERSION + 1).to_le_bytes());
+        // Deliberately omit a bincode envelope. The stable version error proves
+        // the outer preamble is inspected before deserialization is attempted.
+        let frame = RequestFrame {
+            header: RequestHeader {
+                model_id: 7,
+                op_code: OP_OPENAI_WIRE,
+                payload_size: payload.len() as u32,
+            },
+            payload,
+        };
+
+        let error = frame.decode_openai_wire_envelope().unwrap_err();
+        assert!(matches!(
+            error,
+            CodecError::Deserialize(message)
+                if message == "unsupported OpenAI wire transport version 2; expected 1"
+        ));
+    }
+
+    #[test]
     fn legacy_request_layout_decodes_in_one_shared_place() {
         let legacy = LegacyInferenceRequestV1 {
             input: packet(),
@@ -611,6 +1077,34 @@ mod tests {
         assert!(matches!(
             error,
             CodecError::PayloadTooLarge { size: 11, max: 10 }
+        ));
+    }
+
+    #[tokio::test]
+    async fn operation_limit_rejects_wire_payload_before_reading_or_allocating_it() {
+        let (mut peer, mut server) = duplex(64);
+        peer.write_all(&encode_request_header(RequestHeader {
+            model_id: 1,
+            op_code: OP_OPENAI_WIRE,
+            payload_size: 17,
+        }))
+        .await
+        .unwrap();
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            asynchronous::read_request_frame_or_eof_with_operation_limits(
+                &mut server,
+                DEFAULT_MAX_FRAME_PAYLOAD_BYTES,
+                &[(OP_OPENAI_WIRE, 16)],
+            ),
+        )
+        .await
+        .expect("restricted frame must fail from its header without waiting for payload bytes")
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            CodecError::PayloadTooLarge { size: 17, max: 16 }
         ));
     }
 
@@ -675,6 +1169,82 @@ mod tests {
                 .await
                 .unwrap(),
             StreamResponse::End
+        ));
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn openai_wire_stream_uses_distinct_operation_and_raw_byte_frames() {
+        let (mut client, mut server) = duplex(4096);
+        let request = OpenAiWireRequest::new(
+            OpenAiWireEndpoint::ChatCompletions,
+            OpenAiWireFormat::ServerSentEvents,
+            br#"{"model":"served","stream":true}"#.to_vec(),
+        );
+        let server_task = tokio::spawn(async move {
+            let frame =
+                asynchronous::read_request_frame(&mut server, DEFAULT_MAX_FRAME_PAYLOAD_BYTES)
+                    .await
+                    .unwrap();
+            assert_eq!(frame.header.model_id, 17);
+            assert_eq!(frame.header.op_code, OP_OPENAI_WIRE_STREAM);
+            let decoded = frame.decode_openai_wire_request().unwrap();
+            assert_eq!(decoded.body, br#"{"model":"served","stream":true}"#);
+
+            let head = OpenAiWireResponseHead::new(
+                200,
+                vec![OpenAiWireHeader::new(
+                    OpenAiWireHeaderName::ContentType,
+                    b"text/event-stream".to_vec(),
+                )
+                .unwrap()],
+            )
+            .unwrap();
+            asynchronous::write_response_value(&mut server, STATUS_OPENAI_WIRE_HEAD, &head)
+                .await
+                .unwrap();
+            asynchronous::write_response_bytes(
+                &mut server,
+                STATUS_OPENAI_WIRE_CHUNK,
+                b"data: {\"delta\":\"a\"}\n\n\0raw",
+            )
+            .await
+            .unwrap();
+            asynchronous::write_response_bytes(&mut server, STATUS_STREAM_END, &[])
+                .await
+                .unwrap();
+        });
+
+        asynchronous::write_openai_wire_stream_request(&mut client, 17, &request)
+            .await
+            .unwrap();
+        assert!(matches!(
+            asynchronous::read_openai_wire_stream_frame(
+                &mut client,
+                DEFAULT_MAX_FRAME_PAYLOAD_BYTES
+            )
+            .await
+            .unwrap(),
+            OpenAiWireStreamFrame::Head(head) if head.status == 200
+        ));
+        assert!(matches!(
+            asynchronous::read_openai_wire_stream_frame(
+                &mut client,
+                DEFAULT_MAX_FRAME_PAYLOAD_BYTES
+            )
+            .await
+            .unwrap(),
+            OpenAiWireStreamFrame::Chunk(bytes)
+                if bytes == b"data: {\"delta\":\"a\"}\n\n\0raw"
+        ));
+        assert!(matches!(
+            asynchronous::read_openai_wire_stream_frame(
+                &mut client,
+                DEFAULT_MAX_FRAME_PAYLOAD_BYTES
+            )
+            .await
+            .unwrap(),
+            OpenAiWireStreamFrame::End
         ));
         server_task.await.unwrap();
     }
