@@ -1,9 +1,9 @@
 """Command-line boundary for certified vLLM KV-cache planning.
 
-Phase 0 defines and validates the planning contract.  It intentionally refuses
-to derive cache geometry from model configuration alone.  A subsequent
-executor-backed provider will obtain resolved cache specs from the pinned vLLM
-runtime and pass them to :mod:`kapsl_vllm_connector.planning`.
+The provider instantiates the pinned vLLM executor far enough to load the
+model, resolve backend-customized cache specs, and build packed cache metadata.
+It then shuts the executor down before vLLM's physical KV-cache allocation
+boundary.  No Hugging Face configuration formula is used as an authority.
 """
 
 from __future__ import annotations
@@ -14,16 +14,19 @@ import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Any, Callable, Sequence
 
 from .connector import ADAPTER_PROFILE_ID, ADAPTER_VERSION
 from .planning import (
     PLANNER_SCHEMA_VERSION,
     UINT64_MAX,
     GeometryDescriptor,
+    PlannerIdentity,
     PlanningError,
     SizingPolicy,
     build_plan,
+    checked_add,
+    geometry_from_resolved_configs,
     planner_error_json_schema,
     planner_json_schema,
 )
@@ -48,6 +51,26 @@ class RuntimeGeometryUnavailable(PlanningError):
     """The certified runtime could not supply resolved cache geometry."""
 
 
+@dataclass(frozen=True, slots=True)
+class _RuntimePlannerApis:
+    """The exact pinned-vLLM seam used before physical KV allocation.
+
+    Keeping these callables in one value makes the production imports explicit
+    and lets host tests prove that planning stops before
+    ``initialize_from_config`` without importing CUDA or vLLM.
+    """
+
+    engine_args_factory: Callable[..., Any]
+    executor_class_resolver: Callable[[Any], type[Any]]
+    register_all_kvcache_specs: Callable[[Any], None]
+    resolve_kv_cache_layout: Callable[[Any, Any, Any], Any]
+    get_kv_cache_groups: Callable[[Any, dict[str, Any]], list[Any]]
+    get_kv_cache_configs: Callable[[Any, list[dict[str, Any]], list[int]], list[Any]]
+    pool_bytes_per_block: Callable[[list[Any]], int]
+    max_memory_usage_bytes_from_groups: Callable[[Any, list[Any]], int]
+    spec_kind_classifier: Callable[[Any], Any] | None = None
+
+
 class PlanningArgumentParser(argparse.ArgumentParser):
     """Turn malformed CLI input into the same structured failure boundary."""
 
@@ -64,36 +87,176 @@ def installed_vllm_version() -> str:
         ) from error
 
 
+def _load_pinned_runtime_apis(backend_version: str) -> _RuntimePlannerApis:
+    try:
+        from vllm.engine.arg_utils import EngineArgs
+        from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
+        from vllm.v1.core.kv_cache_utils import (
+            _max_memory_usage_bytes_from_groups,
+            _pool_bytes_per_block,
+            get_kv_cache_configs,
+            get_kv_cache_groups,
+        )
+        from vllm.v1.core.single_type_kv_cache_manager import (
+            register_all_kvcache_specs,
+        )
+        from vllm.v1.executor.abstract import Executor
+    except (ImportError, AttributeError) as error:
+        raise RuntimeGeometryUnavailable(
+            f"vLLM {backend_version} lacks the certified executor planning APIs"
+        ) from error
+
+    return _RuntimePlannerApis(
+        engine_args_factory=EngineArgs,
+        executor_class_resolver=Executor.get_class,
+        register_all_kvcache_specs=register_all_kvcache_specs,
+        resolve_kv_cache_layout=resolve_kv_cache_layout,
+        get_kv_cache_groups=get_kv_cache_groups,
+        get_kv_cache_configs=get_kv_cache_configs,
+        pool_bytes_per_block=_pool_bytes_per_block,
+        max_memory_usage_bytes_from_groups=_max_memory_usage_bytes_from_groups,
+    )
+
+
+def _minimum_planning_memory(
+    vllm_config: Any,
+    kv_cache_groups: list[Any],
+    apis: _RuntimePlannerApis,
+) -> int:
+    """Return one-sequence memory plus vLLM's permanently reserved null block."""
+
+    try:
+        stride = apis.pool_bytes_per_block(kv_cache_groups)
+        sequence_bytes = apis.max_memory_usage_bytes_from_groups(
+            vllm_config, kv_cache_groups
+        )
+    except Exception as error:
+        raise RuntimeGeometryUnavailable(
+            f"pinned vLLM could not size its resolved cache groups: {error}"
+        ) from error
+    if not isinstance(stride, int) or isinstance(stride, bool) or stride <= 0:
+        raise RuntimeGeometryUnavailable(
+            "pinned vLLM returned a non-positive cache-pool block stride"
+        )
+    if (
+        not isinstance(sequence_bytes, int)
+        or isinstance(sequence_bytes, bool)
+        or sequence_bytes <= 0
+    ):
+        raise RuntimeGeometryUnavailable(
+            "pinned vLLM returned a non-positive one-sequence cache requirement"
+        )
+    try:
+        return checked_add(sequence_bytes, stride, "minimum planning memory")
+    except PlanningError as error:
+        raise RuntimeGeometryUnavailable(str(error)) from error
+
+
+def _geometry_from_executor(
+    request: RuntimePlanningRequest,
+    backend_version: str,
+    apis: _RuntimePlannerApis,
+) -> GeometryDescriptor:
+    """Load the pinned executor, resolve cache specs, and stop before KV allocation."""
+
+    engine_args = apis.engine_args_factory(
+        model=str(request.model_path),
+        max_model_len=request.max_model_len,
+        tensor_parallel_size=request.tensor_parallel_size,
+        attention_backend=request.attention_backend,
+        enforce_eager=True,
+    )
+    vllm_config = engine_args.create_engine_config()
+    executor_class = apis.executor_class_resolver(vllm_config)
+    executor = executor_class(vllm_config)
+    try:
+        apis.register_all_kvcache_specs(vllm_config)
+        kv_cache_specs = executor.get_kv_cache_specs()
+        if (
+            not isinstance(kv_cache_specs, list)
+            or len(kv_cache_specs) != request.tensor_parallel_size
+            or not kv_cache_specs
+            or any(not isinstance(specs, dict) or not specs for specs in kv_cache_specs)
+        ):
+            raise RuntimeGeometryUnavailable(
+                "pinned vLLM cache specs do not cover every tensor-parallel worker"
+            )
+        first_specs = kv_cache_specs[0]
+        if any(specs != first_specs for specs in kv_cache_specs[1:]):
+            raise RuntimeGeometryUnavailable(
+                "the certified tensor-parallel profile requires identical cache specs on every rank"
+            )
+
+        supported_layouts = executor.get_supported_kv_cache_layouts()
+        layout = apis.resolve_kv_cache_layout(
+            vllm_config,
+            supported_layouts,
+            [spec for specs in kv_cache_specs for spec in specs.values()],
+        )
+        layout_name = getattr(layout, "name", None)
+        if not isinstance(layout_name, str) or not layout_name.strip():
+            raise RuntimeGeometryUnavailable(
+                "pinned vLLM returned an invalid resolved cache layout"
+            )
+        layout_name = layout_name.strip()
+        executor.set_kv_cache_layout(layout_name)
+
+        # Planning is TP-only in this profile, so every worker has the same
+        # cache groups. Ask vLLM for exactly one full sequence plus its null
+        # block; this produces its authoritative packed metadata without ever
+        # calling the physical allocation boundary initialize_from_config.
+        groups = apis.get_kv_cache_groups(vllm_config, dict(first_specs))
+        if not isinstance(groups, list) or not groups:
+            raise RuntimeGeometryUnavailable(
+                "pinned vLLM returned no resolved cache groups"
+            )
+        planning_memory = _minimum_planning_memory(vllm_config, groups, apis)
+        kv_cache_configs = apis.get_kv_cache_configs(
+            vllm_config,
+            kv_cache_specs,
+            [planning_memory] * request.tensor_parallel_size,
+        )
+        if not isinstance(kv_cache_configs, list):
+            raise RuntimeGeometryUnavailable(
+                "pinned vLLM returned malformed worker cache configurations"
+            )
+        for config in kv_cache_configs:
+            config.kv_cache_layout = layout_name
+
+        return geometry_from_resolved_configs(
+            kv_cache_configs,
+            vllm_config,
+            identity=PlannerIdentity(
+                adapter_id="kapsl-vllm-connector",
+                adapter_version=ADAPTER_VERSION,
+                backend_version=backend_version,
+                profile_id=ADAPTER_PROFILE_ID,
+            ),
+            model_fingerprint=request.model_fingerprint,
+            max_model_len=request.max_model_len,
+            attention_backend=request.attention_backend,
+            layout_id=layout_name,
+            device_ids=request.device_ids,
+            spec_kind_classifier=apis.spec_kind_classifier,
+        )
+    finally:
+        # A planner process must fully release its model/CUDA/NCCL footprint
+        # before MemoryAuthority grants and starts the serving generation.
+        executor.shutdown()
+
+
 def obtain_pinned_runtime_geometry(
     request: RuntimePlanningRequest,
 ) -> GeometryDescriptor:
-    """Fail closed until an executor-backed runtime provider is certified.
-
-    Import checks make failures actionable when the command is accidentally
-    run outside the managed bundle.  Merely finding vLLM is not sufficient:
-    its cache specs are created by instantiated attention modules and backend
-    ``customize_spec`` hooks, so Phase 0 never substitutes an HF-config formula.
-    """
+    """Obtain cache geometry from the pinned executor before KV allocation."""
 
     if not request.model_path.is_dir():
         raise RuntimeGeometryUnavailable(
             f"model must be an existing Hugging Face directory: {request.model_path}"
         )
     backend_version = installed_vllm_version()
-    try:
-        from vllm.v1.core.kv_cache_utils import (  # noqa: F401
-            get_kv_cache_configs,
-            get_kv_cache_groups,
-        )
-    except (ImportError, AttributeError) as error:
-        raise RuntimeGeometryUnavailable(
-            f"vLLM {backend_version} lacks the certified cache-planning APIs"
-        ) from error
-
-    raise RuntimeGeometryUnavailable(
-        "pinned vLLM cache APIs are present, but no certified executor-backed "
-        "geometry provider is installed; refusing to estimate from model config"
-    )
+    apis = _load_pinned_runtime_apis(backend_version)
+    return _geometry_from_executor(request, backend_version, apis)
 
 
 def _parser() -> argparse.ArgumentParser:
