@@ -417,6 +417,25 @@ fn build_scheduler_for_queue_tests(
         router: MeshRouter::new(None, 1),
         max_micro_batch: 1,
         queue_overflow_policy: QueueOverflowPolicy::Block,
+        observer: Arc::new(parking_lot::RwLock::new(None)),
+    }
+}
+
+struct RecordingSchedulerObserver {
+    observations: Arc<std::sync::Mutex<Vec<(Priority, &'static str)>>>,
+}
+
+impl SchedulerObserver for RecordingSchedulerObserver {
+    fn observe_queue_wait(
+        &self,
+        priority: Priority,
+        operation: &'static str,
+        _elapsed: std::time::Duration,
+    ) {
+        self.observations
+            .lock()
+            .unwrap()
+            .push((priority, operation));
     }
 }
 
@@ -1006,6 +1025,35 @@ async fn test_scheduler_wire_paths_stamp_priority_and_hold_bounded_stream_admiss
     assert_eq!(scheduler.get_queue_depth(), (0, 0));
 
     assert_eq!(*seen.lock().unwrap(), vec![Some(1), Some(0)]);
+}
+
+#[tokio::test]
+async fn scheduler_observer_covers_translated_and_wire_admission() {
+    let seen_priorities = Arc::new(std::sync::Mutex::new(Vec::<Option<u8>>::new()));
+    let engine: EngineHandle = Arc::new(PriorityRecordingEngine::delegated(seen_priorities));
+    let observations = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let scheduler = Scheduler::new(vec![engine], 1, 1, 8, true, 1, 0, None).with_observer(
+        Arc::new(RecordingSchedulerObserver {
+            observations: observations.clone(),
+        }),
+    );
+
+    scheduler
+        .infer(make_inference_request(None), Priority::Throughput, false)
+        .await
+        .expect("translated request should complete");
+    ReplicaScheduler::infer_openai_wire(
+        &scheduler,
+        make_openai_wire_request(OpenAiWireFormat::Json),
+        Priority::LatencyCritical,
+        false,
+    )
+    .await
+    .expect("wire request should complete");
+
+    let observations = observations.lock().unwrap().clone();
+    assert!(observations.contains(&(Priority::Throughput, "translated")));
+    assert!(observations.contains(&(Priority::LatencyCritical, "wire")));
 }
 
 #[tokio::test]

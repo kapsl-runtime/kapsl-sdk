@@ -38,6 +38,300 @@ pub struct GpuDevicePoolOwnerMetrics {
     pub allocatable_bytes: u64,
 }
 
+/// Managed-vLLM-specific observability kept separate from backend-neutral
+/// engine metrics. Labels are bounded runtime identities: model ID, replica
+/// ID, CUDA ordinal, bridge mode, and a fixed stage/error vocabulary.
+#[derive(Debug, Clone)]
+pub struct ManagedVllmMetrics {
+    pub kv_requested_bytes: IntGaugeVec,
+    pub kv_granted_bytes: IntGaugeVec,
+    pub kv_minimum_bytes: IntGaugeVec,
+    pub kv_backing_bytes: IntGaugeVec,
+    pub kv_logical_leased_bytes: IntGaugeVec,
+    pub kv_blocks_total: IntGaugeVec,
+    pub kv_blocks_allocated: IntGaugeVec,
+    pub kv_blocks_active: IntGaugeVec,
+    pub kv_blocks_idle: IntGaugeVec,
+    pub kv_quarantine_bytes: IntGaugeVec,
+    pub effective_target_concurrency: IntGaugeVec,
+    pub provisional_reservation_age_seconds: GaugeVec,
+    pub provisional_reservation_state: IntGaugeVec,
+    pub restart_generation: IntGaugeVec,
+    pub planning_reductions_total: IntCounterVec,
+    pub planning_rejections_total: IntCounterVec,
+    pub bridge_stage_seconds: HistogramVec,
+    pub bridge_requests_total: IntCounterVec,
+    pub bridge_relayed_bytes_total: IntCounterVec,
+    pub bridge_relayed_chunks_total: IntCounterVec,
+    pub bridge_active_streams: IntGaugeVec,
+    pub bridge_connection_attempts_total: IntCounterVec,
+    pub bridge_open_connections: IntGaugeVec,
+    pub bridge_cancellations_total: IntCounterVec,
+    pub bridge_upstream_errors_total: IntCounterVec,
+}
+
+impl ManagedVllmMetrics {
+    fn new(registry: &Registry) -> Self {
+        let memory_labels = &["model", "replica", "device"];
+        let replica_labels = &["model", "replica"];
+        let bridge_labels = &["model", "replica", "mode"];
+        let kv_requested_bytes = IntGaugeVec::new(
+            Opts::new(
+                "kapsl_managed_vllm_kv_requested_bytes",
+                "Desired exact vLLM KV bytes per replica and CUDA device",
+            ),
+            memory_labels,
+        )
+        .unwrap();
+        let kv_granted_bytes = IntGaugeVec::new(
+            Opts::new(
+                "kapsl_managed_vllm_kv_granted_bytes",
+                "MemoryAuthority-granted vLLM KV bytes per replica and CUDA device",
+            ),
+            memory_labels,
+        )
+        .unwrap();
+        let kv_minimum_bytes = IntGaugeVec::new(
+            Opts::new(
+                "kapsl_managed_vllm_kv_minimum_bytes",
+                "Minimum bytes required for one maximum-length vLLM sequence",
+            ),
+            memory_labels,
+        )
+        .unwrap();
+        let kv_backing_bytes = IntGaugeVec::new(
+            Opts::new(
+                "kapsl_managed_vllm_kv_backing_bytes",
+                "Physical CUDA-IPC KV backing bytes",
+            ),
+            memory_labels,
+        )
+        .unwrap();
+        let kv_logical_leased_bytes = IntGaugeVec::new(
+            Opts::new(
+                "kapsl_managed_vllm_kv_logical_leased_bytes",
+                "Logical request-leased bytes inside the physical vLLM KV backing",
+            ),
+            memory_labels,
+        )
+        .unwrap();
+        let block_metric = |name: &str, help: &str| {
+            IntGaugeVec::new(Opts::new(name, help), memory_labels).unwrap()
+        };
+        let kv_blocks_total = block_metric(
+            "kapsl_managed_vllm_kv_blocks_total",
+            "Total certified block capacity of the vLLM backing",
+        );
+        let kv_blocks_allocated = block_metric(
+            "kapsl_managed_vllm_kv_blocks_allocated",
+            "Blocks physically allocated in the fixed vLLM backing",
+        );
+        let kv_blocks_active = block_metric(
+            "kapsl_managed_vllm_kv_blocks_active",
+            "Blocks covered by active logical request leases",
+        );
+        let kv_blocks_idle = block_metric(
+            "kapsl_managed_vllm_kv_blocks_idle",
+            "Immediately reusable idle blocks inside the vLLM backing",
+        );
+        let kv_quarantine_bytes = IntGaugeVec::new(
+            Opts::new(
+                "kapsl_managed_vllm_kv_quarantine_bytes",
+                "Bytes retained after an ambiguous shared-pool release",
+            ),
+            memory_labels,
+        )
+        .unwrap();
+        let effective_target_concurrency = IntGaugeVec::new(
+            Opts::new(
+                "kapsl_managed_vllm_effective_target_concurrency",
+                "Whole maximum-length sequences admitted by the exact KV grant",
+            ),
+            replica_labels,
+        )
+        .unwrap();
+        let provisional_reservation_age_seconds = GaugeVec::new(
+            Opts::new(
+                "kapsl_managed_vllm_provisional_reservation_age_seconds",
+                "Age of an unconsumed exact-KV reservation",
+            ),
+            replica_labels,
+        )
+        .unwrap();
+        let provisional_reservation_state = IntGaugeVec::new(
+            Opts::new(
+                "kapsl_managed_vllm_provisional_reservation_state",
+                "One-hot provisional reservation state",
+            ),
+            &["model", "replica", "state"],
+        )
+        .unwrap();
+        let restart_generation = IntGaugeVec::new(
+            Opts::new(
+                "kapsl_managed_vllm_restart_generation",
+                "Current supervised managed-vLLM process generation",
+            ),
+            replica_labels,
+        )
+        .unwrap();
+        let planning_reductions_total = IntCounterVec::new(
+            Opts::new(
+                "kapsl_managed_vllm_planning_reductions_total",
+                "Exact-KV planning reductions by reason",
+            ),
+            &["model", "replica", "reason"],
+        )
+        .unwrap();
+        let planning_rejections_total = IntCounterVec::new(
+            Opts::new(
+                "kapsl_managed_vllm_planning_rejections_total",
+                "Exact-KV planning or authority rejections by reason",
+            ),
+            &["model", "replica", "reason"],
+        )
+        .unwrap();
+        let bridge_stage_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "kapsl_managed_vllm_bridge_stage_seconds",
+                "Managed-vLLM bridge latency by bounded processing stage",
+            )
+            .buckets(vec![
+                0.0001, 0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0,
+                5.0, 10.0,
+            ]),
+            &["model", "replica", "mode", "stage"],
+        )
+        .unwrap();
+        let bridge_requests_total = IntCounterVec::new(
+            Opts::new(
+                "kapsl_managed_vllm_bridge_requests_total",
+                "Managed-vLLM bridge requests by mode and streaming shape",
+            ),
+            &["model", "replica", "mode", "stream"],
+        )
+        .unwrap();
+        let bridge_relayed_bytes_total = IntCounterVec::new(
+            Opts::new(
+                "kapsl_managed_vllm_bridge_relayed_bytes_total",
+                "Bytes relayed from managed vLLM",
+            ),
+            bridge_labels,
+        )
+        .unwrap();
+        let bridge_relayed_chunks_total = IntCounterVec::new(
+            Opts::new(
+                "kapsl_managed_vllm_bridge_relayed_chunks_total",
+                "Response chunks relayed from managed vLLM",
+            ),
+            bridge_labels,
+        )
+        .unwrap();
+        let bridge_active_streams = IntGaugeVec::new(
+            Opts::new(
+                "kapsl_managed_vllm_bridge_active_streams",
+                "Currently active managed-vLLM response streams",
+            ),
+            bridge_labels,
+        )
+        .unwrap();
+        let bridge_connection_attempts_total = IntCounterVec::new(
+            Opts::new(
+                "kapsl_managed_vllm_bridge_connection_attempts_total",
+                "New private upstream connection attempts by client implementation",
+            ),
+            &["model", "replica", "client"],
+        )
+        .unwrap();
+        let bridge_open_connections = IntGaugeVec::new(
+            Opts::new(
+                "kapsl_managed_vllm_bridge_open_connections",
+                "Private upstream connections currently owned by the bridge",
+            ),
+            &["model", "replica", "client"],
+        )
+        .unwrap();
+        let bridge_cancellations_total = IntCounterVec::new(
+            Opts::new(
+                "kapsl_managed_vllm_bridge_cancellations_total",
+                "Managed-vLLM upstream operations cancelled by downstream ownership",
+            ),
+            bridge_labels,
+        )
+        .unwrap();
+        let bridge_upstream_errors_total = IntCounterVec::new(
+            Opts::new(
+                "kapsl_managed_vllm_bridge_upstream_errors_total",
+                "Managed-vLLM upstream errors by bounded category",
+            ),
+            &["model", "replica", "mode", "kind"],
+        )
+        .unwrap();
+
+        macro_rules! register {
+            ($collector:ident) => {
+                registry
+                    .register(Box::new($collector.clone()))
+                    .unwrap_or_else(|error| {
+                        panic!("Failed to register {}: {error}", stringify!($collector))
+                    });
+            };
+        }
+        register!(kv_requested_bytes);
+        register!(kv_granted_bytes);
+        register!(kv_minimum_bytes);
+        register!(kv_backing_bytes);
+        register!(kv_logical_leased_bytes);
+        register!(kv_blocks_total);
+        register!(kv_blocks_allocated);
+        register!(kv_blocks_active);
+        register!(kv_blocks_idle);
+        register!(kv_quarantine_bytes);
+        register!(effective_target_concurrency);
+        register!(provisional_reservation_age_seconds);
+        register!(provisional_reservation_state);
+        register!(restart_generation);
+        register!(planning_reductions_total);
+        register!(planning_rejections_total);
+        register!(bridge_stage_seconds);
+        register!(bridge_requests_total);
+        register!(bridge_relayed_bytes_total);
+        register!(bridge_relayed_chunks_total);
+        register!(bridge_active_streams);
+        register!(bridge_connection_attempts_total);
+        register!(bridge_open_connections);
+        register!(bridge_cancellations_total);
+        register!(bridge_upstream_errors_total);
+
+        Self {
+            kv_requested_bytes,
+            kv_granted_bytes,
+            kv_minimum_bytes,
+            kv_backing_bytes,
+            kv_logical_leased_bytes,
+            kv_blocks_total,
+            kv_blocks_allocated,
+            kv_blocks_active,
+            kv_blocks_idle,
+            kv_quarantine_bytes,
+            effective_target_concurrency,
+            provisional_reservation_age_seconds,
+            provisional_reservation_state,
+            restart_generation,
+            planning_reductions_total,
+            planning_rejections_total,
+            bridge_stage_seconds,
+            bridge_requests_total,
+            bridge_relayed_bytes_total,
+            bridge_relayed_chunks_total,
+            bridge_active_streams,
+            bridge_connection_attempts_total,
+            bridge_open_connections,
+            bridge_cancellations_total,
+            bridge_upstream_errors_total,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct KapslMetrics {
     pub registry: Arc<Registry>,
@@ -92,6 +386,7 @@ pub struct KapslMetrics {
     pub gpu_device_pool_owner_quota_max_bytes: IntGaugeVec,
     pub gpu_device_pool_owner_admitted: IntGaugeVec,
     pub gpu_device_pool_owner_allocatable_bytes: IntGaugeVec,
+    pub managed_vllm: ManagedVllmMetrics,
     gpu_device_pool_owner_labels: Arc<Mutex<HashMap<String, HashSet<String>>>>,
     /// Most recent time-to-first-token (milliseconds) per model. Surfaced on the
     /// runtime `/api/models` so control-plane autoscalers can scale on TTFT SLOs.
@@ -469,6 +764,7 @@ impl KapslMetrics {
             &["device", "owner"],
         )
         .unwrap();
+        let managed_vllm = ManagedVllmMetrics::new(registry);
 
         registry
             .register(Box::new(inference_latency.clone()))
@@ -662,6 +958,7 @@ impl KapslMetrics {
             gpu_device_pool_owner_quota_max_bytes,
             gpu_device_pool_owner_admitted,
             gpu_device_pool_owner_allocatable_bytes,
+            managed_vllm,
             gpu_device_pool_owner_labels: Arc::new(Mutex::new(HashMap::new())),
             model_ttft_ms,
         }

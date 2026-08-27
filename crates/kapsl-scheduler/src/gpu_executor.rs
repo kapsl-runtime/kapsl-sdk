@@ -1,5 +1,6 @@
 use crate::priority::{stamp_engine_priority, Priority};
 use crate::request::Request;
+use crate::scheduler::SharedSchedulerObserver;
 use kapsl_engine_api::{BatchingMode, EngineError, EngineHandle, InferenceRequest};
 use log::info;
 use std::collections::VecDeque;
@@ -21,12 +22,20 @@ impl Drop for InFlightGuard {
 }
 
 struct WorkQueueInner {
-    queue: Mutex<VecDeque<Request>>,
+    queue: Mutex<VecDeque<QueuedRequest>>,
     capacity: usize,
     queue_len: AtomicUsize,
     closed: AtomicBool,
     not_empty: Notify,
     not_full: Notify,
+    observer: SharedSchedulerObserver,
+    priority: Priority,
+    operation: &'static str,
+}
+
+struct QueuedRequest {
+    request: Request,
+    queued_at: Instant,
 }
 
 #[derive(Clone)]
@@ -35,7 +44,22 @@ pub(crate) struct WorkQueue {
 }
 
 impl WorkQueue {
+    #[cfg(test)]
     pub(crate) fn new(capacity: usize) -> Self {
+        Self::new_observed(
+            capacity,
+            Priority::Throughput,
+            "translated",
+            Arc::new(parking_lot::RwLock::new(None)),
+        )
+    }
+
+    pub(crate) fn new_observed(
+        capacity: usize,
+        priority: Priority,
+        operation: &'static str,
+        observer: SharedSchedulerObserver,
+    ) -> Self {
         let capacity = capacity.max(1);
         Self {
             inner: Arc::new(WorkQueueInner {
@@ -45,6 +69,9 @@ impl WorkQueue {
                 closed: AtomicBool::new(false),
                 not_empty: Notify::new(),
                 not_full: Notify::new(),
+                observer,
+                priority,
+                operation,
             }),
         }
     }
@@ -89,7 +116,10 @@ impl WorkQueue {
         if queue.len() >= self.inner.capacity {
             return Err(request);
         }
-        queue.push_back(request);
+        queue.push_back(QueuedRequest {
+            request,
+            queued_at: Instant::now(),
+        });
         self.inner.queue_len.fetch_add(1, Ordering::Relaxed);
         drop(queue);
         self.inner.not_empty.notify_one();
@@ -106,17 +136,23 @@ impl WorkQueue {
         }
         let is_full = queue.len() >= self.inner.capacity;
         let dropped = if is_full { queue.pop_front() } else { None };
-        queue.push_back(request);
+        queue.push_back(QueuedRequest {
+            request,
+            queued_at: Instant::now(),
+        });
         if !is_full {
             self.inner.queue_len.fetch_add(1, Ordering::Relaxed);
         }
         drop(queue);
         self.inner.not_empty.notify_one();
-        dropped
+        dropped.map(|queued| queued.request)
     }
 
     pub(crate) async fn push_block(&self, request: Request) {
-        let mut pending = Some(request);
+        let mut pending = Some(QueuedRequest {
+            request,
+            queued_at: Instant::now(),
+        });
         loop {
             if self.is_closed() {
                 return;
@@ -153,7 +189,16 @@ impl WorkQueue {
         if popped.is_some() {
             self.inner.not_full.notify_one();
         }
-        popped
+        popped.map(|queued| {
+            if let Some(observer) = self.inner.observer.read().as_ref() {
+                observer.observe_queue_wait(
+                    self.inner.priority,
+                    self.inner.operation,
+                    queued.queued_at.elapsed(),
+                );
+            }
+            queued.request
+        })
     }
 
     pub(crate) async fn pop_timeout(&self, timeout_duration: Duration) -> Option<Request> {
