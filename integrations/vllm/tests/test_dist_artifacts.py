@@ -25,7 +25,7 @@ CHECKER = _load_checker()
 
 
 class DistributionArtifactTests(unittest.TestCase):
-    version = "0.6.0"
+    version = "0.7.0"
     normalized_name = "kapsl_vllm_connector"
 
     def setUp(self) -> None:

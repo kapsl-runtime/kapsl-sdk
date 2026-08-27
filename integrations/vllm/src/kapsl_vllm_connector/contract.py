@@ -811,6 +811,9 @@ def validate_response(response: Mapping[str, Any], request_id: str) -> None:
 def _validate_elastic_pool(
     elastic: Mapping[str, Any], *, block_count: int, bytes_per_block: int
 ) -> None:
+    minimum_blocks = _positive_int(
+        elastic.get("minimum_block_count"), "minimum_block_count"
+    )
     mapped_blocks = _positive_int(
         elastic.get("mapped_block_count"), "mapped_block_count"
     )
@@ -824,14 +827,21 @@ def _validate_elastic_pool(
     alignment = _positive_int(
         elastic.get("resize_alignment_blocks"), "resize_alignment_blocks"
     )
-    if maximum_blocks != block_count or mapped_blocks > maximum_blocks:
+    if (
+        maximum_blocks != block_count
+        or minimum_blocks > mapped_blocks
+        or mapped_blocks > maximum_blocks
+    ):
         raise ContractValidationError(
-            "elastic block counts must fit and match the shared pool maximum"
+            "elastic minimum and mapped block counts must fit and match the shared pool maximum"
         )
+    minimum_bytes = minimum_blocks * bytes_per_block
     mapped_bytes = mapped_blocks * bytes_per_block
     maximum_bytes = maximum_blocks * bytes_per_block
     if (
-        mapped_blocks % alignment
+        minimum_blocks % alignment
+        or mapped_blocks % alignment
+        or minimum_bytes % granularity
         or mapped_bytes % granularity
         or maximum_bytes % granularity
     ):

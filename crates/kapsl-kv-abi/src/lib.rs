@@ -1087,6 +1087,9 @@ impl KvVmmSegmentDescriptor {
 /// `mapped_block_count` is the physical capacity available at registration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KvElasticPoolDescriptor {
+    /// Smallest physical prefix that may remain mapped. This is the certified
+    /// capacity for one maximum-length request, including fixed/null blocks.
+    pub minimum_block_count: u64,
     pub mapped_block_count: u64,
     pub maximum_block_count: u64,
     pub allocation_granularity_bytes: u64,
@@ -1100,20 +1103,31 @@ impl KvElasticPoolDescriptor {
         virtual_block_count: u64,
         bytes_per_block: u64,
     ) -> Result<(), KvContractError> {
-        if self.mapped_block_count == 0
+        if self.minimum_block_count == 0
+            || self.mapped_block_count == 0
             || self.maximum_block_count != virtual_block_count
+            || self.minimum_block_count > self.mapped_block_count
             || self.mapped_block_count > self.maximum_block_count
             || self.allocation_granularity_bytes == 0
             || self.resize_alignment_blocks == 0
             || self.segments.is_empty()
             || !self
+                .minimum_block_count
+                .is_multiple_of(self.resize_alignment_blocks)
+            || !self
                 .mapped_block_count
                 .is_multiple_of(self.resize_alignment_blocks)
         {
             return Err(KvContractError::invalid_capabilities(
-                "elastic pool geometry requires aligned mapped capacity within the maximum virtual capacity",
+                "elastic pool geometry requires an aligned minimum and mapped capacity within the maximum virtual capacity",
             ));
         }
+        let minimum_bytes = self
+            .minimum_block_count
+            .checked_mul(bytes_per_block)
+            .ok_or_else(|| {
+                KvContractError::invalid_capabilities("elastic pool byte size overflow")
+            })?;
         let mapped_bytes = self
             .mapped_block_count
             .checked_mul(bytes_per_block)
@@ -1126,7 +1140,8 @@ impl KvElasticPoolDescriptor {
             .ok_or_else(|| {
                 KvContractError::invalid_capabilities("elastic pool byte size overflow")
             })?;
-        if !mapped_bytes.is_multiple_of(self.allocation_granularity_bytes)
+        if !minimum_bytes.is_multiple_of(self.allocation_granularity_bytes)
+            || !mapped_bytes.is_multiple_of(self.allocation_granularity_bytes)
             || !maximum_bytes.is_multiple_of(self.allocation_granularity_bytes)
         {
             return Err(KvContractError::invalid_capabilities(
@@ -1835,7 +1850,7 @@ impl KvPoolResizeOperation {
             self.stage,
             KvPoolResizeStage::MapWorkers | KvPoolResizeStage::UnmapWorkers
         );
-        if physical_stage != !self.segments.is_empty() {
+        if physical_stage == self.segments.is_empty() {
             return Err(KvContractError::invalid_request(
                 "worker resize phases require segment ranges and scheduler phases must not carry them",
             ));
@@ -2828,6 +2843,7 @@ mod tests {
                 transport: KvTransport::CudaVmm,
                 descriptor: "scm_rights:cuda-vmm-v1".to_string(),
                 elastic: Some(KvElasticPoolDescriptor {
+                    minimum_block_count: 16,
                     mapped_block_count: 32,
                     maximum_block_count: 64,
                     allocation_granularity_bytes: 65_536,
@@ -2853,6 +2869,17 @@ mod tests {
             .mapped_block_count = 31;
         assert!(matches!(
             inexact.validate_for(&registration),
+            Err(KvContractError::InvalidCapabilities { .. })
+        ));
+
+        let mut below_minimum = receipt.clone();
+        below_minimum.shared_pools[0]
+            .elastic
+            .as_mut()
+            .expect("elastic")
+            .minimum_block_count = 48;
+        assert!(matches!(
+            below_minimum.validate_for(&registration),
             Err(KvContractError::InvalidCapabilities { .. })
         ));
 

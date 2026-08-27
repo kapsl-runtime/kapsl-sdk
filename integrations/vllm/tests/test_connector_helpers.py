@@ -20,6 +20,44 @@ from kapsl_vllm_connector.connector import (
 
 
 class ConnectorHelperTests(unittest.TestCase):
+    def test_worker_resize_lock_spans_target_and_deferred_draft_forwards(self) -> None:
+        connector = KapslConnectorV1.__new__(KapslConnectorV1)
+        connector._is_scheduler = False
+        connector._live_resize = True
+        connector._worker_forward_lock = threading.Lock()
+        connector._worker_forward_active = False
+        applied: list[str] = []
+        connector._apply_worker_resizes = lambda: applied.append("resize")
+
+        connector.start_load_kv(SimpleNamespace(attn_metadata={}))
+        self.assertEqual(applied, ["resize"])
+        self.assertTrue(connector._worker_forward_active)
+        self.assertTrue(connector._worker_forward_lock.locked())
+
+        # Pinned vLLM calls this before its deferred speculative/draft forward.
+        # It must not permit a physical unmap yet.
+        connector.build_connector_worker_meta()
+        self.assertTrue(connector._worker_forward_lock.locked())
+
+        connector.wait_for_save()
+        self.assertFalse(connector._worker_forward_active)
+        self.assertFalse(connector._worker_forward_lock.locked())
+
+    def test_worker_resize_zero_token_step_releases_without_wait_for_save(self) -> None:
+        connector = KapslConnectorV1.__new__(KapslConnectorV1)
+        connector._is_scheduler = False
+        connector._live_resize = True
+        connector._worker_forward_lock = threading.Lock()
+        connector._worker_forward_active = False
+        applied: list[str] = []
+        connector._apply_worker_resizes = lambda: applied.append("resize")
+
+        connector.start_load_kv(SimpleNamespace(attn_metadata=None))
+
+        self.assertEqual(applied, ["resize"])
+        self.assertFalse(connector._worker_forward_active)
+        self.assertFalse(connector._worker_forward_lock.locked())
+
     def test_scheduler_activates_shared_pool_once_before_admission(self) -> None:
         class FakeClient:
             def __init__(self) -> None:

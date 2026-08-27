@@ -13,11 +13,16 @@ import ctypes
 import ctypes.util
 import importlib
 import inspect
+import logging
 import os
 import sys
 import threading
 from collections.abc import Mapping
 from typing import Any
+
+
+logger = logging.getLogger(__name__)
+_VMM_CONFORMANCE_ENV = "KAPSL_VLLM_VMM_CONFORMANCE"
 
 
 class SharedPoolImportError(RuntimeError):
@@ -135,10 +140,15 @@ def select_cuda_binding(
             raise SharedPoolImportError(
                 "Kapsl elastic maximum does not match vLLM's virtual allocator"
             )
+        minimum_blocks = int(elastic.get("minimum_block_count", 0))
         mapped_blocks = int(elastic.get("mapped_block_count", 0))
-        if mapped_blocks <= 0 or mapped_blocks > num_blocks:
+        if (
+            minimum_blocks <= 0
+            or minimum_blocks > mapped_blocks
+            or mapped_blocks > num_blocks
+        ):
             raise SharedPoolImportError(
-                "Kapsl elastic mapped block count is outside virtual capacity"
+                "Kapsl elastic minimum/mapped block counts are outside virtual capacity"
             )
     elif elastic is not None:
         raise SharedPoolImportError(
@@ -565,7 +575,13 @@ class _ManagedVmmImport:
                 ):
                     raise SharedPoolImportError("invalid CUDA VMM segment descriptor")
                 handle = self.driver.import_fd(handles[handle_index])
-                self.driver.map(self.pointer + offset, length, handle, self.device_id)
+                try:
+                    self.driver.map(
+                        self.pointer + offset, length, handle, self.device_id
+                    )
+                except Exception:
+                    self.driver.release_handle(handle)
+                    raise
                 imported.append((segment_id, offset, length, handle))
             for segment_id, offset, length, handle in imported:
                 self.segments[segment_id] = (offset, length, handle)
@@ -668,6 +684,15 @@ class CudaVmmBuffer:
         self._virtual_bytes = virtual_bytes
         self._mapped_bytes = mapped_bytes
         self._granularity = granularity
+        self._conformance = os.environ.get(_VMM_CONFORMANCE_ENV) == "1"
+        if self._conformance:
+            self._verify_zero_segments(list(elastic["segments"]), "initial")
+            logger.info(
+                "KAPSL_VMM_CONFORMANCE stable_address=%#x mapped_bytes=%d virtual_bytes=%d phase=initial zeroed=true",
+                imported.pointer,
+                mapped_bytes,
+                virtual_bytes,
+            )
 
     @property
     def mapped_bytes(self) -> int:
@@ -680,6 +705,14 @@ class CudaVmmBuffer:
             raise SharedPoolImportError("invalid CUDA VMM growth target")
         self._torch.cuda.synchronize(self.tensor.device)
         self._imported.map_segments(segments, handles)
+        if self._conformance:
+            self._verify_zero_segments(segments, "grow")
+            logger.info(
+                "KAPSL_VMM_CONFORMANCE stable_address=%#x mapped_bytes=%d virtual_bytes=%d phase=grow zeroed=true",
+                self._imported.pointer,
+                target_bytes,
+                self._virtual_bytes,
+            )
         self._mapped_bytes = target_bytes
 
     def unmap_segments(
@@ -690,6 +723,13 @@ class CudaVmmBuffer:
         self._torch.cuda.synchronize(self.tensor.device)
         self._imported.unmap_segments(segments)
         self._mapped_bytes = target_bytes
+        if self._conformance:
+            logger.info(
+                "KAPSL_VMM_CONFORMANCE stable_address=%#x mapped_bytes=%d virtual_bytes=%d phase=shrink",
+                self._imported.pointer,
+                target_bytes,
+                self._virtual_bytes,
+            )
 
     def release(self) -> None:
         if self.tensor is None:
@@ -701,6 +741,19 @@ class CudaVmmBuffer:
     def mapping_open(self) -> bool:
         with _LIVE_IMPORTS_LOCK:
             return self._managed_address in _LIVE_IMPORTS
+
+    def _verify_zero_segments(
+        self, segments: list[Mapping[str, Any]], phase: str
+    ) -> None:
+        for segment in segments:
+            start = int(segment["offset_bytes"])
+            length = int(segment["length_bytes"])
+            nonzero = int(self._torch.count_nonzero(self.tensor[start : start + length]))
+            if nonzero != 0:
+                raise SharedPoolImportError(
+                    f"CUDA VMM {phase} segment {segment['segment_id']!r} was not zeroed"
+                )
+        self._torch.cuda.synchronize(self.tensor.device)
 
 
 class VllmSharedPoolHook:
@@ -752,6 +805,7 @@ class VllmSharedPoolHook:
             self._buffer = CudaIpcBuffer(str(binding["descriptor"]), allocation_bytes)
         else:
             raise SharedPoolImportError("unsupported shared-pool CUDA transport")
+        self._last_worker_resize: tuple[Any, ...] | None = None
         self._used = False
         self._patches: list[tuple[Any, Any]] = []
         self._replacement = self._allocate_kv_cache
@@ -831,6 +885,12 @@ class VllmSharedPoolHook:
         if worker_utils is None:
             raise SharedPoolImportError("vLLM worker utilities are unavailable")
 
+        conformance = os.environ.get(_VMM_CONFORMANCE_ENV) == "1"
+        allocated_before = (
+            int(self._buffer._torch.cuda.memory_allocated(raw.device))
+            if conformance
+            else 0
+        )
         caches: dict[str, Any] = {}
         for tensor in kv_cache_config.kv_cache_tensors:
             layers = getattr(tensor, "layers", None)
@@ -871,6 +931,19 @@ class VllmSharedPoolHook:
                     "vLLM returned an unexpected number of views for a KV tensor placement"
                 )
             caches.update(zip(tensor.layers, views))
+        if conformance:
+            allocated_after = int(
+                self._buffer._torch.cuda.memory_allocated(raw.device)
+            )
+            if allocated_after != allocated_before:
+                raise SharedPoolImportError(
+                    "vLLM KV view construction created a second PyTorch CUDA allocation: "
+                    f"before={allocated_before}, after={allocated_after}"
+                )
+            logger.info(
+                "KAPSL_VMM_CONFORMANCE allocator_delta_bytes=0 virtual_bytes=%d",
+                self._expected_bytes,
+            )
         self._used = True
         return caches
 
@@ -900,8 +973,32 @@ class VllmSharedPoolHook:
         target_bytes = int(operation["target_block_count"]) * int(
             operation["bytes_per_block"]
         )
-        stage = operation.get("stage")
+        stage = str(operation.get("stage"))
         segments = [dict(segment) for segment in operation.get("segments", [])]
+        generation = int(operation["resize_generation"])
+        operation_key = (
+            generation,
+            stage,
+            target_bytes,
+            tuple(
+                (
+                    str(segment["segment_id"]),
+                    int(segment["offset_bytes"]),
+                    int(segment["length_bytes"]),
+                    int(segment["handle_index"]),
+                )
+                for segment in segments
+            ),
+        )
+        previous = self._last_worker_resize
+        if previous == operation_key:
+            # The physical mutation completed but its acknowledgement may have
+            # been lost. Exact coordinator replays must be harmless.
+            return
+        if previous is not None and generation <= int(previous[0]):
+            raise SharedPoolImportError(
+                "worker received a non-monotonic or altered resize replay"
+            )
         if stage == "map_workers":
             self._buffer.map_segments(segments, handles, target_bytes)
         elif stage == "unmap_workers":
@@ -910,6 +1007,7 @@ class VllmSharedPoolHook:
             self._buffer.unmap_segments(segments, target_bytes)
         else:
             raise SharedPoolImportError("worker received a scheduler resize stage")
+        self._last_worker_resize = operation_key
 
     def attachment_views(self, kv_caches: Mapping[str, Any]) -> list[dict[str, Any]]:
         """Prove every registered vLLM KV tensor aliases the imported storage."""
@@ -1002,12 +1100,28 @@ class VllmElasticBlockPool:
             raise SharedPoolImportError(
                 "this vLLM build has no certified resizable BlockPool surface"
             )
-        for block in blocks[self.initial_blocks :]:
+        inactive = blocks[self.initial_blocks :]
+        for block in inactive:
             if int(getattr(block, "ref_cnt", -1)) != 0:
                 raise SharedPoolImportError(
                     "inactive vLLM block is unexpectedly referenced at startup"
                 )
-            queue.remove(block)
+        removed: list[Any] = []
+        try:
+            for block in inactive:
+                queue.remove(block)
+                removed.append(block)
+        except Exception as error:
+            try:
+                queue.append_n(removed)
+            except Exception as rollback_error:
+                raise SharedPoolImportError(
+                    "vLLM inactive-block setup failed and its free-queue "
+                    "rollback was ambiguous; the engine must restart"
+                ) from rollback_error
+            raise SharedPoolImportError(
+                "vLLM inactive-block setup could not update the free queue"
+            ) from error
         pool.num_gpu_blocks = self.initial_blocks
         self._pool = pool
 
@@ -1043,9 +1157,28 @@ class VllmElasticBlockPool:
                 raise SharedPoolImportError(
                     "this vLLM build lacks the certified cache-eviction seam"
                 )
-            for block in retired:
-                evict(block)
-                queue.remove(block)
+            removed: list[Any] = []
+            try:
+                # Remove the complete tail before evicting prefix metadata. If
+                # any queue mutation fails, every successful removal can be
+                # restored without changing the advertised block capacity.
+                for block in retired:
+                    queue.remove(block)
+                    removed.append(block)
+                for block in retired:
+                    evict(block)
+            except Exception as error:
+                try:
+                    queue.append_n(removed)
+                except Exception as rollback_error:
+                    raise SharedPoolImportError(
+                        "vLLM tail retirement failed and its free-queue "
+                        "rollback was ambiguous; the engine must restart"
+                    ) from rollback_error
+                raise SharedPoolImportError(
+                    "vLLM tail retirement was rolled back before resize "
+                    "acknowledgement"
+                ) from error
         pool.num_gpu_blocks = target_blocks
         self.current_blocks = target_blocks
 

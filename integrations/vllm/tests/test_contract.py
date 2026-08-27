@@ -82,6 +82,7 @@ class ContractTests(unittest.TestCase):
                     "transport": {"kind": "cuda_vmm"},
                     "descriptor": "scm_rights:cuda-vmm-v1",
                     "elastic": {
+                        "minimum_block_count": 16,
                         "mapped_block_count": 32,
                         "maximum_block_count": 64,
                         "allocation_granularity_bytes": 65536,
@@ -99,6 +100,13 @@ class ContractTests(unittest.TestCase):
             ],
         }
         validate_registration_receipt(receipt, "vllm-0")
+        for invalid_minimum in (0, 17, 48):
+            malformed_receipt = deepcopy(receipt)
+            malformed_receipt["shared_pools"][0]["elastic"][
+                "minimum_block_count"
+            ] = invalid_minimum
+            with self.assertRaises(ContractValidationError):
+                validate_registration_receipt(malformed_receipt, "vllm-0")
 
         operation = {
             "participant_epoch": 3,

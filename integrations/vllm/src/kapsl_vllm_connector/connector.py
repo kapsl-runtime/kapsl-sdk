@@ -260,18 +260,20 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
                 )
             else:
                 receipt = self._client.register(registration)
-            self._participant_epoch = int(receipt["participant_epoch"])
-            if self._live_resize:
-                initial_blocks, maximum_blocks = _elastic_receipt_block_counts(receipt)
-                if self._is_scheduler:
-                    self._elastic_block_pool = VllmElasticBlockPool(
-                        initial_blocks, maximum_blocks
+            try:
+                self._participant_epoch = int(receipt["participant_epoch"])
+                if self._live_resize:
+                    initial_blocks, maximum_blocks = _elastic_receipt_block_counts(
+                        receipt
                     )
-            if self._mode == "shared_pool" and not self._is_scheduler:
-                global_rank = (
-                    0 if tensor_parallel_size == 1 else vllm_distributed_rank()
-                )
-                try:
+                    if self._is_scheduler:
+                        self._elastic_block_pool = VllmElasticBlockPool(
+                            initial_blocks, maximum_blocks
+                        )
+                if self._mode == "shared_pool" and not self._is_scheduler:
+                    global_rank = (
+                        0 if tensor_parallel_size == 1 else vllm_distributed_rank()
+                    )
                     binding = select_cuda_binding(
                         receipt,
                         kv_cache_config,
@@ -284,12 +286,12 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
                         kv_cache_config,
                         handles=received_handles if self._live_resize else None,
                     )
-                finally:
-                    _close_os_handles(received_handles)
-                if shared_topology is None:
-                    raise AssertionError("shared topology was not constructed")
-                self._shared_shard = dict(shared_topology["shard"])
-                self._shared_shard["tensor_parallel_rank"] = global_rank
+                    if shared_topology is None:
+                        raise AssertionError("shared topology was not constructed")
+                    self._shared_shard = dict(shared_topology["shard"])
+                    self._shared_shard["tensor_parallel_rank"] = global_rank
+            finally:
+                _close_os_handles(received_handles)
             logger.info(
                 "registered Kapsl KV participant %s in %s mode (%s role)",
                 self._participant_id,
@@ -414,13 +416,20 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
     # Worker-side interface ----------------------------------------------------
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
-        del forward_context, kwargs
+        del kwargs
         if self._is_scheduler or not self._live_resize:
             return
+        has_model_forward = getattr(forward_context, "attn_metadata", None) is not None
         self._worker_forward_lock.acquire()
         self._worker_forward_active = True
         try:
             self._apply_worker_resizes()
+            if not has_model_forward:
+                # Pinned vLLM uses a zero-token connector step to drain
+                # has_pending_push_work() while idle. There is no attention
+                # forward to fence in that path and wait_for_save is skipped.
+                self._worker_forward_active = False
+                self._worker_forward_lock.release()
         except Exception:
             self._worker_forward_active = False
             self._worker_forward_lock.release()
@@ -439,12 +448,12 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
         del layer_name, kv_layer, attn_metadata, kwargs
 
     def wait_for_save(self) -> None:
-        return None
-
-    def build_connector_worker_meta(self) -> None:
         if self._worker_forward_active:
             self._worker_forward_active = False
             self._worker_forward_lock.release()
+        return None
+
+    def build_connector_worker_meta(self) -> None:
         return None
 
     def register_kv_caches(self, kv_caches: dict[str, "torch.Tensor"]) -> None:
@@ -794,7 +803,7 @@ def _elastic_receipt_block_counts(receipt: Mapping[str, Any]) -> tuple[int, int]
     pools = receipt.get("shared_pools")
     if not isinstance(pools, list) or not pools:
         raise SharedPoolImportError("elastic registration returned no shared pools")
-    shapes: set[tuple[int, int]] = set()
+    shapes: set[tuple[int, int, int]] = set()
     for pool in pools:
         if not isinstance(pool, Mapping):
             raise SharedPoolImportError("elastic shared pool must be an object")
@@ -803,6 +812,9 @@ def _elastic_receipt_block_counts(receipt: Mapping[str, Any]) -> tuple[int, int]
             raise SharedPoolImportError("elastic shared pool metadata is missing")
         shapes.add(
             (
+                _positive_integer(
+                    elastic.get("minimum_block_count"), "minimum_block_count"
+                ),
                 _positive_integer(
                     elastic.get("mapped_block_count"), "mapped_block_count"
                 ),
@@ -815,9 +827,11 @@ def _elastic_receipt_block_counts(receipt: Mapping[str, Any]) -> tuple[int, int]
         raise SharedPoolImportError(
             "tensor-parallel elastic bindings must share one block-count state"
         )
-    initial, maximum = shapes.pop()
-    if initial > maximum:
-        raise SharedPoolImportError("elastic mapped capacity exceeds its maximum")
+    minimum, initial, maximum = shapes.pop()
+    if minimum > initial or initial > maximum:
+        raise SharedPoolImportError(
+            "elastic minimum/mapped capacity exceeds its next capacity bound"
+        )
     return initial, maximum
 
 

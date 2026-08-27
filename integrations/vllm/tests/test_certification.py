@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from kapsl_vllm_connector import ADAPTER_VERSION
 from kapsl_vllm_connector.certification import (
     CertificationError,
     allowlist_entry,
@@ -29,7 +30,7 @@ def _passing_report() -> dict[str, object]:
         "status": "passed",
         "profile": {
             "adapter_id": "kapsl-vllm-connector",
-            "adapter_version": "0.6.0",
+            "adapter_version": ADAPTER_VERSION,
             "backend_version": "0.test",
             "profile_id": "vllm-v1-packed-cuda-ipc/flash-attn",
         },
@@ -130,7 +131,7 @@ class CertificationTests(unittest.TestCase):
 
         self.assertEqual(
             allowlist_entry(report),
-            "kapsl-vllm-connector,0.6.0,0.test,"
+            f"kapsl-vllm-connector,{ADAPTER_VERSION},0.test,"
             "vllm-v1-packed-cuda-ipc/flash-attn",
         )
 
