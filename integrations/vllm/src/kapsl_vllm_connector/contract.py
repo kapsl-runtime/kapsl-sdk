@@ -8,9 +8,10 @@ from __future__ import annotations
 
 from copy import deepcopy
 from collections.abc import Sequence
+import re
 from typing import Any, Mapping
 
-ABI_VERSION: dict[str, int] = {"major": 1, "minor": 3}
+ABI_VERSION: dict[str, int] = {"major": 1, "minor": 4}
 
 
 class ContractValidationError(ValueError):
@@ -89,6 +90,7 @@ def shared_pool_registration(
     profile: Mapping[str, Any],
     *,
     backend: str = "vllm",
+    provisioning_grant: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     capabilities = shared_pool_capabilities()
     if len(capacity_groups) > 1:
@@ -102,6 +104,9 @@ def shared_pool_registration(
         "adapter_profile": dict(profile),
         "topology": deepcopy(dict(topology)),
     }
+    if provisioning_grant is not None:
+        capabilities["features"].append("provisioning_grant")
+        registration["provisioning_grant"] = dict(provisioning_grant)
     validate_registration(registration)
     return registration
 
@@ -215,6 +220,40 @@ def validate_registration(registration: Mapping[str, Any]) -> None:
     if tier == "shared_pool":
         topology = _mapping(registration.get("topology"), "topology")
         _validate_topology(topology, model_fingerprint, seen, capabilities)
+
+    grant = registration.get("provisioning_grant")
+    advertises_grant = "provisioning_grant" in features
+    if advertises_grant != (grant is not None):
+        raise ContractValidationError(
+            "provisioning_grant capability and proof must be present together"
+        )
+    if grant is not None:
+        if tier != "shared_pool" or capabilities.get("ownership") != "kapsl_runtime":
+            raise ContractValidationError(
+                "provisioning grants require a runtime-owned shared pool"
+            )
+        _validate_provisioning_grant(_mapping(grant, "provisioning grant"))
+
+
+def _validate_provisioning_grant(grant: Mapping[str, Any]) -> None:
+    token = _nonempty(grant.get("token"), "provisioning grant token")
+    if len(token) > 256:
+        raise ContractValidationError("provisioning grant token is too long")
+    digest = _nonempty(
+        grant.get("geometry_digest"), "provisioning grant geometry_digest"
+    )
+    if re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
+        raise ContractValidationError(
+            "provisioning grant geometry_digest must be canonical sha256"
+        )
+    _positive_int(
+        grant.get("authority_generation"),
+        "provisioning grant authority_generation",
+    )
+    _positive_int(
+        grant.get("expires_at_unix_ms"),
+        "provisioning grant expires_at_unix_ms",
+    )
 
 
 def _validate_topology(

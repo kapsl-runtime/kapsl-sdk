@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
 /// Version implemented by this crate.
-pub const KAPSL_KV_ABI_VERSION: KvAbiVersion = KvAbiVersion::new(1, 3);
+pub const KAPSL_KV_ABI_VERSION: KvAbiVersion = KvAbiVersion::new(1, 4);
 
 /// Semantic version of the KV participant contract.
 ///
@@ -98,6 +98,9 @@ pub enum KvFeature {
     /// An out-of-process shared-pool participant reports imported tensor views
     /// and must be activated before Kapsl grants request leases.
     ExternalPoolAttachment,
+    /// The runtime provisioned this participant from an exact, single-use
+    /// MemoryAuthority grant created before the backend process started.
+    ProvisioningGrant,
 }
 
 /// Data-plane mechanism used to identify or transfer KV blocks.
@@ -1045,6 +1048,44 @@ pub struct KvAdapterProfile {
     pub profile_id: String,
 }
 
+/// Opaque proof that MemoryAuthority precharged an exact external KV backing.
+///
+/// The host keeps the authoritative participant/device/byte scope. The wire
+/// value deliberately carries only replay-fencing metadata and the certified
+/// geometry digest; a participant cannot use it to choose a different grant.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct KvProvisioningGrant {
+    pub token: String,
+    pub geometry_digest: String,
+    pub authority_generation: u64,
+    pub expires_at_unix_ms: u64,
+}
+
+impl KvProvisioningGrant {
+    pub fn validate(&self) -> Result<(), KvContractError> {
+        let digest = self
+            .geometry_digest
+            .strip_prefix("sha256:")
+            .filter(|digest| {
+                digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            });
+        if self.token.trim().is_empty()
+            || self.token.len() > 256
+            || digest.is_none()
+            || self.authority_generation == 0
+            || self.expires_at_unix_ms == 0
+        {
+            return Err(KvContractError::invalid_request(
+                "provisioning grant requires a bounded token, canonical sha256 geometry digest, generation, and expiry",
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl KvAdapterProfile {
     pub fn validate(&self) -> Result<(), KvContractError> {
         if self.adapter_id.trim().is_empty()
@@ -1341,6 +1382,9 @@ pub struct KvParticipantRegistration {
     pub adapter_profile: Option<KvAdapterProfile>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topology: Option<KvTopology>,
+    /// Exact pre-start reservation proof for runtime-owned external pools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provisioning_grant: Option<KvProvisioningGrant>,
 }
 
 impl KvParticipantRegistration {
@@ -1363,6 +1407,30 @@ impl KvParticipantRegistration {
         }
         if let Some(profile) = &self.adapter_profile {
             profile.validate()?;
+        }
+        if let Some(grant) = &self.provisioning_grant {
+            grant.validate()?;
+        }
+        let advertises_grant = self
+            .capabilities
+            .features
+            .contains(&KvFeature::ProvisioningGrant);
+        if advertises_grant != self.provisioning_grant.is_some() {
+            return Err(KvContractError::invalid_capabilities(
+                "provisioning_grant capability and registration proof must be present together",
+            ));
+        }
+        if self.provisioning_grant.is_some()
+            && (self.capabilities.tier != KvIntegrationTier::SharedPool
+                || self.capabilities.ownership != KvCacheOwnership::KapslRuntime
+                || !self
+                    .capabilities
+                    .features
+                    .contains(&KvFeature::ExternalPoolAttachment))
+        {
+            return Err(KvContractError::invalid_capabilities(
+                "provisioning grants require an externally attached runtime-owned shared pool",
+            ));
         }
         if self.capabilities.tier != KvIntegrationTier::SharedPool && self.adapter_profile.is_some()
         {
@@ -2140,6 +2208,7 @@ mod tests {
             },
             adapter_profile: None,
             topology: Some(topology),
+            provisioning_grant: None,
         };
         assert!(registration.validate().is_err());
         registration
@@ -2182,6 +2251,7 @@ mod tests {
                     KvCachePolicy::FullAttention,
                 )],
             }),
+            provisioning_grant: None,
         };
         registration.validate().expect("valid shared registration");
         let mut missing_profile = registration.clone();
@@ -2238,6 +2308,58 @@ mod tests {
         missing.shared_pools.clear();
         assert!(matches!(
             missing.validate_for(&registration),
+            Err(KvContractError::InvalidCapabilities { .. })
+        ));
+    }
+
+    #[test]
+    fn provisioning_grant_requires_exact_shared_pool_capability_pair() {
+        let mut registration: KvParticipantRegistration = serde_json::from_str(include_str!(
+            "../tests/fixtures/shared_pool_registration.json"
+        ))
+        .expect("valid shared-pool fixture");
+        let grant = KvProvisioningGrant {
+            token: format!("kvg1_{}", "ab".repeat(32)),
+            geometry_digest: format!("sha256:{}", "cd".repeat(32)),
+            authority_generation: 7,
+            expires_at_unix_ms: 1_800_000_000_000,
+        };
+        registration.provisioning_grant = Some(grant.clone());
+        registration
+            .capabilities
+            .features
+            .insert(KvFeature::ProvisioningGrant);
+        registration.validate().expect("valid provisioning grant");
+
+        let mut missing_capability = registration.clone();
+        missing_capability
+            .capabilities
+            .features
+            .remove(&KvFeature::ProvisioningGrant);
+        assert!(matches!(
+            missing_capability.validate(),
+            Err(KvContractError::InvalidCapabilities { .. })
+        ));
+
+        let mut malformed = registration.clone();
+        malformed
+            .provisioning_grant
+            .as_mut()
+            .expect("grant")
+            .geometry_digest = "SHA256:not-canonical".to_string();
+        assert!(matches!(
+            malformed.validate(),
+            Err(KvContractError::InvalidRequest { .. })
+        ));
+
+        let mut opaque = registration;
+        opaque.capabilities =
+            KvBackendCapabilities::opaque_connected().with_feature(KvFeature::ProvisioningGrant);
+        opaque.adapter_profile = None;
+        opaque.topology = None;
+        opaque.provisioning_grant = Some(grant);
+        assert!(matches!(
+            opaque.validate(),
             Err(KvContractError::InvalidCapabilities { .. })
         ));
     }
@@ -2364,6 +2486,7 @@ mod tests {
             },
             adapter_profile: None,
             topology: None,
+            provisioning_grant: None,
         };
         registration.validate().expect("valid registration");
 

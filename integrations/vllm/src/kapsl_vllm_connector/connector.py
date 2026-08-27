@@ -171,6 +171,11 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
             if self._mode == "shared_pool"
             else None
         )
+        provisioning_grant = (
+            _provisioning_grant(self._kv_transfer_config)
+            if self._mode == "shared_pool"
+            else None
+        )
         registration = (
             shared_pool_registration(
                 self._participant_id,
@@ -179,6 +184,7 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
                 shared_topology,
                 shared_profile,
                 backend="vllm",
+                provisioning_grant=provisioning_grant,
             )
             if self._mode == "shared_pool"
             else opaque_registration(
@@ -553,6 +559,15 @@ def _required_memory_domains(config: Any) -> list[dict[str, Any]]:
             raise ValueError(f"kapsl_memory_domains[{index}] must be an object")
         domains.append(dict(raw_domain))
     return domains
+
+
+def _provisioning_grant(config: Any) -> dict[str, Any] | None:
+    raw_grant = _extra(config, "kapsl_provisioning_grant", None)
+    if raw_grant is None:
+        return None
+    if not isinstance(raw_grant, Mapping):
+        raise ValueError("kapsl_provisioning_grant must be an object")
+    return dict(raw_grant)
 
 
 def _positive_integer(value: Any, field: str) -> int:

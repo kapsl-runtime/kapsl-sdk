@@ -164,6 +164,39 @@ class ContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ContractValidationError, "adapter profile"):
             validate_registration(missing_profile)
 
+    def test_shared_pool_provisioning_grant_is_versioned_and_fail_closed(self) -> None:
+        grant = {
+            "token": "kvg1_" + "ab" * 32,
+            "geometry_digest": "sha256:" + "cd" * 32,
+            "authority_generation": 7,
+            "expires_at_unix_ms": 1_800_000_000_000,
+        }
+        registration = shared_pool_registration(
+            "vllm-0",
+            "sha256:model",
+            CAPACITY_GROUPS,
+            TOPOLOGY,
+            PROFILE,
+            provisioning_grant=grant,
+        )
+
+        self.assertEqual(registration["provisioning_grant"], grant)
+        self.assertIn(
+            "provisioning_grant",
+            registration["capabilities"]["features"],
+        )
+        validate_registration(registration)
+
+        missing_feature = deepcopy(registration)
+        missing_feature["capabilities"]["features"].remove("provisioning_grant")
+        with self.assertRaisesRegex(ContractValidationError, "present together"):
+            validate_registration(missing_feature)
+
+        malformed = deepcopy(registration)
+        malformed["provisioning_grant"]["geometry_digest"] = "SHA256:not-canonical"
+        with self.assertRaisesRegex(ContractValidationError, "canonical sha256"):
+            validate_registration(malformed)
+
     def test_shared_pool_topology_and_capacity_groups_must_match(self) -> None:
         topology = dict(TOPOLOGY)
         topology["cache_groups"] = [dict(TOPOLOGY["cache_groups"][0])]

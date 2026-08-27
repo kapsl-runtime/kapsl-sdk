@@ -9,7 +9,7 @@ description = "Large language model inference with GGUF and ONNX backend support
 [dependencies]
 kapsl-core = { version = "0.2.0", path = "../kapsl-core" }
 kapsl-engine-api = { version = "0.2.0", path = "../kapsl-engine-api" }
-kapsl-kv-abi = { version = "0.4.0", path = "../kapsl-kv-abi" }
+kapsl-kv-abi = { version = "0.5.0", path = "../kapsl-kv-abi" }
 kapsl-quantization = { version = "0.2.0", path = "../kapsl-quantization" }
 kapsl-kernels = { version = "0.2.0", path = "../kapsl-kernels" }
 kapsl-loader = { version = "0.2.0", path = "../kapsl-loader", optional = true }
