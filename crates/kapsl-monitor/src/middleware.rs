@@ -3,7 +3,8 @@ use futures::Stream;
 use kapsl_engine_api::Engine;
 use kapsl_engine_api::{
     BatchingPolicy, BinaryTensorPacket, EngineError, EngineModelInfo, InferenceRequest,
-    KvBackendCapabilities, KvTopology,
+    KvBackendCapabilities, KvTopology, MemoryReport, OpenAiWireRequest, OpenAiWireResponse,
+    OpenAiWireStreamResponse, RequestMemoryAdmission,
 };
 use std::collections::VecDeque;
 use std::pin::Pin;
@@ -22,8 +23,8 @@ pub struct MonitoringMiddleware<E: Engine> {
     auto_tune: Arc<ConcurrencyAutoTuneState>,
 }
 
-struct MetricStream {
-    inner: Pin<Box<dyn Stream<Item = Result<BinaryTensorPacket, EngineError>> + Send>>,
+struct MetricStream<T> {
+    inner: Pin<Box<dyn Stream<Item = Result<T, EngineError>> + Send>>,
     metrics: KapslMetrics,
     model_id: String,
     version: String,
@@ -111,9 +112,9 @@ impl ConcurrencyAutoTuneState {
     }
 }
 
-impl MetricStream {
+impl<T> MetricStream<T> {
     fn new(
-        inner: Pin<Box<dyn Stream<Item = Result<BinaryTensorPacket, EngineError>> + Send>>,
+        inner: Pin<Box<dyn Stream<Item = Result<T, EngineError>> + Send>>,
         metrics: KapslMetrics,
         model_id: String,
         version: String,
@@ -159,8 +160,8 @@ impl MetricStream {
     }
 }
 
-impl Stream for MetricStream {
-    type Item = Result<BinaryTensorPacket, EngineError>;
+impl<T> Stream for MetricStream<T> {
+    type Item = Result<T, EngineError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
@@ -205,7 +206,7 @@ impl Stream for MetricStream {
     }
 }
 
-impl Drop for MetricStream {
+impl<T> Drop for MetricStream<T> {
     fn drop(&mut self) {
         if !self.finished {
             self.saw_error = true;
@@ -258,6 +259,70 @@ impl<E: Engine> MonitoringMiddleware<E> {
             .batch_size_hist
             .with_label_values(&[self.model_id.as_str()])
             .observe(request_count as f64);
+    }
+
+    fn begin_wire_observation(&self) -> Instant {
+        self.metrics
+            .active_inferences
+            .with_label_values(&[self.model_id.as_str()])
+            .inc();
+        self.auto_tune.on_request_start();
+        self.observe_dispatch_size(1);
+        Instant::now()
+    }
+
+    fn finish_wire_observation(&self, start: Instant, succeeded: bool) {
+        let status = if succeeded { "ok" } else { "err" };
+        self.metrics
+            .inference_count
+            .with_label_values(&[self.model_id.as_str(), status])
+            .inc();
+        self.metrics
+            .inference_latency
+            .with_label_values(&[self.model_id.as_str(), self.version.as_str(), status])
+            .observe(start.elapsed().as_secs_f64());
+        self.metrics
+            .active_inferences
+            .with_label_values(&[self.model_id.as_str()])
+            .dec();
+        self.auto_tune.on_request_end();
+    }
+
+    async fn observe_wire_unary<F>(&self, operation: F) -> Result<OpenAiWireResponse, EngineError>
+    where
+        F: std::future::Future<Output = Result<OpenAiWireResponse, EngineError>>,
+    {
+        let start = self.begin_wire_observation();
+        let result = operation.await;
+        self.finish_wire_observation(start, result.is_ok());
+        result
+    }
+
+    async fn observe_wire_stream<F>(
+        &self,
+        operation: F,
+    ) -> Result<OpenAiWireStreamResponse, EngineError>
+    where
+        F: std::future::Future<Output = Result<OpenAiWireStreamResponse, EngineError>>,
+    {
+        let start = self.begin_wire_observation();
+        match operation.await {
+            Ok(response) => Ok(OpenAiWireStreamResponse {
+                head: response.head,
+                body: Box::pin(MetricStream::new(
+                    response.body,
+                    self.metrics.clone(),
+                    self.model_id.clone(),
+                    self.version.clone(),
+                    start,
+                    self.auto_tune.clone(),
+                )),
+            }),
+            Err(error) => {
+                self.finish_wire_observation(start, false);
+                Err(error)
+            }
+        }
     }
 }
 
@@ -347,6 +412,54 @@ impl<E: Engine> Engine for MonitoringMiddleware<E> {
         self.auto_tune.on_request_end();
 
         result
+    }
+
+    fn supports_openai_wire(&self) -> bool {
+        self.inner.supports_openai_wire()
+    }
+
+    fn planned_openai_wire_request_memory(&self, request: &OpenAiWireRequest) -> MemoryReport {
+        self.inner.planned_openai_wire_request_memory(request)
+    }
+
+    async fn infer_openai_wire_with_memory_admission(
+        &self,
+        request: &OpenAiWireRequest,
+        admission: RequestMemoryAdmission,
+    ) -> Result<OpenAiWireResponse, EngineError> {
+        self.observe_wire_unary(
+            self.inner
+                .infer_openai_wire_with_memory_admission(request, admission),
+        )
+        .await
+    }
+
+    async fn infer_openai_wire(
+        &self,
+        request: &OpenAiWireRequest,
+    ) -> Result<OpenAiWireResponse, EngineError> {
+        self.observe_wire_unary(self.inner.infer_openai_wire(request))
+            .await
+    }
+
+    async fn infer_openai_wire_stream(
+        &self,
+        request: &OpenAiWireRequest,
+    ) -> Result<OpenAiWireStreamResponse, EngineError> {
+        self.observe_wire_stream(self.inner.infer_openai_wire_stream(request))
+            .await
+    }
+
+    async fn infer_openai_wire_stream_with_memory_admission(
+        &self,
+        request: &OpenAiWireRequest,
+        admission: RequestMemoryAdmission,
+    ) -> Result<OpenAiWireStreamResponse, EngineError> {
+        self.observe_wire_stream(
+            self.inner
+                .infer_openai_wire_stream_with_memory_admission(request, admission),
+        )
+        .await
     }
 
     fn infer_batch(
@@ -540,6 +653,42 @@ mod tests {
             Ok(request.input.clone())
         }
 
+        fn supports_openai_wire(&self) -> bool {
+            true
+        }
+
+        fn planned_openai_wire_request_memory(&self, request: &OpenAiWireRequest) -> MemoryReport {
+            MemoryReport::single(
+                "mock:wire-request",
+                kapsl_engine_api::MemoryDomain::Host,
+                kapsl_engine_api::MemoryAllocationClass::RequestTransient,
+                request.body.len(),
+            )
+        }
+
+        async fn infer_openai_wire(
+            &self,
+            request: &OpenAiWireRequest,
+        ) -> Result<OpenAiWireResponse, EngineError> {
+            Ok(OpenAiWireResponse {
+                head: kapsl_engine_api::OpenAiWireResponseHead::new(200, Vec::new())?,
+                body: request.body.clone(),
+            })
+        }
+
+        async fn infer_openai_wire_stream(
+            &self,
+            request: &OpenAiWireRequest,
+        ) -> Result<OpenAiWireStreamResponse, EngineError> {
+            Ok(OpenAiWireStreamResponse {
+                head: kapsl_engine_api::OpenAiWireResponseHead::new(200, Vec::new())?,
+                body: Box::pin(futures::stream::once({
+                    let body = request.body.clone();
+                    async move { Ok(body) }
+                })),
+            })
+        }
+
         fn infer_stream(
             &self,
             request: &InferenceRequest,
@@ -588,6 +737,45 @@ mod tests {
         let result = middleware.infer(&request);
 
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn openai_wire_methods_delegate_and_stream_metrics_finish_on_drop() {
+        let registry = std::sync::Arc::new(prometheus::Registry::new());
+        let middleware =
+            MonitoringMiddleware::new(MockEngine, "wire".to_string(), "v1".to_string(), &registry);
+        let unary = OpenAiWireRequest::new(
+            kapsl_engine_api::OpenAiWireEndpoint::ChatCompletions,
+            kapsl_engine_api::OpenAiWireFormat::Json,
+            b"unary".to_vec(),
+        );
+        assert!(middleware.supports_openai_wire());
+        assert_eq!(
+            middleware
+                .planned_openai_wire_request_memory(&unary)
+                .bytes_for_domain(&kapsl_engine_api::MemoryDomain::Host),
+            5
+        );
+        assert_eq!(
+            middleware.infer_openai_wire(&unary).await.unwrap().body,
+            b"unary"
+        );
+
+        let streaming = OpenAiWireRequest::new(
+            kapsl_engine_api::OpenAiWireEndpoint::ChatCompletions,
+            kapsl_engine_api::OpenAiWireFormat::ServerSentEvents,
+            b"stream".to_vec(),
+        );
+        let mut response = middleware
+            .infer_openai_wire_stream(&streaming)
+            .await
+            .unwrap();
+        assert_eq!(response.body.next().await.unwrap().unwrap(), b"stream");
+        drop(response);
+
+        let text = metrics_text(&registry);
+        assert!(text.contains("kapsl_inference_total"));
+        assert!(text.contains("model=\"wire\""));
     }
 
     #[test]

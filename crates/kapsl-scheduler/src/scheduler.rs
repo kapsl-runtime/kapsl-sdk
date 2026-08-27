@@ -1,16 +1,18 @@
 use crate::gpu_executor::{GpuExecutor, WorkQueue};
 use crate::mesh_routing::{MeshRouter, MeshRouterStats};
-use crate::priority::{stamp_engine_priority, Priority};
+use crate::priority::{stamp_engine_priority, stamp_openai_wire_priority, Priority};
 use crate::request::Request;
 use futures::Stream;
 use kapsl_engine_api::{
-    BatchingMode, BinaryTensorPacket, EngineError, EngineHandle, EngineModelInfo, EngineStream,
-    InferenceRequest,
+    BatchingMode, BinaryTensorPacket, CancellationToken, EngineError, EngineHandle,
+    EngineModelInfo, EngineStream, InferenceRequest, OpenAiWireFormat, OpenAiWireRequest,
+    OpenAiWireResponse, OpenAiWireStream, OpenAiWireStreamResponse,
 };
+use parking_lot::Mutex;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
-use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{oneshot, Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 use kapsl_hal::device_mesh::DeviceMesh;
 use std::sync::Arc;
@@ -34,16 +36,229 @@ impl QueueOverflowPolicy {
 
 struct StreamAdmissionGuard {
     counter: Arc<AtomicUsize>,
-    _permit: Option<OwnedSemaphorePermit>,
+    _permit: Option<PriorityAdmissionPermit>,
 }
 
 impl StreamAdmissionGuard {
-    fn new(counter: Arc<AtomicUsize>, permit: Option<OwnedSemaphorePermit>) -> Self {
+    fn new(counter: Arc<AtomicUsize>, permit: Option<PriorityAdmissionPermit>) -> Self {
         counter.fetch_add(1, Ordering::Relaxed);
         Self {
             counter,
             _permit: permit,
         }
+    }
+}
+
+#[derive(Default)]
+struct PriorityAdmissionState {
+    latency_waiters: usize,
+    throughput_waiters: usize,
+}
+
+/// Bounded direct-dispatch admission with strict priority between waiting
+/// classes. The semaphore bounds active work; waiter counters plus `Notify`
+/// avoid an unbounded handoff queue while ensuring a queued throughput request
+/// cannot take a newly released slot while any latency-critical request waits.
+struct PriorityAdmission {
+    slots: Arc<Semaphore>,
+    state: Mutex<PriorityAdmissionState>,
+    changed: Notify,
+}
+
+impl PriorityAdmission {
+    fn new(capacity: usize) -> Arc<Self> {
+        Arc::new(Self {
+            slots: Arc::new(Semaphore::new(capacity)),
+            state: Mutex::new(PriorityAdmissionState::default()),
+            changed: Notify::new(),
+        })
+    }
+
+    async fn acquire(
+        self: &Arc<Self>,
+        priority: Priority,
+        overflow_policy: QueueOverflowPolicy,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<PriorityAdmissionPermit, EngineError> {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Err(EngineError::cancelled(
+                "Request cancelled while awaiting admission",
+            ));
+        }
+        match overflow_policy {
+            QueueOverflowPolicy::Block => self.acquire_blocking(priority, cancellation).await,
+            QueueOverflowPolicy::DropNewest => self.try_acquire().map_err(|error| match error {
+                TryAcquireError::Closed => {
+                    EngineError::overloaded("GPU stream slots closed".to_string())
+                }
+                TryAcquireError::NoPermits => EngineError::overloaded(format!(
+                    "GPU stream slots full (policy={})",
+                    overflow_policy.as_str()
+                )),
+            }),
+            QueueOverflowPolicy::DropOldest => self.try_acquire().map_err(|error| match error {
+                TryAcquireError::Closed => {
+                    EngineError::overloaded("GPU stream slots closed".to_string())
+                }
+                TryAcquireError::NoPermits => EngineError::overloaded(
+                    "GPU stream slots full (policy=drop_oldest; active streams cannot be evicted)"
+                        .to_string(),
+                ),
+            }),
+        }
+    }
+
+    async fn acquire_blocking(
+        self: &Arc<Self>,
+        priority: Priority,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<PriorityAdmissionPermit, EngineError> {
+        let mut waiter = PriorityAdmissionWaiter::register(Arc::clone(self), priority);
+        loop {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                waiter.finish();
+                return Err(EngineError::cancelled(
+                    "Request cancelled while awaiting admission",
+                ));
+            }
+            // Register the notification before checking state so a release or
+            // high-priority cancellation cannot be lost between the check and
+            // the await.
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            let attempt = {
+                let state = self.state.lock();
+                let may_acquire =
+                    priority == Priority::LatencyCritical || state.latency_waiters == 0;
+                may_acquire.then(|| self.slots.clone().try_acquire_owned())
+            };
+
+            match attempt {
+                Some(Ok(permit)) => {
+                    waiter.finish();
+                    return Ok(PriorityAdmissionPermit::new(Arc::clone(self), permit));
+                }
+                Some(Err(TryAcquireError::Closed)) => {
+                    waiter.finish();
+                    return Err(EngineError::overloaded(
+                        "GPU stream slots closed".to_string(),
+                    ));
+                }
+                Some(Err(TryAcquireError::NoPermits)) | None => {
+                    if let Some(cancellation) = cancellation {
+                        tokio::select! {
+                            _ = &mut notified => {}
+                            _ = cancellation.cancelled() => {
+                                waiter.finish();
+                                return Err(EngineError::cancelled(
+                                    "Request cancelled while awaiting admission",
+                                ));
+                            }
+                        }
+                    } else {
+                        notified.await;
+                    }
+                }
+            }
+        }
+    }
+
+    fn try_acquire(self: &Arc<Self>) -> Result<PriorityAdmissionPermit, TryAcquireError> {
+        self.slots
+            .clone()
+            .try_acquire_owned()
+            .map(|permit| PriorityAdmissionPermit::new(Arc::clone(self), permit))
+    }
+
+    fn unregister_waiter(&self, priority: Priority) {
+        {
+            let mut state = self.state.lock();
+            let waiters = match priority {
+                Priority::LatencyCritical => &mut state.latency_waiters,
+                Priority::Throughput => &mut state.throughput_waiters,
+            };
+            debug_assert!(*waiters > 0, "priority admission waiter underflow");
+            *waiters = waiters.saturating_sub(1);
+        }
+        // In particular, wake throughput waiters when the last queued latency
+        // request is cancelled or admitted.
+        self.changed.notify_waiters();
+    }
+
+    fn close(&self) {
+        self.slots.close();
+        self.changed.notify_waiters();
+    }
+
+    #[cfg(test)]
+    fn waiter_counts(&self) -> (usize, usize) {
+        let state = self.state.lock();
+        (state.latency_waiters, state.throughput_waiters)
+    }
+
+    #[cfg(test)]
+    fn available_permits(&self) -> usize {
+        self.slots.available_permits()
+    }
+}
+
+struct PriorityAdmissionWaiter {
+    admission: Arc<PriorityAdmission>,
+    priority: Priority,
+    registered: bool,
+}
+
+impl PriorityAdmissionWaiter {
+    fn register(admission: Arc<PriorityAdmission>, priority: Priority) -> Self {
+        {
+            let mut state = admission.state.lock();
+            match priority {
+                Priority::LatencyCritical => state.latency_waiters += 1,
+                Priority::Throughput => state.throughput_waiters += 1,
+            }
+        }
+        Self {
+            admission,
+            priority,
+            registered: true,
+        }
+    }
+
+    fn finish(&mut self) {
+        if std::mem::replace(&mut self.registered, false) {
+            self.admission.unregister_waiter(self.priority);
+        }
+    }
+}
+
+impl Drop for PriorityAdmissionWaiter {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+struct PriorityAdmissionPermit {
+    admission: Arc<PriorityAdmission>,
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+impl PriorityAdmissionPermit {
+    fn new(admission: Arc<PriorityAdmission>, permit: OwnedSemaphorePermit) -> Self {
+        Self {
+            admission,
+            permit: Some(permit),
+        }
+    }
+}
+
+impl Drop for PriorityAdmissionPermit {
+    fn drop(&mut self) {
+        // Return capacity before waking waiters. The state lock in acquisition
+        // then makes the high-priority check and permit claim one atomic choice.
+        drop(self.permit.take());
+        self.admission.changed.notify_waiters();
     }
 }
 
@@ -68,6 +283,21 @@ impl Stream for TrackedEngineStream {
     }
 }
 
+struct TrackedOpenAiWireStream {
+    inner: OpenAiWireStream,
+    _guard: StreamAdmissionGuard,
+}
+
+impl Unpin for TrackedOpenAiWireStream {}
+
+impl Stream for TrackedOpenAiWireStream {
+    type Item = Result<Vec<u8>, EngineError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.inner.as_mut().poll_next(cx)
+    }
+}
+
 /// Main scheduler that coordinates CPU and GPU execution
 pub struct Scheduler {
     engines: Vec<EngineHandle>,
@@ -83,7 +313,7 @@ pub struct Scheduler {
     // Track active GPU streams, which bypass the one-shot executor queue but
     // still need admission/backpressure accounting.
     gpu_stream_in_flight_count: Arc<AtomicUsize>,
-    gpu_stream_slots: Arc<Semaphore>,
+    gpu_stream_admission: Arc<PriorityAdmission>,
     // Device mesh for distributed inference
     device_mesh: Option<Arc<DeviceMesh>>,
     // Mesh router for topology-aware routing
@@ -104,6 +334,7 @@ impl Drop for Scheduler {
         {
             queue.close();
         }
+        self.gpu_stream_admission.close();
     }
 }
 
@@ -131,7 +362,7 @@ impl Scheduler {
         let mut gpu_high_priority_queues = Vec::with_capacity(total_workers);
         let mut gpu_low_priority_queues = Vec::with_capacity(total_workers);
         let gpu_in_flight_count = Arc::new(AtomicUsize::new(0));
-        let gpu_stream_slots = Arc::new(Semaphore::new(total_workers.max(1) * queue_size.max(1)));
+        let gpu_stream_admission = PriorityAdmission::new(total_workers.max(1) * queue_size.max(1));
 
         for engine in &engines {
             for _ in 0..workers_per_device {
@@ -167,7 +398,7 @@ impl Scheduler {
             cpu_active_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             gpu_in_flight_count,
             gpu_stream_in_flight_count: Arc::new(AtomicUsize::new(0)),
-            gpu_stream_slots,
+            gpu_stream_admission,
             device_mesh,
             router,
             max_micro_batch,
@@ -199,37 +430,14 @@ impl Scheduler {
         self.router.route(session_id, tp_group_hint)
     }
 
-    async fn acquire_gpu_stream_permit(&self) -> Result<OwnedSemaphorePermit, EngineError> {
-        match self.queue_overflow_policy {
-            QueueOverflowPolicy::Block => self
-                .gpu_stream_slots
-                .clone()
-                .acquire_owned()
-                .await
-                .map_err(|_| EngineError::overloaded("GPU stream slots closed".to_string())),
-            QueueOverflowPolicy::DropNewest => {
-                self.gpu_stream_slots
-                    .clone()
-                    .try_acquire_owned()
-                    .map_err(|_| {
-                        EngineError::overloaded(format!(
-                            "GPU stream slots full (policy={})",
-                            self.queue_overflow_policy.as_str()
-                        ))
-                    })
-            }
-            QueueOverflowPolicy::DropOldest => {
-                self.gpu_stream_slots
-                    .clone()
-                    .try_acquire_owned()
-                    .map_err(|_| {
-                        EngineError::overloaded(
-                            "GPU stream slots full (policy=drop_oldest; active streams cannot be evicted)"
-                                .to_string(),
-                        )
-                    })
-            }
-        }
+    async fn acquire_gpu_stream_permit(
+        &self,
+        priority: Priority,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<PriorityAdmissionPermit, EngineError> {
+        self.gpu_stream_admission
+            .acquire(priority, self.queue_overflow_policy, cancellation)
+            .await
     }
 
     /// Get mesh routing statistics
@@ -511,6 +719,150 @@ impl crate::replica_pool::ReplicaScheduler for Scheduler {
         self.infer(request.clone(), priority, force_cpu).await
     }
 
+    async fn infer_openai_wire(
+        &self,
+        mut request: OpenAiWireRequest,
+        priority: Priority,
+        force_cpu: bool,
+    ) -> Result<OpenAiWireResponse, EngineError> {
+        if request.format != OpenAiWireFormat::Json {
+            return Err(EngineError::invalid_input(
+                "non-streaming OpenAI wire inference requires JSON format",
+            ));
+        }
+        request.validate(usize::MAX)?;
+        if request
+            .cancellation
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
+        {
+            return Err(EngineError::cancelled("Request cancelled"));
+        }
+        if !self.is_healthy() {
+            return Err(EngineError::overloaded("Scheduler overloaded".to_string()));
+        }
+
+        let worker_idx = if force_cpu {
+            0
+        } else {
+            self.get_worker_index(&request.session_id)
+        };
+        let engine = self.engines[worker_idx % self.engines.len()].clone();
+        if !engine.supports_openai_wire() {
+            return Err(EngineError::backend(
+                "selected engine does not support protocol-native OpenAI requests",
+            ));
+        }
+        let batching_policy = engine.batching_policy();
+        if matches!(
+            batching_policy.mode,
+            BatchingMode::Continuous | BatchingMode::Delegated
+        ) && batching_policy.supports_priority
+        {
+            stamp_openai_wire_priority(&mut request, priority);
+        }
+
+        let (counter, permit) = if force_cpu {
+            (self.cpu_active_count.clone(), None)
+        } else {
+            (
+                self.gpu_stream_in_flight_count.clone(),
+                Some(
+                    self.acquire_gpu_stream_permit(priority, request.cancellation.as_ref())
+                        .await?,
+                ),
+            )
+        };
+        if request
+            .cancellation
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
+        {
+            return Err(EngineError::cancelled(
+                "Request cancelled while awaiting admission",
+            ));
+        }
+        let _guard = StreamAdmissionGuard::new(counter, permit);
+        let response = engine.infer_openai_wire(&request).await?;
+        response.head.validate()?;
+        Ok(response)
+    }
+
+    async fn infer_openai_wire_stream(
+        &self,
+        mut request: OpenAiWireRequest,
+        priority: Priority,
+        force_cpu: bool,
+    ) -> Result<OpenAiWireStreamResponse, EngineError> {
+        if request.format != OpenAiWireFormat::ServerSentEvents {
+            return Err(EngineError::invalid_input(
+                "streaming OpenAI wire inference requires SSE format",
+            ));
+        }
+        request.validate(usize::MAX)?;
+        if request
+            .cancellation
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
+        {
+            return Err(EngineError::cancelled("Request cancelled"));
+        }
+        if !self.is_healthy() {
+            return Err(EngineError::overloaded("Scheduler overloaded".to_string()));
+        }
+
+        let worker_idx = if force_cpu {
+            0
+        } else {
+            self.get_worker_index(&request.session_id)
+        };
+        let engine = self.engines[worker_idx % self.engines.len()].clone();
+        if !engine.supports_openai_wire() {
+            return Err(EngineError::backend(
+                "selected engine does not support protocol-native OpenAI streams",
+            ));
+        }
+        let batching_policy = engine.batching_policy();
+        if matches!(
+            batching_policy.mode,
+            BatchingMode::Continuous | BatchingMode::Delegated
+        ) && batching_policy.supports_priority
+        {
+            stamp_openai_wire_priority(&mut request, priority);
+        }
+
+        let (counter, permit) = if force_cpu {
+            (self.cpu_active_count.clone(), None)
+        } else {
+            (
+                self.gpu_stream_in_flight_count.clone(),
+                Some(
+                    self.acquire_gpu_stream_permit(priority, request.cancellation.as_ref())
+                        .await?,
+                ),
+            )
+        };
+        if request
+            .cancellation
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
+        {
+            return Err(EngineError::cancelled(
+                "Request cancelled while awaiting admission",
+            ));
+        }
+        let guard = StreamAdmissionGuard::new(counter, permit);
+        let response = engine.infer_openai_wire_stream(&request).await?;
+        response.head.validate()?;
+        Ok(OpenAiWireStreamResponse {
+            head: response.head,
+            body: Box::pin(TrackedOpenAiWireStream {
+                inner: response.body,
+                _guard: guard,
+            }),
+        })
+    }
+
     async fn infer_stream(
         &self,
         mut request: InferenceRequest,
@@ -557,9 +909,21 @@ impl crate::replica_pool::ReplicaScheduler for Scheduler {
         } else {
             (
                 self.gpu_stream_in_flight_count.clone(),
-                Some(self.acquire_gpu_stream_permit().await?),
+                Some(
+                    self.acquire_gpu_stream_permit(priority, request.cancellation.as_ref())
+                        .await?,
+                ),
             )
         };
+        if request
+            .cancellation
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
+        {
+            return Err(EngineError::cancelled(
+                "Request cancelled while awaiting admission",
+            ));
+        }
         let guard = StreamAdmissionGuard::new(counter, permit);
         let stream = engine.infer_stream(&request);
         Ok(Box::pin(TrackedEngineStream {

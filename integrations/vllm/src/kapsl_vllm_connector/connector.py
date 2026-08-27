@@ -7,7 +7,7 @@ import threading
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from importlib import metadata
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from .client import KapslKvControlClient, KapslKvControlError
 from .contract import (
@@ -16,6 +16,12 @@ from .contract import (
     make_reserve_request,
     opaque_registration,
     shared_pool_registration,
+)
+from .planning import (
+    UINT64_MAX,
+    extract_cache_group_topologies,
+    shared_pool_block_stride,
+    validate_certified_shared_pool_execution,
 )
 from .shared_pool import (
     SharedPoolImportError,
@@ -60,7 +66,7 @@ else:
 
 
 logger = logging.getLogger(__name__)
-ADAPTER_VERSION = "0.5.0"
+ADAPTER_VERSION = "0.6.0"
 ADAPTER_PROFILE_ID = "vllm-v1-packed-cuda-ipc/flash-attn"
 
 
@@ -474,45 +480,7 @@ def _required_extra(config: Any, key: str) -> str:
 
 
 def _validate_shared_pool_execution(vllm_config: Any) -> None:
-    parallel_config = getattr(vllm_config, "parallel_config", None)
-    unsupported_parallelism = {
-        name: int(getattr(parallel_config, name, 1) or 1)
-        for name in (
-            "pipeline_parallel_size",
-            "data_parallel_size",
-            "decode_context_parallel_size",
-        )
-    }
-    enabled = [
-        name for name, size in unsupported_parallelism.items() if size != 1
-    ]
-    if enabled:
-        raise ValueError(
-            "vLLM shared_pool does not yet support " + ", ".join(enabled)
-        )
-
-    model_config = getattr(vllm_config, "model_config", None)
-    if bool(getattr(model_config, "enable_sleep_mode", False)):
-        raise ValueError(
-            "vLLM shared_pool does not yet support sleep mode because the "
-            "Kapsl-owned CUDA allocation must remain exported"
-        )
-
-    attention_config = getattr(vllm_config, "attention_config", None)
-    backend = getattr(attention_config, "backend", None)
-    backend_name = str(getattr(backend, "name", backend or "")).strip().upper()
-    if backend_name != "FLASH_ATTN":
-        raise ValueError(
-            "vLLM shared_pool currently requires the explicitly selected "
-            "FLASH_ATTN backend; automatic or different attention backends "
-            "need their own conformance profile"
-        )
-    backend_per_kind = getattr(attention_config, "backend_per_kind", None) or {}
-    if backend_per_kind:
-        raise ValueError(
-            "vLLM shared_pool does not yet support per-cache-kind attention "
-            "backend overrides"
-        )
+    validate_certified_shared_pool_execution(vllm_config)
 
 
 def _vllm_adapter_profile(vllm_config: Any) -> dict[str, str]:
@@ -587,48 +555,75 @@ def _required_memory_domains(config: Any) -> list[dict[str, Any]]:
     return domains
 
 
+def _positive_integer(value: Any, field: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ValueError(f"{field} must be a positive integer")
+    return value
+
+
 def _vllm_capacity_groups(
     kv_cache_config: Any,
     memory_domains: Sequence[Mapping[str, Any]],
     *,
     shared_pool: bool = False,
+    spec_kind_classifier: Callable[[Any], Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Extract byte-accounting hints without exposing vLLM block handles."""
 
     groups = getattr(kv_cache_config, "kv_cache_groups", None)
-    max_allocations = int(getattr(kv_cache_config, "num_blocks", 0) or 0)
-    if not groups or max_allocations <= 0:
+    raw_max_allocations = getattr(kv_cache_config, "num_blocks", None)
+    if not groups or raw_max_allocations is None:
         raise ValueError(
             "vLLM KVCacheConfig must expose non-empty kv_cache_groups and num_blocks"
         )
-
-    group_shapes: list[tuple[int, int]] = []
-    for index, group in enumerate(groups):
-        spec = getattr(group, "kv_cache_spec", None)
-        layer_names = getattr(group, "layer_names", None)
-        if spec is None or not layer_names:
-            raise ValueError(f"vLLM KV cache group {index} has no spec or layers")
-        block_size = int(getattr(spec, "block_size", 0) or 0)
-        page_size = int(getattr(spec, "page_size_bytes", 0) or 0)
-        # UniformTypeKVCacheSpecs.page_size_bytes already sums its per-layer
-        # specs; an ordinary merged spec describes one layer and must be scaled
-        # by the number of layers sharing the block table.
-        group_bytes = (
-            page_size
-            if getattr(spec, "kv_cache_specs", None) is not None
-            else page_size * len(layer_names)
-        )
-        if block_size <= 0 or group_bytes <= 0:
-            raise ValueError(f"vLLM KV cache group {index} has invalid page accounting")
-        group_shapes.append((block_size, group_bytes))
+    max_allocations = _positive_integer(raw_max_allocations, "vLLM num_blocks")
 
     # Modern packed layouts publish the exact shared allocation size. Opaque
     # compatibility keeps the page-derived fallback for older vLLM releases.
     if shared_pool:
+        topologies = extract_cache_group_topologies(
+            kv_cache_config,
+            spec_kind_classifier=spec_kind_classifier,
+        )
+        group_shapes = [
+            (group.block_size_tokens, group.bytes_per_group_block)
+            for group in topologies
+        ]
+        certified_pool_stride = shared_pool_block_stride(topologies)
         _, configured_blocks, pool_stride = vllm_backing_geometry(kv_cache_config)
         if configured_blocks != max_allocations:
             raise AssertionError("vLLM backing geometry changed during extraction")
+        if pool_stride != certified_pool_stride:
+            raise ValueError(
+                "resolved packed allocation block stride disagrees with "
+                "certified cache-group page accounting"
+            )
     else:
+        group_shapes = []
+        for index, group in enumerate(groups):
+            spec = getattr(group, "kv_cache_spec", None)
+            layer_names = getattr(group, "layer_names", None)
+            if spec is None or not layer_names:
+                raise ValueError(
+                    f"vLLM KV cache group {index} has no spec or layers"
+                )
+            block_size = _positive_integer(
+                getattr(spec, "block_size", None),
+                f"vLLM KV cache group {index} block_size",
+            )
+            page_size = _positive_integer(
+                getattr(spec, "page_size_bytes", None),
+                f"vLLM KV cache group {index} page_size_bytes",
+            )
+            # UniformTypeKVCacheSpecs.page_size_bytes already sums its per-layer
+            # specs; an ordinary merged spec describes one layer and must be
+            # scaled by the number of layers sharing the block table.
+            group_bytes = (
+                page_size
+                if getattr(spec, "kv_cache_specs", None) is not None
+                else page_size * len(layer_names)
+            )
+            group_shapes.append((block_size, group_bytes))
         # vLLM HMA groups alias one backing block pool; a shared pool ID tells
         # Kapsl to charge the maximum reservation rather than summing groups.
         pool_stride = max(group_bytes for _, group_bytes in group_shapes)
@@ -652,66 +647,44 @@ def _vllm_topology(
     model_fingerprint: str,
     *,
     tensor_parallel_world_size: int = 1,
+    spec_kind_classifier: Callable[[Any], Any] | None = None,
 ) -> dict[str, Any]:
     """Translate supported vLLM attention specs into ABI topology metadata."""
 
-    layout_id = str(
-        getattr(kv_cache_config, "kv_cache_layout", None) or "packed"
-    ).strip()
+    raw_layout_id = getattr(kv_cache_config, "kv_cache_layout", None)
+    if not isinstance(raw_layout_id, str) or not raw_layout_id.strip():
+        raise ValueError("resolved vLLM KVCacheConfig must expose kv_cache_layout")
+    layout_id = raw_layout_id.strip()
+    resolved_groups = extract_cache_group_topologies(
+        kv_cache_config,
+        spec_kind_classifier=spec_kind_classifier,
+    )
     cache_groups: list[dict[str, Any]] = []
     next_layer_index = 0
-    for group_index, group in enumerate(kv_cache_config.kv_cache_groups):
-        layer_names = list(getattr(group, "layer_names", None) or [])
-        if not layer_names:
-            raise ValueError(f"vLLM KV cache group {group_index} has no layers")
-        spec = getattr(group, "kv_cache_spec", None)
-        per_layer_specs = getattr(spec, "kv_cache_specs", None)
-        if isinstance(per_layer_specs, Mapping):
-            spec = per_layer_specs.get(layer_names[0])
-        if spec is None:
-            raise ValueError(f"vLLM KV cache group {group_index} has no usable spec")
-
-        block_size = int(getattr(spec, "block_size", 0) or 0)
-        kv_heads = int(
-            getattr(spec, "num_kv_heads", None)
-            or getattr(spec, "num_heads", 0)
-            or 0
-        )
-        key_head_dim = int(getattr(spec, "head_size", 0) or 0)
-        value_head_dim = int(
-            getattr(spec, "head_size_v", None) or key_head_dim
-        )
-        if min(block_size, kv_heads, key_head_dim, value_head_dim) <= 0:
-            raise ValueError(
-                f"vLLM KV cache group {group_index} is not a supported attention spec"
-            )
-        attention_chunk = getattr(spec, "attention_chunk_size", None)
-        if attention_chunk is not None:
-            raise ValueError(
-                "vLLM shared_pool does not yet support chunked-local attention"
-            )
-        sliding_window = getattr(spec, "sliding_window", None)
-        policy = (
-            {"kind": "sliding_window", "window_tokens": int(sliding_window)}
-            if sliding_window is not None
-            else {"kind": "full_attention"}
-        )
+    for group in resolved_groups:
+        if group.policy_kind == "sliding_window":
+            policy = {
+                "kind": "sliding_window",
+                "window_tokens": group.window_tokens,
+            }
+        else:
+            policy = {"kind": "full_attention"}
         layers = [
             {"index": next_layer_index + offset, "name": str(layer_name)}
-            for offset, layer_name in enumerate(layer_names)
+            for offset, layer_name in enumerate(group.layers)
         ]
         next_layer_index += len(layers)
         cache_groups.append(
             {
-                "group_id": f"vllm.group.{group_index}",
+                "group_id": group.group_id,
                 "layers": layers,
                 "geometry": {
                     "kind": "paged_attention",
-                    "block_size_tokens": block_size,
-                    "kv_heads": kv_heads,
-                    "key_head_dim": key_head_dim,
-                    "value_head_dim": value_head_dim,
-                    "element_type": _element_type(getattr(spec, "dtype", None)),
+                    "block_size_tokens": group.block_size_tokens,
+                    "kv_heads": group.kv_heads,
+                    "key_head_dim": group.key_head_dim,
+                    "value_head_dim": group.value_head_dim,
+                    "element_type": _element_type(group.element_type.name),
                     "layout": {
                         "kind": "backend_native",
                         "layout_id": f"vllm:{layout_id}",
@@ -754,6 +727,38 @@ def _element_type(dtype: Any) -> dict[str, Any]:
     return {"kind": "custom", "name": name}
 
 
+def _strict_nonnegative_integer(value: Any, field: str) -> int:
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or value < 0
+        or value > UINT64_MAX
+    ):
+        raise ValueError(
+            f"{field} must be a non-negative unsigned 64-bit integer"
+        )
+    return value
+
+
+def _canonical_rank(value: Any) -> int:
+    if isinstance(value, int) and not isinstance(value, bool):
+        return _strict_nonnegative_integer(value, "kapsl_rank_device_map rank")
+    if isinstance(value, str) and (
+        value == "0"
+        or (
+            value
+            and value[0] in "123456789"
+            and all(character in "0123456789" for character in value[1:])
+        )
+    ):
+        return _strict_nonnegative_integer(
+            int(value), "kapsl_rank_device_map rank"
+        )
+    raise ValueError(
+        "kapsl_rank_device_map ranks must be canonical non-negative integers"
+    )
+
+
 def _rank_device_map(config: Any) -> dict[int, int] | None:
     raw_map = _extra(config, "kapsl_rank_device_map", None)
     if raw_map is None:
@@ -762,15 +767,14 @@ def _rank_device_map(config: Any) -> dict[int, int] | None:
         raise ValueError("kapsl_rank_device_map must be an object")
     result: dict[int, int] = {}
     for raw_rank, raw_device_id in raw_map.items():
-        try:
-            rank = int(raw_rank)
-            device_id = int(raw_device_id)
-        except (TypeError, ValueError) as error:
+        rank = _canonical_rank(raw_rank)
+        device_id = _strict_nonnegative_integer(
+            raw_device_id, "kapsl_rank_device_map device ID"
+        )
+        if rank in result:
             raise ValueError(
-                "kapsl_rank_device_map keys and values must be integers"
-            ) from error
-        if rank < 0 or device_id < 0:
-            raise ValueError("kapsl_rank_device_map values cannot be negative")
+                "kapsl_rank_device_map contains duplicate or colliding ranks"
+            )
         result[rank] = device_id
     if not result:
         raise ValueError("kapsl_rank_device_map must not be empty")
@@ -782,10 +786,20 @@ def _validated_shared_rank_device_map(
     memory_domains: Sequence[Mapping[str, Any]],
     tensor_parallel_size: int,
 ) -> dict[int, int] | None:
-    if tensor_parallel_size <= 0:
-        raise ValueError("vLLM tensor_parallel_size must be positive")
-    device_ids = [int(domain.get("device_id", -1)) for domain in memory_domains]
-    if len(device_ids) != tensor_parallel_size or len(set(device_ids)) != len(device_ids):
+    tensor_parallel_size = _positive_integer(
+        tensor_parallel_size, "vLLM tensor_parallel_size"
+    )
+    device_ids = [
+        _strict_nonnegative_integer(
+            domain.get("device_id"),
+            f"kapsl_memory_domains[{index}].device_id",
+        )
+        for index, domain in enumerate(memory_domains)
+    ]
+    if (
+        len(device_ids) != tensor_parallel_size
+        or len(set(device_ids)) != len(device_ids)
+    ):
         raise ValueError(
             "vLLM shared_pool requires exactly one distinct CUDA domain per tensor-parallel rank"
         )

@@ -1,17 +1,22 @@
 use crate::protocol::{
-    HybridRequest, HybridResponse, OP_HYBRID_INFER, OP_INFER, OP_INFER_STREAM, STATUS_ERR,
-    STATUS_OK, STATUS_STREAM_CHUNK, STATUS_STREAM_END,
+    HybridRequest, HybridResponse, OP_HYBRID_INFER, OP_INFER, OP_INFER_STREAM, OP_OPENAI_WIRE,
+    OP_OPENAI_WIRE_STREAM, STATUS_ERR, STATUS_OK, STATUS_OPENAI_WIRE_CHUNK,
+    STATUS_OPENAI_WIRE_HEAD, STATUS_STREAM_CHUNK, STATUS_STREAM_END,
 };
 use async_trait::async_trait;
-use kapsl_engine_api::{BinaryTensorPacket, InferenceRequest, TensorDtype};
+use kapsl_engine_api::{
+    BinaryTensorPacket, CancellationToken, InferenceRequest, OpenAiWireFormat, OpenAiWireRequest,
+    TensorDtype,
+};
 use kapsl_scheduler::{Priority, ReplicaScheduler};
 use kapsl_transport::protocol::{
     asynchronous as wire, decode_inference_request, CodecError, DEFAULT_MAX_FRAME_PAYLOAD_BYTES,
+    MAX_OPENAI_WIRE_REQUEST_PAYLOAD_BYTES,
 };
 use kapsl_transport::{ResponseMetadata, TransportError, TransportServer};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -25,14 +30,76 @@ use kapsl_shm::memory::{ShmManager, TensorHeader};
 pub type SchedulerLookup =
     Arc<dyn Fn(u32) -> Option<Arc<dyn ReplicaScheduler + Send + Sync>> + Send + Sync>;
 
+// OpenAI ingress bodies are JSON/SSE control payloads, not arbitrary tensor
+// storage. Keep their pre-auth allocation ceiling substantially below the
+// legacy tensor-frame maximum so an unauthenticated peer cannot force a 1 GiB
+// allocation before the transport envelope's credential is checked.
+const OPENAI_WIRE_OPERATION_LIMITS: &[(u32, usize)] = &[
+    (OP_OPENAI_WIRE, MAX_OPENAI_WIRE_REQUEST_PAYLOAD_BYTES),
+    (OP_OPENAI_WIRE_STREAM, MAX_OPENAI_WIRE_REQUEST_PAYLOAD_BYTES),
+];
+// A zero operation limit rejects every valid OpenAI wire envelope directly
+// from its fixed header. This is used for plaintext TCP listeners exposed
+// beyond loopback, before bearer credentials or prompt bytes are allocated or
+// read from the socket.
+const DISABLED_OPENAI_WIRE_OPERATION_LIMITS: &[(u32, usize)] =
+    &[(OP_OPENAI_WIRE, 0), (OP_OPENAI_WIRE_STREAM, 0)];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenAiWireTransportPolicy {
+    Local,
+    PlaintextRemote,
+}
+
+impl OpenAiWireTransportPolicy {
+    fn operation_limits(self) -> &'static [(u32, usize)] {
+        match self {
+            Self::Local => OPENAI_WIRE_OPERATION_LIMITS,
+            Self::PlaintextRemote => DISABLED_OPENAI_WIRE_OPERATION_LIMITS,
+        }
+    }
+
+    fn rejects(self, operation: u32) -> bool {
+        self == Self::PlaintextRemote && matches!(operation, OP_OPENAI_WIRE | OP_OPENAI_WIRE_STREAM)
+    }
+}
+
+struct WireCancellationGuard(CancellationToken);
+
+impl Drop for WireCancellationGuard {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+async fn wait_for_peer_disconnect<T>(connection: &mut T) -> std::io::Result<()>
+where
+    T: AsyncRead + Unpin + ?Sized,
+{
+    let mut byte = [0u8; 1];
+    match connection.read(&mut byte).await? {
+        0 => Ok(()),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "IPC clients must not pipeline a request while a wire response is active",
+        )),
+    }
+}
+
 fn check_auth(request: &InferenceRequest, expected: Option<&str>) -> Option<String> {
+    check_presented_auth(
+        request
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.auth_token.as_deref()),
+        expected,
+    )
+}
+
+fn check_presented_auth(presented: Option<&str>, expected: Option<&str>) -> Option<String> {
     let Some(expected_token) = expected else {
         return None; // auth not configured — allow all
     };
-    let presented = request
-        .metadata
-        .as_ref()
-        .and_then(|m| m.auth_token.as_deref());
     if presented != Some(expected_token) {
         Some("Unauthorized".to_string())
     } else {
@@ -41,11 +108,27 @@ fn check_auth(request: &InferenceRequest, expected: Option<&str>) -> Option<Stri
 }
 
 fn request_priority(request: &InferenceRequest, default: Priority) -> Priority {
-    match request
-        .metadata
-        .as_ref()
-        .and_then(|metadata| metadata.priority)
-    {
+    priority_value(
+        request
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.priority),
+        default,
+    )
+}
+
+fn openai_wire_priority(request: &OpenAiWireRequest, default: Priority) -> Priority {
+    priority_value(
+        request
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.priority),
+        default,
+    )
+}
+
+fn priority_value(priority: Option<u8>, default: Priority) -> Priority {
+    match priority {
         Some(0) => Priority::LatencyCritical,
         Some(_) => Priority::Throughput,
         None => default,
@@ -179,7 +262,7 @@ impl TransportServer for IpcServer {
 }
 
 pub(crate) async fn handle_connection<T>(
-    mut connection: T,
+    connection: T,
     scheduler_lookup: SchedulerLookup,
     shm_manager: Option<Arc<ShmManager>>,
     auth_token: Option<Arc<str>>,
@@ -187,17 +270,220 @@ pub(crate) async fn handle_connection<T>(
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
+    handle_connection_with_wire_policy(
+        connection,
+        scheduler_lookup,
+        shm_manager,
+        auth_token,
+        OpenAiWireTransportPolicy::Local,
+    )
+    .await
+}
+
+pub(crate) async fn handle_connection_with_wire_policy<T>(
+    mut connection: T,
+    scheduler_lookup: SchedulerLookup,
+    shm_manager: Option<Arc<ShmManager>>,
+    auth_token: Option<Arc<str>>,
+    wire_policy: OpenAiWireTransportPolicy,
+) -> std::io::Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
     loop {
-        let Some(frame) =
-            wire::read_request_frame_or_eof(&mut connection, DEFAULT_MAX_FRAME_PAYLOAD_BYTES)
-                .await
-                .map_err(codec_io)?
+        let Some(frame) = wire::read_request_frame_or_eof_with_operation_limits(
+            &mut connection,
+            DEFAULT_MAX_FRAME_PAYLOAD_BYTES,
+            wire_policy.operation_limits(),
+        )
+        .await
+        .map_err(codec_io)?
         else {
             return Ok(());
         };
 
+        // The zero-sized limit above rejects every real envelope before its
+        // payload is read. Keep this explicit check so even a malformed
+        // zero-payload wire operation cannot enter dispatch on remote plaintext
+        // TCP.
+        if wire_policy.rejects(frame.header.op_code) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "protocol-native OpenAI operations require local IPC, loopback TCP, or a certified secure transport",
+            ));
+        }
+
         let model_id = frame.header.model_id;
         match frame.header.op_code {
+            OP_OPENAI_WIRE_STREAM => {
+                let envelope = match frame.decode_openai_wire_envelope() {
+                    Ok(envelope)
+                        if envelope.request.format == OpenAiWireFormat::ServerSentEvents =>
+                    {
+                        envelope
+                    }
+                    Ok(_) => {
+                        write_error_response(
+                            &mut connection,
+                            "streaming OpenAI wire operation requires SSE format",
+                        )
+                        .await?;
+                        continue;
+                    }
+                    Err(error) => {
+                        write_error_response(&mut connection, &error.to_string()).await?;
+                        continue;
+                    }
+                };
+                if let Some(error) =
+                    check_presented_auth(envelope.auth_token.as_deref(), auth_token.as_deref())
+                {
+                    write_error_response(&mut connection, &error).await?;
+                    continue;
+                }
+                let mut request = envelope.request;
+                let scheduler = match scheduler_lookup(model_id) {
+                    Some(scheduler) => scheduler,
+                    None => {
+                        write_error_response(
+                            &mut connection,
+                            &format!("Model {model_id} not found"),
+                        )
+                        .await?;
+                        continue;
+                    }
+                };
+
+                let cancellation = CancellationToken::new();
+                request.cancellation = Some(cancellation.clone());
+                let _cancel_on_drop = WireCancellationGuard(cancellation);
+                let priority = openai_wire_priority(&request, Priority::LatencyCritical);
+                let operation = scheduler.infer_openai_wire_stream(request, priority, false);
+                tokio::pin!(operation);
+                let stream_result = tokio::select! {
+                    result = &mut operation => result,
+                    disconnected = wait_for_peer_disconnect(&mut connection) => {
+                        return disconnected;
+                    }
+                };
+                match stream_result {
+                    Ok(mut response) => {
+                        if let Err(error) = response.head.validate() {
+                            write_error_response(&mut connection, &error.to_string()).await?;
+                            continue;
+                        }
+                        wire::write_response_value(
+                            &mut connection,
+                            STATUS_OPENAI_WIRE_HEAD,
+                            &response.head,
+                        )
+                        .await
+                        .map_err(codec_io)?;
+
+                        use futures::StreamExt;
+                        let mut completed = true;
+                        loop {
+                            let next = response.body.next();
+                            tokio::pin!(next);
+                            let Some(chunk) = (tokio::select! {
+                                chunk = &mut next => chunk,
+                                disconnected = wait_for_peer_disconnect(&mut connection) => {
+                                    return disconnected;
+                                }
+                            }) else {
+                                break;
+                            };
+                            match chunk {
+                                Ok(chunk) => wire::write_response_bytes(
+                                    &mut connection,
+                                    STATUS_OPENAI_WIRE_CHUNK,
+                                    &chunk,
+                                )
+                                .await
+                                .map_err(codec_io)?,
+                                Err(error) => {
+                                    write_error_response(&mut connection, &error.to_string())
+                                        .await?;
+                                    completed = false;
+                                    break;
+                                }
+                            }
+                        }
+                        // Do not append End after an error frame: doing so
+                        // leaves an unread frame that poisons connection reuse.
+                        if completed {
+                            wire::write_response_bytes(&mut connection, STATUS_STREAM_END, &[])
+                                .await
+                                .map_err(codec_io)?;
+                        }
+                    }
+                    Err(error) => {
+                        write_error_response(&mut connection, &error.to_string()).await?;
+                    }
+                }
+            }
+            OP_OPENAI_WIRE => {
+                let envelope = match frame.decode_openai_wire_envelope() {
+                    Ok(envelope) if envelope.request.format == OpenAiWireFormat::Json => envelope,
+                    Ok(_) => {
+                        write_error_response(
+                            &mut connection,
+                            "non-streaming OpenAI wire operation requires JSON format",
+                        )
+                        .await?;
+                        continue;
+                    }
+                    Err(error) => {
+                        write_error_response(&mut connection, &error.to_string()).await?;
+                        continue;
+                    }
+                };
+                if let Some(error) =
+                    check_presented_auth(envelope.auth_token.as_deref(), auth_token.as_deref())
+                {
+                    write_error_response(&mut connection, &error).await?;
+                    continue;
+                }
+                let mut request = envelope.request;
+                let scheduler = match scheduler_lookup(model_id) {
+                    Some(scheduler) => scheduler,
+                    None => {
+                        write_error_response(
+                            &mut connection,
+                            &format!("Model {model_id} not found"),
+                        )
+                        .await?;
+                        continue;
+                    }
+                };
+
+                let cancellation = CancellationToken::new();
+                request.cancellation = Some(cancellation.clone());
+                let _cancel_on_drop = WireCancellationGuard(cancellation);
+                let priority = openai_wire_priority(&request, Priority::Throughput);
+                let operation = scheduler.infer_openai_wire(request, priority, false);
+                tokio::pin!(operation);
+                let unary_result = tokio::select! {
+                    result = &mut operation => result,
+                    disconnected = wait_for_peer_disconnect(&mut connection) => {
+                        return disconnected;
+                    }
+                };
+                match unary_result {
+                    Ok(response) => {
+                        if let Err(error) = response.head.validate() {
+                            write_error_response(&mut connection, &error.to_string()).await?;
+                            continue;
+                        }
+                        wire::write_response_value(&mut connection, STATUS_OK, &response)
+                            .await
+                            .map_err(codec_io)?;
+                    }
+                    Err(error) => {
+                        write_error_response(&mut connection, &error.to_string()).await?;
+                    }
+                }
+            }
             OP_INFER_STREAM => {
                 let request = match decode_inference_request(&frame.payload) {
                     Ok(req) => req,
@@ -465,16 +751,35 @@ where
 mod tests {
     use super::*;
     use futures::Stream;
-    use kapsl_engine_api::{EngineError, EngineMetrics, RequestMetadata, TensorDtype};
+    use kapsl_engine_api::{
+        EngineError, EngineMetrics, OpenAiWireEndpoint, OpenAiWireMetadata, OpenAiWireResponse,
+        OpenAiWireResponseHead, OpenAiWireStreamResponse, RequestMetadata, TensorDtype,
+    };
     use kapsl_transport::connection_pool::PoolConfig;
     use kapsl_transport::protocol::ResponseFrame;
     use kapsl_transport::tcp::TcpClient;
     use std::pin::Pin;
     use std::sync::Mutex;
-    use tokio::io::{duplex, DuplexStream};
+    use tokio::io::{duplex, AsyncWriteExt, DuplexStream};
 
     struct PriorityRecordingScheduler {
         seen: Arc<Mutex<Vec<Priority>>>,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct SeenWireRequest {
+        priority: Priority,
+        metadata_priority: Option<u8>,
+        session_id: Option<String>,
+        body: Vec<u8>,
+    }
+
+    struct WireRecordingScheduler {
+        seen: Arc<Mutex<Vec<SeenWireRequest>>>,
+    }
+
+    struct IdleWireStreamScheduler {
+        cancellation: Arc<Mutex<Option<CancellationToken>>>,
     }
 
     #[async_trait::async_trait]
@@ -517,6 +822,134 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl ReplicaScheduler for WireRecordingScheduler {
+        fn get_queue_depth(&self) -> (usize, usize) {
+            (0, 0)
+        }
+
+        fn is_healthy(&self) -> bool {
+            true
+        }
+
+        fn get_metrics(&self) -> EngineMetrics {
+            EngineMetrics::default()
+        }
+
+        async fn infer(
+            &self,
+            _request: &InferenceRequest,
+            _priority: Priority,
+            _force_cpu: bool,
+        ) -> Result<BinaryTensorPacket, EngineError> {
+            Err(EngineError::backend("tensor inference not used"))
+        }
+
+        async fn infer_openai_wire(
+            &self,
+            request: OpenAiWireRequest,
+            priority: Priority,
+            _force_cpu: bool,
+        ) -> Result<OpenAiWireResponse, EngineError> {
+            self.record(&request, priority);
+            Ok(OpenAiWireResponse {
+                head: OpenAiWireResponseHead::new(201, Vec::new())?,
+                body: b"{\"ok\":true}".to_vec(),
+            })
+        }
+
+        async fn infer_openai_wire_stream(
+            &self,
+            request: OpenAiWireRequest,
+            priority: Priority,
+            _force_cpu: bool,
+        ) -> Result<OpenAiWireStreamResponse, EngineError> {
+            self.record(&request, priority);
+            Ok(OpenAiWireStreamResponse {
+                head: OpenAiWireResponseHead::new(200, Vec::new())?,
+                body: Box::pin(futures::stream::iter(vec![
+                    Ok(b"data: {\"part\":".to_vec()),
+                    Ok(b"1}\n\ndata: [DONE]\n\n".to_vec()),
+                ])),
+            })
+        }
+
+        async fn infer_stream(
+            &self,
+            _request: InferenceRequest,
+            _priority: Priority,
+            _force_cpu: bool,
+        ) -> Result<
+            Pin<Box<dyn Stream<Item = Result<BinaryTensorPacket, EngineError>> + Send>>,
+            EngineError,
+        > {
+            Err(EngineError::backend("tensor streaming not used"))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ReplicaScheduler for IdleWireStreamScheduler {
+        fn get_queue_depth(&self) -> (usize, usize) {
+            (0, 0)
+        }
+
+        fn is_healthy(&self) -> bool {
+            true
+        }
+
+        fn get_metrics(&self) -> EngineMetrics {
+            EngineMetrics::default()
+        }
+
+        async fn infer(
+            &self,
+            _request: &InferenceRequest,
+            _priority: Priority,
+            _force_cpu: bool,
+        ) -> Result<BinaryTensorPacket, EngineError> {
+            Err(EngineError::backend("tensor inference not used"))
+        }
+
+        async fn infer_openai_wire_stream(
+            &self,
+            request: OpenAiWireRequest,
+            _priority: Priority,
+            _force_cpu: bool,
+        ) -> Result<OpenAiWireStreamResponse, EngineError> {
+            *self.cancellation.lock().unwrap() = request.cancellation;
+            Ok(OpenAiWireStreamResponse {
+                head: OpenAiWireResponseHead::new(200, Vec::new())?,
+                body: Box::pin(futures::stream::pending()),
+            })
+        }
+
+        async fn infer_stream(
+            &self,
+            _request: InferenceRequest,
+            _priority: Priority,
+            _force_cpu: bool,
+        ) -> Result<
+            Pin<Box<dyn Stream<Item = Result<BinaryTensorPacket, EngineError>> + Send>>,
+            EngineError,
+        > {
+            Err(EngineError::backend("tensor streaming not used"))
+        }
+    }
+
+    impl WireRecordingScheduler {
+        fn record(&self, request: &OpenAiWireRequest, priority: Priority) {
+            self.seen.lock().unwrap().push(SeenWireRequest {
+                priority,
+                metadata_priority: request
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.priority),
+                session_id: request.session_id.clone(),
+                body: request.body.clone(),
+            });
+        }
+    }
+
     fn request_with_priority(priority: u8) -> InferenceRequest {
         let metadata = RequestMetadata {
             priority: Some(priority),
@@ -547,8 +980,82 @@ mod tests {
             .expect("read response frame")
     }
 
+    fn request_header(model_id: u32, operation: u32, payload_size: u32) -> [u8; 12] {
+        let mut header = [0u8; 12];
+        header[0..4].copy_from_slice(&model_id.to_le_bytes());
+        header[4..8].copy_from_slice(&operation.to_le_bytes());
+        header[8..12].copy_from_slice(&payload_size.to_le_bytes());
+        header
+    }
+
     fn lookup_for(scheduler: Arc<dyn ReplicaScheduler + Send + Sync>) -> SchedulerLookup {
         Arc::new(move |model_id| (model_id == 7).then(|| scheduler.clone()))
+    }
+
+    #[tokio::test]
+    async fn plaintext_remote_policy_rejects_wire_before_payload_read_or_dispatch() {
+        for (operation, payload_size, expected_kind) in [
+            (OP_OPENAI_WIRE, 1024, std::io::ErrorKind::InvalidData),
+            (
+                OP_OPENAI_WIRE_STREAM,
+                0,
+                std::io::ErrorKind::PermissionDenied,
+            ),
+        ] {
+            let lookup: SchedulerLookup =
+                Arc::new(|_| panic!("remote plaintext wire request reached scheduler lookup"));
+            let (mut client, server) = duplex(64);
+            let task = tokio::spawn(handle_connection_with_wire_policy(
+                server,
+                lookup,
+                None,
+                Some(Arc::from("secret")),
+                OpenAiWireTransportPolicy::PlaintextRemote,
+            ));
+
+            client
+                .write_all(&request_header(7, operation, payload_size))
+                .await
+                .expect("write fixed request header only");
+            let error = tokio::time::timeout(std::time::Duration::from_millis(200), task)
+                .await
+                .expect("remote wire request must be rejected from its header")
+                .expect("connection task")
+                .expect_err("remote plaintext wire request must fail");
+            assert_eq!(error.kind(), expected_kind);
+        }
+    }
+
+    #[tokio::test]
+    async fn plaintext_remote_policy_preserves_authenticated_native_inference() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let scheduler: Arc<dyn ReplicaScheduler + Send + Sync> =
+            Arc::new(PriorityRecordingScheduler { seen: seen.clone() });
+        let (mut client, server) = duplex(4096);
+        let task = tokio::spawn(handle_connection_with_wire_policy(
+            server,
+            lookup_for(scheduler),
+            None,
+            Some(Arc::from("secret")),
+            OpenAiWireTransportPolicy::PlaintextRemote,
+        ));
+        let mut request = request_with_priority(1);
+        request
+            .metadata
+            .as_mut()
+            .expect("request metadata")
+            .auth_token = Some("secret".to_string());
+
+        let output = wire::infer_request_over_stream(&mut client, 7, &request)
+            .await
+            .expect("authenticated native inference remains available");
+        assert_eq!(output.data, request.input.data);
+
+        drop(client);
+        task.await
+            .expect("server task")
+            .expect("connection handler");
+        assert_eq!(*seen.lock().unwrap(), vec![Priority::Throughput]);
     }
 
     #[tokio::test]
@@ -635,6 +1142,142 @@ mod tests {
             .expect("server task")
             .expect("connection handler");
         assert_eq!(*seen.lock().unwrap(), vec![Priority::Throughput]);
+    }
+
+    #[tokio::test]
+    async fn openai_wire_envelope_authenticates_before_dispatching_clean_policy_request() {
+        use kapsl_transport::protocol::OpenAiWireStreamFrame;
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let scheduler: Arc<dyn ReplicaScheduler + Send + Sync> =
+            Arc::new(WireRecordingScheduler { seen: seen.clone() });
+        let (mut client, server) = duplex(16 * 1024);
+        let task = tokio::spawn(handle_connection(
+            server,
+            lookup_for(scheduler),
+            None,
+            Some(Arc::from("secret")),
+        ));
+
+        let metadata = OpenAiWireMetadata {
+            request_id: Some("request-42".to_string()),
+            timeout_ms: Some(5000),
+            priority: Some(0),
+        };
+        let unary = OpenAiWireRequest::new(
+            OpenAiWireEndpoint::ChatCompletions,
+            OpenAiWireFormat::Json,
+            br#"{"model":"served","messages":[]}"#.to_vec(),
+        )
+        .with_session_id("session-42")
+        .with_metadata(metadata.clone());
+        let unauthenticated = wire::openai_wire_over_stream(&mut client, 7, &unary).await;
+        assert!(matches!(
+            unauthenticated,
+            Err(CodecError::Remote(message)) if message == "Unauthorized"
+        ));
+        let response =
+            wire::openai_wire_over_stream_authenticated(&mut client, 7, &unary, "secret")
+                .await
+                .expect("authenticated unary wire dispatch");
+        assert_eq!(response.head.status, 201);
+        assert_eq!(response.body, br#"{"ok":true}"#);
+
+        let streaming = OpenAiWireRequest::new(
+            OpenAiWireEndpoint::ChatCompletions,
+            OpenAiWireFormat::ServerSentEvents,
+            br#"{"model":"served","messages":[],"stream":true}"#.to_vec(),
+        )
+        .with_session_id("session-42")
+        .with_metadata(OpenAiWireMetadata {
+            priority: Some(1),
+            ..metadata
+        });
+        wire::write_openai_wire_stream_request_authenticated(&mut client, 7, &streaming, "secret")
+            .await
+            .expect("write authenticated wire stream");
+        assert!(matches!(
+            wire::read_openai_wire_stream_frame(&mut client, DEFAULT_MAX_FRAME_PAYLOAD_BYTES)
+                .await
+                .unwrap(),
+            OpenAiWireStreamFrame::Head(head) if head.status == 200
+        ));
+        assert_eq!(
+            wire::read_openai_wire_stream_frame(&mut client, DEFAULT_MAX_FRAME_PAYLOAD_BYTES)
+                .await
+                .unwrap(),
+            OpenAiWireStreamFrame::Chunk(b"data: {\"part\":".to_vec())
+        );
+        assert_eq!(
+            wire::read_openai_wire_stream_frame(&mut client, DEFAULT_MAX_FRAME_PAYLOAD_BYTES)
+                .await
+                .unwrap(),
+            OpenAiWireStreamFrame::Chunk(b"1}\n\ndata: [DONE]\n\n".to_vec())
+        );
+        assert!(matches!(
+            wire::read_openai_wire_stream_frame(&mut client, DEFAULT_MAX_FRAME_PAYLOAD_BYTES)
+                .await
+                .unwrap(),
+            OpenAiWireStreamFrame::End
+        ));
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].priority, Priority::LatencyCritical);
+        assert_eq!(seen[0].metadata_priority, Some(0));
+        assert_eq!(seen[0].session_id.as_deref(), Some("session-42"));
+        assert_eq!(seen[0].body, unary.body);
+        assert_eq!(seen[1].priority, Priority::Throughput);
+        assert_eq!(seen[1].metadata_priority, Some(1));
+        assert_eq!(seen[1].session_id.as_deref(), Some("session-42"));
+        assert_eq!(seen[1].body, streaming.body);
+
+        drop(client);
+        task.await
+            .expect("server task")
+            .expect("connection handler");
+    }
+
+    #[tokio::test]
+    async fn dropping_wire_stream_client_cancels_idle_server_request_and_exits_handler() {
+        use kapsl_transport::protocol::OpenAiWireStreamFrame;
+
+        let cancellation = Arc::new(Mutex::new(None));
+        let scheduler: Arc<dyn ReplicaScheduler + Send + Sync> =
+            Arc::new(IdleWireStreamScheduler {
+                cancellation: cancellation.clone(),
+            });
+        let (mut client, server) = duplex(4096);
+        let task = tokio::spawn(handle_connection(server, lookup_for(scheduler), None, None));
+        let request = OpenAiWireRequest::new(
+            OpenAiWireEndpoint::ChatCompletions,
+            OpenAiWireFormat::ServerSentEvents,
+            br#"{"model":"served","messages":[],"stream":true}"#.to_vec(),
+        );
+
+        wire::write_openai_wire_stream_request(&mut client, 7, &request)
+            .await
+            .expect("write wire stream request");
+        assert!(matches!(
+            wire::read_openai_wire_stream_frame(&mut client, DEFAULT_MAX_FRAME_PAYLOAD_BYTES)
+                .await
+                .expect("read wire response head"),
+            OpenAiWireStreamFrame::Head(head) if head.status == 200
+        ));
+        let server_cancellation = cancellation
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("server installs a local cancellation token");
+        assert!(!server_cancellation.is_cancelled());
+
+        drop(client);
+        tokio::time::timeout(std::time::Duration::from_millis(500), task)
+            .await
+            .expect("disconnect should wake an idle stream handler")
+            .expect("server task")
+            .expect("connection handler exits cleanly");
+        assert!(server_cancellation.is_cancelled());
     }
 
     #[tokio::test]

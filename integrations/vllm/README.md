@@ -96,7 +96,7 @@ kapsl run \
   --kv-control-socket /run/kapsl/kv-control.sock \
   --kv-control-lease-ttl-ms 30000 \
   --kv-shared-pool-profile \
-    'kapsl-vllm-connector,0.5.0,<vllm-version>,vllm-v1-packed-cuda-ipc/flash-attn'
+    'kapsl-vllm-connector,0.6.0,<vllm-version>,vllm-v1-packed-cuda-ipc/flash-attn'
 ```
 
 Create `/run/kapsl` with ownership suitable for the runtime user first. The
@@ -136,6 +136,29 @@ supports CUDA, packed vLLM KV tensors, tensor parallelism on one host, and no
 pipeline/data/decode-context parallel partitions or vLLM sleep mode. The Kapsl
 wire contract and client have no vLLM dependency.
 
+## Exact-cache planning contract
+
+The package includes the phase-0, versioned exact-cache planning contract in
+`kapsl_vllm_connector.planning`. It validates cache groups already resolved by
+the certified vLLM runtime, uses each group's own
+`max_memory_usage_bytes` result for hybrid-safe per-sequence sizing, includes
+vLLM's reserved null block, and emits a canonical SHA-256 geometry digest. It
+never estimates cache geometry from a Hugging Face model-family formula.
+
+The JSON schema is available without vLLM or CUDA:
+
+```bash
+python -m kapsl_vllm_connector.plan --print-schema
+python -m kapsl_vllm_connector.plan --print-error-schema
+```
+
+The `kapsl-vllm-plan` command is intentionally fail-closed until an
+executor-backed provider is installed and certified. Finding a model config or
+even importing vLLM is not enough: the final cache specs depend on instantiated
+attention modules and the selected backend's spec customization. The later
+provider will stop before vLLM's final KV allocation and feed its resolved
+worker configs through this contract.
+
 The shared-pool startup lifecycle is `register -> attach every worker ->
 activate -> reserve`. `register_kv_caches` verifies the complete layer set,
 storage base, imported byte size, and every tensor's bounded byte span before
@@ -145,6 +168,25 @@ also defines synchronized detach, but this connector does not send it until
 vLLM exposes a teardown callback that guarantees every model-owned KV view has
 been destroyed. A crash or ambiguous teardown intentionally retains the
 exported backing instead of risking a use-after-free.
+
+## Release
+
+The connector has an isolated PyPI release workflow at
+`.github/workflows/publish-vllm-connector.yml`. A release tag must exactly
+match the version in `pyproject.toml`, for example
+`kapsl-vllm-connector-v0.6.0`. This namespace intentionally does not begin
+with `v`, so it cannot trigger the root `kapsl-sdk` package's `v*` workflow.
+
+The workflow's manual dispatch is build-only by default. Selecting
+`publish: true` is accepted only when the dispatch ref is the same matching
+connector tag. Before the first upload, configure the PyPI pending/trusted
+publisher for this repository, workflow `publish-vllm-connector.yml`, and
+GitHub environment `pypi-vllm-connector`.
+
+Every release runs the host suite on Python 3.12, builds one universal wheel
+and one source distribution, runs strict Twine metadata checks, and verifies
+the archives' version, console scripts, planner modules, Apache `LICENSE`, and
+`NOTICE` before granting the publish job an OIDC token.
 
 ## Test
 

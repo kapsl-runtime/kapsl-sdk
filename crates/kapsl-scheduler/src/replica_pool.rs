@@ -1,5 +1,8 @@
 use crate::priority::Priority;
-use kapsl_engine_api::{BinaryTensorPacket, EngineError, EngineMetrics, InferenceRequest};
+use kapsl_engine_api::{
+    BinaryTensorPacket, EngineError, EngineMetrics, InferenceRequest, OpenAiWireRequest,
+    OpenAiWireResponse, OpenAiWireStreamResponse,
+};
 use parking_lot::RwLock;
 use std::cmp::Reverse;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -255,6 +258,55 @@ where
         result
     }
 
+    /// Select one locally healthy replica before dispatching a generation.
+    ///
+    /// Failover is deliberately limited to this pre-dispatch decision. Once a
+    /// wire request has entered an engine, a timeout/reset/backend error is
+    /// ambiguous: replaying it could run the same generation twice.
+    fn select_openai_scheduler(
+        &self,
+        request: &OpenAiWireRequest,
+    ) -> Result<(u32, Arc<T>), EngineError> {
+        let replicas = self.replicas.read();
+        let memory_aware = Self::memory_routing_enabled(&replicas);
+        if replicas.is_empty() {
+            return Err(EngineError::overloaded(
+                "No replicas available in pool".to_string(),
+            ));
+        }
+
+        let selected_idx = match self.strategy {
+            PoolStrategy::RoundRobin => self.select_round_robin(&replicas),
+            PoolStrategy::LeastLoaded => self.select_least_loaded(&replicas),
+            PoolStrategy::Sticky => {
+                self.select_sticky_session(&replicas, request.session_id.as_deref())
+            }
+        };
+        let selected = &replicas[selected_idx];
+        let chosen = if selected.scheduler.is_healthy() {
+            selected
+        } else {
+            replicas
+                .iter()
+                .enumerate()
+                .filter(|(index, replica)| *index != selected_idx && replica.scheduler.is_healthy())
+                .min_by_key(|(_, replica)| self.routing_key(replica, memory_aware))
+                .map(|(_, replica)| replica)
+                .ok_or_else(|| {
+                    EngineError::overloaded("No healthy replicas available in pool".to_string())
+                })?
+        };
+        if chosen.replica_id != selected.replica_id {
+            log::info!(
+                "Selecting healthy OpenAI wire replica {} instead of unroutable replica {}",
+                chosen.replica_id,
+                selected.replica_id
+            );
+        }
+        chosen.requests_total.fetch_add(1, Ordering::Relaxed);
+        Ok((chosen.replica_id, chosen.scheduler.clone()))
+    }
+
     fn select_round_robin(&self, replicas: &[PooledReplica<T>]) -> usize {
         let counter = self.round_robin_counter.fetch_add(1, Ordering::Relaxed);
         counter % replicas.len()
@@ -282,8 +334,16 @@ where
     }
 
     fn select_sticky(&self, replicas: &[PooledReplica<T>], request: &InferenceRequest) -> usize {
-        // If request has session_id, use hash-based routing
-        if let Some(ref session_id) = request.session_id {
+        self.select_sticky_session(replicas, request.session_id.as_deref())
+    }
+
+    fn select_sticky_session(
+        &self,
+        replicas: &[PooledReplica<T>],
+        session_id: Option<&str>,
+    ) -> usize {
+        // If the request has a session ID, use hash-based routing.
+        if let Some(session_id) = session_id {
             use std::collections::hash_map::DefaultHasher;
             use std::hash::{Hash, Hasher};
 
@@ -444,6 +504,30 @@ where
         self.execute(request.clone(), priority, force_cpu).await
     }
 
+    async fn infer_openai_wire(
+        &self,
+        request: OpenAiWireRequest,
+        priority: Priority,
+        force_cpu: bool,
+    ) -> Result<OpenAiWireResponse, EngineError> {
+        let (_replica_id, scheduler) = self.select_openai_scheduler(&request)?;
+        scheduler
+            .infer_openai_wire(request.clone(), priority, force_cpu)
+            .await
+    }
+
+    async fn infer_openai_wire_stream(
+        &self,
+        request: OpenAiWireRequest,
+        priority: Priority,
+        force_cpu: bool,
+    ) -> Result<OpenAiWireStreamResponse, EngineError> {
+        let (_replica_id, scheduler) = self.select_openai_scheduler(&request)?;
+        scheduler
+            .infer_openai_wire_stream(request, priority, force_cpu)
+            .await
+    }
+
     async fn infer_stream(
         &self,
         request: InferenceRequest,
@@ -567,6 +651,28 @@ pub trait ReplicaScheduler: Send + Sync {
         force_cpu: bool,
     ) -> Result<BinaryTensorPacket, EngineError>;
 
+    async fn infer_openai_wire(
+        &self,
+        _request: OpenAiWireRequest,
+        _priority: Priority,
+        _force_cpu: bool,
+    ) -> Result<OpenAiWireResponse, EngineError> {
+        Err(EngineError::backend(
+            "scheduler does not support protocol-native OpenAI requests",
+        ))
+    }
+
+    async fn infer_openai_wire_stream(
+        &self,
+        _request: OpenAiWireRequest,
+        _priority: Priority,
+        _force_cpu: bool,
+    ) -> Result<OpenAiWireStreamResponse, EngineError> {
+        Err(EngineError::backend(
+            "scheduler does not support protocol-native OpenAI streams",
+        ))
+    }
+
     async fn infer_stream(
         &self,
         request: InferenceRequest,
@@ -584,8 +690,10 @@ pub trait ReplicaScheduler: Send + Sync {
 mod tests {
     use super::*;
     use futures::StreamExt;
-    use kapsl_engine_api::BinaryTensorPacket;
-    use kapsl_engine_api::TensorDtype;
+    use kapsl_engine_api::{
+        BinaryTensorPacket, OpenAiWireEndpoint, OpenAiWireFormat, OpenAiWireResponseHead,
+        TensorDtype,
+    };
 
     struct MockScheduler {
         queue_depth: (usize, usize),
@@ -643,6 +751,36 @@ mod tests {
             Ok(request.input.clone())
         }
 
+        async fn infer_openai_wire(
+            &self,
+            request: OpenAiWireRequest,
+            _priority: Priority,
+            _force_cpu: bool,
+        ) -> Result<OpenAiWireResponse, EngineError> {
+            if !self.healthy {
+                return Err(EngineError::backend("Unhealthy replica"));
+            }
+            Ok(OpenAiWireResponse {
+                head: OpenAiWireResponseHead::new(200, Vec::new())?,
+                body: request.body,
+            })
+        }
+
+        async fn infer_openai_wire_stream(
+            &self,
+            request: OpenAiWireRequest,
+            _priority: Priority,
+            _force_cpu: bool,
+        ) -> Result<OpenAiWireStreamResponse, EngineError> {
+            if !self.healthy {
+                return Err(EngineError::backend("Unhealthy replica"));
+            }
+            Ok(OpenAiWireStreamResponse {
+                head: OpenAiWireResponseHead::new(200, Vec::new())?,
+                body: Box::pin(futures::stream::once(async move { Ok(request.body) })),
+            })
+        }
+
         fn get_metrics(&self) -> kapsl_engine_api::EngineMetrics {
             self.metrics.clone()
         }
@@ -667,6 +805,205 @@ mod tests {
             let result = Ok(request.input.clone());
             Ok(Box::pin(futures::stream::once(async move { result })))
         }
+    }
+
+    #[derive(Debug)]
+    struct WireDispatchSource(&'static str);
+
+    impl std::fmt::Display for WireDispatchSource {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str(self.0)
+        }
+    }
+
+    impl std::error::Error for WireDispatchSource {}
+
+    #[derive(Clone, Copy)]
+    enum WireDispatchFailure {
+        None,
+        Unary,
+        Stream,
+    }
+
+    struct WireDispatchScheduler {
+        failure: WireDispatchFailure,
+        unary_calls: AtomicUsize,
+        stream_calls: AtomicUsize,
+    }
+
+    impl WireDispatchScheduler {
+        fn new(failure: WireDispatchFailure) -> Self {
+            Self {
+                failure,
+                unary_calls: AtomicUsize::new(0),
+                stream_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ReplicaScheduler for WireDispatchScheduler {
+        fn get_queue_depth(&self) -> (usize, usize) {
+            (0, 0)
+        }
+
+        fn is_healthy(&self) -> bool {
+            true
+        }
+
+        fn get_metrics(&self) -> kapsl_engine_api::EngineMetrics {
+            kapsl_engine_api::EngineMetrics::default()
+        }
+
+        async fn infer(
+            &self,
+            request: &InferenceRequest,
+            _priority: Priority,
+            _force_cpu: bool,
+        ) -> Result<BinaryTensorPacket, EngineError> {
+            Ok(request.input.clone())
+        }
+
+        async fn infer_openai_wire(
+            &self,
+            request: OpenAiWireRequest,
+            _priority: Priority,
+            _force_cpu: bool,
+        ) -> Result<OpenAiWireResponse, EngineError> {
+            self.unary_calls.fetch_add(1, Ordering::SeqCst);
+            if matches!(self.failure, WireDispatchFailure::Unary) {
+                return Err(EngineError::TimeoutError {
+                    message: "ambiguous unary failure after dispatch".to_string(),
+                    source: Some(Box::new(WireDispatchSource("unary transport reset"))),
+                });
+            }
+
+            Ok(OpenAiWireResponse {
+                head: OpenAiWireResponseHead::new(200, Vec::new())?,
+                body: request.body,
+            })
+        }
+
+        async fn infer_openai_wire_stream(
+            &self,
+            request: OpenAiWireRequest,
+            _priority: Priority,
+            _force_cpu: bool,
+        ) -> Result<OpenAiWireStreamResponse, EngineError> {
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            if matches!(self.failure, WireDispatchFailure::Stream) {
+                return Err(EngineError::Backend {
+                    message: "ambiguous stream failure after dispatch".to_string(),
+                    source: Some(Box::new(WireDispatchSource("stream header reset"))),
+                });
+            }
+
+            Ok(OpenAiWireStreamResponse {
+                head: OpenAiWireResponseHead::new(200, Vec::new())?,
+                body: Box::pin(futures::stream::once(async move { Ok(request.body) })),
+            })
+        }
+
+        async fn infer_stream(
+            &self,
+            request: InferenceRequest,
+            _priority: Priority,
+            _force_cpu: bool,
+        ) -> Result<
+            std::pin::Pin<
+                Box<dyn futures::Stream<Item = Result<BinaryTensorPacket, EngineError>> + Send>,
+            >,
+            EngineError,
+        > {
+            Ok(Box::pin(futures::stream::once(
+                async move { Ok(request.input) },
+            )))
+        }
+    }
+
+    fn assert_preserved_wire_error(
+        error: EngineError,
+        expected_message: &str,
+        expected_source: &str,
+        expect_timeout: bool,
+    ) {
+        let (message, source) = match error {
+            EngineError::TimeoutError { message, source } if expect_timeout => (message, source),
+            EngineError::Backend { message, source } if !expect_timeout => (message, source),
+            other => panic!("wire error changed variant: {other:?}"),
+        };
+        assert_eq!(message, expected_message);
+        let source = source.expect("wire error source must be preserved");
+        let source = source
+            .downcast_ref::<WireDispatchSource>()
+            .expect("wire error source type must be preserved");
+        assert_eq!(source.0, expected_source);
+    }
+
+    #[tokio::test]
+    async fn openai_wire_unary_ambiguous_error_is_not_replayed_and_is_preserved() {
+        let pool = ReplicaPool::new(PoolStrategy::RoundRobin);
+        let failing = Arc::new(WireDispatchScheduler::new(WireDispatchFailure::Unary));
+        let fallback = Arc::new(WireDispatchScheduler::new(WireDispatchFailure::None));
+        pool.add_replica(0, failing.clone());
+        pool.add_replica(1, fallback.clone());
+
+        let request = OpenAiWireRequest::new(
+            OpenAiWireEndpoint::ChatCompletions,
+            OpenAiWireFormat::Json,
+            b"unary".to_vec(),
+        );
+        let error = match pool
+            .infer_openai_wire(request, Priority::Throughput, false)
+            .await
+        {
+            Ok(_) => panic!("ambiguous unary failure unexpectedly succeeded"),
+            Err(error) => error,
+        };
+
+        assert_preserved_wire_error(
+            error,
+            "ambiguous unary failure after dispatch",
+            "unary transport reset",
+            true,
+        );
+        assert_eq!(failing.unary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback.unary_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(pool.stats()[0].requests_total, 1);
+        assert_eq!(pool.stats()[1].requests_total, 0);
+    }
+
+    #[tokio::test]
+    async fn openai_wire_stream_ambiguous_error_is_not_replayed_and_is_preserved() {
+        let pool = ReplicaPool::new(PoolStrategy::RoundRobin);
+        let failing = Arc::new(WireDispatchScheduler::new(WireDispatchFailure::Stream));
+        let fallback = Arc::new(WireDispatchScheduler::new(WireDispatchFailure::None));
+        pool.add_replica(0, failing.clone());
+        pool.add_replica(1, fallback.clone());
+
+        let request = OpenAiWireRequest::new(
+            OpenAiWireEndpoint::ChatCompletions,
+            OpenAiWireFormat::ServerSentEvents,
+            b"stream".to_vec(),
+        );
+        let error = match pool
+            .infer_openai_wire_stream(request, Priority::LatencyCritical, false)
+            .await
+        {
+            Ok(_) => panic!("ambiguous stream failure unexpectedly succeeded"),
+            Err(error) => error,
+        };
+
+        assert_preserved_wire_error(
+            error,
+            "ambiguous stream failure after dispatch",
+            "stream header reset",
+            false,
+        );
+        assert_eq!(failing.stream_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback.stream_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(pool.stats()[0].requests_total, 1);
+        assert_eq!(pool.stats()[1].requests_total, 0);
     }
 
     #[tokio::test]
@@ -811,6 +1148,52 @@ mod tests {
         let stats = pool.stats();
         // Replica 1 should have received the request (Replica 0 failed)
         assert!(stats[1].requests_total >= 1);
+    }
+
+    #[tokio::test]
+    async fn openai_wire_paths_preserve_replica_selection_and_startup_failover() {
+        let pool = ReplicaPool::new(PoolStrategy::RoundRobin);
+        pool.add_replica(0, Arc::new(MockScheduler::new((0, 0), false)));
+        pool.add_replica(1, Arc::new(MockScheduler::new((0, 0), true)));
+
+        let unary = OpenAiWireRequest::new(
+            OpenAiWireEndpoint::ChatCompletions,
+            OpenAiWireFormat::Json,
+            b"unary-body".to_vec(),
+        )
+        .with_session_id("session-a")
+        .with_metadata(kapsl_engine_api::OpenAiWireMetadata {
+            request_id: Some("wire-request".to_string()),
+            ..Default::default()
+        });
+        let response = pool
+            .infer_openai_wire(unary, Priority::Throughput, false)
+            .await
+            .expect("unary wire request should fail over");
+        assert_eq!(response.body, b"unary-body");
+
+        // Advance round-robin back to the unhealthy replica and verify stream
+        // startup can fail over before a response head is committed.
+        let advance = OpenAiWireRequest::new(
+            OpenAiWireEndpoint::ChatCompletions,
+            OpenAiWireFormat::Json,
+            b"advance".to_vec(),
+        );
+        pool.infer_openai_wire(advance, Priority::Throughput, false)
+            .await
+            .expect("healthy replica should accept the intervening request");
+        let streaming = OpenAiWireRequest::new(
+            OpenAiWireEndpoint::ChatCompletions,
+            OpenAiWireFormat::ServerSentEvents,
+            b"raw-sse".to_vec(),
+        )
+        .with_session_id("session-a");
+        let mut response = pool
+            .infer_openai_wire_stream(streaming, Priority::LatencyCritical, false)
+            .await
+            .expect("wire stream should fail over during startup");
+        assert_eq!(response.body.next().await.unwrap().unwrap(), b"raw-sse");
+        assert_eq!(pool.stats()[1].requests_total, 3);
     }
 
     #[tokio::test]
