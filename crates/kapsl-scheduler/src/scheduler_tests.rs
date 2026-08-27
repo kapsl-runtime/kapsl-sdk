@@ -1057,6 +1057,19 @@ async fn scheduler_observer_covers_translated_and_wire_admission() {
 }
 
 #[tokio::test]
+async fn delegated_scheduler_metrics_publish_backend_concurrency_capacity() {
+    let mut policy = BatchingPolicy::delegated();
+    policy.max_requests = 7;
+    let engine: EngineHandle = Arc::new(PriorityRecordingEngine {
+        seen: Arc::new(std::sync::Mutex::new(Vec::new())),
+        policy,
+    });
+    let scheduler = Scheduler::new(vec![engine], 1, 1, 8, true, 1, 0, None);
+
+    assert_eq!(ReplicaScheduler::get_metrics(&scheduler).batch_size, 7);
+}
+
+#[tokio::test]
 async fn test_scheduler_wire_admission_prioritizes_latency_over_queued_throughput() {
     let seen = Arc::new(std::sync::Mutex::new(Vec::<Option<u8>>::new()));
     let engine: EngineHandle = Arc::new(PriorityRecordingEngine::delegated(seen.clone()));

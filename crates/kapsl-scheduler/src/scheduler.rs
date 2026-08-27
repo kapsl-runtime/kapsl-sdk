@@ -676,10 +676,20 @@ impl crate::replica_pool::ReplicaScheduler for Scheduler {
         let mut total_onnx_session_pool_idle = 0;
         let mut total_onnx_session_pool_waits = 0;
         let mut total_onnx_session_pool_wait_seconds = 0.0;
+        let mut delegated_capacity = 0usize;
+        let mut has_delegated_capacity = false;
         let count = self.engines.len();
 
         for engine in &self.engines {
             let m = engine.metrics();
+            let batching = engine.batching_policy();
+            if matches!(
+                batching.mode,
+                BatchingMode::Continuous | BatchingMode::Delegated
+            ) {
+                has_delegated_capacity = true;
+                delegated_capacity = delegated_capacity.saturating_add(batching.max_requests);
+            }
             total_memory += m.memory_usage;
             total_gpu_util += m.gpu_utilization;
             total_throughput += m.throughput;
@@ -714,7 +724,11 @@ impl crate::replica_pool::ReplicaScheduler for Scheduler {
                 0.0
             },
             throughput: total_throughput,
-            batch_size: self.max_micro_batch,
+            batch_size: if has_delegated_capacity {
+                delegated_capacity.max(1)
+            } else {
+                self.max_micro_batch
+            },
             queue_depth: cpu_q + gpu_q,
             kv_cache_bytes_used: total_kv_bytes_used,
             kv_cache_bytes_capacity: total_kv_bytes_capacity,
