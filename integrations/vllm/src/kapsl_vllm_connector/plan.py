@@ -16,7 +16,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
-from .connector import ADAPTER_PROFILE_ID, ADAPTER_VERSION
+from .connector import (
+    ADAPTER_PROFILE_ID,
+    ADAPTER_VERSION,
+    ELASTIC_ADAPTER_PROFILE_ID,
+)
 from .planning import (
     PLANNER_SCHEMA_VERSION,
     UINT64_MAX,
@@ -40,6 +44,7 @@ class RuntimePlanningRequest:
     tensor_parallel_size: int
     attention_backend: str
     device_ids: tuple[int, ...]
+    live_resize: bool = False
 
 
 GeometryProvider = Callable[[RuntimePlanningRequest], GeometryDescriptor]
@@ -167,6 +172,8 @@ def _geometry_from_executor(
         enforce_eager=True,
     )
     vllm_config = engine_args.create_engine_config()
+    if request.live_resize:
+        vllm_config.cache_config.kv_cache_layout = "BLNHC"
     executor_class = apis.executor_class_resolver(vllm_config)
     executor = executor_class(vllm_config)
     try:
@@ -230,7 +237,11 @@ def _geometry_from_executor(
                 adapter_id="kapsl-vllm-connector",
                 adapter_version=ADAPTER_VERSION,
                 backend_version=backend_version,
-                profile_id=ADAPTER_PROFILE_ID,
+                profile_id=(
+                    ELASTIC_ADAPTER_PROFILE_ID
+                    if request.live_resize
+                    else ADAPTER_PROFILE_ID
+                ),
             ),
             model_fingerprint=request.model_fingerprint,
             max_model_len=request.max_model_len,
@@ -273,12 +284,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--attention-backend", default="FLASH_ATTN")
     parser.add_argument("--devices")
     parser.add_argument("--target-concurrency", type=int, default=16)
+    parser.add_argument("--maximum-concurrency", type=int)
     parser.add_argument("--headroom-percent", type=int, default=20)
     parser.add_argument("--prefix-blocks", type=int, default=0)
     parser.add_argument("--alignment-blocks", type=int, default=1)
     parser.add_argument("--min-bytes", type=int)
     parser.add_argument("--max-bytes", type=int)
     parser.add_argument("--strict-concurrency", action="store_true")
+    parser.add_argument("--live-resize", action="store_true")
     return parser
 
 
@@ -335,6 +348,7 @@ def _request(arguments: argparse.Namespace) -> RuntimePlanningRequest:
         tensor_parallel_size=arguments.tensor_parallel_size,
         attention_backend="FLASH_ATTN",
         device_ids=devices,
+        live_resize=bool(getattr(arguments, "live_resize", False)),
     )
 
 
@@ -346,7 +360,12 @@ def _validate_provider_result(
     if (
         geometry.identity.adapter_id != "kapsl-vllm-connector"
         or geometry.identity.adapter_version != ADAPTER_VERSION
-        or geometry.identity.profile_id != ADAPTER_PROFILE_ID
+        or geometry.identity.profile_id
+        != (
+            ELASTIC_ADAPTER_PROFILE_ID
+            if request.live_resize
+            else ADAPTER_PROFILE_ID
+        )
     ):
         raise PlanningError(
             "runtime geometry adapter/profile identity is not this certified connector"
@@ -367,6 +386,8 @@ def _validate_provider_result(
         raise PlanningError("runtime geometry device mapping does not match the request")
     if geometry.attention_backend.upper() != request.attention_backend:
         raise PlanningError("runtime geometry attention backend does not match the request")
+    if request.live_resize and geometry.layout_id.upper() != "BLNHC":
+        raise PlanningError("live-resize runtime geometry must use BLNHC layout")
 
 
 def _sizing_policy(arguments: argparse.Namespace) -> SizingPolicy:
@@ -374,6 +395,7 @@ def _sizing_policy(arguments: argparse.Namespace) -> SizingPolicy:
 
     return SizingPolicy(
         target_concurrency=arguments.target_concurrency,
+        maximum_concurrency=getattr(arguments, "maximum_concurrency", None),
         headroom_percent=arguments.headroom_percent,
         prefix_blocks=arguments.prefix_blocks,
         alignment_blocks=arguments.alignment_blocks,

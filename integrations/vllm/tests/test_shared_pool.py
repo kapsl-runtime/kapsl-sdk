@@ -8,6 +8,7 @@ from unittest.mock import patch
 from kapsl_vllm_connector.shared_pool import (
     CudaIpcBuffer,
     SharedPoolImportError,
+    VllmElasticBlockPool,
     VllmSharedPoolHook,
     select_cuda_binding,
     vllm_backing_geometry,
@@ -43,6 +44,74 @@ def _binding(device_id: int, **overrides: object) -> dict[str, object]:
 
 
 class SharedPoolTests(unittest.TestCase):
+    def test_elastic_binding_uses_virtual_maximum_and_mapped_prefix(self) -> None:
+        binding = _binding(
+            0,
+            transport={"kind": "cuda_vmm"},
+            descriptor="scm_rights:cuda-vmm-v1",
+            elastic={
+                "mapped_block_count": 2,
+                "maximum_block_count": 4,
+                "allocation_granularity_bytes": 64,
+                "resize_alignment_blocks": 2,
+                "segments": [
+                    {
+                        "segment_id": "initial-0",
+                        "offset_bytes": 0,
+                        "length_bytes": 64,
+                        "handle_index": 0,
+                    }
+                ],
+            },
+        )
+        selected = select_cuda_binding(
+            {"shared_pools": [binding]},
+            _config(),
+            None,
+            live_resize=True,
+        )
+        self.assertEqual(selected["elastic"]["mapped_block_count"], 2)
+        with self.assertRaisesRegex(SharedPoolImportError, "no cuda_ipc"):
+            select_cuda_binding({"shared_pools": [binding]}, _config(), None)
+
+    def test_elastic_block_pool_only_retires_free_tail_blocks(self) -> None:
+        class Queue:
+            def __init__(self, blocks: list[SimpleNamespace]) -> None:
+                self.values = list(blocks)
+
+            def remove(self, block: SimpleNamespace) -> None:
+                self.values.remove(block)
+
+            def append_n(self, blocks: list[SimpleNamespace]) -> None:
+                self.values.extend(blocks)
+
+        blocks = [
+            SimpleNamespace(block_id=index, ref_cnt=0, is_null=index == 0)
+            for index in range(8)
+        ]
+        pool = SimpleNamespace(
+            blocks=blocks,
+            num_gpu_blocks=8,
+            free_block_queue=Queue(blocks[1:]),
+            _maybe_evict_cached_block=lambda block: None,
+        )
+        elastic = VllmElasticBlockPool(4, 8)
+        elastic.bind(pool)
+        self.assertEqual([block.block_id for block in pool.free_block_queue.values], [1, 2, 3])
+        elastic.apply(6)
+        self.assertEqual(pool.num_gpu_blocks, 6)
+        self.assertEqual(
+            [block.block_id for block in pool.free_block_queue.values],
+            [1, 2, 3, 4, 5],
+        )
+        blocks[5].ref_cnt = 1
+        with self.assertRaisesRegex(SharedPoolImportError, "live"):
+            elastic.apply(4)
+        blocks[5].ref_cnt = 0
+        elastic.apply(4)
+        self.assertEqual(pool.num_gpu_blocks, 4)
+        self.assertEqual([block.block_id for block in pool.free_block_queue.values], [1, 2, 3])
+
     def test_attachment_views_prove_tensor_storage_aliases_the_import(self) -> None:
         class FakeStorage:
             def __init__(self, pointer: int, size: int) -> None:

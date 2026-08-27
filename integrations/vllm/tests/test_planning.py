@@ -249,6 +249,28 @@ def _resolved_geometry() -> GeometryDescriptor:
 
 
 class PlanningTests(unittest.TestCase):
+    def test_elastic_sizing_separates_initial_and_virtual_capacity(self) -> None:
+        geometry = _resolved_geometry()
+        result = build_plan(
+            geometry,
+            SizingPolicy(
+                target_concurrency=2,
+                maximum_concurrency=6,
+                headroom_percent=0,
+                alignment_blocks=2,
+            ),
+        )
+        sizing = result.ranks[0]
+        self.assertGreater(sizing.maximum_blocks, sizing.desired_blocks)
+        self.assertEqual(
+            sizing.maximum_bytes,
+            sizing.maximum_blocks * sizing.bytes_per_block,
+        )
+        self.assertEqual(
+            result.to_dict()["sizing"]["total_maximum_bytes"],
+            sizing.maximum_bytes,
+        )
+
     def _executor_planner_fixture(
         self,
         *,

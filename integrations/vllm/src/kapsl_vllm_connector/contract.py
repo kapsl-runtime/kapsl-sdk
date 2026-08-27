@@ -11,7 +11,7 @@ from collections.abc import Sequence
 import re
 from typing import Any, Mapping
 
-ABI_VERSION: dict[str, int] = {"major": 1, "minor": 4}
+ABI_VERSION: dict[str, int] = {"major": 1, "minor": 5}
 
 
 class ContractValidationError(ValueError):
@@ -45,10 +45,10 @@ def opaque_capabilities() -> dict[str, Any]:
     }
 
 
-def shared_pool_capabilities() -> dict[str, Any]:
+def shared_pool_capabilities(*, live_resize: bool = False) -> dict[str, Any]:
     """Kapsl-owned CUDA pool with block selection left to vLLM."""
 
-    return {
+    capabilities = {
         "abi_version": abi_version(),
         "tier": "shared_pool",
         "metadata_mode": "structured",
@@ -61,6 +61,10 @@ def shared_pool_capabilities() -> dict[str, Any]:
         ],
         "transports": [{"kind": "cuda_ipc"}],
     }
+    if live_resize:
+        capabilities["features"].append("live_pool_resize")
+        capabilities["transports"] = [{"kind": "cuda_vmm"}]
+    return capabilities
 
 
 def opaque_registration(
@@ -91,8 +95,9 @@ def shared_pool_registration(
     *,
     backend: str = "vllm",
     provisioning_grant: Mapping[str, Any] | None = None,
+    live_resize: bool = False,
 ) -> dict[str, Any]:
-    capabilities = shared_pool_capabilities()
+    capabilities = shared_pool_capabilities(live_resize=live_resize)
     if len(capacity_groups) > 1:
         capabilities["features"].append("multiple_cache_groups")
     registration = {
@@ -154,8 +159,16 @@ def validate_registration(registration: Mapping[str, Any]) -> None:
             raise ContractValidationError(
                 "shared_pool requires direct attention, attachment, and participant block selection"
             )
-        if {"kind": "cuda_ipc"} not in transports:
-            raise ContractValidationError("shared_pool vLLM requires cuda_ipc")
+        live_resize = "live_pool_resize" in features
+        expected_transport = {"kind": "cuda_vmm" if live_resize else "cuda_ipc"}
+        if expected_transport not in transports:
+            raise ContractValidationError(
+                "shared_pool vLLM transport does not match live-resize capabilities"
+            )
+        if live_resize and transports != [{"kind": "cuda_vmm"}]:
+            raise ContractValidationError(
+                "live-resize shared_pool vLLM requires only cuda_vmm transport"
+            )
         _validate_adapter_profile(
             _mapping(registration.get("adapter_profile"), "adapter profile")
         )
@@ -442,6 +455,7 @@ def validate_registration_receipt(
     pools = receipt.get("shared_pools", [])
     if not isinstance(pools, list):
         raise ContractValidationError("shared_pools must be a list")
+    live_resize: bool | None = None
     for raw_pool in pools:
         pool = _mapping(raw_pool, "shared pool")
         _nonempty(pool.get("binding_id"), "binding_id")
@@ -461,7 +475,25 @@ def validate_registration_receipt(
         for group_id in group_ids:
             _nonempty(group_id, "shared pool group_id")
         _mapping(pool.get("memory_domain"), "shared pool memory_domain")
-        _mapping(pool.get("transport"), "shared pool transport")
+        transport = _mapping(pool.get("transport"), "shared pool transport")
+        elastic = pool.get("elastic")
+        pool_is_live = transport.get("kind") == "cuda_vmm"
+        if live_resize is None:
+            live_resize = pool_is_live
+        elif live_resize != pool_is_live:
+            raise ContractValidationError(
+                "shared pool receipts cannot mix fixed and elastic transports"
+            )
+        if pool_is_live:
+            _validate_elastic_pool(
+                _mapping(elastic, "elastic shared pool"),
+                block_count=int(pool["block_count"]),
+                bytes_per_block=int(pool["bytes_per_block"]),
+            )
+        elif elastic is not None:
+            raise ContractValidationError(
+                "elastic shared pool metadata requires cuda_vmm transport"
+            )
     return deepcopy(dict(receipt))
 
 
@@ -472,6 +504,7 @@ def make_shared_pool_attachment(
     shard: Mapping[str, Any],
     profile: Mapping[str, Any],
     imported_bytes: int,
+    mapped_bytes: int | None = None,
     views: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
     attachment = {
@@ -482,6 +515,8 @@ def make_shared_pool_attachment(
         "imported_bytes": imported_bytes,
         "views": [dict(view) for view in views],
     }
+    if mapped_bytes is not None:
+        attachment["mapped_bytes"] = mapped_bytes
     validate_shared_pool_attachment(attachment)
     return attachment
 
@@ -490,6 +525,11 @@ def validate_shared_pool_attachment(attachment: Mapping[str, Any]) -> None:
     _positive_int(attachment.get("participant_epoch"), "participant_epoch")
     _nonempty(attachment.get("binding_id"), "binding_id")
     _positive_int(attachment.get("imported_bytes"), "imported_bytes")
+    mapped_bytes = attachment.get("mapped_bytes")
+    if mapped_bytes is not None:
+        mapped_bytes = _positive_int(mapped_bytes, "mapped_bytes")
+        if mapped_bytes > int(attachment["imported_bytes"]):
+            raise ContractValidationError("mapped_bytes exceeds imported_bytes")
     shard = _mapping(attachment.get("shard"), "attachment shard")
     tp_rank = _nonnegative_int(
         shard.get("tensor_parallel_rank"), "tensor_parallel_rank"
@@ -587,6 +627,162 @@ def validate_shared_pool_detach_request(request: Mapping[str, Any]) -> None:
         )
 
 
+def make_resize_poll_request(
+    *, participant_epoch: int, actor: Mapping[str, Any], applied_generation: int
+) -> dict[str, Any]:
+    request = {
+        "participant_epoch": participant_epoch,
+        "actor": dict(actor),
+        "applied_generation": applied_generation,
+    }
+    validate_resize_poll_request(request)
+    return request
+
+
+def validate_resize_poll_request(request: Mapping[str, Any]) -> None:
+    _positive_int(request.get("participant_epoch"), "participant_epoch")
+    _validate_resize_actor(_mapping(request.get("actor"), "resize actor"))
+    _nonnegative_int(request.get("applied_generation"), "applied_generation")
+
+
+def make_resize_ack_request(
+    *,
+    participant_epoch: int,
+    actor: Mapping[str, Any],
+    binding_id: str,
+    resize_generation: int,
+    stage: str,
+    applied_block_count: int,
+) -> dict[str, Any]:
+    request = {
+        "participant_epoch": participant_epoch,
+        "actor": dict(actor),
+        "binding_id": binding_id,
+        "resize_generation": resize_generation,
+        "stage": stage,
+        "applied_block_count": applied_block_count,
+    }
+    validate_resize_ack_request(request)
+    return request
+
+
+def validate_resize_ack_request(request: Mapping[str, Any]) -> None:
+    _positive_int(request.get("participant_epoch"), "participant_epoch")
+    _validate_resize_actor(_mapping(request.get("actor"), "resize actor"))
+    _nonempty(request.get("binding_id"), "binding_id")
+    _positive_int(request.get("resize_generation"), "resize_generation")
+    _validate_resize_stage(request.get("stage"))
+    _positive_int(request.get("applied_block_count"), "applied_block_count")
+
+
+def validate_resize_operation(operation: Mapping[str, Any]) -> dict[str, Any]:
+    _positive_int(operation.get("participant_epoch"), "participant_epoch")
+    _positive_int(operation.get("resize_generation"), "resize_generation")
+    _nonempty(operation.get("binding_id"), "binding_id")
+    stage = _validate_resize_stage(operation.get("stage"))
+    from_blocks = _positive_int(
+        operation.get("from_block_count"), "from_block_count"
+    )
+    target_blocks = _positive_int(
+        operation.get("target_block_count"), "target_block_count"
+    )
+    if from_blocks == target_blocks:
+        raise ContractValidationError("resize block counts must differ")
+    growing = target_blocks > from_blocks
+    if (growing and stage not in {"map_workers", "activate_scheduler"}) or (
+        not growing and stage not in {"retire_scheduler", "unmap_workers"}
+    ):
+        raise ContractValidationError("resize stage does not match direction")
+    stride = _positive_int(operation.get("bytes_per_block"), "bytes_per_block")
+    granularity = _positive_int(
+        operation.get("allocation_granularity_bytes"),
+        "allocation_granularity_bytes",
+    )
+    start = min(from_blocks, target_blocks) * stride
+    end = max(from_blocks, target_blocks) * stride
+    if start % granularity or end % granularity:
+        raise ContractValidationError("resize endpoints are not VMM aligned")
+    segments = operation.get("segments", [])
+    if not isinstance(segments, list):
+        raise ContractValidationError("resize segments must be a list")
+    physical = stage in {"map_workers", "unmap_workers"}
+    if physical != bool(segments):
+        raise ContractValidationError(
+            "worker resize phases require segments and scheduler phases forbid them"
+        )
+    expected_offset = start
+    seen_ids: set[str] = set()
+    seen_handles: set[int] = set()
+    for raw_segment in sorted(
+        segments,
+        key=lambda raw: _nonnegative_int(
+            _mapping(raw, "resize segment").get("offset_bytes"), "offset_bytes"
+        ),
+    ):
+        segment = _mapping(raw_segment, "resize segment")
+        segment_id = _nonempty(segment.get("segment_id"), "segment_id")
+        offset = _nonnegative_int(segment.get("offset_bytes"), "offset_bytes")
+        length = _positive_int(segment.get("length_bytes"), "length_bytes")
+        handle_index = _nonnegative_int(
+            segment.get("handle_index"), "handle_index"
+        )
+        if (
+            segment_id in seen_ids
+            or handle_index in seen_handles
+            or offset != expected_offset
+            or offset % granularity
+            or length % granularity
+        ):
+            raise ContractValidationError(
+                "resize segments must uniquely and densely cover the changed tail"
+            )
+        seen_ids.add(segment_id)
+        seen_handles.add(handle_index)
+        expected_offset += length
+    if physical and expected_offset != end:
+        raise ContractValidationError(
+            "resize segments do not exactly cover the changed tail"
+        )
+    return deepcopy(dict(operation))
+
+
+def _validate_resize_actor(actor: Mapping[str, Any]) -> None:
+    role = actor.get("role")
+    if role == "scheduler":
+        if set(actor) != {"role"}:
+            raise ContractValidationError("scheduler resize actor has unknown fields")
+        return
+    if role != "worker":
+        raise ContractValidationError("resize actor role is unsupported")
+    shard = _mapping(actor.get("shard"), "resize worker shard")
+    tp_rank = _nonnegative_int(
+        shard.get("tensor_parallel_rank"), "tensor_parallel_rank"
+    )
+    tp_world = _positive_int(
+        shard.get("tensor_parallel_world_size"), "tensor_parallel_world_size"
+    )
+    pp_rank = _nonnegative_int(
+        shard.get("pipeline_parallel_rank"), "pipeline_parallel_rank"
+    )
+    pp_world = _positive_int(
+        shard.get("pipeline_parallel_world_size"), "pipeline_parallel_world_size"
+    )
+    if tp_rank >= tp_world or pp_rank >= pp_world:
+        raise ContractValidationError("resize worker shard rank is outside its world size")
+
+
+def _validate_resize_stage(value: Any) -> str:
+    stage = _nonempty(value, "resize stage")
+    if stage not in {
+        "map_workers",
+        "activate_scheduler",
+        "retire_scheduler",
+        "unmap_workers",
+    }:
+        raise ContractValidationError("resize stage is unsupported")
+    return stage
+
+
 def make_envelope(request_id: str, operation: str, **payload: Any) -> dict[str, Any]:
     envelope = {
         "abi_version": abi_version(),
@@ -602,8 +798,80 @@ def validate_response(response: Mapping[str, Any], request_id: str) -> None:
         raise ContractValidationError("unsupported response ABI version")
     if response.get("request_id") != request_id:
         raise ContractValidationError("response request_id does not match request")
-    if response.get("result") not in {"registered", "lease", "ack", "error"}:
+    if response.get("result") not in {
+        "registered",
+        "lease",
+        "resize",
+        "ack",
+        "error",
+    }:
         raise ContractValidationError("unknown control response result")
+
+
+def _validate_elastic_pool(
+    elastic: Mapping[str, Any], *, block_count: int, bytes_per_block: int
+) -> None:
+    mapped_blocks = _positive_int(
+        elastic.get("mapped_block_count"), "mapped_block_count"
+    )
+    maximum_blocks = _positive_int(
+        elastic.get("maximum_block_count"), "maximum_block_count"
+    )
+    granularity = _positive_int(
+        elastic.get("allocation_granularity_bytes"),
+        "allocation_granularity_bytes",
+    )
+    alignment = _positive_int(
+        elastic.get("resize_alignment_blocks"), "resize_alignment_blocks"
+    )
+    if maximum_blocks != block_count or mapped_blocks > maximum_blocks:
+        raise ContractValidationError(
+            "elastic block counts must fit and match the shared pool maximum"
+        )
+    mapped_bytes = mapped_blocks * bytes_per_block
+    maximum_bytes = maximum_blocks * bytes_per_block
+    if (
+        mapped_blocks % alignment
+        or mapped_bytes % granularity
+        or maximum_bytes % granularity
+    ):
+        raise ContractValidationError("elastic pool geometry is not VMM aligned")
+    segments = elastic.get("segments")
+    if not isinstance(segments, list) or not segments:
+        raise ContractValidationError("elastic pool requires mapped segments")
+    expected_offset = 0
+    seen_ids: set[str] = set()
+    seen_handles: set[int] = set()
+    ordered = sorted(
+        (_mapping(segment, "VMM segment") for segment in segments),
+        key=lambda segment: _nonnegative_int(
+            segment.get("offset_bytes"), "VMM segment offset_bytes"
+        ),
+    )
+    for segment in ordered:
+        segment_id = _nonempty(segment.get("segment_id"), "VMM segment_id")
+        offset = _nonnegative_int(segment.get("offset_bytes"), "offset_bytes")
+        length = _positive_int(segment.get("length_bytes"), "length_bytes")
+        handle_index = _nonnegative_int(
+            segment.get("handle_index"), "handle_index"
+        )
+        if (
+            segment_id in seen_ids
+            or handle_index in seen_handles
+            or offset != expected_offset
+            or offset % granularity
+            or length % granularity
+        ):
+            raise ContractValidationError(
+                "VMM segments must uniquely and densely cover an aligned prefix"
+            )
+        seen_ids.add(segment_id)
+        seen_handles.add(handle_index)
+        expected_offset += length
+    if expected_offset != mapped_bytes:
+        raise ContractValidationError(
+            "VMM segments do not exactly cover mapped physical bytes"
+        )
 
 
 def _mapping(value: Any, field: str) -> Mapping[str, Any]:

@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
 /// Version implemented by this crate.
-pub const KAPSL_KV_ABI_VERSION: KvAbiVersion = KvAbiVersion::new(1, 4);
+pub const KAPSL_KV_ABI_VERSION: KvAbiVersion = KvAbiVersion::new(1, 5);
 
 /// Semantic version of the KV participant contract.
 ///
@@ -101,6 +101,9 @@ pub enum KvFeature {
     /// The runtime provisioned this participant from an exact, single-use
     /// MemoryAuthority grant created before the backend process started.
     ProvisioningGrant,
+    /// A runtime-owned shared pool exposes a stable virtual address while its
+    /// mapped physical tail can grow and shrink at cache-block boundaries.
+    LivePoolResize,
 }
 
 /// Data-plane mechanism used to identify or transfer KV blocks.
@@ -113,6 +116,9 @@ pub enum KvTransport {
     InProcess,
     /// CUDA inter-process memory/event handles.
     CudaIpc,
+    /// CUDA virtual-memory allocations exported as OS handles. The JSON
+    /// contract carries only segment metadata; handles travel out-of-band.
+    CudaVmm,
     /// NIXL-backed transfer.
     Nixl,
     /// Host or pinned-host staging copies.
@@ -190,6 +196,16 @@ impl KvBackendCapabilities {
         }
     }
 
+    /// Out-of-process shared pool with a stable CUDA virtual address and
+    /// runtime-coordinated physical tail resizing.
+    pub fn cuda_vmm_shared_pool() -> Self {
+        let mut capabilities = Self::cuda_ipc_shared_pool();
+        capabilities.features.insert(KvFeature::LivePoolResize);
+        capabilities.transports.remove(&KvTransport::CudaIpc);
+        capabilities.transports.insert(KvTransport::CudaVmm);
+        capabilities
+    }
+
     pub fn with_feature(mut self, feature: KvFeature) -> Self {
         self.features.insert(feature);
         self
@@ -223,6 +239,17 @@ impl KvBackendCapabilities {
         {
             return Err(KvContractError::invalid_capabilities(
                 "external pool attachment is valid only for shared-pool backends",
+            ));
+        }
+
+        if self.features.contains(&KvFeature::LivePoolResize)
+            && (self.tier != KvIntegrationTier::SharedPool
+                || self.ownership != KvCacheOwnership::KapslRuntime
+                || !self.features.contains(&KvFeature::ExternalPoolAttachment)
+                || !self.transports.contains(&KvTransport::CudaVmm))
+        {
+            return Err(KvContractError::invalid_capabilities(
+                "live pool resize requires an externally attached runtime-owned CUDA VMM shared pool",
             ));
         }
 
@@ -277,7 +304,7 @@ impl KvTransport {
     fn is_direct(&self) -> bool {
         matches!(
             self,
-            Self::InProcess | Self::CudaIpc | Self::Nixl | Self::Custom { .. }
+            Self::InProcess | Self::CudaIpc | Self::CudaVmm | Self::Nixl | Self::Custom { .. }
         )
     }
 }
@@ -1023,6 +1050,120 @@ pub enum KvSharedPoolAllocationMode {
     ParticipantManaged,
 }
 
+/// One runtime-owned CUDA VMM allocation mapped into a stable participant
+/// virtual-address range. `handle_index` identifies the POSIX file descriptor
+/// transferred alongside the JSON response with `SCM_RIGHTS`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KvVmmSegmentDescriptor {
+    pub segment_id: String,
+    pub offset_bytes: u64,
+    pub length_bytes: u64,
+    pub handle_index: u32,
+}
+
+impl KvVmmSegmentDescriptor {
+    pub fn validate(&self, allocation_granularity_bytes: u64) -> Result<(), KvContractError> {
+        if self.segment_id.trim().is_empty()
+            || self.length_bytes == 0
+            || allocation_granularity_bytes == 0
+            || !self
+                .offset_bytes
+                .is_multiple_of(allocation_granularity_bytes)
+            || !self
+                .length_bytes
+                .is_multiple_of(allocation_granularity_bytes)
+            || self.offset_bytes.checked_add(self.length_bytes).is_none()
+        {
+            return Err(KvContractError::invalid_capabilities(
+                "CUDA VMM segments require an ID and bounded granularity-aligned byte range",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Elastic physical state behind one stable virtual shared-pool binding.
+/// `KvSharedPoolDescriptor::block_count` is the maximum virtual block count;
+/// `mapped_block_count` is the physical capacity available at registration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KvElasticPoolDescriptor {
+    pub mapped_block_count: u64,
+    pub maximum_block_count: u64,
+    pub allocation_granularity_bytes: u64,
+    pub resize_alignment_blocks: u64,
+    pub segments: Vec<KvVmmSegmentDescriptor>,
+}
+
+impl KvElasticPoolDescriptor {
+    fn validate(
+        &self,
+        virtual_block_count: u64,
+        bytes_per_block: u64,
+    ) -> Result<(), KvContractError> {
+        if self.mapped_block_count == 0
+            || self.maximum_block_count != virtual_block_count
+            || self.mapped_block_count > self.maximum_block_count
+            || self.allocation_granularity_bytes == 0
+            || self.resize_alignment_blocks == 0
+            || self.segments.is_empty()
+            || !self
+                .mapped_block_count
+                .is_multiple_of(self.resize_alignment_blocks)
+        {
+            return Err(KvContractError::invalid_capabilities(
+                "elastic pool geometry requires aligned mapped capacity within the maximum virtual capacity",
+            ));
+        }
+        let mapped_bytes = self
+            .mapped_block_count
+            .checked_mul(bytes_per_block)
+            .ok_or_else(|| {
+                KvContractError::invalid_capabilities("elastic pool byte size overflow")
+            })?;
+        let maximum_bytes = self
+            .maximum_block_count
+            .checked_mul(bytes_per_block)
+            .ok_or_else(|| {
+                KvContractError::invalid_capabilities("elastic pool byte size overflow")
+            })?;
+        if !mapped_bytes.is_multiple_of(self.allocation_granularity_bytes)
+            || !maximum_bytes.is_multiple_of(self.allocation_granularity_bytes)
+        {
+            return Err(KvContractError::invalid_capabilities(
+                "elastic pool mapped and maximum sizes must align to CUDA VMM granularity",
+            ));
+        }
+
+        let mut segment_ids = BTreeSet::new();
+        let mut handle_indices = BTreeSet::new();
+        let mut ordered = self.segments.iter().collect::<Vec<_>>();
+        ordered.sort_by_key(|segment| segment.offset_bytes);
+        let mut expected_offset = 0u64;
+        for segment in ordered {
+            segment.validate(self.allocation_granularity_bytes)?;
+            if !segment_ids.insert(segment.segment_id.as_str())
+                || !handle_indices.insert(segment.handle_index)
+                || segment.offset_bytes != expected_offset
+            {
+                return Err(KvContractError::invalid_capabilities(
+                    "elastic pool segments must have unique IDs/handles and densely cover the mapped prefix",
+                ));
+            }
+            expected_offset = expected_offset
+                .checked_add(segment.length_bytes)
+                .ok_or_else(|| {
+                    KvContractError::invalid_capabilities("elastic segment range overflow")
+                })?;
+        }
+        if expected_offset != mapped_bytes {
+            return Err(KvContractError::invalid_capabilities(
+                "elastic pool segments must exactly cover mapped physical bytes",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KvSharedPoolDescriptor {
     pub binding_id: String,
@@ -1036,6 +1177,8 @@ pub struct KvSharedPoolDescriptor {
     pub allocation_mode: KvSharedPoolAllocationMode,
     pub transport: KvTransport,
     pub descriptor: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elastic: Option<KvElasticPoolDescriptor>,
 }
 
 /// Exact backend and adapter combination claiming a shared-pool attachment.
@@ -1138,7 +1281,12 @@ pub struct KvSharedPoolAttachment {
     pub binding_id: String,
     pub shard: KvShard,
     pub profile: KvAdapterProfile,
+    /// Stable virtual span backing all tensor views.
     pub imported_bytes: u64,
+    /// Physical prefix currently mapped into the virtual span. Absent for
+    /// fixed CUDA IPC pools and required for CUDA VMM pools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mapped_bytes: Option<u64>,
     pub views: Vec<KvAttachmentView>,
 }
 
@@ -1147,6 +1295,9 @@ impl KvSharedPoolAttachment {
         if self.participant_epoch == 0
             || self.binding_id.trim().is_empty()
             || self.imported_bytes == 0
+            || self
+                .mapped_bytes
+                .is_some_and(|mapped| mapped == 0 || mapped > self.imported_bytes)
             || self.views.is_empty()
         {
             return Err(KvContractError::invalid_request(
@@ -1225,6 +1376,22 @@ impl KvSharedPoolDescriptor {
                 "shared-pool bindings require unique IDs, non-zero geometry, and a direct transport descriptor",
             ));
         }
+        match (&self.transport, &self.elastic) {
+            (KvTransport::CudaVmm, Some(elastic)) => {
+                elastic.validate(self.block_count, self.bytes_per_block)?;
+            }
+            (KvTransport::CudaVmm, None) => {
+                return Err(KvContractError::invalid_capabilities(
+                    "CUDA VMM shared-pool bindings require elastic geometry",
+                ));
+            }
+            (_, Some(_)) => {
+                return Err(KvContractError::invalid_capabilities(
+                    "elastic geometry is valid only for CUDA VMM shared-pool bindings",
+                ));
+            }
+            (_, None) => {}
+        }
         self.memory_domain.validate()
     }
 }
@@ -1296,6 +1463,10 @@ impl KvRegistrationReceipt {
             .capabilities
             .features
             .contains(&KvFeature::ParticipantBlockSelection);
+        let live_resize = registration
+            .capabilities
+            .features
+            .contains(&KvFeature::LivePoolResize);
         for binding in &self.shared_pools {
             binding.validate()?;
             if !binding_ids.insert(binding.binding_id.as_str()) {
@@ -1318,6 +1489,14 @@ impl KvRegistrationReceipt {
             {
                 return Err(KvContractError::invalid_capabilities(format!(
                     "shared-pool binding '{}' allocation mode does not match participant block-selection capabilities",
+                    binding.binding_id
+                )));
+            }
+            if binding.elastic.is_some() != live_resize
+                || matches!(binding.transport, KvTransport::CudaVmm) != live_resize
+            {
+                return Err(KvContractError::invalid_capabilities(format!(
+                    "shared-pool binding '{}' live-resize transport does not match participant capabilities",
                     binding.binding_id
                 )));
             }
@@ -1567,6 +1746,197 @@ impl KvReleaseCompletion {
     }
 }
 
+/// Participant process applying one phase of a live shared-pool resize.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "role")]
+pub enum KvResizeActor {
+    Scheduler,
+    Worker { shard: KvShard },
+}
+
+impl KvResizeActor {
+    fn validate(&self) -> Result<(), KvContractError> {
+        match self {
+            Self::Scheduler => Ok(()),
+            Self::Worker { shard } => validate_shard(*shard),
+        }
+    }
+}
+
+/// Ordered resize phase. Growth maps workers before exposing scheduler blocks;
+/// shrinkage retires scheduler blocks before workers unmap physical pages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KvPoolResizeStage {
+    MapWorkers,
+    ActivateScheduler,
+    RetireScheduler,
+    UnmapWorkers,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KvPoolResizeOperation {
+    pub participant_epoch: u64,
+    pub resize_generation: u64,
+    pub binding_id: String,
+    pub stage: KvPoolResizeStage,
+    pub from_block_count: u64,
+    pub target_block_count: u64,
+    pub bytes_per_block: u64,
+    pub allocation_granularity_bytes: u64,
+    #[serde(default)]
+    pub segments: Vec<KvVmmSegmentDescriptor>,
+}
+
+impl KvPoolResizeOperation {
+    pub fn validate(&self) -> Result<(), KvContractError> {
+        if self.participant_epoch == 0
+            || self.resize_generation == 0
+            || self.binding_id.trim().is_empty()
+            || self.from_block_count == 0
+            || self.target_block_count == 0
+            || self.from_block_count == self.target_block_count
+            || self.bytes_per_block == 0
+            || self.allocation_granularity_bytes == 0
+        {
+            return Err(KvContractError::invalid_request(
+                "resize operations require an epoch, generation, binding, and distinct non-zero block counts",
+            ));
+        }
+        let growing = self.target_block_count > self.from_block_count;
+        let stage_matches_direction = matches!(
+            (growing, self.stage),
+            (true, KvPoolResizeStage::MapWorkers)
+                | (true, KvPoolResizeStage::ActivateScheduler)
+                | (false, KvPoolResizeStage::RetireScheduler)
+                | (false, KvPoolResizeStage::UnmapWorkers)
+        );
+        if !stage_matches_direction {
+            return Err(KvContractError::invalid_request(
+                "resize stage ordering does not match its growth or shrink direction",
+            ));
+        }
+        let from_bytes = self
+            .from_block_count
+            .checked_mul(self.bytes_per_block)
+            .ok_or_else(|| KvContractError::invalid_request("resize byte size overflow"))?;
+        let target_bytes = self
+            .target_block_count
+            .checked_mul(self.bytes_per_block)
+            .ok_or_else(|| KvContractError::invalid_request("resize byte size overflow"))?;
+        if from_bytes % self.allocation_granularity_bytes != 0
+            || target_bytes % self.allocation_granularity_bytes != 0
+        {
+            return Err(KvContractError::invalid_request(
+                "resize endpoints must align to CUDA VMM allocation granularity",
+            ));
+        }
+        let physical_stage = matches!(
+            self.stage,
+            KvPoolResizeStage::MapWorkers | KvPoolResizeStage::UnmapWorkers
+        );
+        if physical_stage != !self.segments.is_empty() {
+            return Err(KvContractError::invalid_request(
+                "worker resize phases require segment ranges and scheduler phases must not carry them",
+            ));
+        }
+        let expected_start = from_bytes.min(target_bytes);
+        let expected_end = from_bytes.max(target_bytes);
+        let mut ordered = self.segments.iter().collect::<Vec<_>>();
+        ordered.sort_by_key(|segment| segment.offset_bytes);
+        let mut expected_offset = expected_start;
+        let mut segment_ids = BTreeSet::new();
+        let mut handle_indices = BTreeSet::new();
+        for segment in ordered {
+            segment.validate(self.allocation_granularity_bytes)?;
+            if segment.offset_bytes != expected_offset
+                || !segment_ids.insert(segment.segment_id.as_str())
+                || !handle_indices.insert(segment.handle_index)
+            {
+                return Err(KvContractError::invalid_request(
+                    "resize segments must uniquely and densely cover the changed physical tail",
+                ));
+            }
+            expected_offset = expected_offset
+                .checked_add(segment.length_bytes)
+                .ok_or_else(|| KvContractError::invalid_request("resize segment overflow"))?;
+        }
+        if physical_stage && expected_offset != expected_end {
+            return Err(KvContractError::invalid_request(
+                "resize segments must exactly cover the changed physical tail",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KvResizePollRequest {
+    pub participant_epoch: u64,
+    pub actor: KvResizeActor,
+    /// Last resize generation fully applied by this process. Zero means none.
+    pub applied_generation: u64,
+}
+
+impl KvResizePollRequest {
+    pub fn validate(&self) -> Result<(), KvContractError> {
+        if self.participant_epoch == 0 {
+            return Err(KvContractError::invalid_request(
+                "resize poll requires a participant epoch",
+            ));
+        }
+        self.actor.validate()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KvResizeAckRequest {
+    pub participant_epoch: u64,
+    pub actor: KvResizeActor,
+    pub binding_id: String,
+    pub resize_generation: u64,
+    pub stage: KvPoolResizeStage,
+    pub applied_block_count: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KvResizePollResult {
+    /// True while the coordinator is waiting for another actor or stage even
+    /// when this poll has no immediately applicable operation.
+    pub pending: bool,
+    #[serde(default)]
+    pub operations: Vec<KvPoolResizeOperation>,
+}
+
+impl KvResizePollResult {
+    pub fn validate(&self) -> Result<(), KvContractError> {
+        if !self.pending && !self.operations.is_empty() {
+            return Err(KvContractError::invalid_request(
+                "resize operations require a pending resize transaction",
+            ));
+        }
+        for operation in &self.operations {
+            operation.validate()?;
+        }
+        Ok(())
+    }
+}
+
+impl KvResizeAckRequest {
+    pub fn validate(&self) -> Result<(), KvContractError> {
+        if self.participant_epoch == 0
+            || self.binding_id.trim().is_empty()
+            || self.resize_generation == 0
+            || self.applied_block_count == 0
+        {
+            return Err(KvContractError::invalid_request(
+                "resize acknowledgement requires an epoch, binding, generation, and applied block count",
+            ));
+        }
+        self.actor.validate()
+    }
+}
+
 /// One newline-delimited JSON request sent from a backend adapter to Kapsl's
 /// KV coordinator. The envelope keeps version negotiation and correlation
 /// independent of the transport (Unix socket, TCP, or an in-process codec).
@@ -1616,6 +1986,14 @@ pub enum KvControlRequest {
     Detach {
         participant_id: String,
         request: KvSharedPoolDetachRequest,
+    },
+    ResizePoll {
+        participant_id: String,
+        request: KvResizePollRequest,
+    },
+    ResizeAck {
+        participant_id: String,
+        request: KvResizeAckRequest,
     },
 }
 
@@ -1692,6 +2070,20 @@ impl KvControlRequest {
                 validate_participant_id(participant_id)?;
                 request.validate()
             }
+            Self::ResizePoll {
+                participant_id,
+                request,
+            } => {
+                validate_participant_id(participant_id)?;
+                request.validate()
+            }
+            Self::ResizeAck {
+                participant_id,
+                request,
+            } => {
+                validate_participant_id(participant_id)?;
+                request.validate()
+            }
         }
     }
 }
@@ -1717,10 +2109,21 @@ pub struct KvControlResponseEnvelope {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "result")]
 pub enum KvControlResponse {
-    Registered { receipt: KvRegistrationReceipt },
-    Lease { lease: KvLease },
+    Registered {
+        receipt: KvRegistrationReceipt,
+    },
+    Lease {
+        lease: KvLease,
+    },
+    Resize {
+        pending: bool,
+        #[serde(default)]
+        operations: Vec<KvPoolResizeOperation>,
+    },
     Ack,
-    Error { error: KvContractError },
+    Error {
+        error: KvContractError,
+    },
 }
 
 /// Validate and dispatch one transport-decoded control request. Transport
@@ -1793,6 +2196,24 @@ pub fn dispatch_control_request(
             } => coordinator
                 .detach(&participant_id, &request)
                 .map(|()| KvControlResponse::Ack),
+            KvControlRequest::ResizePoll {
+                participant_id,
+                request,
+            } => coordinator
+                .poll_resize(&participant_id, &request)
+                .and_then(|result| {
+                    result.validate()?;
+                    Ok(KvControlResponse::Resize {
+                        pending: result.pending,
+                        operations: result.operations,
+                    })
+                }),
+            KvControlRequest::ResizeAck {
+                participant_id,
+                request,
+            } => coordinator
+                .ack_resize(&participant_id, &request)
+                .map(|()| KvControlResponse::Ack),
         }
     }
     .unwrap_or_else(|error| KvControlResponse::Error { error });
@@ -1861,6 +2282,22 @@ pub trait KvCoordinator: Send + Sync {
         _request: &KvSharedPoolDetachRequest,
     ) -> Result<(), KvContractError> {
         Err(KvContractError::unsupported("detach_shared_pool"))
+    }
+
+    fn poll_resize(
+        &self,
+        _participant_id: &str,
+        _request: &KvResizePollRequest,
+    ) -> Result<KvResizePollResult, KvContractError> {
+        Err(KvContractError::unsupported("poll_shared_pool_resize"))
+    }
+
+    fn ack_resize(
+        &self,
+        _participant_id: &str,
+        _request: &KvResizeAckRequest,
+    ) -> Result<(), KvContractError> {
+        Err(KvContractError::unsupported("ack_shared_pool_resize"))
     }
 }
 
@@ -2275,6 +2712,7 @@ mod tests {
                 allocation_mode: KvSharedPoolAllocationMode::RuntimeLeased,
                 transport: KvTransport::CudaIpc,
                 descriptor: "base64-cuda-ipc-handle".to_string(),
+                elastic: None,
             }],
         };
         receipt
@@ -2365,6 +2803,108 @@ mod tests {
     }
 
     #[test]
+    fn cuda_vmm_receipt_separates_virtual_and_mapped_capacity() {
+        let mut registration: KvParticipantRegistration = serde_json::from_str(include_str!(
+            "../tests/fixtures/shared_pool_registration.json"
+        ))
+        .expect("shared registration fixture");
+        registration.capabilities = KvBackendCapabilities::cuda_vmm_shared_pool()
+            .with_feature(KvFeature::ParticipantBlockSelection);
+        registration.capacity_model.groups[0].max_allocations = Some(64);
+        registration.capacity_model.groups[0].bytes_per_allocation = 4096;
+
+        let receipt = KvRegistrationReceipt {
+            participant_id: registration.participant_id.clone(),
+            participant_epoch: 3,
+            shared_pools: vec![KvSharedPoolDescriptor {
+                binding_id: "cuda:0".to_string(),
+                capacity_pool_id: "vllm.pool.0".to_string(),
+                generation: 1,
+                group_ids: vec!["vllm.group.0".to_string()],
+                memory_domain: KvMemoryDomain::Cuda { device_id: 0 },
+                block_count: 64,
+                bytes_per_block: 4096,
+                allocation_mode: KvSharedPoolAllocationMode::ParticipantManaged,
+                transport: KvTransport::CudaVmm,
+                descriptor: "scm_rights:cuda-vmm-v1".to_string(),
+                elastic: Some(KvElasticPoolDescriptor {
+                    mapped_block_count: 32,
+                    maximum_block_count: 64,
+                    allocation_granularity_bytes: 65_536,
+                    resize_alignment_blocks: 16,
+                    segments: vec![KvVmmSegmentDescriptor {
+                        segment_id: "initial-0".to_string(),
+                        offset_bytes: 0,
+                        length_bytes: 131_072,
+                        handle_index: 0,
+                    }],
+                }),
+            }],
+        };
+        receipt
+            .validate_for(&registration)
+            .expect("valid elastic receipt");
+
+        let mut inexact = receipt.clone();
+        inexact.shared_pools[0]
+            .elastic
+            .as_mut()
+            .expect("elastic")
+            .mapped_block_count = 31;
+        assert!(matches!(
+            inexact.validate_for(&registration),
+            Err(KvContractError::InvalidCapabilities { .. })
+        ));
+
+        let mut missing_feature = registration;
+        missing_feature
+            .capabilities
+            .features
+            .remove(&KvFeature::LivePoolResize);
+        assert!(matches!(
+            receipt.validate_for(&missing_feature),
+            Err(KvContractError::InvalidCapabilities { .. })
+        ));
+    }
+
+    #[test]
+    fn resize_operation_enforces_worker_then_scheduler_ordering() {
+        let operation = KvPoolResizeOperation {
+            participant_epoch: 3,
+            resize_generation: 7,
+            binding_id: "cuda:0".to_string(),
+            stage: KvPoolResizeStage::MapWorkers,
+            from_block_count: 32,
+            target_block_count: 48,
+            bytes_per_block: 4096,
+            allocation_granularity_bytes: 65_536,
+            segments: vec![KvVmmSegmentDescriptor {
+                segment_id: "grow-7-0".to_string(),
+                offset_bytes: 131_072,
+                length_bytes: 65_536,
+                handle_index: 0,
+            }],
+        };
+        operation.validate().expect("valid worker map operation");
+
+        let mut wrong_stage = operation.clone();
+        wrong_stage.stage = KvPoolResizeStage::RetireScheduler;
+        assert!(matches!(
+            wrong_stage.validate(),
+            Err(KvContractError::InvalidRequest { .. })
+        ));
+
+        let scheduler = KvPoolResizeOperation {
+            stage: KvPoolResizeStage::ActivateScheduler,
+            segments: Vec::new(),
+            ..operation
+        };
+        scheduler
+            .validate()
+            .expect("scheduler activation follows worker mapping");
+    }
+
+    #[test]
     fn release_completion_rejects_opaque_or_empty_fences() {
         assert!(KvReleaseCompletion::BackendSynchronized.validate().is_ok());
         assert!(KvReleaseCompletion::TransportFence {
@@ -2394,6 +2934,7 @@ mod tests {
                 profile_id: "vllm-v1-packed-cuda-ipc".to_string(),
             },
             imported_bytes: 4096,
+            mapped_bytes: None,
             views: vec![KvAttachmentView {
                 group_id: "vllm.group.0".to_string(),
                 layer: KvLayerId {
@@ -2432,6 +2973,7 @@ mod tests {
                 profile_id: "profile".to_string(),
             },
             imported_bytes: 64,
+            mapped_bytes: None,
             views: vec![KvAttachmentView {
                 group_id: "group-0".to_string(),
                 layer: KvLayerId::indexed(0),

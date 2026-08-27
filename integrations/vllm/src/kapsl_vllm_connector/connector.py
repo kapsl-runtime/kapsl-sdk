@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -12,6 +13,8 @@ from typing import TYPE_CHECKING, Any, Callable
 from .client import KapslKvControlClient, KapslKvControlError
 from .contract import (
     ABI_VERSION,
+    make_resize_ack_request,
+    make_resize_poll_request,
     make_shared_pool_attachment,
     make_reserve_request,
     opaque_registration,
@@ -25,6 +28,7 @@ from .planning import (
 )
 from .shared_pool import (
     SharedPoolImportError,
+    VllmElasticBlockPool,
     VllmSharedPoolHook,
     select_cuda_binding,
     vllm_backing_geometry,
@@ -66,8 +70,9 @@ else:
 
 
 logger = logging.getLogger(__name__)
-ADAPTER_VERSION = "0.6.0"
+ADAPTER_VERSION = "0.7.0"
 ADAPTER_PROFILE_ID = "vllm-v1-packed-cuda-ipc/flash-attn"
+ELASTIC_ADAPTER_PROFILE_ID = "vllm-v1-packed-cuda-vmm/flash-attn-blnhc"
 
 
 @dataclass
@@ -87,6 +92,16 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
     @property
     def requires_kv_delivery(self) -> bool:
         return False
+
+    @classmethod
+    def get_required_kvcache_layout(cls, vllm_config: Any) -> str | None:
+        transfer = getattr(vllm_config, "kv_transfer_config", None)
+        if transfer is None:
+            return None
+        raw = _extra(transfer, "kapsl_live_resize", False)
+        if not isinstance(raw, bool):
+            raise ValueError("kapsl_live_resize must be a boolean")
+        return "BLNHC" if raw else None
 
     def __init__(
         self,
@@ -126,12 +141,23 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
         ).strip().lower()
         if self._mode not in {"opaque", "shared_pool"}:
             raise ValueError("kapsl_kv_mode must be 'opaque' or 'shared_pool'")
+        raw_live_resize = _extra(
+            self._kv_transfer_config, "kapsl_live_resize", False
+        )
+        if not isinstance(raw_live_resize, bool):
+            raise ValueError("kapsl_live_resize must be a boolean")
+        self._live_resize = raw_live_resize
+        if self._live_resize and self._mode != "shared_pool":
+            raise ValueError("kapsl_live_resize requires shared_pool mode")
         parallel_config = getattr(vllm_config, "parallel_config", None)
         tensor_parallel_size = int(
             getattr(parallel_config, "tensor_parallel_size", 1) or 1
         )
         if self._mode == "shared_pool":
-            _validate_shared_pool_execution(vllm_config)
+            if self._live_resize:
+                _validate_elastic_shared_pool_execution(vllm_config, kv_cache_config)
+            else:
+                _validate_shared_pool_execution(vllm_config)
         self._participant_id = (
             f"{participant_base}:{engine_id}"
             if self._mode == "shared_pool"
@@ -167,7 +193,7 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
             else None
         )
         shared_profile = (
-            _vllm_adapter_profile(vllm_config)
+            _vllm_adapter_profile(vllm_config, live_resize=self._live_resize)
             if self._mode == "shared_pool"
             else None
         )
@@ -185,6 +211,7 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
                 shared_profile,
                 backend="vllm",
                 provisioning_grant=provisioning_grant,
+                live_resize=self._live_resize,
             )
             if self._mode == "shared_pool"
             else opaque_registration(
@@ -213,27 +240,52 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
         self._shared_attached = False
         self._shared_active = False
         self._activation_lock = threading.Lock()
+        self._resize_lock = threading.RLock()
+        self._resize_pending = False
+        self._resize_applied_generation = 0
+        self._pending_scheduler_operations: list[dict[str, Any]] = []
+        self._elastic_block_pool: VllmElasticBlockPool | None = None
+        self._worker_forward_lock = threading.Lock()
+        self._worker_forward_active = False
         if self._is_scheduler or self._mode == "shared_pool":
             self._client = KapslKvControlClient(
                 endpoint,
                 self._participant_id,
                 timeout_seconds=timeout_ms / 1000.0,
             )
-            receipt = self._client.register(registration)
+            received_handles: list[int] = []
+            if self._live_resize and not self._is_scheduler:
+                receipt, received_handles = self._client.register_with_handles(
+                    registration
+                )
+            else:
+                receipt = self._client.register(registration)
             self._participant_epoch = int(receipt["participant_epoch"])
+            if self._live_resize:
+                initial_blocks, maximum_blocks = _elastic_receipt_block_counts(receipt)
+                if self._is_scheduler:
+                    self._elastic_block_pool = VllmElasticBlockPool(
+                        initial_blocks, maximum_blocks
+                    )
             if self._mode == "shared_pool" and not self._is_scheduler:
                 global_rank = (
                     0 if tensor_parallel_size == 1 else vllm_distributed_rank()
                 )
-                binding = select_cuda_binding(
-                    receipt,
-                    kv_cache_config,
-                    rank_device_map,
-                    global_rank=global_rank,
-                )
-                self._shared_pool_hook = VllmSharedPoolHook(
-                    binding, kv_cache_config
-                )
+                try:
+                    binding = select_cuda_binding(
+                        receipt,
+                        kv_cache_config,
+                        rank_device_map,
+                        global_rank=global_rank,
+                        live_resize=self._live_resize,
+                    )
+                    self._shared_pool_hook = VllmSharedPoolHook(
+                        binding,
+                        kv_cache_config,
+                        handles=received_handles if self._live_resize else None,
+                    )
+                finally:
+                    _close_os_handles(received_handles)
                 if shared_topology is None:
                     raise AssertionError("shared topology was not constructed")
                 self._shared_shard = dict(shared_topology["shard"])
@@ -305,7 +357,22 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
     ) -> KapslConnectorMetadata:
         del scheduler_output
         self._raise_if_control_failed()
+        self._apply_scheduler_resizes()
         return KapslConnectorMetadata()
+
+    def bind_gpu_block_pool(self, gpu_block_pool: Any) -> None:
+        if not self._is_scheduler or not self._live_resize:
+            return
+        elastic = self._elastic_block_pool
+        if elastic is None:
+            raise SharedPoolImportError(
+                "elastic scheduler has no negotiated block-pool geometry"
+            )
+        elastic.bind(gpu_block_pool)
+
+    def has_pending_push_work(self) -> bool:
+        with self._resize_lock:
+            return self._resize_pending or bool(self._pending_scheduler_operations)
 
     def request_finished(
         self,
@@ -348,6 +415,16 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
         del forward_context, kwargs
+        if self._is_scheduler or not self._live_resize:
+            return
+        self._worker_forward_lock.acquire()
+        self._worker_forward_active = True
+        try:
+            self._apply_worker_resizes()
+        except Exception:
+            self._worker_forward_active = False
+            self._worker_forward_lock.release()
+            raise
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         del layer_name
@@ -362,6 +439,12 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
         del layer_name, kv_layer, attn_metadata, kwargs
 
     def wait_for_save(self) -> None:
+        return None
+
+    def build_connector_worker_meta(self) -> None:
+        if self._worker_forward_active:
+            self._worker_forward_active = False
+            self._worker_forward_lock.release()
         return None
 
     def register_kv_caches(self, kv_caches: dict[str, "torch.Tensor"]) -> None:
@@ -388,6 +471,7 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
             shard=self._shared_shard,
             profile=self._shared_profile,
             imported_bytes=hook.imported_bytes,
+            mapped_bytes=hook.mapped_bytes if self._live_resize else None,
             views=hook.attachment_views(kv_caches),
         )
         self._control_client().attach(attachment)
@@ -399,6 +483,9 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
         )
 
     def shutdown(self) -> None:
+        if self._worker_forward_active:
+            self._worker_forward_active = False
+            self._worker_forward_lock.release()
         if self._shared_pool_hook is not None:
             self._shared_pool_hook.shutdown()
             self._shared_pool_hook = None
@@ -418,8 +505,21 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
                 logger.warning("failed to release KV lease %s at shutdown: %s", lease_id, error)
 
     def _heartbeat_loop(self) -> None:
-        interval_seconds = max(0.25, self._lease_ttl_ms / 3000.0)
+        interval_seconds = (
+            0.25 if self._live_resize else max(0.25, self._lease_ttl_ms / 3000.0)
+        )
         while not self._heartbeat_stop.wait(interval_seconds):
+            if self._live_resize:
+                try:
+                    self._poll_scheduler_resizes()
+                except KapslKvControlError as error:
+                    with self._lease_lock:
+                        self._control_failure = error
+                    logger.error(
+                        "lost Kapsl live-resize authority; scheduler will fail closed: %s",
+                        error,
+                    )
+                    return
             with self._lease_lock:
                 has_live_leases = bool(self._leases)
             if not has_live_leases:
@@ -436,6 +536,105 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
                     error,
                 )
                 return
+
+    def _poll_scheduler_resizes(self) -> None:
+        if self._participant_epoch is None:
+            raise SharedPoolImportError("elastic scheduler has no participant epoch")
+        operations, handles, pending = self._control_client().poll_resize_state_with_handles(
+            make_resize_poll_request(
+                participant_epoch=self._participant_epoch,
+                actor={"role": "scheduler"},
+                applied_generation=self._resize_applied_generation,
+            )
+        )
+        try:
+            if handles:
+                raise SharedPoolImportError(
+                    "scheduler resize phase received CUDA allocation handles"
+                )
+            with self._resize_lock:
+                known = {
+                    int(operation["resize_generation"])
+                    for operation in self._pending_scheduler_operations
+                }
+                self._pending_scheduler_operations.extend(
+                    operation
+                    for operation in operations
+                    if int(operation["resize_generation"])
+                    > self._resize_applied_generation
+                    and int(operation["resize_generation"]) not in known
+                )
+                self._resize_pending = pending
+        finally:
+            _close_os_handles(handles)
+
+    def _apply_scheduler_resizes(self) -> None:
+        if not self._live_resize:
+            return
+        elastic = self._elastic_block_pool
+        if elastic is None:
+            raise SharedPoolImportError("elastic scheduler block pool is unavailable")
+        with self._resize_lock:
+            operations = list(self._pending_scheduler_operations)
+            self._pending_scheduler_operations.clear()
+        for operation in operations:
+            stage = str(operation["stage"])
+            if stage not in {"activate_scheduler", "retire_scheduler"}:
+                raise SharedPoolImportError("scheduler received a worker resize stage")
+            target = int(operation["target_block_count"])
+            elastic.apply(target)
+            generation = int(operation["resize_generation"])
+            self._control_client().ack_resize(
+                make_resize_ack_request(
+                    participant_epoch=int(operation["participant_epoch"]),
+                    actor={"role": "scheduler"},
+                    binding_id=str(operation["binding_id"]),
+                    resize_generation=generation,
+                    stage=stage,
+                    applied_block_count=target,
+                )
+            )
+            self._resize_applied_generation = max(
+                self._resize_applied_generation, generation
+            )
+
+    def _apply_worker_resizes(self) -> None:
+        if (
+            not self._live_resize
+            or self._participant_epoch is None
+            or self._shared_shard is None
+        ):
+            return
+        hook = self._shared_pool_hook
+        if hook is None:
+            raise SharedPoolImportError("elastic worker has no shared-pool hook")
+        operations, handles, _ = self._control_client().poll_resize_state_with_handles(
+            make_resize_poll_request(
+                participant_epoch=self._participant_epoch,
+                actor={"role": "worker", "shard": self._shared_shard},
+                applied_generation=self._resize_applied_generation,
+            )
+        )
+        try:
+            for operation in operations:
+                hook.apply_worker_resize(operation, handles)
+                target = int(operation["target_block_count"])
+                generation = int(operation["resize_generation"])
+                self._control_client().ack_resize(
+                    make_resize_ack_request(
+                        participant_epoch=int(operation["participant_epoch"]),
+                        actor={"role": "worker", "shard": self._shared_shard},
+                        binding_id=str(operation["binding_id"]),
+                        resize_generation=generation,
+                        stage=str(operation["stage"]),
+                        applied_block_count=target,
+                    )
+                )
+                self._resize_applied_generation = max(
+                    self._resize_applied_generation, generation
+                )
+        finally:
+            _close_os_handles(handles)
 
     def _ensure_shared_active(self) -> None:
         if self._mode != "shared_pool" or self._shared_active:
@@ -489,7 +688,26 @@ def _validate_shared_pool_execution(vllm_config: Any) -> None:
     validate_certified_shared_pool_execution(vllm_config)
 
 
-def _vllm_adapter_profile(vllm_config: Any) -> dict[str, str]:
+def _validate_elastic_shared_pool_execution(
+    vllm_config: Any, kv_cache_config: Any
+) -> None:
+    _validate_shared_pool_execution(vllm_config)
+    if str(getattr(kv_cache_config, "kv_cache_layout", "")).strip().upper() != "BLNHC":
+        raise SharedPoolImportError(
+            "live-resize shared_pool requires vLLM's block-outermost BLNHC layout"
+        )
+    concurrent_batches = getattr(vllm_config, "max_concurrent_batches", 1)
+    if not isinstance(concurrent_batches, int) or isinstance(concurrent_batches, bool):
+        raise SharedPoolImportError("vLLM max_concurrent_batches must be an integer")
+    if concurrent_batches != 1:
+        raise SharedPoolImportError(
+            "live-resize shared_pool requires one in-flight model batch per worker"
+        )
+
+
+def _vllm_adapter_profile(
+    vllm_config: Any, *, live_resize: bool = False
+) -> dict[str, str]:
     # Keep the production profile coupled to the same constraints exercised by
     # the hardware probe.  A generic "vLLM" profile would accidentally allow a
     # build to switch from FlashAttention to another reader at startup.
@@ -513,7 +731,9 @@ def _vllm_adapter_profile(vllm_config: Any) -> dict[str, str]:
         "adapter_id": "kapsl-vllm-connector",
         "adapter_version": ADAPTER_VERSION,
         "backend_version": backend_version,
-        "profile_id": ADAPTER_PROFILE_ID,
+        "profile_id": (
+            ELASTIC_ADAPTER_PROFILE_ID if live_resize else ADAPTER_PROFILE_ID
+        ),
     }
 
 
@@ -568,6 +788,45 @@ def _provisioning_grant(config: Any) -> dict[str, Any] | None:
     if not isinstance(raw_grant, Mapping):
         raise ValueError("kapsl_provisioning_grant must be an object")
     return dict(raw_grant)
+
+
+def _elastic_receipt_block_counts(receipt: Mapping[str, Any]) -> tuple[int, int]:
+    pools = receipt.get("shared_pools")
+    if not isinstance(pools, list) or not pools:
+        raise SharedPoolImportError("elastic registration returned no shared pools")
+    shapes: set[tuple[int, int]] = set()
+    for pool in pools:
+        if not isinstance(pool, Mapping):
+            raise SharedPoolImportError("elastic shared pool must be an object")
+        elastic = pool.get("elastic")
+        if not isinstance(elastic, Mapping):
+            raise SharedPoolImportError("elastic shared pool metadata is missing")
+        shapes.add(
+            (
+                _positive_integer(
+                    elastic.get("mapped_block_count"), "mapped_block_count"
+                ),
+                _positive_integer(
+                    elastic.get("maximum_block_count"), "maximum_block_count"
+                ),
+            )
+        )
+    if len(shapes) != 1:
+        raise SharedPoolImportError(
+            "tensor-parallel elastic bindings must share one block-count state"
+        )
+    initial, maximum = shapes.pop()
+    if initial > maximum:
+        raise SharedPoolImportError("elastic mapped capacity exceeds its maximum")
+    return initial, maximum
+
+
+def _close_os_handles(handles: Sequence[int]) -> None:
+    for descriptor in handles:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
 
 
 def _positive_integer(value: Any, field: str) -> int:
