@@ -213,13 +213,19 @@ def _geometry_from_executor(
 ) -> GeometryDescriptor:
     """Load the pinned executor, resolve cache specs, and stop before KV allocation."""
 
-    engine_args = apis.engine_args_factory(
-        model=str(request.model_path),
-        max_model_len=request.max_model_len,
-        tensor_parallel_size=request.tensor_parallel_size,
-        attention_backend=request.attention_backend,
-        enforce_eager=True,
-    )
+    engine_options: dict[str, Any] = {
+        "model": str(request.model_path),
+        "max_model_len": request.max_model_len,
+        "tensor_parallel_size": request.tensor_parallel_size,
+        "attention_backend": request.attention_backend,
+        "enforce_eager": True,
+    }
+    if request.live_resize:
+        # Safe tail unmapping requires every worker forward to have settled
+        # before a free block is retired. Pinned vLLM otherwise enables async
+        # scheduling by default and overlaps two model batches.
+        engine_options["async_scheduling"] = False
+    engine_args = apis.engine_args_factory(**engine_options)
     vllm_config = engine_args.create_engine_config()
     if request.live_resize:
         vllm_config.cache_config.kv_cache_layout = "BLNHC"

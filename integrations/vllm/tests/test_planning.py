@@ -106,6 +106,7 @@ def _vllm_config(
     pipeline_parallel_size: int = 1,
 ) -> SimpleNamespace:
     return SimpleNamespace(
+        cache_config=SimpleNamespace(kv_cache_layout=None),
         model_config=SimpleNamespace(
             max_model_len=max_model_len,
             enable_sleep_mode=False,
@@ -467,6 +468,21 @@ class PlanningTests(unittest.TestCase):
 
         self.assertEqual(calls["shutdown"], 1)
         self.assertEqual(calls["initialize"], 0)
+
+    def test_elastic_executor_planner_disables_overlapping_batches(self) -> None:
+        request, apis, calls = self._executor_planner_fixture(
+            resolve_error=RuntimeError("stop after engine configuration")
+        )
+        request = replace(request, live_resize=True)
+
+        with self.assertRaisesRegex(RuntimeError, "stop after engine configuration"):
+            _geometry_from_executor(request, "0.test", apis)
+
+        engine_args = cast(dict[str, object], calls["engine_args"])
+        self.assertIs(engine_args["async_scheduling"], False)
+        resolved = cast(SimpleNamespace, calls["resolved_config"])
+        self.assertEqual(resolved.cache_config.kv_cache_layout, "BLNHC")
+        self.assertEqual(calls["shutdown"], 1)
 
     def test_executor_planner_rejects_incomplete_worker_specs_and_shuts_down(
         self,
