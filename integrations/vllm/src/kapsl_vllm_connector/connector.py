@@ -298,15 +298,28 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
                 self._mode,
                 role_name,
             )
-        if self._is_scheduler:
-            self._heartbeat_thread = threading.Thread(
-                target=self._heartbeat_loop,
-                name=f"kapsl-kv-heartbeat-{engine_id}",
-                daemon=True,
-            )
-            self._heartbeat_thread.start()
+        self._start_scheduler_control(engine_id)
 
     # Scheduler-side lifecycle -------------------------------------------------
+
+    def _start_scheduler_control(self, engine_id: str) -> None:
+        if not self._is_scheduler:
+            return
+        # The pinned vLLM build constructs its scheduler connector only after
+        # every worker has initialized and registered its KV tensors. Activate
+        # here so Kapsl can publish the fully attached participant as Routable;
+        # deferring activation until on_new_request creates a readiness cycle
+        # because Kapsl deliberately will not route that first request yet.
+        # Coordinator activation still verifies the complete binding set and
+        # therefore fails startup closed if vLLM's construction order drifts.
+        if self._mode == "shared_pool":
+            self._ensure_shared_active()
+        self._heartbeat_thread = threading.Thread(
+            target=self._heartbeat_loop,
+            name=f"kapsl-kv-heartbeat-{engine_id}",
+            daemon=True,
+        )
+        self._heartbeat_thread.start()
 
     def on_new_request(self, request: "Request") -> None:
         if not self._is_scheduler:

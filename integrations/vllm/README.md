@@ -213,6 +213,12 @@ that mapped prefix as the available block count and restores the virtual maximum
 before scheduling begins. This prevents warmup-generated block IDs from touching
 unmapped VMM pages without reducing live serving capacity.
 
+The pinned scheduler connector activates a shared-pool participant during
+scheduler startup, after worker KV tensors have attached and before its
+heartbeat thread starts. Kapsl still validates the complete binding set, so a
+construction-order drift fails startup instead of deadlocking readiness on the
+first request.
+
 The shared-pool startup lifecycle is `plan -> reserve -> register/adopt ->
 attach every worker -> activate -> routable -> reserve requests`.
 `register_kv_caches` verifies the complete layer set,

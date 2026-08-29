@@ -79,6 +79,66 @@ class ConnectorHelperTests(unittest.TestCase):
 
         self.assertEqual(connector._client.epochs, [7])
 
+    def test_scheduler_startup_activates_before_heartbeat(self) -> None:
+        events: list[str] = []
+
+        class FakeThread:
+            def __init__(self, *, target, name: str, daemon: bool) -> None:
+                self.target = target
+                self.name = name
+                self.daemon = daemon
+
+            def start(self) -> None:
+                events.append("heartbeat")
+
+        connector = KapslConnectorV1.__new__(KapslConnectorV1)
+        connector._is_scheduler = True
+        connector._mode = "shared_pool"
+        connector._heartbeat_loop = lambda: None
+        connector._ensure_shared_active = lambda: events.append("activate")
+
+        with patch(
+            "kapsl_vllm_connector.connector.threading.Thread", FakeThread
+        ):
+            connector._start_scheduler_control("engine-7")
+
+        self.assertEqual(events, ["activate", "heartbeat"])
+        self.assertEqual(
+            connector._heartbeat_thread.name, "kapsl-kv-heartbeat-engine-7"
+        )
+        self.assertTrue(connector._heartbeat_thread.daemon)
+
+    def test_worker_startup_does_not_activate_or_start_heartbeat(self) -> None:
+        connector = KapslConnectorV1.__new__(KapslConnectorV1)
+        connector._is_scheduler = False
+        connector._mode = "shared_pool"
+        connector._heartbeat_thread = None
+        connector._ensure_shared_active = lambda: self.fail("worker activated pool")
+
+        with patch("kapsl_vllm_connector.connector.threading.Thread") as thread:
+            connector._start_scheduler_control("engine-7")
+
+        thread.assert_not_called()
+        self.assertIsNone(connector._heartbeat_thread)
+
+    def test_scheduler_startup_fails_before_heartbeat_when_activation_fails(
+        self,
+    ) -> None:
+        def fail_activation() -> None:
+            raise KapslKvControlError("worker binding is missing")
+
+        connector = KapslConnectorV1.__new__(KapslConnectorV1)
+        connector._is_scheduler = True
+        connector._mode = "shared_pool"
+        connector._heartbeat_loop = lambda: None
+        connector._ensure_shared_active = fail_activation
+
+        with patch("kapsl_vllm_connector.connector.threading.Thread") as thread:
+            with self.assertRaisesRegex(KapslKvControlError, "binding is missing"):
+                connector._start_scheduler_control("engine-7")
+
+        thread.assert_not_called()
+
     def test_shared_pool_rejects_vllm_sleep_mode(self) -> None:
         config = SimpleNamespace(
             parallel_config=SimpleNamespace(),
