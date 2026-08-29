@@ -149,6 +149,9 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
         self._live_resize = raw_live_resize
         if self._live_resize and self._mode != "shared_pool":
             raise ValueError("kapsl_live_resize requires shared_pool mode")
+        self._vmm_conformance = _validated_vmm_conformance(
+            self._kv_transfer_config, self._live_resize
+        )
         parallel_config = getattr(vllm_config, "parallel_config", None)
         tensor_parallel_size = int(
             getattr(parallel_config, "tensor_parallel_size", 1) or 1
@@ -285,6 +288,7 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
                         binding,
                         kv_cache_config,
                         handles=received_handles if self._live_resize else None,
+                        conformance=self._vmm_conformance,
                     )
                     if shared_topology is None:
                         raise AssertionError("shared topology was not constructed")
@@ -718,6 +722,15 @@ def _required_extra(config: Any, key: str) -> str:
     value = str(_extra(config, key, "")).strip()
     if not value:
         raise ValueError(f"{key} is required for KapslConnectorV1")
+    return value
+
+
+def _validated_vmm_conformance(config: Any, live_resize: bool) -> bool:
+    value = _extra(config, "kapsl_vmm_conformance", False)
+    if not isinstance(value, bool):
+        raise ValueError("kapsl_vmm_conformance must be a boolean")
+    if value and not live_resize:
+        raise ValueError("kapsl_vmm_conformance requires live resize")
     return value
 
 

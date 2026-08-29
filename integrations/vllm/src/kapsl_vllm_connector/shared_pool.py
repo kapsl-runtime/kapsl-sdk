@@ -23,7 +23,6 @@ from typing import Any
 
 
 logger = logging.getLogger(__name__)
-_VMM_CONFORMANCE_ENV = "KAPSL_VLLM_VMM_CONFORMANCE"
 
 
 class SharedPoolImportError(RuntimeError):
@@ -647,8 +646,11 @@ class CudaVmmBuffer:
         binding: Mapping[str, Any],
         handles: list[int],
         *,
+        conformance: bool = False,
         driver_factory: Any = _CudaVmmDriver,
     ) -> None:
+        if not isinstance(conformance, bool):
+            raise SharedPoolImportError("CUDA VMM conformance mode must be a boolean")
         elastic = binding.get("elastic")
         if not isinstance(elastic, Mapping):
             raise SharedPoolImportError("CUDA VMM binding has no elastic geometry")
@@ -685,7 +687,7 @@ class CudaVmmBuffer:
         self._virtual_bytes = virtual_bytes
         self._mapped_bytes = mapped_bytes
         self._granularity = granularity
-        self._conformance = os.environ.get(_VMM_CONFORMANCE_ENV) == "1"
+        self._conformance = conformance
         if self._conformance:
             self._verify_zero_segments(list(elastic["segments"]), "initial")
             logger.warning(
@@ -776,7 +778,10 @@ class VllmSharedPoolHook:
         kv_cache_config: Any,
         *,
         handles: list[int] | None = None,
+        conformance: bool = False,
     ) -> None:
+        if not isinstance(conformance, bool):
+            raise SharedPoolImportError("shared-pool conformance mode must be a boolean")
         allocation_bytes, maximum_blocks, _ = vllm_backing_geometry(kv_cache_config)
         self._expected_bytes = allocation_bytes
         self._maximum_blocks = maximum_blocks
@@ -797,6 +802,11 @@ class VllmSharedPoolHook:
                 next_layer_index += 1
         transport = binding.get("transport")
         transport_kind = transport.get("kind") if isinstance(transport, Mapping) else None
+        if conformance and transport_kind != "cuda_vmm":
+            raise SharedPoolImportError(
+                "shared-pool conformance mode requires CUDA VMM transport"
+            )
+        self._conformance = conformance
         self._startup_mapped_blocks: int | None = None
         if transport_kind == "cuda_vmm":
             if handles is None:
@@ -807,7 +817,9 @@ class VllmSharedPoolHook:
             if not isinstance(elastic, Mapping):
                 raise SharedPoolImportError("CUDA VMM binding has no elastic geometry")
             self._startup_mapped_blocks = int(elastic["mapped_block_count"])
-            self._buffer = CudaVmmBuffer(binding, handles)
+            self._buffer = CudaVmmBuffer(
+                binding, handles, conformance=self._conformance
+            )
         elif transport_kind == "cuda_ipc":
             if handles:
                 raise SharedPoolImportError(
@@ -975,7 +987,7 @@ class VllmSharedPoolHook:
                 ) from error
             warmup_logger = (
                 logger.warning
-                if os.environ.get(_VMM_CONFORMANCE_ENV) == "1"
+                if self._conformance
                 else logger.info
             )
             warmup_logger(
@@ -1029,7 +1041,7 @@ class VllmSharedPoolHook:
         if worker_utils is None:
             raise SharedPoolImportError("vLLM worker utilities are unavailable")
 
-        conformance = os.environ.get(_VMM_CONFORMANCE_ENV) == "1"
+        conformance = self._conformance
         allocated_before = (
             int(self._buffer._torch.cuda.memory_allocated(raw.device))
             if conformance

@@ -10,6 +10,7 @@ from kapsl_vllm_connector.connector import (
     _element_type,
     _vllm_adapter_profile,
     _validate_shared_pool_execution,
+    _validated_vmm_conformance,
     _validated_shared_rank_device_map,
     _vllm_topology,
     _request_computed_tokens,
@@ -20,6 +21,22 @@ from kapsl_vllm_connector.connector import (
 
 
 class ConnectorHelperTests(unittest.TestCase):
+    def test_vmm_conformance_requires_an_explicit_elastic_boolean(self) -> None:
+        self.assertFalse(_validated_vmm_conformance(SimpleNamespace(), False))
+        config = SimpleNamespace(
+            kv_connector_extra_config={"kapsl_vmm_conformance": True}
+        )
+        self.assertTrue(_validated_vmm_conformance(config, True))
+        with self.assertRaisesRegex(ValueError, "requires live resize"):
+            _validated_vmm_conformance(config, False)
+        with self.assertRaisesRegex(ValueError, "must be a boolean"):
+            _validated_vmm_conformance(
+                SimpleNamespace(
+                    kv_connector_extra_config={"kapsl_vmm_conformance": 1}
+                ),
+                True,
+            )
+
     def test_worker_resize_lock_spans_target_and_deferred_draft_forwards(self) -> None:
         connector = KapslConnectorV1.__new__(KapslConnectorV1)
         connector._is_scheduler = False

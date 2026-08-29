@@ -396,6 +396,7 @@ class SharedPoolTests(unittest.TestCase):
         hook = VllmSharedPoolHook.__new__(VllmSharedPoolHook)
         hook._expected_bytes = 128
         hook._used = False
+        hook._conformance = False
         hook._buffer = SimpleNamespace(
             tensor=SimpleNamespace(device=SimpleNamespace(type="cuda", index=0)),
             _torch=FakeTorch(),
@@ -415,6 +416,7 @@ class SharedPoolTests(unittest.TestCase):
         self,
     ) -> None:
         hook = VllmSharedPoolHook.__new__(VllmSharedPoolHook)
+        hook._conformance = True
         hook._startup_mapped_blocks = 2
         hook._maximum_blocks = 4
         hook._startup_warmup_lock = threading.Lock()
@@ -432,15 +434,9 @@ class SharedPoolTests(unittest.TestCase):
             observed.append(model_runner.kv_cache_config.num_blocks)
             return "warmed"
 
-        with (
-            patch.dict(
-                "kapsl_vllm_connector.shared_pool.os.environ",
-                {"KAPSL_VLLM_VMM_CONFORMANCE": "1"},
-            ),
-            self.assertLogs(
-                "kapsl_vllm_connector.shared_pool", level="WARNING"
-            ) as captured,
-        ):
+        with self.assertLogs(
+            "kapsl_vllm_connector.shared_pool", level="WARNING"
+        ) as captured:
             result = hook._run_startup_warmup(
                 original,
                 runner,
@@ -460,6 +456,7 @@ class SharedPoolTests(unittest.TestCase):
 
     def test_elastic_startup_warmup_restores_capacity_after_failure(self) -> None:
         hook = VllmSharedPoolHook.__new__(VllmSharedPoolHook)
+        hook._conformance = False
         hook._startup_mapped_blocks = 2
         hook._maximum_blocks = 4
         hook._startup_warmup_lock = threading.Lock()
@@ -503,6 +500,7 @@ class SharedPoolTests(unittest.TestCase):
             "vllm.v1.worker.gpu_worker": worker_module,
         }
         hook = VllmSharedPoolHook.__new__(VllmSharedPoolHook)
+        hook._conformance = False
         hook._startup_mapped_blocks = 2
         hook._maximum_blocks = 4
         hook._startup_warmup_lock = threading.Lock()
@@ -563,6 +561,38 @@ class SharedPoolTests(unittest.TestCase):
             VllmSharedPoolHook(_binding(0), _config())
 
         self.assertIs(supported.allocate_kv_cache, original)
+
+    def test_explicit_conformance_mode_reaches_the_cuda_vmm_buffer(self) -> None:
+        binding = _binding(
+            0,
+            transport={"kind": "cuda_vmm"},
+            descriptor="scm_rights:cuda-vmm-v1",
+            elastic={
+                "minimum_block_count": 2,
+                "mapped_block_count": 2,
+                "maximum_block_count": 4,
+                "allocation_granularity_bytes": 64,
+                "resize_alignment_blocks": 2,
+                "segments": [],
+            },
+        )
+        with (
+            patch.object(VllmSharedPoolHook, "_install"),
+            patch(
+                "kapsl_vllm_connector.shared_pool.CudaVmmBuffer"
+            ) as buffer_type,
+        ):
+            hook = VllmSharedPoolHook(
+                binding,
+                _config(),
+                handles=[11],
+                conformance=True,
+            )
+
+        self.assertTrue(hook._conformance)
+        buffer_type.assert_called_once_with(binding, [11], conformance=True)
+        with self.assertRaisesRegex(SharedPoolImportError, "must be a boolean"):
+            VllmSharedPoolHook(binding, _config(), handles=[11], conformance=1)
 
 
 if __name__ == "__main__":
