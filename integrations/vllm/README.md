@@ -208,6 +208,10 @@ one-sequence minimum, uses checked uint64 arithmetic, and emits exact per-rank
 desired/maximum bytes. Fixed CUDA IPC uses the initial exact allocation. The
 elastic profile launches vLLM with the certified virtual maximum while Kapsl
 physically maps and accounts only the transactionally granted prefix.
+During vLLM's synthetic startup warmup, the connector temporarily exposes only
+that mapped prefix as the available block count and restores the virtual maximum
+before scheduling begins. This prevents warmup-generated block IDs from touching
+unmapped VMM pages without reducing live serving capacity.
 
 The shared-pool startup lifecycle is `plan -> reserve -> register/adopt ->
 attach every worker -> activate -> routable -> reserve requests`.

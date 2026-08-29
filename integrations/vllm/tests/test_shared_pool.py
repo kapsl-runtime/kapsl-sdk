@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -409,6 +410,122 @@ class SharedPoolTests(unittest.TestCase):
         self.assertTrue(hook.used)
         with self.assertRaisesRegex(SharedPoolImportError, "more than once"):
             hook._allocate_kv_cache(_config(), "cuda:0", "BHLNC")
+
+    def test_elastic_startup_warmup_is_capped_and_virtual_capacity_restored(
+        self,
+    ) -> None:
+        hook = VllmSharedPoolHook.__new__(VllmSharedPoolHook)
+        hook._startup_mapped_blocks = 2
+        hook._maximum_blocks = 4
+        hook._startup_warmup_lock = threading.Lock()
+        hook._startup_warmup_attempted = False
+        config = SimpleNamespace(num_blocks=4)
+        runner = SimpleNamespace(kv_cache_config=config)
+        observed: list[int] = []
+
+        def original(
+            model_runner: object,
+            worker_execute_model: object,
+            worker_sample_tokens: object,
+        ) -> str:
+            del worker_execute_model, worker_sample_tokens
+            observed.append(model_runner.kv_cache_config.num_blocks)
+            return "warmed"
+
+        with (
+            patch.dict(
+                "kapsl_vllm_connector.shared_pool.os.environ",
+                {"KAPSL_VLLM_VMM_CONFORMANCE": "1"},
+            ),
+            self.assertLogs(
+                "kapsl_vllm_connector.shared_pool", level="WARNING"
+            ) as captured,
+        ):
+            result = hook._run_startup_warmup(
+                original,
+                runner,
+                object(),
+                object(),
+            )
+
+        self.assertEqual(result, "warmed")
+        self.assertEqual(observed, [2])
+        self.assertEqual(config.num_blocks, 4)
+        self.assertIn(
+            "capped vLLM startup warmup to 2 mapped blocks out of 4 virtual blocks",
+            "\n".join(captured.output),
+        )
+        with self.assertRaisesRegex(SharedPoolImportError, "more than once"):
+            hook._run_startup_warmup(original, runner, object(), object())
+
+    def test_elastic_startup_warmup_restores_capacity_after_failure(self) -> None:
+        hook = VllmSharedPoolHook.__new__(VllmSharedPoolHook)
+        hook._startup_mapped_blocks = 2
+        hook._maximum_blocks = 4
+        hook._startup_warmup_lock = threading.Lock()
+        hook._startup_warmup_attempted = False
+        config = SimpleNamespace(num_blocks=4)
+        runner = SimpleNamespace(kv_cache_config=config)
+
+        def failing_warmup(
+            model_runner: object,
+            worker_execute_model: object,
+            worker_sample_tokens: object,
+        ) -> None:
+            del worker_execute_model, worker_sample_tokens
+            self.assertEqual(model_runner.kv_cache_config.num_blocks, 2)
+            raise RuntimeError("injected warmup failure")
+
+        with self.assertRaisesRegex(RuntimeError, "injected warmup failure"):
+            hook._run_startup_warmup(
+                failing_warmup,
+                runner,
+                object(),
+                object(),
+            )
+        self.assertEqual(config.num_blocks, 4)
+
+    def test_elastic_startup_warmup_patches_and_restores_both_references(
+        self,
+    ) -> None:
+        def original(
+            model_runner: object,
+            worker_execute_model: object,
+            worker_sample_tokens: object,
+        ) -> str:
+            del model_runner, worker_execute_model, worker_sample_tokens
+            return "warmed"
+
+        warmup_module = SimpleNamespace(warmup_kernels=original)
+        worker_module = SimpleNamespace(warmup_kernels=original)
+        modules = {
+            "vllm.v1.worker.gpu.warmup": warmup_module,
+            "vllm.v1.worker.gpu_worker": worker_module,
+        }
+        hook = VllmSharedPoolHook.__new__(VllmSharedPoolHook)
+        hook._startup_mapped_blocks = 2
+        hook._maximum_blocks = 4
+        hook._startup_warmup_lock = threading.Lock()
+        hook._startup_warmup_attempted = False
+        hook._warmup_patches = []
+        hook._warmup_replacement = None
+
+        with patch(
+            "kapsl_vllm_connector.shared_pool.importlib.import_module",
+            side_effect=lambda name: modules[name],
+        ):
+            hook._install_startup_warmup_cap()
+
+        replacement = warmup_module.warmup_kernels
+        self.assertIs(replacement, worker_module.warmup_kernels)
+        self.assertIsNot(replacement, original)
+        runner = SimpleNamespace(kv_cache_config=SimpleNamespace(num_blocks=4))
+        self.assertEqual(replacement(runner, object(), object()), "warmed")
+        self.assertEqual(runner.kv_cache_config.num_blocks, 4)
+
+        hook.shutdown()
+        self.assertIs(warmup_module.warmup_kernels, original)
+        self.assertIs(worker_module.warmup_kernels, original)
 
     def test_failed_install_restores_partially_patched_modules(self) -> None:
         supported = SimpleNamespace()

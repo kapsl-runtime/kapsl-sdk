@@ -11,6 +11,7 @@ import base64
 import binascii
 import ctypes
 import ctypes.util
+import functools
 import importlib
 import inspect
 import logging
@@ -687,7 +688,7 @@ class CudaVmmBuffer:
         self._conformance = os.environ.get(_VMM_CONFORMANCE_ENV) == "1"
         if self._conformance:
             self._verify_zero_segments(list(elastic["segments"]), "initial")
-            logger.info(
+            logger.warning(
                 "KAPSL_VMM_CONFORMANCE stable_address=%#x mapped_bytes=%d virtual_bytes=%d phase=initial zeroed=true",
                 imported.pointer,
                 mapped_bytes,
@@ -707,7 +708,7 @@ class CudaVmmBuffer:
         self._imported.map_segments(segments, handles)
         if self._conformance:
             self._verify_zero_segments(segments, "grow")
-            logger.info(
+            logger.warning(
                 "KAPSL_VMM_CONFORMANCE stable_address=%#x mapped_bytes=%d virtual_bytes=%d phase=grow zeroed=true",
                 self._imported.pointer,
                 target_bytes,
@@ -724,7 +725,7 @@ class CudaVmmBuffer:
         self._imported.unmap_segments(segments)
         self._mapped_bytes = target_bytes
         if self._conformance:
-            logger.info(
+            logger.warning(
                 "KAPSL_VMM_CONFORMANCE stable_address=%#x mapped_bytes=%d virtual_bytes=%d phase=shrink",
                 self._imported.pointer,
                 target_bytes,
@@ -764,6 +765,10 @@ class VllmSharedPoolHook:
         "vllm.v1.worker.gpu_model_runner",
         "vllm.v1.worker.gpu.attn_utils",
     )
+    _WARMUP_MODULES = (
+        "vllm.v1.worker.gpu.warmup",
+        "vllm.v1.worker.gpu_worker",
+    )
 
     def __init__(
         self,
@@ -772,8 +777,9 @@ class VllmSharedPoolHook:
         *,
         handles: list[int] | None = None,
     ) -> None:
-        allocation_bytes, _, _ = vllm_backing_geometry(kv_cache_config)
+        allocation_bytes, maximum_blocks, _ = vllm_backing_geometry(kv_cache_config)
         self._expected_bytes = allocation_bytes
+        self._maximum_blocks = maximum_blocks
         self._binding_id = str(binding["binding_id"])
         self._layer_identity: dict[str, tuple[str, int]] = {}
         next_layer_index = 0
@@ -791,11 +797,16 @@ class VllmSharedPoolHook:
                 next_layer_index += 1
         transport = binding.get("transport")
         transport_kind = transport.get("kind") if isinstance(transport, Mapping) else None
+        self._startup_mapped_blocks: int | None = None
         if transport_kind == "cuda_vmm":
             if handles is None:
                 raise SharedPoolImportError(
                     "CUDA VMM binding requires out-of-band allocation handles"
                 )
+            elastic = binding.get("elastic")
+            if not isinstance(elastic, Mapping):
+                raise SharedPoolImportError("CUDA VMM binding has no elastic geometry")
+            self._startup_mapped_blocks = int(elastic["mapped_block_count"])
             self._buffer = CudaVmmBuffer(binding, handles)
         elif transport_kind == "cuda_ipc":
             if handles:
@@ -808,6 +819,10 @@ class VllmSharedPoolHook:
         self._last_worker_resize: tuple[Any, ...] | None = None
         self._used = False
         self._patches: list[tuple[Any, Any]] = []
+        self._warmup_patches: list[tuple[Any, Any]] = []
+        self._warmup_replacement: Any | None = None
+        self._startup_warmup_lock = threading.Lock()
+        self._startup_warmup_attempted = False
         self._replacement = self._allocate_kv_cache
         self._worker_utils: Any | None = None
         try:
@@ -852,6 +867,135 @@ class VllmSharedPoolHook:
             raise SharedPoolImportError(
                 "this vLLM build has no supported packed KV allocation hook"
             )
+        if (
+            self._startup_mapped_blocks is not None
+            and self._startup_mapped_blocks < self._maximum_blocks
+        ):
+            self._install_startup_warmup_cap()
+
+    def _install_startup_warmup_cap(self) -> None:
+        """Keep pinned vLLM's synthetic warmup inside mapped VMM pages.
+
+        vLLM sizes its hand-built warmup batch from ``KVCacheConfig.num_blocks``.
+        For an elastic pool that value is the virtual maximum, while only the
+        initial physical prefix is mapped before the engine becomes active.
+        Patch both the defining module and the symbol imported by ``gpu_worker``
+        so this one startup call sees the mapped prefix. The complete virtual
+        block count is restored before normal scheduling starts.
+        """
+
+        modules: list[Any] = []
+        original: Any | None = None
+        expected_parameters = [
+            "model_runner",
+            "worker_execute_model",
+            "worker_sample_tokens",
+        ]
+        for module_name in self._WARMUP_MODULES:
+            try:
+                module = importlib.import_module(module_name)
+            except ImportError as error:
+                raise SharedPoolImportError(
+                    f"this vLLM build has no certified startup warmup module {module_name}"
+                ) from error
+            candidate = getattr(module, "warmup_kernels", None)
+            if not callable(candidate):
+                raise SharedPoolImportError(
+                    f"this vLLM build has no callable {module_name}.warmup_kernels"
+                )
+            parameters = list(inspect.signature(candidate).parameters)
+            if parameters != expected_parameters:
+                raise SharedPoolImportError(
+                    "unsupported vLLM warmup_kernels signature in "
+                    f"{module_name}: {parameters}"
+                )
+            if original is None:
+                original = candidate
+            elif candidate is not original:
+                raise SharedPoolImportError(
+                    "vLLM startup warmup references do not share one pinned function"
+                )
+            modules.append(module)
+        if original is None:
+            raise SharedPoolImportError("vLLM startup warmup function is unavailable")
+
+        @functools.wraps(original)
+        def capped_warmup(
+            model_runner: Any,
+            worker_execute_model: Any,
+            worker_sample_tokens: Any,
+        ) -> Any:
+            return self._run_startup_warmup(
+                original,
+                model_runner,
+                worker_execute_model,
+                worker_sample_tokens,
+            )
+
+        self._warmup_replacement = capped_warmup
+        for module in modules:
+            self._warmup_patches.append((module, original))
+            setattr(module, "warmup_kernels", capped_warmup)
+
+    def _run_startup_warmup(
+        self,
+        original: Any,
+        model_runner: Any,
+        worker_execute_model: Any,
+        worker_sample_tokens: Any,
+    ) -> Any:
+        mapped_blocks = self._startup_mapped_blocks
+        if mapped_blocks is None:
+            raise SharedPoolImportError("fixed shared pool entered elastic warmup")
+        with self._startup_warmup_lock:
+            if self._startup_warmup_attempted:
+                raise SharedPoolImportError(
+                    "elastic vLLM startup warmup was invoked more than once"
+                )
+            self._startup_warmup_attempted = True
+            kv_cache_config = getattr(model_runner, "kv_cache_config", None)
+            advertised_blocks = getattr(kv_cache_config, "num_blocks", None)
+            if (
+                isinstance(advertised_blocks, bool)
+                or not isinstance(advertised_blocks, int)
+                or advertised_blocks != self._maximum_blocks
+            ):
+                raise SharedPoolImportError(
+                    "vLLM changed the virtual KV block count before startup warmup"
+                )
+            if mapped_blocks <= 1 or mapped_blocks > advertised_blocks:
+                raise SharedPoolImportError(
+                    "elastic startup mapped block count is outside virtual capacity"
+                )
+            try:
+                kv_cache_config.num_blocks = mapped_blocks
+            except Exception as error:
+                raise SharedPoolImportError(
+                    "vLLM KVCacheConfig cannot be capped for elastic startup warmup"
+                ) from error
+            warmup_logger = (
+                logger.warning
+                if os.environ.get(_VMM_CONFORMANCE_ENV) == "1"
+                else logger.info
+            )
+            warmup_logger(
+                "capped vLLM startup warmup to %d mapped blocks out of %d virtual blocks",
+                mapped_blocks,
+                advertised_blocks,
+            )
+            try:
+                return original(
+                    model_runner,
+                    worker_execute_model,
+                    worker_sample_tokens,
+                )
+            finally:
+                try:
+                    kv_cache_config.num_blocks = advertised_blocks
+                except Exception as error:
+                    raise SharedPoolImportError(
+                        "vLLM KVCacheConfig could not restore virtual capacity after warmup"
+                    ) from error
 
     def _allocate_kv_cache(
         self,
@@ -940,7 +1084,7 @@ class VllmSharedPoolHook:
                     "vLLM KV view construction created a second PyTorch CUDA allocation: "
                     f"before={allocated_before}, after={allocated_after}"
                 )
-            logger.info(
+            logger.warning(
                 "KAPSL_VMM_CONFORMANCE allocator_delta_bytes=0 virtual_bytes=%d",
                 self._expected_bytes,
             )
@@ -1061,6 +1205,11 @@ class VllmSharedPoolHook:
         return views
 
     def shutdown(self) -> None:
+        warmup_replacement = getattr(self, "_warmup_replacement", None)
+        for module, original in reversed(getattr(self, "_warmup_patches", [])):
+            if getattr(module, "warmup_kernels", None) is warmup_replacement:
+                setattr(module, "warmup_kernels", original)
+        self._warmup_patches = []
         replacement = getattr(self, "_replacement", None)
         for module, original in reversed(getattr(self, "_patches", [])):
             if getattr(module, "allocate_kv_cache", None) is replacement:
