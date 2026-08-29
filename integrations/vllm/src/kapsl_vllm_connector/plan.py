@@ -53,6 +53,16 @@ GeometryProvider = Callable[[RuntimePlanningRequest], GeometryDescriptor]
 BackendVersionProvider = Callable[[], str]
 MAX_TENSOR_PARALLEL_SIZE = 1024
 
+# Pinned vLLM unconditionally turns ``gpu_memory_utilization`` into a
+# whole-device free-memory requirement while constructing each worker, even
+# when the caller stops before memory profiling and physical KV allocation.
+# The geometry planner is not allowed to claim a card-sized fraction: model
+# admission is already charged by Kapsl and the authoritative KV amount below
+# is supplied directly to ``get_kv_cache_configs``. Keep this positive because
+# vLLM rejects zero, but make the non-authoritative constructor guard
+# negligible so geometry can be resolved alongside an active replica.
+_PLANNER_GPU_MEMORY_UTILIZATION = 1e-9
+
 
 class RuntimeGeometryUnavailable(PlanningError):
     """The certified runtime could not supply resolved cache geometry."""
@@ -219,6 +229,7 @@ def _geometry_from_executor(
         "tensor_parallel_size": request.tensor_parallel_size,
         "attention_backend": request.attention_backend,
         "enforce_eager": True,
+        "gpu_memory_utilization": _PLANNER_GPU_MEMORY_UTILIZATION,
     }
     if request.live_resize:
         # Safe tail unmapping requires every worker forward to have settled

@@ -441,6 +441,9 @@ class PlanningTests(unittest.TestCase):
                 "tensor_parallel_size": 2,
                 "attention_backend": "FLASH_ATTN",
                 "enforce_eager": True,
+                # Geometry planning must not inherit vLLM's card-sized 0.92
+                # default when another admitted replica is already resident.
+                "gpu_memory_utilization": 1e-9,
             },
         )
         self.assertEqual(calls["registered"], 1)
