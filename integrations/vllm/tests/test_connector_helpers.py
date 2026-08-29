@@ -58,6 +58,32 @@ class ConnectorHelperTests(unittest.TestCase):
         self.assertFalse(connector._worker_forward_active)
         self.assertFalse(connector._worker_forward_lock.locked())
 
+    def test_scheduler_stays_awake_until_grown_capacity_returns_to_initial(self) -> None:
+        connector = KapslConnectorV1.__new__(KapslConnectorV1)
+        connector._resize_lock = threading.RLock()
+        connector._resize_pending = False
+        connector._pending_scheduler_operations = []
+        connector._elastic_block_pool = SimpleNamespace(
+            initial_blocks=4,
+            current_blocks=4,
+        )
+
+        self.assertFalse(connector.has_pending_push_work())
+
+        # A completed grow can race the supervisor's follow-up shrink after
+        # the last request finishes. Keeping vLLM's supported push-work loop
+        # active lets the scheduler receive and acknowledge that shrink.
+        connector._elastic_block_pool.current_blocks = 8
+        self.assertTrue(connector.has_pending_push_work())
+
+        connector._elastic_block_pool.current_blocks = 4
+        connector._resize_pending = True
+        self.assertTrue(connector.has_pending_push_work())
+
+        connector._resize_pending = False
+        connector._pending_scheduler_operations = [{"resize_generation": 2}]
+        self.assertTrue(connector.has_pending_push_work())
+
     def test_scheduler_activates_shared_pool_once_before_admission(self) -> None:
         class FakeClient:
             def __init__(self) -> None:

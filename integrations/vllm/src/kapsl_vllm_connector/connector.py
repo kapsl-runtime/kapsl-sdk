@@ -387,7 +387,22 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
 
     def has_pending_push_work(self) -> bool:
         with self._resize_lock:
-            return self._resize_pending or bool(self._pending_scheduler_operations)
+            pending = self._resize_pending or bool(
+                self._pending_scheduler_operations
+            )
+            elastic = self._elastic_block_pool
+            # The pinned vLLM core blocks on its request queue after the last
+            # request finishes. A shrink is normally requested immediately
+            # after that transition, so keep the connector's supported
+            # zero-token push-work loop alive while capacity is still above
+            # the startup minimum. Otherwise the background control poll can
+            # discover retire_scheduler work but cannot wake the sleeping
+            # scheduler thread to apply and acknowledge it.
+            above_initial_capacity = (
+                elastic is not None
+                and elastic.current_blocks > elastic.initial_blocks
+            )
+            return pending or above_initial_capacity
 
     def request_finished(
         self,
