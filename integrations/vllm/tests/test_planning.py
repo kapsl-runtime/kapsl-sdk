@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import re
 import tempfile
 import unittest
@@ -1349,6 +1350,76 @@ class PlanningTests(unittest.TestCase):
                 json.loads(provider_error.getvalue())["error"]["kind"],
                 "runtime_geometry_unavailable",
             )
+
+    def test_cli_keeps_runtime_provider_logs_out_of_success_stdout(self) -> None:
+        arguments = [
+            "--model",
+            ".",
+            "--model-fingerprint",
+            "sha256:model",
+            "--max-model-len",
+            "1024",
+        ]
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        def noisy_provider(_request: object) -> GeometryDescriptor:
+            print("vLLM model-loading progress on stdout")
+            return _resolved_geometry()
+
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            status = run(
+                arguments,
+                geometry_provider=noisy_provider,
+                backend_version_provider=lambda: "0.test",
+            )
+
+        self.assertEqual(status, 0)
+        self.assertEqual(json.loads(stdout.getvalue())["status"], "planned")
+        self.assertNotIn("vLLM", stdout.getvalue())
+        self.assertIn("vLLM model-loading progress", stderr.getvalue())
+
+    def test_cli_redirects_provider_writes_through_retained_stdout_fd(self) -> None:
+        arguments = [
+            "--model",
+            ".",
+            "--model-fingerprint",
+            "sha256:model",
+            "--max-model-len",
+            "1024",
+        ]
+        with (
+            tempfile.TemporaryFile(mode="w+") as stdout,
+            tempfile.TemporaryFile(mode="w+") as stderr,
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+        ):
+            retained_stdout = stdout
+
+            def noisy_provider(_request: object) -> GeometryDescriptor:
+                retained_stdout.write("retained logging handler\n")
+                retained_stdout.flush()
+                os.write(retained_stdout.fileno(), b"native stdout write\n")
+                return _resolved_geometry()
+
+            status = run(
+                arguments,
+                geometry_provider=noisy_provider,
+                backend_version_provider=lambda: "0.test",
+            )
+            stdout.flush()
+            stderr.flush()
+            stdout.seek(0)
+            stderr.seek(0)
+            stdout_text = stdout.read()
+            stderr_text = stderr.read()
+
+        self.assertEqual(status, 0)
+        self.assertEqual(json.loads(stdout_text)["status"], "planned")
+        self.assertNotIn("retained logging handler", stdout_text)
+        self.assertNotIn("native stdout write", stdout_text)
+        self.assertIn("retained logging handler", stderr_text)
+        self.assertIn("native stdout write", stderr_text)
 
     def test_cli_structures_malformed_provider_and_backend_failures(self) -> None:
         arguments = [

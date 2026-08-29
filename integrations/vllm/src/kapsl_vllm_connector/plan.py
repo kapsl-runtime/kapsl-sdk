@@ -11,10 +11,12 @@ from __future__ import annotations
 import argparse
 import importlib.metadata as metadata
 import json
+import os
 import sys
+from contextlib import contextmanager, redirect_stdout
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Iterator, Sequence
 
 from .connector import (
     ADAPTER_PROFILE_ID,
@@ -54,6 +56,53 @@ MAX_TENSOR_PARALLEL_SIZE = 1024
 
 class RuntimeGeometryUnavailable(PlanningError):
     """The certified runtime could not supply resolved cache geometry."""
+
+
+@contextmanager
+def _runtime_logs_to_stderr() -> Iterator[None]:
+    """Keep the planner's machine-readable stdout free of runtime logs.
+
+    vLLM, torch, NCCL, and progress helpers do not all resolve ``sys.stdout``
+    at write time. Some retain the original stream object and native code may
+    write directly to file descriptor 1. Redirect both layers while the
+    executor-backed provider runs, then restore stdout before emitting the
+    final planning document.
+
+    The descriptor redirect is skipped for in-memory streams used by host
+    tests, while the Python redirect still preserves the same contract.
+    """
+
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    stdout_fd: int | None = None
+    stderr_fd: int | None = None
+    saved_stdout_fd: int | None = None
+    try:
+        stdout_fd = original_stdout.fileno()
+        stderr_fd = original_stderr.fileno()
+    except (AttributeError, OSError, ValueError):
+        pass
+    else:
+        original_stdout.flush()
+        original_stderr.flush()
+        saved_stdout_fd = os.dup(stdout_fd)
+        try:
+            os.dup2(stderr_fd, stdout_fd)
+        except BaseException:
+            os.close(saved_stdout_fd)
+            raise
+
+    try:
+        with redirect_stdout(original_stderr):
+            yield
+    finally:
+        if saved_stdout_fd is not None and stdout_fd is not None:
+            try:
+                original_stdout.flush()
+                original_stderr.flush()
+            finally:
+                os.dup2(saved_stdout_fd, stdout_fd)
+                os.close(saved_stdout_fd)
 
 
 @dataclass(frozen=True, slots=True)
@@ -481,7 +530,11 @@ def run(
         installed_backend_version = _installed_backend_version(
             backend_version_provider
         )
-        geometry = _runtime_geometry(request, geometry_provider)
+        # The pinned runtime may log through Python streams, retained logging
+        # handlers, tqdm, or native libraries. Keep stdout reserved for the
+        # single planner JSON document consumed by Kapsl.
+        with _runtime_logs_to_stderr():
+            geometry = _runtime_geometry(request, geometry_provider)
         _validate_runtime_geometry(
             request,
             geometry,
