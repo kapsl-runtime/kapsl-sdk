@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import base64
+import logging
 import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from kapsl_vllm_connector import shared_pool
 from kapsl_vllm_connector.shared_pool import (
     CudaIpcBuffer,
     CudaVmmBuffer,
@@ -47,6 +49,18 @@ def _binding(device_id: int, **overrides: object) -> dict[str, object]:
 
 
 class SharedPoolTests(unittest.TestCase):
+    def test_evidence_logger_propagates_through_vllm_handler(self) -> None:
+        self.assertEqual(
+            shared_pool.logger.name,
+            "vllm.kapsl_vllm_connector.shared_pool",
+        )
+        with self.assertLogs("vllm", level=logging.WARNING) as captured:
+            shared_pool.logger.warning(
+                "KAPSL_VMM_CONFORMANCE stable_address=0x1 "
+                "mapped_bytes=64 virtual_bytes=128 phase=initial"
+            )
+        self.assertIn("KAPSL_VMM_CONFORMANCE", "\n".join(captured.output))
+
     def test_vmm_import_releases_generic_handle_when_mapping_fails(self) -> None:
         class FailingDriver:
             def __init__(self) -> None:
@@ -434,9 +448,7 @@ class SharedPoolTests(unittest.TestCase):
             observed.append(model_runner.kv_cache_config.num_blocks)
             return "warmed"
 
-        with self.assertLogs(
-            "kapsl_vllm_connector.shared_pool", level="WARNING"
-        ) as captured:
+        with self.assertLogs("vllm", level="WARNING") as captured:
             result = hook._run_startup_warmup(
                 original,
                 runner,

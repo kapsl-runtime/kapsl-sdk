@@ -69,7 +69,10 @@ else:
     _VLLM_IMPORT_ERROR = None
 
 
-logger = logging.getLogger(__name__)
+# vLLM installs its output handler on the ``vllm`` logger rather than the
+# process root logger. Keep connector records below that namespace so worker
+# evidence and lifecycle diagnostics reach the managed child log.
+logger = logging.getLogger(f"vllm.{__name__}")
 ADAPTER_VERSION = "0.7.0"
 ADAPTER_PROFILE_ID = "vllm-v1-packed-cuda-ipc/flash-attn"
 ELASTIC_ADAPTER_PROFILE_ID = "vllm-v1-packed-cuda-vmm/flash-attn-blnhc"

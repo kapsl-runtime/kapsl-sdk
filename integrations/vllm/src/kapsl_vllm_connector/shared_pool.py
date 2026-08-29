@@ -22,7 +22,10 @@ from collections.abc import Mapping
 from typing import Any
 
 
-logger = logging.getLogger(__name__)
+# vLLM's default logging configuration attaches its only output handler to the
+# ``vllm`` logger. A top-level plugin logger otherwise propagates into an empty
+# root logger, which discards CUDA VMM evidence even though the checks ran.
+logger = logging.getLogger(f"vllm.{__name__}")
 
 
 class SharedPoolImportError(RuntimeError):
