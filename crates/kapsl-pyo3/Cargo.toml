@@ -17,5 +17,4 @@ kapsl-ipc = { path = "../kapsl-ipc" }
 kapsl-engine-api = { path = "../kapsl-engine-api" }
 kapsl-shm = { path = "../kapsl-shm" }
 kapsl-transport = { path = "../kapsl-transport" }
-libc = "0.2"
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["net", "rt", "sync"] }
