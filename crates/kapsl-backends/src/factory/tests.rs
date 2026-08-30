@@ -1,3 +1,5 @@
+//! Tests for backend construction and selection.
+
 #[cfg(test)]
 mod tests {
     use super::super::{BackendFactory, OnnxRuntimeTuning};

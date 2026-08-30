@@ -1,4 +1,4 @@
-//! Unit tests for the ONNX detection post-processor (box decode + NMS).
+//! Tests for the ONNX detection post-processor (box decode and NMS).
 
 use super::*;
 

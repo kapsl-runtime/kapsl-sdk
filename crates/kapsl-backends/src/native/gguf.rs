@@ -1,4 +1,4 @@
-//! GGUF native backend — GGUF weight loading + llama.cpp tokenizer + custom CUDA kernels.
+//! GGUF-native backend: GGUF loading, llama.cpp tokenization, and custom kernels.
 //!
 //! Differs from `GgufBackend` (which delegates all compute to llama.cpp):
 //! llama.cpp is used **only** for tokenization; the full transformer forward pass

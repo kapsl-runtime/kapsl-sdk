@@ -2291,5 +2291,5 @@ fn get_shape_usize(shape: &[i64]) -> Vec<usize> {
     shape.iter().map(|&v| v as usize).collect()
 }
 
-#[path = "onnx_tests.rs"]
+#[path = "tests.rs"]
 mod onnx_tests;

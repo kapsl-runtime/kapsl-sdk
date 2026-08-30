@@ -231,5 +231,5 @@ fn argmax(row: &[f32]) -> usize {
 }
 
 #[cfg(test)]
-#[path = "onnx_transcribe_tests.rs"]
+#[path = "transcribe_tests.rs"]
 mod onnx_transcribe_tests;

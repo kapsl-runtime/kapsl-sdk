@@ -166,5 +166,5 @@ fn softmax_rows(v: &mut [f32], rows: usize, classes: usize) {
 }
 
 #[cfg(test)]
-#[path = "onnx_classify_tests.rs"]
+#[path = "classify_tests.rs"]
 mod onnx_classify_tests;

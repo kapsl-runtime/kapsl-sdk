@@ -1,4 +1,4 @@
-// Hot-swap integration tests for NativeBackend.
+//! Hot-swap integration tests for `NativeBackend`.
 //
 // Requires a CUDA device and two model directories with compatible architectures
 // (same hidden_size, num_layers, num_kv_heads — only weights differ).

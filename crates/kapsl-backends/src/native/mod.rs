@@ -2486,5 +2486,5 @@ mod inner {
 pub use inner::NativeBackend;
 
 #[cfg(all(feature = "native", test))]
-#[path = "native_hotswap_tests.rs"]
+#[path = "hotswap_tests.rs"]
 mod native_hotswap_tests;

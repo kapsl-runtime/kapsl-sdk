@@ -1,3 +1,5 @@
+//! Tests for the shared engine pool.
+
 use super::*;
 use async_trait::async_trait;
 use kapsl_engine_api::{BinaryTensorPacket, EngineError, InferenceRequest, TensorDtype};

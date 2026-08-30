@@ -1,4 +1,4 @@
-//! Unit tests for the ONNX CTC transcription post-processor.
+//! Tests for the ONNX CTC transcription post-processor.
 
 use super::*;
 

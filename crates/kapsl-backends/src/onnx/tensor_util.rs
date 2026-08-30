@@ -1,4 +1,4 @@
-//! Small tensor-packing helpers shared by the ONNX task backends.
+//! Tensor-packing helpers shared by the ONNX task backends.
 //!
 //! Each of the `onnx_{classify,detect,embed,transcribe}` backends decodes raw
 //! little-endian tensor bytes and repacks its results the same way, so the

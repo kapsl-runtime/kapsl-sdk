@@ -1,3 +1,5 @@
+//! Tests for ONNX embedding post-processing.
+
 use super::*;
 use kapsl_engine_api::NamedTensor;
 
