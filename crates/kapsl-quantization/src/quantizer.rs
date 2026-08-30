@@ -87,6 +87,16 @@ pub fn quantize_int8_symmetric(weights: &[f32], shape: &[usize]) -> QuantizedTen
 ///
 /// Better for one-sided distributions (e.g. post-ReLU activations).
 pub fn quantize_int8_asymmetric(weights: &[f32], shape: &[usize]) -> QuantizedTensor {
+    if weights.is_empty() {
+        return QuantizedTensor::Int8(Int8Tensor {
+            weight: Arc::new(Vec::new()),
+            scale: 1.0,
+            zero_point: 0,
+            symmetric: false,
+            shape: shape.to_vec(),
+        });
+    }
+
     let min = weights.iter().copied().fold(f32::INFINITY, f32::min);
     let max = weights.iter().copied().fold(f32::NEG_INFINITY, f32::max);
 
@@ -135,6 +145,19 @@ pub fn quantize_int4_grouped(
     if weights.is_empty() {
         return Err(anyhow!("weights must not be empty"));
     }
+    let shape_elements = shape
+        .iter()
+        .try_fold(1_usize, |elements, dimension| {
+            elements.checked_mul(*dimension)
+        })
+        .ok_or_else(|| anyhow!("shape element count overflow"))?;
+    if shape_elements != weights.len() {
+        return Err(anyhow!(
+            "shape element count {} does not match {} weights",
+            shape_elements,
+            weights.len()
+        ));
+    }
 
     let mut packed: Vec<u8> = Vec::with_capacity(weights.len() / 2 + 1);
     let mut scales: Vec<f16> = Vec::with_capacity(weights.len().div_ceil(group_size));
@@ -148,7 +171,7 @@ pub fn quantize_int4_grouped(
         };
         scales.push(f16::from_f32(scale));
 
-        // Quantize group: map [-absmax, absmax] → [0, 15], center at 8
+        // Quantize group: map [-absmax, absmax] → [0, 15], centered at 7.5.
         let indices: Vec<u8> = group
             .iter()
             .map(|&w| (w / scale + U4_MAX / 2.0).round().clamp(0.0, U4_MAX) as u8)
@@ -176,8 +199,8 @@ pub fn quantize_int4_grouped(
 
 /// Dequantize an [`Int8Tensor`] back to f32.
 ///
-/// For symmetric tensors (`zero_point == 0`) the signed value is used directly.
-/// For asymmetric tensors (`zero_point != 0`) the bit pattern is reinterpreted
+/// For symmetric tensors (`symmetric == true`) the signed value is used directly.
+/// For asymmetric tensors (`symmetric == false`) the bit pattern is reinterpreted
 /// as unsigned (`q as u8 as i32`) before the zero-point shift is applied.
 pub fn dequantize_int8(tensor: &Int8Tensor) -> Vec<f32> {
     tensor
@@ -197,23 +220,48 @@ pub fn dequantize_int8(tensor: &Int8Tensor) -> Vec<f32> {
 
 /// Dequantize an [`Int4Tensor`] back to f32.
 pub fn dequantize_int4(tensor: &Int4Tensor) -> Vec<f32> {
-    let mut out = Vec::with_capacity(tensor.shape.iter().product());
+    if tensor.group_size == 0 {
+        return Vec::new();
+    }
+
+    let Some(element_count) = tensor
+        .shape
+        .iter()
+        .try_fold(1_usize, |elements, dimension| {
+            elements.checked_mul(*dimension)
+        })
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(element_count);
     let center = U4_MAX / 2.0;
+    let bytes_per_group = tensor.group_size.div_ceil(2);
 
     for (group_idx, scale) in tensor.scales.iter().enumerate() {
+        let value_start = group_idx.saturating_mul(tensor.group_size);
+        if value_start >= element_count {
+            break;
+        }
+        let values_in_group = tensor.group_size.min(element_count - value_start);
         let scale_f32 = scale.to_f32();
-        let byte_start = group_idx * tensor.group_size / 2;
-        let byte_end = (byte_start + tensor.group_size / 2).min(tensor.packed.len());
+        let byte_start = group_idx.saturating_mul(bytes_per_group);
+        let byte_end = byte_start
+            .saturating_add(values_in_group.div_ceil(2))
+            .min(tensor.packed.len());
+        if byte_start >= byte_end {
+            break;
+        }
 
-        for &byte in &tensor.packed[byte_start..byte_end] {
+        for (byte_index, &byte) in tensor.packed[byte_start..byte_end].iter().enumerate() {
             let lo = (byte & 0xF) as f32;
             let hi = ((byte >> 4) & 0xF) as f32;
             out.push((lo - center) * scale_f32);
-            out.push((hi - center) * scale_f32);
+            if byte_index * 2 + 1 < values_in_group {
+                out.push((hi - center) * scale_f32);
+            }
         }
     }
 
-    out.truncate(tensor.shape.iter().product());
     out
 }
 
@@ -295,6 +343,39 @@ mod tests {
         assert_eq!(t.packed.len(), 128);
         // 256 / 128 = 2 groups → 2 scales
         assert_eq!(t.scales.len(), 2);
+    }
+
+    #[test]
+    fn int4_grouped_roundtrip_supports_odd_group_sizes() {
+        let weights: Vec<f32> = (0..15).map(|i| (i as f32 - 7.0) / 7.0).collect();
+        let tensor = quantize_int4_grouped(&weights, &[15], 3).unwrap();
+        let QuantizedTensor::Int4(ref tensor) = tensor else {
+            panic!()
+        };
+
+        let recovered = dequantize_int4(tensor);
+
+        assert_eq!(recovered.len(), weights.len());
+        assert!(max_abs_error(&weights, &recovered) < TOLERANCE_INT4);
+    }
+
+    #[test]
+    fn int4_grouped_rejects_shape_mismatch() {
+        let weights = vec![1.0_f32; 8];
+
+        assert!(quantize_int4_grouped(&weights, &[2, 5], 4).is_err());
+    }
+
+    #[test]
+    fn int8_asymmetric_empty_input_is_stable() {
+        let tensor = quantize_int8_asymmetric(&[], &[0]);
+        let QuantizedTensor::Int8(tensor) = tensor else {
+            panic!()
+        };
+
+        assert!(tensor.weight.is_empty());
+        assert_eq!(tensor.scale, 1.0);
+        assert_eq!(tensor.zero_point, 0);
     }
 
     #[test]
