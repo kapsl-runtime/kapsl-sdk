@@ -1,3 +1,5 @@
+//! Prometheus collector definitions and snapshot-to-metric mappings.
+
 use prometheus::{
     GaugeVec, HistogramOpts, HistogramVec, IntCounterVec, IntGaugeVec, Opts, Registry,
 };
@@ -332,6 +334,8 @@ impl ManagedVllmMetrics {
     }
 }
 
+/// Shared Prometheus collectors used by model, scheduler, memory, and backend
+/// monitoring paths.
 #[derive(Debug, Clone)]
 pub struct KapslMetrics {
     pub registry: Arc<Registry>,
@@ -394,6 +398,11 @@ pub struct KapslMetrics {
 }
 
 impl KapslMetrics {
+    /// Create and register all Kapsl collectors in `registry`.
+    ///
+    /// Call this once per registry and clone the returned facade for each
+    /// consumer. Registering the same metric names twice is rejected by
+    /// Prometheus.
     pub fn new(registry: &Arc<Registry>) -> Self {
         let inference_latency = HistogramVec::new(
             HistogramOpts::new(
@@ -973,61 +982,61 @@ impl KapslMetrics {
     pub fn set_engine_metrics(&self, model: &str, metrics: &kapsl_engine_api::EngineMetrics) {
         self.kv_cache_bytes_used
             .with_label_values(&[model])
-            .set(metrics.kv_cache_bytes_used as i64);
+            .set(prometheus_i64(metrics.kv_cache_bytes_used));
         self.kv_cache_bytes_capacity
             .with_label_values(&[model])
-            .set(metrics.kv_cache_bytes_capacity as i64);
+            .set(prometheus_i64(metrics.kv_cache_bytes_capacity));
         self.kv_cache_blocks_total
             .with_label_values(&[model])
-            .set(metrics.kv_cache_blocks_total as i64);
+            .set(prometheus_i64(metrics.kv_cache_blocks_total));
         self.kv_cache_blocks_free
             .with_label_values(&[model])
-            .set(metrics.kv_cache_blocks_free as i64);
+            .set(prometheus_i64(metrics.kv_cache_blocks_free));
         self.kv_cache_sequences
             .with_label_values(&[model])
-            .set(metrics.kv_cache_sequences as i64);
+            .set(prometheus_i64(metrics.kv_cache_sequences));
         self.kv_cache_evicted_blocks
             .with_label_values(&[model])
-            .set(metrics.kv_cache_evicted_blocks as i64);
+            .set(prometheus_i64(metrics.kv_cache_evicted_blocks));
         self.kv_cache_evicted_sequences
             .with_label_values(&[model])
-            .set(metrics.kv_cache_evicted_sequences as i64);
+            .set(prometheus_i64(metrics.kv_cache_evicted_sequences));
         self.kv_cache_packed_layers
             .with_label_values(&[model])
-            .set(metrics.kv_cache_packed_layers as i64);
+            .set(prometheus_i64(metrics.kv_cache_packed_layers));
         self.kv_cache_cpu_offloaded_blocks
             .with_label_values(&[model])
-            .set(metrics.kv_cache_cpu_offloaded_blocks as i64);
+            .set(prometheus_i64(metrics.kv_cache_cpu_offloaded_blocks));
         self.prompt_tokens_total
             .with_label_values(&[model])
-            .set(metrics.prompt_tokens_total as i64);
+            .set(prometheus_i64(metrics.prompt_tokens_total));
         self.generated_tokens_total
             .with_label_values(&[model])
-            .set(metrics.generated_tokens_total as i64);
+            .set(prometheus_i64(metrics.generated_tokens_total));
         self.decode_steps_total
             .with_label_values(&[model])
-            .set(metrics.decode_steps_total as i64);
+            .set(prometheus_i64(metrics.decode_steps_total));
         self.decode_tokens_evaluated_total
             .with_label_values(&[model])
-            .set(metrics.decode_tokens_evaluated_total as i64);
+            .set(prometheus_i64(metrics.decode_tokens_evaluated_total));
         self.kv_partial_reuse_hits_total
             .with_label_values(&[model])
-            .set(metrics.kv_partial_reuse_hits_total as i64);
+            .set(prometheus_i64(metrics.kv_partial_reuse_hits_total));
         self.kv_partial_reuse_tokens_saved_total
             .with_label_values(&[model])
-            .set(metrics.kv_partial_reuse_tokens_saved_total as i64);
+            .set(prometheus_i64(metrics.kv_partial_reuse_tokens_saved_total));
         self.engine_health
             .with_label_values(&[model])
-            .set(metrics.engine_health as i64);
+            .set(prometheus_i64(metrics.engine_health));
         self.onnx_session_pool_total
             .with_label_values(&[model])
-            .set(metrics.onnx_session_pool_total as i64);
+            .set(prometheus_i64(metrics.onnx_session_pool_total));
         self.onnx_session_pool_idle
             .with_label_values(&[model])
-            .set(metrics.onnx_session_pool_idle as i64);
+            .set(prometheus_i64(metrics.onnx_session_pool_idle));
         self.onnx_session_pool_waits_total
             .with_label_values(&[model])
-            .set(metrics.onnx_session_pool_waits_total as i64);
+            .set(prometheus_i64(metrics.onnx_session_pool_waits_total));
         self.onnx_session_pool_wait_seconds_total
             .with_label_values(&[model])
             .set(metrics.onnx_session_pool_wait_seconds_total);
@@ -1152,8 +1161,11 @@ impl KapslMetrics {
     }
 }
 
-fn prometheus_i64(value: u64) -> i64 {
-    i64::try_from(value).unwrap_or(i64::MAX)
+fn prometheus_i64<T>(value: T) -> i64
+where
+    T: TryInto<i64>,
+{
+    value.try_into().unwrap_or(i64::MAX)
 }
 
 fn normalize_fragmentation(value: f64) -> f64 {

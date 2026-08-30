@@ -1,12 +1,16 @@
+//! Instrumentation middleware for the [`Engine`] interface.
+
 use async_trait::async_trait;
 use futures::Stream;
 use kapsl_engine_api::Engine;
 use kapsl_engine_api::{
-    BatchingPolicy, BinaryTensorPacket, EngineError, EngineModelInfo, InferenceRequest,
-    KvBackendCapabilities, KvTopology, MemoryReport, OpenAiWireRequest, OpenAiWireResponse,
-    OpenAiWireStreamResponse, RequestMemoryAdmission,
+    BatchingPolicy, BinaryTensorPacket, EngineError, EngineMetrics, EngineModelInfo,
+    ExternalDeviceMemoryReport, InferenceRequest, KvBackendCapabilities, KvTopology, MemoryReport,
+    OpenAiWireRequest, OpenAiWireResponse, OpenAiWireStreamResponse, RequestMemoryAdmission,
 };
+use prometheus::Registry;
 use std::collections::VecDeque;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -15,24 +19,129 @@ use std::time::Instant;
 
 use crate::metrics::KapslMetrics;
 
+/// Wraps an engine and records request counts, latency, TTFT, dispatch size,
+/// active requests, and observed peak concurrency.
 pub struct MonitoringMiddleware<E: Engine> {
     inner: E,
+    observation: Arc<ObservationContext>,
+}
+
+struct ObservationContext {
     metrics: KapslMetrics,
     model_id: String,
     version: String,
-    auto_tune: Arc<ConcurrencyAutoTuneState>,
+    auto_tune: ConcurrencyAutoTuneState,
+}
+
+impl ObservationContext {
+    fn new(metrics: KapslMetrics, model_id: String, version: String) -> Self {
+        Self {
+            metrics,
+            model_id,
+            version,
+            auto_tune: ConcurrencyAutoTuneState::new(),
+        }
+    }
+}
+
+/// One balanced request observation.
+///
+/// Dropping an unfinished observation records an error. This makes active
+/// gauges and concurrency sampling cancellation-safe for async operations.
+struct RequestObservation {
+    context: Arc<ObservationContext>,
+    start: Instant,
+    request_count: usize,
+    finished: bool,
+}
+
+impl RequestObservation {
+    fn start(context: Arc<ObservationContext>, request_count: usize) -> Self {
+        debug_assert!(request_count > 0);
+        for _ in 0..request_count {
+            context
+                .metrics
+                .active_inferences
+                .with_label_values(&[context.model_id.as_str()])
+                .inc();
+            context.auto_tune.on_request_start();
+        }
+        Self {
+            context,
+            start: Instant::now(),
+            request_count,
+            finished: false,
+        }
+    }
+
+    fn observe_first_item(&self, succeeded: bool) {
+        debug_assert_eq!(self.request_count, 1);
+        let status = metric_status(succeeded);
+        let ttft = self.start.elapsed().as_secs_f64();
+        self.context
+            .metrics
+            .ttft_latency
+            .with_label_values(&[
+                self.context.model_id.as_str(),
+                self.context.version.as_str(),
+                status,
+            ])
+            .observe(ttft);
+        self.context
+            .metrics
+            .model_ttft_ms
+            .with_label_values(&[self.context.model_id.as_str()])
+            .set(ttft * 1000.0);
+    }
+
+    fn finish(&mut self, succeeded: bool) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+
+        let status = metric_status(succeeded);
+        let elapsed = self.start.elapsed().as_secs_f64();
+        for _ in 0..self.request_count {
+            self.context
+                .metrics
+                .inference_count
+                .with_label_values(&[self.context.model_id.as_str(), status])
+                .inc();
+            self.context
+                .metrics
+                .inference_latency
+                .with_label_values(&[
+                    self.context.model_id.as_str(),
+                    self.context.version.as_str(),
+                    status,
+                ])
+                .observe(elapsed);
+            self.context
+                .metrics
+                .active_inferences
+                .with_label_values(&[self.context.model_id.as_str()])
+                .dec();
+            self.context.auto_tune.on_request_end();
+        }
+    }
+}
+
+impl Drop for RequestObservation {
+    fn drop(&mut self) {
+        self.finish(false);
+    }
+}
+
+fn metric_status(succeeded: bool) -> &'static str {
+    if succeeded { "ok" } else { "err" }
 }
 
 struct MetricStream<T> {
     inner: Pin<Box<dyn Stream<Item = Result<T, EngineError>> + Send>>,
-    metrics: KapslMetrics,
-    model_id: String,
-    version: String,
-    start: Instant,
-    finished: bool,
+    observation: RequestObservation,
     saw_error: bool,
     first_token_seen: bool,
-    auto_tune: Arc<ConcurrencyAutoTuneState>,
 }
 
 const PEAK_CONCURRENCY_WINDOW_ENV: &str = "KAPSL_PEAK_CONCURRENCY_WINDOW";
@@ -61,10 +170,18 @@ impl ConcurrencyAutoTuneState {
             .and_then(|v| v.trim().parse::<u64>().ok())
             .unwrap_or(DEFAULT_PEAK_CONCURRENCY_SAMPLE_STRIDE)
             .max(1);
+        Self::with_config(window, sample_stride)
+    }
+
+    fn with_config(window: usize, sample_stride: u64) -> Self {
+        let window = window.max(1);
+        let sample_stride = sample_stride.max(1);
         Self {
             in_flight: AtomicUsize::new(0),
             sample_counter: AtomicU64::new(0),
-            samples: Mutex::new(VecDeque::with_capacity(window)),
+            samples: Mutex::new(VecDeque::with_capacity(
+                window.min(DEFAULT_PEAK_CONCURRENCY_WINDOW),
+            )),
             window,
             sample_stride,
         }
@@ -92,7 +209,12 @@ impl ConcurrencyAutoTuneState {
     }
 
     fn on_request_end(&self) {
-        let _ = self.in_flight.fetch_sub(1, Ordering::Relaxed);
+        let previous =
+            self.in_flight
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |active| {
+                    active.checked_sub(1)
+                });
+        debug_assert!(previous.is_ok(), "request concurrency accounting underflow");
     }
 
     fn estimated_peak_concurrency(&self) -> Option<u32> {
@@ -107,7 +229,11 @@ impl ConcurrencyAutoTuneState {
             samples.iter().copied().collect()
         };
         values.sort_unstable();
-        let idx = ((values.len() - 1) * 95) / 100;
+        let idx = values
+            .len()
+            .saturating_mul(95)
+            .div_ceil(100)
+            .saturating_sub(1);
         Some(values[idx].max(1))
     }
 }
@@ -115,48 +241,18 @@ impl ConcurrencyAutoTuneState {
 impl<T> MetricStream<T> {
     fn new(
         inner: Pin<Box<dyn Stream<Item = Result<T, EngineError>> + Send>>,
-        metrics: KapslMetrics,
-        model_id: String,
-        version: String,
-        start: Instant,
-        auto_tune: Arc<ConcurrencyAutoTuneState>,
+        observation: RequestObservation,
     ) -> Self {
         Self {
             inner,
-            metrics,
-            model_id,
-            version,
-            start,
-            finished: false,
+            observation,
             saw_error: false,
             first_token_seen: false,
-            auto_tune,
         }
     }
 
     fn finish(&mut self) {
-        if self.finished {
-            return;
-        }
-
-        let status = if self.saw_error { "err" } else { "ok" };
-        let elapsed = self.start.elapsed().as_secs_f64();
-
-        self.metrics
-            .inference_count
-            .with_label_values(&[self.model_id.as_str(), status])
-            .inc();
-        self.metrics
-            .inference_latency
-            .with_label_values(&[self.model_id.as_str(), self.version.as_str(), status])
-            .observe(elapsed);
-        self.metrics
-            .active_inferences
-            .with_label_values(&[self.model_id.as_str()])
-            .dec();
-        self.auto_tune.on_request_end();
-
-        self.finished = true;
+        self.observation.finish(!self.saw_error);
     }
 }
 
@@ -169,30 +265,14 @@ impl<T> Stream for MetricStream<T> {
             Poll::Ready(Some(Ok(item))) => {
                 if !this.first_token_seen {
                     this.first_token_seen = true;
-                    let ttft = this.start.elapsed().as_secs_f64();
-                    this.metrics
-                        .ttft_latency
-                        .with_label_values(&[this.model_id.as_str(), this.version.as_str(), "ok"])
-                        .observe(ttft);
-                    this.metrics
-                        .model_ttft_ms
-                        .with_label_values(&[this.model_id.as_str()])
-                        .set(ttft * 1000.0);
+                    this.observation.observe_first_item(true);
                 }
                 Poll::Ready(Some(Ok(item)))
             }
             Poll::Ready(Some(Err(err))) => {
                 if !this.first_token_seen {
                     this.first_token_seen = true;
-                    let ttft = this.start.elapsed().as_secs_f64();
-                    this.metrics
-                        .ttft_latency
-                        .with_label_values(&[this.model_id.as_str(), this.version.as_str(), "err"])
-                        .observe(ttft);
-                    this.metrics
-                        .model_ttft_ms
-                        .with_label_values(&[this.model_id.as_str()])
-                        .set(ttft * 1000.0);
+                    this.observation.observe_first_item(false);
                 }
                 this.saw_error = true;
                 Poll::Ready(Some(Err(err)))
@@ -206,31 +286,16 @@ impl<T> Stream for MetricStream<T> {
     }
 }
 
-impl<T> Drop for MetricStream<T> {
-    fn drop(&mut self) {
-        if !self.finished {
-            self.saw_error = true;
-            self.finish();
-        }
-    }
-}
-
 impl<E: Engine> MonitoringMiddleware<E> {
-    pub fn new(
-        inner: E,
-        model_id: String,
-        version: String,
-        registry: &std::sync::Arc<prometheus::Registry>,
-    ) -> Self {
-        Self {
-            inner,
-            metrics: KapslMetrics::new(registry),
-            model_id,
-            version,
-            auto_tune: Arc::new(ConcurrencyAutoTuneState::new()),
-        }
+    /// Construct a middleware with a newly registered metrics facade.
+    ///
+    /// Prefer [`Self::new_with_metrics`] when several engines share one
+    /// Prometheus registry.
+    pub fn new(inner: E, model_id: String, version: String, registry: &Arc<Registry>) -> Self {
+        Self::new_with_metrics(inner, model_id, version, KapslMetrics::new(registry))
     }
 
+    /// Construct a middleware using an existing shared metrics facade.
     pub fn new_with_metrics(
         inner: E,
         model_id: String,
@@ -239,15 +304,13 @@ impl<E: Engine> MonitoringMiddleware<E> {
     ) -> Self {
         Self {
             inner,
-            metrics,
-            model_id,
-            version,
-            auto_tune: Arc::new(ConcurrencyAutoTuneState::new()),
+            observation: Arc::new(ObservationContext::new(metrics, model_id, version)),
         }
     }
 
-    pub fn registry(&self) -> &std::sync::Arc<prometheus::Registry> {
-        &self.metrics.registry
+    /// Return the Prometheus registry backing this middleware.
+    pub fn registry(&self) -> &Arc<Registry> {
+        &self.observation.metrics.registry
     }
 
     /// Record scheduler dispatch cardinality, not the tensor's leading
@@ -255,46 +318,25 @@ impl<E: Engine> MonitoringMiddleware<E> {
     /// byte count or a PCM sample count rather than a model batch axis.
     fn observe_dispatch_size(&self, request_count: usize) {
         debug_assert!(request_count > 0);
-        self.metrics
+        self.observation
+            .metrics
             .batch_size_hist
-            .with_label_values(&[self.model_id.as_str()])
+            .with_label_values(&[self.observation.model_id.as_str()])
             .observe(request_count as f64);
     }
 
-    fn begin_wire_observation(&self) -> Instant {
-        self.metrics
-            .active_inferences
-            .with_label_values(&[self.model_id.as_str()])
-            .inc();
-        self.auto_tune.on_request_start();
-        self.observe_dispatch_size(1);
-        Instant::now()
-    }
-
-    fn finish_wire_observation(&self, start: Instant, succeeded: bool) {
-        let status = if succeeded { "ok" } else { "err" };
-        self.metrics
-            .inference_count
-            .with_label_values(&[self.model_id.as_str(), status])
-            .inc();
-        self.metrics
-            .inference_latency
-            .with_label_values(&[self.model_id.as_str(), self.version.as_str(), status])
-            .observe(start.elapsed().as_secs_f64());
-        self.metrics
-            .active_inferences
-            .with_label_values(&[self.model_id.as_str()])
-            .dec();
-        self.auto_tune.on_request_end();
+    fn begin_request_observation(&self, request_count: usize) -> RequestObservation {
+        RequestObservation::start(self.observation.clone(), request_count)
     }
 
     async fn observe_wire_unary<F>(&self, operation: F) -> Result<OpenAiWireResponse, EngineError>
     where
         F: std::future::Future<Output = Result<OpenAiWireResponse, EngineError>>,
     {
-        let start = self.begin_wire_observation();
+        self.observe_dispatch_size(1);
+        let mut observation = self.begin_request_observation(1);
         let result = operation.await;
-        self.finish_wire_observation(start, result.is_ok());
+        observation.finish(result.is_ok());
         result
     }
 
@@ -305,21 +347,15 @@ impl<E: Engine> MonitoringMiddleware<E> {
     where
         F: std::future::Future<Output = Result<OpenAiWireStreamResponse, EngineError>>,
     {
-        let start = self.begin_wire_observation();
+        self.observe_dispatch_size(1);
+        let mut observation = self.begin_request_observation(1);
         match operation.await {
             Ok(response) => Ok(OpenAiWireStreamResponse {
                 head: response.head,
-                body: Box::pin(MetricStream::new(
-                    response.body,
-                    self.metrics.clone(),
-                    self.model_id.clone(),
-                    self.version.clone(),
-                    start,
-                    self.auto_tune.clone(),
-                )),
+                body: Box::pin(MetricStream::new(response.body, observation)),
             }),
             Err(error) => {
-                self.finish_wire_observation(start, false);
+                observation.finish(false);
                 Err(error)
             }
         }
@@ -336,81 +372,38 @@ impl<E: Engine> Engine for MonitoringMiddleware<E> {
         self.inner.kv_topology()
     }
 
-    fn planned_memory(
-        &self,
-        model_path: &std::path::Path,
-    ) -> Result<kapsl_engine_api::MemoryReport, EngineError> {
+    fn planned_memory(&self, model_path: &Path) -> Result<MemoryReport, EngineError> {
         self.inner.planned_memory(model_path)
     }
 
     fn planned_external_device_memory(
         &self,
-        model_path: &std::path::Path,
-    ) -> Result<kapsl_engine_api::ExternalDeviceMemoryReport, EngineError> {
+        model_path: &Path,
+    ) -> Result<ExternalDeviceMemoryReport, EngineError> {
         self.inner.planned_external_device_memory(model_path)
     }
 
-    async fn load(&mut self, model_path: &std::path::Path) -> Result<(), EngineError> {
+    async fn load(&mut self, model_path: &Path) -> Result<(), EngineError> {
         self.inner.load(model_path).await
     }
 
-    fn actual_external_device_memory(&self) -> kapsl_engine_api::ExternalDeviceMemoryReport {
+    fn actual_external_device_memory(&self) -> ExternalDeviceMemoryReport {
         self.inner.actual_external_device_memory()
     }
 
-    fn actual_memory(&self) -> kapsl_engine_api::MemoryReport {
+    fn actual_memory(&self) -> MemoryReport {
         self.inner.actual_memory()
     }
 
-    fn planned_request_memory(&self, request: &InferenceRequest) -> kapsl_engine_api::MemoryReport {
+    fn planned_request_memory(&self, request: &InferenceRequest) -> MemoryReport {
         self.inner.planned_request_memory(request)
     }
 
     fn infer(&self, request: &InferenceRequest) -> Result<BinaryTensorPacket, EngineError> {
-        let start_active = Instant::now();
-        self.metrics
-            .active_inferences
-            .with_label_values(&[self.model_id.as_str()])
-            .inc();
-        self.auto_tune.on_request_start();
-
         self.observe_dispatch_size(1);
-
-        let start = Instant::now();
+        let mut observation = self.begin_request_observation(1);
         let result = self.inner.infer(request);
-        let elapsed = start.elapsed().as_secs_f64();
-
-        match &result {
-            Ok(_) => {
-                self.metrics
-                    .inference_count
-                    .with_label_values(&[self.model_id.as_str(), "ok"])
-                    .inc();
-                self.metrics
-                    .inference_latency
-                    .with_label_values(&[self.model_id.as_str(), self.version.as_str(), "ok"])
-                    .observe(elapsed);
-            }
-            Err(_) => {
-                self.metrics
-                    .inference_count
-                    .with_label_values(&[self.model_id.as_str(), "err"])
-                    .inc();
-                self.metrics
-                    .inference_latency
-                    .with_label_values(&[self.model_id.as_str(), self.version.as_str(), "err"])
-                    .observe(elapsed);
-            }
-        }
-
-        let _active_elapsed = start_active.elapsed().as_secs_f64();
-
-        self.metrics
-            .active_inferences
-            .with_label_values(&[self.model_id.as_str()])
-            .dec();
-        self.auto_tune.on_request_end();
-
+        observation.finish(result.is_ok());
         result
     }
 
@@ -470,36 +463,11 @@ impl<E: Engine> Engine for MonitoringMiddleware<E> {
             return self.inner.infer_batch(requests);
         }
 
-        let model_id = self.model_id.as_str();
         self.observe_dispatch_size(requests.len());
-        for _ in requests {
-            self.metrics
-                .active_inferences
-                .with_label_values(&[model_id])
-                .inc();
-            self.auto_tune.on_request_start();
-        }
+        let mut observation = self.begin_request_observation(requests.len());
 
-        let start = Instant::now();
         let result = self.inner.infer_batch(requests);
-        let elapsed = start.elapsed().as_secs_f64();
-
-        let status = if result.is_ok() { "ok" } else { "err" };
-        for _ in requests {
-            self.metrics
-                .inference_count
-                .with_label_values(&[model_id, status])
-                .inc();
-            self.metrics
-                .inference_latency
-                .with_label_values(&[model_id, self.version.as_str(), status])
-                .observe(elapsed);
-            self.metrics
-                .active_inferences
-                .with_label_values(&[model_id])
-                .dec();
-            self.auto_tune.on_request_end();
-        }
+        observation.finish(result.is_ok());
 
         result
     }
@@ -519,26 +487,11 @@ impl<E: Engine> Engine for MonitoringMiddleware<E> {
     fn infer_stream(
         &self,
         request: &InferenceRequest,
-    ) -> std::pin::Pin<
-        Box<dyn futures::stream::Stream<Item = Result<BinaryTensorPacket, EngineError>> + Send>,
-    > {
-        self.metrics
-            .active_inferences
-            .with_label_values(&[self.model_id.as_str()])
-            .inc();
-        self.auto_tune.on_request_start();
+    ) -> Pin<Box<dyn Stream<Item = Result<BinaryTensorPacket, EngineError>> + Send>> {
         self.observe_dispatch_size(1);
-
-        let start = Instant::now();
+        let observation = self.begin_request_observation(1);
         let inner = self.inner.infer_stream(request);
-        let wrapped = MetricStream::new(
-            inner,
-            self.metrics.clone(),
-            self.model_id.clone(),
-            self.version.clone(),
-            start,
-            self.auto_tune.clone(),
-        );
+        let wrapped = MetricStream::new(inner, observation);
 
         Box::pin(wrapped)
     }
@@ -547,13 +500,13 @@ impl<E: Engine> Engine for MonitoringMiddleware<E> {
         self.inner.unload()
     }
 
-    fn metrics(&self) -> kapsl_engine_api::EngineMetrics {
+    fn metrics(&self) -> EngineMetrics {
         self.inner.metrics()
     }
 
     fn model_info(&self) -> Option<EngineModelInfo> {
         let mut info = self.inner.model_info()?;
-        if let Some(observed_p95) = self.auto_tune.estimated_peak_concurrency() {
+        if let Some(observed_p95) = self.observation.auto_tune.estimated_peak_concurrency() {
             info.peak_concurrency = Some(info.peak_concurrency.unwrap_or(1).max(observed_p95));
         }
         Some(info)
@@ -571,7 +524,7 @@ impl<E: Engine> Engine for MonitoringMiddleware<E> {
         self.inner.is_staged()
     }
 
-    async fn stage(&self, path: &std::path::Path) -> Result<(), EngineError> {
+    async fn stage(&self, path: &Path) -> Result<(), EngineError> {
         self.inner.stage(path).await
     }
 
@@ -604,6 +557,20 @@ mod tests {
             .encode(&registry.gather(), &mut output)
             .expect("encode metrics");
         String::from_utf8(output).expect("metrics are UTF-8")
+    }
+
+    #[test]
+    fn concurrency_auto_tuning_uses_nearest_rank_p95() {
+        let state = ConcurrencyAutoTuneState::with_config(8, 1);
+
+        state.on_request_start();
+        state.on_request_start();
+
+        assert_eq!(state.estimated_peak_concurrency(), Some(2));
+
+        state.on_request_end();
+        state.on_request_end();
+        assert_eq!(state.in_flight.load(Ordering::Relaxed), 0);
     }
 
     #[async_trait]
@@ -710,8 +677,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_monitoring_middleware() {
+    #[test]
+    fn infer_delegates_successfully() {
         let engine = MockEngine;
         let registry = std::sync::Arc::new(prometheus::Registry::new());
         let middleware = MonitoringMiddleware::new(
@@ -776,6 +743,59 @@ mod tests {
         let text = metrics_text(&registry);
         assert!(text.contains("kapsl_inference_total"));
         assert!(text.contains("model=\"wire\""));
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_wire_future_balances_request_metrics() {
+        let registry = std::sync::Arc::new(prometheus::Registry::new());
+        let middleware = MonitoringMiddleware::new(
+            MockEngine,
+            "cancelled-wire".to_string(),
+            "v1".to_string(),
+            &registry,
+        );
+
+        {
+            let future = middleware.observe_wire_unary(futures::future::pending());
+            tokio::pin!(future);
+            assert!(futures::poll!(future.as_mut()).is_pending());
+            assert_eq!(
+                middleware
+                    .observation
+                    .metrics
+                    .active_inferences
+                    .with_label_values(&["cancelled-wire"])
+                    .get(),
+                1
+            );
+        }
+
+        assert_eq!(
+            middleware
+                .observation
+                .metrics
+                .active_inferences
+                .with_label_values(&["cancelled-wire"])
+                .get(),
+            0
+        );
+        assert_eq!(
+            middleware
+                .observation
+                .metrics
+                .inference_count
+                .with_label_values(&["cancelled-wire", "err"])
+                .get(),
+            1
+        );
+        assert_eq!(
+            middleware
+                .observation
+                .auto_tune
+                .in_flight
+                .load(Ordering::Relaxed),
+            0
+        );
     }
 
     #[test]
@@ -862,7 +882,3 @@ mod tests {
         assert!(metrics.contains(r#"kapsl_batch_size_count{model="streaming-audio"} 1"#));
     }
 }
-
-#[cfg(test)]
-#[path = "middleware_tests.rs"]
-mod middleware_tests;
