@@ -2081,11 +2081,8 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "half",
- "log",
  "safetensors 0.3.3",
  "serde",
- "serde_json",
- "thiserror 1.0.69",
  "turboquant-rs",
 ]
 
