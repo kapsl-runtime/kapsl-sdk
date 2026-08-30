@@ -1,3 +1,5 @@
+//! Tests for model hardware requirements.
+
 #[cfg(test)]
 mod tests {
     use super::super::HardwareRequirements;

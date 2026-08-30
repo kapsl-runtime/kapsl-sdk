@@ -1,3 +1,5 @@
+//! Tests for package and raw-model loading.
+
 #[cfg(test)]
 mod tests {
     use super::super::{LoaderError, Manifest, PackageLoader};

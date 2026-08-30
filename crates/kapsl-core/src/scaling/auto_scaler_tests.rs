@@ -1,3 +1,5 @@
+//! Tests for runtime model autoscaling.
+
 #[cfg(test)]
 mod tests {
     use super::super::*;
