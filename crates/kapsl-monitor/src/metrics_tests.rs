@@ -186,3 +186,62 @@ fn pool_metric_values_are_safe_for_prometheus_gauges() {
     let text = gather_text(&registry);
     assert!(text.contains(r#"kapsl_gpu_device_pool_fragmentation_ratio{device="9"} 0"#));
 }
+
+#[test]
+fn managed_vllm_metrics_export_memory_lifecycle_and_bridge_stages() {
+    let registry = Arc::new(Registry::new());
+    let metrics = KapslMetrics::new(&registry);
+    let memory = &["qwen", "2", "0"];
+    metrics
+        .managed_vllm
+        .kv_granted_bytes
+        .with_label_values(memory)
+        .set(4096);
+    metrics
+        .managed_vllm
+        .kv_blocks_active
+        .with_label_values(memory)
+        .set(3);
+    metrics
+        .managed_vllm
+        .provisional_reservation_state
+        .with_label_values(&["qwen", "2", "active"])
+        .set(1);
+    metrics
+        .managed_vllm
+        .bridge_stage_seconds
+        .with_label_values(&["qwen", "2", "wire", "scheduler_queue"])
+        .observe(0.002);
+    metrics
+        .managed_vllm
+        .bridge_relayed_bytes_total
+        .with_label_values(&["qwen", "2", "wire"])
+        .inc_by(512);
+    metrics
+        .managed_vllm
+        .bridge_connection_attempts_total
+        .with_label_values(&["qwen", "2", "async"])
+        .inc();
+
+    let text = gather_text(&registry);
+    assert!(text.contains(
+        r#"kapsl_managed_vllm_kv_granted_bytes{device="0",model="qwen",replica="2"} 4096"#
+    ));
+    assert!(
+        text.contains(
+            r#"kapsl_managed_vllm_kv_blocks_active{device="0",model="qwen",replica="2"} 3"#
+        )
+    );
+    assert!(text.contains(
+        r#"kapsl_managed_vllm_provisional_reservation_state{model="qwen",replica="2",state="active"} 1"#
+    ));
+    assert!(text.contains(
+        r#"kapsl_managed_vllm_bridge_stage_seconds_count{mode="wire",model="qwen",replica="2",stage="scheduler_queue"} 1"#
+    ));
+    assert!(text.contains(
+        r#"kapsl_managed_vllm_bridge_relayed_bytes_total{mode="wire",model="qwen",replica="2"} 512"#
+    ));
+    assert!(text.contains(
+        r#"kapsl_managed_vllm_bridge_connection_attempts_total{client="async",model="qwen",replica="2"} 1"#
+    ));
+}

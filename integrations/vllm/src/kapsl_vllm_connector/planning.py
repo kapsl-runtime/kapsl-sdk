@@ -502,6 +502,7 @@ class GeometryDescriptor:
 @dataclass(frozen=True, slots=True)
 class SizingPolicy:
     target_concurrency: int
+    maximum_concurrency: int | None = None
     headroom_percent: int = 0
     prefix_blocks: int = 0
     alignment_blocks: int = 1
@@ -511,6 +512,12 @@ class SizingPolicy:
 
     def __post_init__(self) -> None:
         _uint(self.target_concurrency, "target_concurrency")
+        if self.maximum_concurrency is not None:
+            _uint(self.maximum_concurrency, "maximum_concurrency")
+            if self.maximum_concurrency < self.target_concurrency:
+                raise PlanningError(
+                    "maximum_concurrency cannot be below target_concurrency"
+                )
         _uint(self.headroom_percent, "headroom_percent", allow_zero=True)
         if self.headroom_percent > 100:
             raise PlanningError("headroom_percent cannot exceed 100")
@@ -541,6 +548,8 @@ class SizingPolicy:
             value["min_bytes"] = self.min_bytes
         if self.max_bytes is not None:
             value["max_bytes"] = self.max_bytes
+        if self.maximum_concurrency is not None:
+            value["maximum_concurrency"] = self.maximum_concurrency
         return value
 
 
@@ -556,6 +565,8 @@ class RankSizing:
     headroom_blocks: int
     desired_blocks: int
     desired_bytes: int
+    maximum_blocks: int
+    maximum_bytes: int
     effective_target_concurrency: int
     concurrency_reduced: bool
 
@@ -571,6 +582,8 @@ class RankSizing:
             "headroom_blocks": self.headroom_blocks,
             "desired_blocks": self.desired_blocks,
             "desired_bytes": self.desired_bytes,
+            "maximum_blocks": self.maximum_blocks,
+            "maximum_bytes": self.maximum_bytes,
             "effective_target_concurrency": self.effective_target_concurrency,
             "concurrency_reduced": self.concurrency_reduced,
         }
@@ -594,6 +607,14 @@ class PlanningResult:
             raise PlanningError(
                 "the pinned vLLM exact-byte CLI requires the same byte grant on every rank"
             )
+        if len({rank.maximum_blocks for rank in ranks}) != 1 or len(
+            {rank.maximum_bytes for rank in ranks}
+        ) != 1:
+            raise PlanningError(
+                "vLLM tensor-parallel ranks require one virtual maximum"
+            )
+        if any(rank.maximum_blocks < rank.desired_blocks for rank in ranks):
+            raise PlanningError("virtual maximum cannot be below initial capacity")
         object.__setattr__(self, "ranks", ranks)
         _ = self.total_desired_bytes
 
@@ -602,6 +623,13 @@ class PlanningResult:
         total = 0
         for rank in self.ranks:
             total = checked_add(total, rank.desired_bytes, "total_desired_bytes")
+        return total
+
+    @property
+    def total_maximum_bytes(self) -> int:
+        total = 0
+        for rank in self.ranks:
+            total = checked_add(total, rank.maximum_bytes, "total_maximum_bytes")
         return total
 
     def to_dict(self) -> dict[str, Any]:
@@ -615,6 +643,7 @@ class PlanningResult:
             "sizing": {
                 "ranks": [rank.to_dict() for rank in self.ranks],
                 "total_desired_bytes": self.total_desired_bytes,
+                "total_maximum_bytes": self.total_maximum_bytes,
             },
         }
 
@@ -702,6 +731,50 @@ def size_rank(rank: RankGeometry, policy: SizingPolicy) -> RankSizing:
     desired_bytes = checked_mul(
         desired_blocks, rank.pool_bytes_per_block, "desired_bytes"
     )
+    maximum_blocks = desired_blocks
+    if policy.maximum_concurrency is not None:
+        maximum_workload = checked_mul(
+            sequence_blocks, policy.maximum_concurrency, "maximum workload blocks"
+        )
+        maximum_workload = checked_add(
+            maximum_workload, policy.prefix_blocks, "maximum workload blocks"
+        )
+        maximum_headroom = ceil_div(
+            checked_mul(
+                maximum_workload,
+                policy.headroom_percent,
+                "maximum headroom blocks",
+            ),
+            100,
+            "maximum headroom blocks",
+        )
+        maximum_blocks = round_up(
+            checked_add(
+                checked_add(
+                    rank.fixed_overhead_blocks,
+                    maximum_workload,
+                    "maximum blocks",
+                ),
+                maximum_headroom,
+                "maximum blocks",
+            ),
+            policy.alignment_blocks,
+            "maximum blocks",
+        )
+        if policy.max_bytes is not None:
+            maximum_cap = round_down(
+                policy.max_bytes // rank.pool_bytes_per_block,
+                policy.alignment_blocks,
+                "maximum max_bytes blocks",
+            )
+            maximum_blocks = min(maximum_blocks, maximum_cap)
+        if maximum_blocks < desired_blocks:
+            raise PlanningError(
+                "maximum_concurrency capacity cannot fit the initial target after caps"
+            )
+    maximum_bytes = checked_mul(
+        maximum_blocks, rank.pool_bytes_per_block, "maximum_bytes"
+    )
     # Prefix retention and headroom are optional capacity.  A byte cap sheds
     # both before it reduces the number of whole max-length sequences that the
     # pool can hold.  Counting the configured prefix allowance here would let
@@ -730,6 +803,8 @@ def size_rank(rank: RankGeometry, policy: SizingPolicy) -> RankSizing:
         headroom_blocks=headroom_blocks,
         desired_blocks=desired_blocks,
         desired_bytes=desired_bytes,
+        maximum_blocks=maximum_blocks,
+        maximum_bytes=maximum_bytes,
         effective_target_concurrency=effective,
         concurrency_reduced=reduced,
     )
@@ -1218,6 +1293,8 @@ def planner_json_schema() -> dict[str, Any]:
         "headroom_blocks": nonnegative,
         "desired_blocks": positive,
         "desired_bytes": positive,
+        "maximum_blocks": positive,
+        "maximum_bytes": positive,
         "effective_target_concurrency": positive,
         "concurrency_reduced": {"type": "boolean"},
     }
@@ -1380,6 +1457,7 @@ def planner_json_schema() -> dict[str, Any]:
             "strict_concurrency": {"type": "boolean"},
             "min_bytes": positive,
             "max_bytes": positive,
+            "maximum_concurrency": positive,
         },
     }
     return {
@@ -1410,7 +1488,11 @@ def planner_json_schema() -> dict[str, Any]:
             "sizing": {
                 "type": "object",
                 "additionalProperties": False,
-                "required": ["ranks", "total_desired_bytes"],
+                "required": [
+                    "ranks",
+                    "total_desired_bytes",
+                    "total_maximum_bytes",
+                ],
                 "properties": {
                     "ranks": {
                         "type": "array",
@@ -1423,6 +1505,7 @@ def planner_json_schema() -> dict[str, Any]:
                         },
                     },
                     "total_desired_bytes": positive,
+                    "total_maximum_bytes": positive,
                 },
             },
         },

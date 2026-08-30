@@ -505,7 +505,7 @@ fn gguf_shared_kv_block_count(
         .max(n_layers)
 }
 
-#[cfg(feature = "gguf-external-kv")]
+#[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
 fn gguf_external_kv_block_count(
     n_layers: usize,
     config: GgufServingConfig,
@@ -5482,6 +5482,8 @@ impl Engine for GgufBackend {
 
 #[cfg(all(test, feature = "gguf"))]
 mod tests {
+    #[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
+    use super::gguf_external_kv_block_count;
     use super::{
         gguf_cross_session_prefix_cache_opt_in, gguf_shared_kv_topology, highest_priority_index,
         planned_gguf_request_kv_bytes, GgufServingConfig,
@@ -5496,6 +5498,13 @@ mod tests {
     #[cfg(feature = "gguf-external-kv")]
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
+    #[test]
+    fn external_kv_block_counter_is_available_for_every_shared_pool_build() {
+        let counter: fn(usize, GgufServingConfig, usize) -> usize = gguf_external_kv_block_count;
+        std::hint::black_box(counter);
+    }
 
     #[cfg(feature = "gguf-external-kv")]
     unsafe extern "C" fn external_test_reserve(

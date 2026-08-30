@@ -8,7 +8,7 @@ use kapsl_engine_api::{
     EngineModelInfo, EngineStream, InferenceRequest, OpenAiWireFormat, OpenAiWireRequest,
     OpenAiWireResponse, OpenAiWireStream, OpenAiWireStreamResponse,
 };
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
@@ -16,6 +16,15 @@ use tokio::sync::{oneshot, Notify, OwnedSemaphorePermit, Semaphore, TryAcquireEr
 
 use kapsl_hal::device_mesh::DeviceMesh;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+/// Optional scheduler instrumentation hook. Implementations must remain cheap:
+/// observations are emitted synchronously on request dispatch.
+pub trait SchedulerObserver: Send + Sync {
+    fn observe_queue_wait(&self, priority: Priority, operation: &'static str, elapsed: Duration);
+}
+
+pub(crate) type SharedSchedulerObserver = Arc<RwLock<Option<Arc<dyn SchedulerObserver>>>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueueOverflowPolicy {
@@ -320,6 +329,7 @@ pub struct Scheduler {
     router: MeshRouter,
     max_micro_batch: usize,
     queue_overflow_policy: QueueOverflowPolicy,
+    observer: SharedSchedulerObserver,
 }
 
 impl Drop for Scheduler {
@@ -363,12 +373,23 @@ impl Scheduler {
         let mut gpu_low_priority_queues = Vec::with_capacity(total_workers);
         let gpu_in_flight_count = Arc::new(AtomicUsize::new(0));
         let gpu_stream_admission = PriorityAdmission::new(total_workers.max(1) * queue_size.max(1));
+        let observer: SharedSchedulerObserver = Arc::new(RwLock::new(None));
 
         for engine in &engines {
             for _ in 0..workers_per_device {
                 // Create GPU executor channels for this worker
-                let high_queue = WorkQueue::new(queue_size);
-                let low_queue = WorkQueue::new(queue_size);
+                let high_queue = WorkQueue::new_observed(
+                    queue_size,
+                    Priority::LatencyCritical,
+                    "translated",
+                    observer.clone(),
+                );
+                let low_queue = WorkQueue::new_observed(
+                    queue_size,
+                    Priority::Throughput,
+                    "translated",
+                    observer.clone(),
+                );
 
                 gpu_high_priority_queues.push(high_queue.clone());
                 gpu_low_priority_queues.push(low_queue.clone());
@@ -403,7 +424,13 @@ impl Scheduler {
             router,
             max_micro_batch,
             queue_overflow_policy: QueueOverflowPolicy::Block,
+            observer,
         }
+    }
+
+    pub fn with_observer(self, observer: Arc<dyn SchedulerObserver>) -> Self {
+        *self.observer.write() = Some(observer);
+        self
     }
 
     pub fn with_queue_overflow_policy(mut self, policy: QueueOverflowPolicy) -> Self {
@@ -438,6 +465,12 @@ impl Scheduler {
         self.gpu_stream_admission
             .acquire(priority, self.queue_overflow_policy, cancellation)
             .await
+    }
+
+    fn observe_queue_wait(&self, priority: Priority, operation: &'static str, started: Instant) {
+        if let Some(observer) = self.observer.read().as_ref() {
+            observer.observe_queue_wait(priority, operation, started.elapsed());
+        }
     }
 
     /// Get mesh routing statistics
@@ -643,10 +676,20 @@ impl crate::replica_pool::ReplicaScheduler for Scheduler {
         let mut total_onnx_session_pool_idle = 0;
         let mut total_onnx_session_pool_waits = 0;
         let mut total_onnx_session_pool_wait_seconds = 0.0;
+        let mut delegated_capacity = 0usize;
+        let mut has_delegated_capacity = false;
         let count = self.engines.len();
 
         for engine in &self.engines {
             let m = engine.metrics();
+            let batching = engine.batching_policy();
+            if matches!(
+                batching.mode,
+                BatchingMode::Continuous | BatchingMode::Delegated
+            ) {
+                has_delegated_capacity = true;
+                delegated_capacity = delegated_capacity.saturating_add(batching.max_requests);
+            }
             total_memory += m.memory_usage;
             total_gpu_util += m.gpu_utilization;
             total_throughput += m.throughput;
@@ -681,7 +724,11 @@ impl crate::replica_pool::ReplicaScheduler for Scheduler {
                 0.0
             },
             throughput: total_throughput,
-            batch_size: self.max_micro_batch,
+            batch_size: if has_delegated_capacity {
+                delegated_capacity.max(1)
+            } else {
+                self.max_micro_batch
+            },
             queue_depth: cpu_q + gpu_q,
             kv_cache_bytes_used: total_kv_bytes_used,
             kv_cache_bytes_capacity: total_kv_bytes_capacity,
@@ -762,6 +809,7 @@ impl crate::replica_pool::ReplicaScheduler for Scheduler {
             stamp_openai_wire_priority(&mut request, priority);
         }
 
+        let queue_started = Instant::now();
         let (counter, permit) = if force_cpu {
             (self.cpu_active_count.clone(), None)
         } else {
@@ -773,6 +821,7 @@ impl crate::replica_pool::ReplicaScheduler for Scheduler {
                 ),
             )
         };
+        self.observe_queue_wait(priority, "wire", queue_started);
         if request
             .cancellation
             .as_ref()
@@ -831,6 +880,7 @@ impl crate::replica_pool::ReplicaScheduler for Scheduler {
             stamp_openai_wire_priority(&mut request, priority);
         }
 
+        let queue_started = Instant::now();
         let (counter, permit) = if force_cpu {
             (self.cpu_active_count.clone(), None)
         } else {
@@ -842,6 +892,7 @@ impl crate::replica_pool::ReplicaScheduler for Scheduler {
                 ),
             )
         };
+        self.observe_queue_wait(priority, "wire", queue_started);
         if request
             .cancellation
             .as_ref()

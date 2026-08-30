@@ -12,7 +12,7 @@ futures = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 async-trait = "0.1.89"
 base64 = "0.22"
-kapsl-kv-abi = { version = "0.4.0", path = "../kapsl-kv-abi" }
+kapsl-kv-abi = { version = "0.6.0", path = "../kapsl-kv-abi" }
 
 [dev-dependencies]
 bincode = "1.3"

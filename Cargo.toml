@@ -52,7 +52,7 @@ kapsl-llama-cpp-sys-2 = { path = "patches/llama-cpp-sys-2" }
 kapsl-llama-cpp-2 = { path = "patches/llama-cpp-2" }
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/kapsl-runtime/kapsl-sdk"

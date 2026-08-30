@@ -392,6 +392,7 @@ where
         let mut total_memory = 0;
         let mut total_gpu_util = 0.0;
         let mut total_throughput = 0.0;
+        let mut total_batch_size = 0usize;
         let mut total_kv_bytes_used = 0;
         let mut total_kv_bytes_capacity = 0;
         let mut total_kv_blocks_total = 0;
@@ -426,6 +427,7 @@ where
                 total_memory += m.memory_usage;
                 total_gpu_util += m.gpu_utilization;
                 total_throughput += m.throughput;
+                total_batch_size = total_batch_size.saturating_add(m.batch_size);
                 total_kv_bytes_used += m.kv_cache_bytes_used;
                 total_kv_bytes_capacity += m.kv_cache_bytes_capacity;
                 total_kv_blocks_total += m.kv_cache_blocks_total;
@@ -459,6 +461,7 @@ where
                 0.0
             },
             throughput: total_throughput,
+            batch_size: total_batch_size,
             queue_depth: cpu_q + gpu_q,
             kv_cache_bytes_used: total_kv_bytes_used,
             kv_cache_bytes_capacity: total_kv_bytes_capacity,
@@ -1033,6 +1036,26 @@ mod tests {
         for stat in stats {
             assert_eq!(stat.requests_total, 3);
         }
+    }
+
+    #[test]
+    fn pool_metrics_sum_delegated_capacity_across_replicas() {
+        let pool = ReplicaPool::new(PoolStrategy::RoundRobin);
+        for (replica_id, capacity) in [(0, 7), (1, 5)] {
+            pool.add_replica(
+                replica_id,
+                Arc::new(MockScheduler::with_metrics(
+                    (0, 0),
+                    true,
+                    kapsl_engine_api::EngineMetrics {
+                        batch_size: capacity,
+                        ..Default::default()
+                    },
+                )),
+            );
+        }
+
+        assert_eq!(ReplicaScheduler::get_metrics(&pool).batch_size, 12);
     }
 
     #[tokio::test]

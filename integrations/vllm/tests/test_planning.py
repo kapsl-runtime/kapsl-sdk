@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import re
 import tempfile
 import unittest
@@ -17,7 +18,13 @@ from kapsl_vllm_connector.connector import (
     _vllm_capacity_groups,
     _vllm_topology,
 )
-from kapsl_vllm_connector.plan import run
+from kapsl_vllm_connector.plan import (
+    RuntimeGeometryUnavailable,
+    RuntimePlanningRequest,
+    _geometry_from_executor,
+    _RuntimePlannerApis,
+    run,
+)
 from kapsl_vllm_connector.planning import (
     PLANNER_SCHEMA_VERSION,
     UINT64_MAX,
@@ -99,6 +106,7 @@ def _vllm_config(
     pipeline_parallel_size: int = 1,
 ) -> SimpleNamespace:
     return SimpleNamespace(
+        cache_config=SimpleNamespace(kv_cache_layout=None),
         model_config=SimpleNamespace(
             max_model_len=max_model_len,
             enable_sleep_mode=False,
@@ -243,6 +251,256 @@ def _resolved_geometry() -> GeometryDescriptor:
 
 
 class PlanningTests(unittest.TestCase):
+    def test_elastic_sizing_separates_initial_and_virtual_capacity(self) -> None:
+        geometry = _resolved_geometry()
+        result = build_plan(
+            geometry,
+            SizingPolicy(
+                target_concurrency=2,
+                maximum_concurrency=6,
+                headroom_percent=0,
+                alignment_blocks=2,
+            ),
+        )
+        sizing = result.ranks[0]
+        self.assertGreater(sizing.maximum_blocks, sizing.desired_blocks)
+        self.assertEqual(
+            sizing.maximum_bytes,
+            sizing.maximum_blocks * sizing.bytes_per_block,
+        )
+        self.assertEqual(
+            result.to_dict()["sizing"]["total_maximum_bytes"],
+            sizing.maximum_bytes,
+        )
+
+    def _executor_planner_fixture(
+        self,
+        *,
+        tensor_parallel_size: int = 2,
+        malformed_specs: object | None = None,
+        resolve_error: Exception | None = None,
+    ) -> tuple[
+        RuntimePlanningRequest,
+        _RuntimePlannerApis,
+        dict[str, object],
+    ]:
+        calls: dict[str, object] = {
+            "engine_args": None,
+            "resolved_config": None,
+            "registered": 0,
+            "supported_layouts": 0,
+            "published_layouts": [],
+            "available_memory": None,
+            "shutdown": 0,
+            "initialize": 0,
+            "profile": 0,
+        }
+        resolved = _vllm_config()
+        resolved.parallel_config.tensor_parallel_size = tensor_parallel_size
+        spec = SyntheticSpec(
+            block_size=16,
+            page_size_bytes=1024,
+            maximum_pages=64,
+        )
+        worker_specs = [
+            {
+                "model.layers.0.attn": spec,
+                "model.layers.1.attn": spec,
+            }
+            for _ in range(tensor_parallel_size)
+        ]
+        group = SimpleNamespace(
+            layer_names=list(worker_specs[0]),
+            kv_cache_spec=spec,
+        )
+
+        class FakeEngineArgs:
+            def __init__(self, **kwargs: object) -> None:
+                calls["engine_args"] = kwargs
+
+            def create_engine_config(self) -> SimpleNamespace:
+                calls["resolved_config"] = resolved
+                return resolved
+
+        class FakeExecutor:
+            def __init__(self, config: object) -> None:
+                self.config = config
+
+            def get_kv_cache_specs(self) -> object:
+                return worker_specs if malformed_specs is None else malformed_specs
+
+            def get_supported_kv_cache_layouts(self) -> list[list[str]]:
+                calls["supported_layouts"] = cast(
+                    int, calls["supported_layouts"]
+                ) + 1
+                return [["BHLNC"] for _ in range(tensor_parallel_size)]
+
+            def set_kv_cache_layout(self, layout: str) -> None:
+                cast(list[str], calls["published_layouts"]).append(layout)
+
+            def determine_available_memory(self) -> list[int]:
+                calls["profile"] = cast(int, calls["profile"]) + 1
+                raise AssertionError("planner crossed the memory-profile boundary")
+
+            def initialize_from_config(self, _configs: object) -> None:
+                calls["initialize"] = cast(int, calls["initialize"]) + 1
+                raise AssertionError("planner crossed the physical KV boundary")
+
+            def shutdown(self) -> None:
+                calls["shutdown"] = cast(int, calls["shutdown"]) + 1
+
+        def resolve_layout(
+            config: object,
+            supported: object,
+            specs: object,
+        ) -> SimpleNamespace:
+            self.assertIs(config, resolved)
+            self.assertEqual(
+                supported,
+                [["BHLNC"] for _ in range(tensor_parallel_size)],
+            )
+            self.assertEqual(len(cast(list[object], specs)), 2 * tensor_parallel_size)
+            if resolve_error is not None:
+                raise resolve_error
+            return SimpleNamespace(name="BHLNC")
+
+        def get_groups(
+            config: object, specs: dict[str, object]
+        ) -> list[SimpleNamespace]:
+            self.assertIs(config, resolved)
+            self.assertEqual(set(specs), set(worker_specs[0]))
+            return [group]
+
+        def get_configs(
+            config: object,
+            specs: list[dict[str, object]],
+            available_memory: list[int],
+        ) -> list[SimpleNamespace]:
+            self.assertIs(config, resolved)
+            self.assertIs(specs, worker_specs)
+            # One full sequence consumes 64 shared blocks and vLLM retains one
+            # additional null block. The physical stride is two 1024-byte pages.
+            self.assertEqual(
+                available_memory,
+                [65 * 2048 for _ in range(tensor_parallel_size)],
+            )
+            calls["available_memory"] = list(available_memory)
+            return [
+                SimpleNamespace(
+                    num_blocks=65,
+                    kv_cache_groups=[group],
+                    kv_cache_tensors=[SimpleNamespace(size=65 * 2048)],
+                    kv_cache_layout=None,
+                )
+                for _ in range(tensor_parallel_size)
+            ]
+
+        def register(config: object) -> None:
+            self.assertIs(config, resolved)
+            calls["registered"] = cast(int, calls["registered"]) + 1
+
+        request = RuntimePlanningRequest(
+            model_path=Path("/models/test"),
+            model_fingerprint="sha256:model",
+            max_model_len=1024,
+            tensor_parallel_size=tensor_parallel_size,
+            attention_backend="FLASH_ATTN",
+            device_ids=tuple(range(4, 4 + tensor_parallel_size)),
+        )
+        apis = _RuntimePlannerApis(
+            engine_args_factory=FakeEngineArgs,
+            executor_class_resolver=lambda config: (
+                self.assertIs(config, resolved) or FakeExecutor
+            ),
+            register_all_kvcache_specs=register,
+            resolve_kv_cache_layout=resolve_layout,
+            get_kv_cache_groups=get_groups,
+            get_kv_cache_configs=get_configs,
+            pool_bytes_per_block=lambda groups: (
+                self.assertEqual(groups, [group]) or 2048
+            ),
+            max_memory_usage_bytes_from_groups=lambda config, groups: (
+                self.assertIs(config, resolved)
+                or self.assertEqual(groups, [group])
+                or 64 * 2048
+            ),
+            spec_kind_classifier=_synthetic_spec_classifier,
+        )
+        return request, apis, calls
+
+    def test_executor_planner_stops_before_physical_kv_allocation(self) -> None:
+        request, apis, calls = self._executor_planner_fixture()
+
+        geometry = _geometry_from_executor(request, "0.test", apis)
+
+        self.assertEqual(
+            calls["engine_args"],
+            {
+                "model": str(request.model_path),
+                "max_model_len": 1024,
+                "tensor_parallel_size": 2,
+                "attention_backend": "FLASH_ATTN",
+                "enforce_eager": True,
+                # Geometry planning must not inherit vLLM's card-sized 0.92
+                # default when another admitted replica is already resident.
+                "gpu_memory_utilization": 1e-9,
+            },
+        )
+        self.assertEqual(calls["registered"], 1)
+        self.assertEqual(calls["supported_layouts"], 1)
+        self.assertEqual(calls["published_layouts"], ["BHLNC"])
+        self.assertEqual(calls["shutdown"], 1)
+        self.assertEqual(calls["profile"], 0)
+        self.assertEqual(calls["initialize"], 0)
+        self.assertEqual(geometry.identity.backend_version, "0.test")
+        self.assertEqual(geometry.model_fingerprint, "sha256:model")
+        self.assertEqual(geometry.max_model_len, 1024)
+        self.assertEqual(geometry.tensor_parallel_size, 2)
+        self.assertEqual([rank.device_id for rank in geometry.ranks], [4, 5])
+        self.assertEqual(geometry.layout_id, "BHLNC")
+        self.assertEqual(geometry.ranks[0].pool_bytes_per_block, 2048)
+        self.assertEqual(geometry.ranks[0].required_blocks_per_sequence, 64)
+
+    def test_executor_planner_shuts_down_on_resolved_geometry_failure(self) -> None:
+        request, apis, calls = self._executor_planner_fixture(
+            resolve_error=RuntimeError("layout unavailable")
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "layout unavailable"):
+            _geometry_from_executor(request, "0.test", apis)
+
+        self.assertEqual(calls["shutdown"], 1)
+        self.assertEqual(calls["initialize"], 0)
+
+    def test_elastic_executor_planner_disables_overlapping_batches(self) -> None:
+        request, apis, calls = self._executor_planner_fixture(
+            resolve_error=RuntimeError("stop after engine configuration")
+        )
+        request = replace(request, live_resize=True)
+
+        with self.assertRaisesRegex(RuntimeError, "stop after engine configuration"):
+            _geometry_from_executor(request, "0.test", apis)
+
+        engine_args = cast(dict[str, object], calls["engine_args"])
+        self.assertIs(engine_args["async_scheduling"], False)
+        resolved = cast(SimpleNamespace, calls["resolved_config"])
+        self.assertEqual(resolved.cache_config.kv_cache_layout, "BLNHC")
+        self.assertEqual(calls["shutdown"], 1)
+
+    def test_executor_planner_rejects_incomplete_worker_specs_and_shuts_down(
+        self,
+    ) -> None:
+        request, apis, calls = self._executor_planner_fixture(
+            malformed_specs=[{"only.rank": object()}]
+        )
+
+        with self.assertRaisesRegex(RuntimeGeometryUnavailable, "every tensor"):
+            _geometry_from_executor(request, "0.test", apis)
+
+        self.assertEqual(calls["shutdown"], 1)
+        self.assertEqual(calls["supported_layouts"], 0)
+        self.assertEqual(calls["initialize"], 0)
+
     def test_resolved_hybrid_groups_use_vllm_per_group_requirements(self) -> None:
         geometry = _resolved_geometry()
         rank = geometry.ranks[0]
@@ -1111,6 +1369,76 @@ class PlanningTests(unittest.TestCase):
                 json.loads(provider_error.getvalue())["error"]["kind"],
                 "runtime_geometry_unavailable",
             )
+
+    def test_cli_keeps_runtime_provider_logs_out_of_success_stdout(self) -> None:
+        arguments = [
+            "--model",
+            ".",
+            "--model-fingerprint",
+            "sha256:model",
+            "--max-model-len",
+            "1024",
+        ]
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        def noisy_provider(_request: object) -> GeometryDescriptor:
+            print("vLLM model-loading progress on stdout")
+            return _resolved_geometry()
+
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            status = run(
+                arguments,
+                geometry_provider=noisy_provider,
+                backend_version_provider=lambda: "0.test",
+            )
+
+        self.assertEqual(status, 0)
+        self.assertEqual(json.loads(stdout.getvalue())["status"], "planned")
+        self.assertNotIn("vLLM", stdout.getvalue())
+        self.assertIn("vLLM model-loading progress", stderr.getvalue())
+
+    def test_cli_redirects_provider_writes_through_retained_stdout_fd(self) -> None:
+        arguments = [
+            "--model",
+            ".",
+            "--model-fingerprint",
+            "sha256:model",
+            "--max-model-len",
+            "1024",
+        ]
+        with (
+            tempfile.TemporaryFile(mode="w+") as stdout,
+            tempfile.TemporaryFile(mode="w+") as stderr,
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+        ):
+            retained_stdout = stdout
+
+            def noisy_provider(_request: object) -> GeometryDescriptor:
+                retained_stdout.write("retained logging handler\n")
+                retained_stdout.flush()
+                os.write(retained_stdout.fileno(), b"native stdout write\n")
+                return _resolved_geometry()
+
+            status = run(
+                arguments,
+                geometry_provider=noisy_provider,
+                backend_version_provider=lambda: "0.test",
+            )
+            stdout.flush()
+            stderr.flush()
+            stdout.seek(0)
+            stderr.seek(0)
+            stdout_text = stdout.read()
+            stderr_text = stderr.read()
+
+        self.assertEqual(status, 0)
+        self.assertEqual(json.loads(stdout_text)["status"], "planned")
+        self.assertNotIn("retained logging handler", stdout_text)
+        self.assertNotIn("native stdout write", stdout_text)
+        self.assertIn("retained logging handler", stderr_text)
+        self.assertIn("native stdout write", stderr_text)
 
     def test_cli_structures_malformed_provider_and_backend_failures(self) -> None:
         arguments = [
