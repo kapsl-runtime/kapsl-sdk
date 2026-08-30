@@ -1,3 +1,5 @@
+//! Model package manifests, extraction, caching, and raw-file loading.
+
 use flate2::read::GzDecoder;
 use fs2::available_space;
 use std::collections::HashSet;

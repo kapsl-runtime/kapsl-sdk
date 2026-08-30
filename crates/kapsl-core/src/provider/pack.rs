@@ -1,3 +1,5 @@
+//! Discovery and validation of installed accelerator provider packs.
+
 use serde::Deserialize;
 use std::env;
 use std::path::{Path, PathBuf};

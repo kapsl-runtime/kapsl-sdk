@@ -1,3 +1,5 @@
+//! Runtime policy for selecting an inference provider.
+
 /// Environment variable controlling whether runtime provider selection follows
 /// the package manifest or considers the fastest available provider.
 pub const PROVIDER_POLICY_ENV: &str = "KAPSL_PROVIDER_POLICY";
