@@ -50,10 +50,10 @@ from kapsl_sdk import KapslClient, KapslShmClient, KapslHybridClient
 client = KapslClient("tcp://192.168.1.10:9096")
 
 # Shared memory (same machine only)
-client = KapslShmClient()
+client = KapslShmClient("kapsl-shm-default")
 
 # Hybrid
-client = KapslHybridClient()
+client = KapslHybridClient("kapsl-shm-default", "/tmp/kapsl.sock")
 ```
 
 ## Authentication

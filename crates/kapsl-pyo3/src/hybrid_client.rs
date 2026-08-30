@@ -1,32 +1,34 @@
 use kapsl_engine_api::TensorDtype;
 use kapsl_ipc::protocol::{HybridRequest, HybridResponse};
-use kapsl_shm::allocator::{ShmPoolAllocator, TieredShmAllocator};
-use kapsl_shm::memory::{ShmManager, TensorHeader};
+use kapsl_shm::allocator::TieredShmAllocator;
+use kapsl_shm::memory::ShmManager;
 use kapsl_transport::protocol::{
     asynchronous, DEFAULT_MAX_FRAME_PAYLOAD_BYTES, OP_HYBRID_INFER, STATUS_OK,
 };
 use kapsl_transport::RequestMetadata;
 use pyo3::prelude::*;
 use std::path::PathBuf;
-use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
 #[cfg(windows)]
 use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient, PipeMode};
 #[cfg(unix)]
 use tokio::net::UnixStream;
-use tokio::runtime::Runtime;
+use tokio::runtime::{Builder, Runtime};
 use tokio::sync::Mutex;
+
+use crate::shm_tensor::{
+    create_tensor_allocator, next_request_id, parse_shm_dtype, read_tensor, stage_tensor,
+};
 
 #[pyclass]
 pub struct KapslHybridClient {
     shm: Arc<ShmManager>,
-    allocator: TieredShmAllocator,
+    allocator: Arc<TieredShmAllocator>,
     socket_path: PathBuf,
     #[cfg(unix)]
-    stream: Arc<Mutex<Option<UnixStream>>>,
+    stream: Mutex<Option<UnixStream>>,
     #[cfg(windows)]
-    stream: Arc<Mutex<Option<NamedPipeClient>>>,
+    stream: Mutex<Option<NamedPipeClient>>,
     rt: Runtime,
     request_id_counter: u64,
 }
@@ -41,183 +43,106 @@ impl KapslHybridClient {
 
         let shm_arc = Arc::new(shm);
 
-        // Initialize simple allocator
-        let tensor_pool_offset = shm_arc.tensor_pool_offset();
-        let max_tensor_size = shm_arc.max_tensor_size();
-
-        let allocator = TieredShmAllocator::new_with_default_classes(
-            tensor_pool_offset,
-            max_tensor_size,
-            Duration::from_secs(30),
-        );
-
-        let rt = Runtime::new()
+        let allocator = create_tensor_allocator(&shm_arc).map_err(PyErr::from)?;
+        let rt = Builder::new_current_thread()
+            .enable_io()
+            .build()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
         Ok(Self {
             shm: shm_arc,
             allocator,
             socket_path: PathBuf::from(socket_path),
-            stream: Arc::new(Mutex::new(None)),
+            stream: Mutex::new(None),
             rt,
             request_id_counter: 1,
         })
     }
 
-    fn infer(&mut self, shape: Vec<i64>, dtype: String, data: Vec<u8>) -> PyResult<Vec<u8>> {
-        let request_id = self.request_id_counter;
-        self.request_id_counter += 1;
-
-        // 1. Allocate SHM slot
-        let tensor_size = std::mem::size_of::<TensorHeader>() + data.len();
-        let tensor_offset = self.allocator.try_allocate(tensor_size).ok_or_else(|| {
-            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                "SHM tensor pool exhausted (required={} bytes, largest_slot={} bytes, layout={})",
-                tensor_size,
-                self.allocator.largest_slot_size(),
-                self.allocator.layout_summary(),
-            ))
-        })?;
-        let _request_lease = RequestSlotLease::new(&self.allocator, tensor_offset);
-
-        // 2. Write tensor to SHM
-        unsafe {
-            let dtype = TensorDtype::from_str(&dtype)
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
-            write_tensor_to_shm(self.shm.as_ptr(), tensor_offset, &shape, &dtype, &data);
-        }
-
-        // 3. Prepare Hybrid Request
-        let metadata = RequestMetadata::new(request_id, 0, 0, false);
+    #[pyo3(signature = (shape, dtype, data, *, model_id = 0))]
+    fn infer(
+        &mut self,
+        py: Python<'_>,
+        shape: Vec<i64>,
+        dtype: String,
+        data: Vec<u8>,
+        model_id: u32,
+    ) -> PyResult<Vec<u8>> {
+        let request_id = next_request_id(&mut self.request_id_counter);
+        let dtype: TensorDtype = parse_shm_dtype(&dtype).map_err(PyErr::from)?;
+        let staged =
+            stage_tensor(&self.shm, &self.allocator, &shape, dtype, &data).map_err(PyErr::from)?;
+        let metadata = RequestMetadata::new(request_id, model_id, 0, false);
 
         let request = HybridRequest {
             metadata,
-            shm_offset: tensor_offset as u64,
-            shm_size: tensor_size as u64,
+            shm_offset: staged.offset() as u64,
+            shm_size: staged.encoded_size() as u64,
         };
 
-        // 4. Send Request via IPC and await Response
-        let stream_mutex = self.stream.clone();
-        let socket_path = self.socket_path.clone();
+        let runtime = &self.rt;
+        let stream_mutex = &self.stream;
+        let socket_path = &self.socket_path;
+        let response = py
+            .detach(|| {
+                runtime.block_on(async {
+                    let mut guard = stream_mutex.lock().await;
+                    if guard.is_none() {
+                        #[cfg(unix)]
+                        let stream = UnixStream::connect(socket_path).await?;
+                        #[cfg(windows)]
+                        let stream = ClientOptions::new()
+                            .pipe_mode(PipeMode::Byte)
+                            .open(socket_path)
+                            .map_err(|e| {
+                                std::io::Error::new(
+                                    std::io::ErrorKind::ConnectionRefused,
+                                    format!(
+                                        "Failed to open named pipe '{}': {}",
+                                        socket_path.display(),
+                                        e
+                                    ),
+                                )
+                            })?;
 
-        let response = self
-            .rt
-            .block_on(async move {
-                let mut guard = stream_mutex.lock().await;
-                if guard.is_none() {
-                    #[cfg(unix)]
-                    let stream = UnixStream::connect(&socket_path).await?;
-                    #[cfg(windows)]
-                    let stream = ClientOptions::new()
-                        .pipe_mode(PipeMode::Byte)
-                        .open(&socket_path)
-                        .map_err(|e| {
-                            std::io::Error::new(
-                                std::io::ErrorKind::ConnectionRefused,
-                                format!(
-                                    "Failed to open named pipe '{}': {}",
-                                    socket_path.display(),
-                                    e
-                                ),
-                            )
+                        *guard = Some(stream);
+                    }
+                    let result = async {
+                        let stream = guard.as_mut().ok_or_else(|| {
+                            std::io::Error::other("hybrid connection was not initialized")
                         })?;
+                        asynchronous::write_request_value(stream, 0, OP_HYBRID_INFER, &request)
+                            .await
+                            .map_err(std::io::Error::other)?;
 
-                    *guard = Some(stream);
-                }
-                let stream = guard.as_mut().unwrap();
-
-                asynchronous::write_request_value(stream, 0, OP_HYBRID_INFER, &request)
-                    .await
-                    .map_err(std::io::Error::other)?;
-
-                let response =
-                    asynchronous::read_response_frame(stream, DEFAULT_MAX_FRAME_PAYLOAD_BYTES)
+                        let response = asynchronous::read_response_frame(
+                            stream,
+                            DEFAULT_MAX_FRAME_PAYLOAD_BYTES,
+                        )
                         .await
                         .map_err(std::io::Error::other)?;
-
-                if response.header.status != STATUS_OK {
-                    return Err(std::io::Error::other(response.remote_error()));
-                }
-
-                response
-                    .deserialize::<HybridResponse>()
-                    .map_err(std::io::Error::other)
+                        if response.header.status != STATUS_OK {
+                            return Err(std::io::Error::other(response.remote_error()));
+                        }
+                        response
+                            .deserialize::<HybridResponse>()
+                            .map_err(std::io::Error::other)
+                    }
+                    .await;
+                    if result.is_err() {
+                        *guard = None;
+                    }
+                    result
+                })
             })
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
-        // 5. Read Result from SHM
-        let result_offset = response.shm_offset as usize;
-        let header_size = std::mem::size_of::<TensorHeader>();
-
-        unsafe {
-            let header_ptr = self.shm.as_ptr().add(result_offset) as *const TensorHeader;
-            let header = &*header_ptr;
-
-            let byte_ptr = self.shm.as_ptr().add(result_offset + header_size) as *const u8;
-            let byte_len = header.data_size as usize;
-            let byte_data = std::slice::from_raw_parts(byte_ptr, byte_len);
-            Ok(byte_data.to_vec())
-        }
+        let result_offset = usize::try_from(response.shm_offset)
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("SHM offset is too large"))?;
+        let result_size = usize::try_from(response.shm_size)
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("SHM size is too large"))?;
+        read_tensor(&self.shm, result_offset, result_size)
+            .map_err(PyErr::from)
+            .map(|packet| packet.data)
     }
-}
-
-struct RequestSlotLease {
-    allocator: *const TieredShmAllocator,
-    offset: usize,
-}
-
-// Safety: RequestSlotLease is always created and dropped within a single
-// `infer` call on `&mut self`, so the pointer is never accessed concurrently.
-unsafe impl Send for RequestSlotLease {}
-
-impl RequestSlotLease {
-    fn new(allocator: &TieredShmAllocator, offset: usize) -> Self {
-        Self {
-            allocator: allocator as *const _,
-            offset,
-        }
-    }
-}
-
-impl Drop for RequestSlotLease {
-    fn drop(&mut self) {
-        // Safety: allocator outlives the lease (both live within the same `infer` call).
-        let _ = unsafe { &*self.allocator }.release(self.offset);
-    }
-}
-
-// Helper function
-unsafe fn write_tensor_to_shm(
-    base: *mut u8,
-    offset: usize,
-    shape: &[i64],
-    dtype: &TensorDtype,
-    data: &[u8],
-) {
-    let mut shape_array = [0i64; 8];
-    for (i, &s) in shape.iter().enumerate() {
-        shape_array[i] = s;
-    }
-
-    let dtype_byte = match dtype {
-        TensorDtype::Float32 => 0,
-        TensorDtype::Float64 => 1,
-        TensorDtype::Int32 => 2,
-        TensorDtype::Int64 => 3,
-        _ => 0,
-    };
-
-    let header = TensorHeader {
-        ndim: shape.len() as u32,
-        dtype: dtype_byte,
-        _padding: [0; 3],
-        shape: shape_array,
-        data_size: data.len() as u64,
-    };
-
-    let header_ptr = base.add(offset) as *mut TensorHeader;
-    std::ptr::write(header_ptr, header);
-
-    let data_ptr = base.add(offset + std::mem::size_of::<TensorHeader>());
-    std::ptr::copy_nonoverlapping(data.as_ptr(), data_ptr, data.len());
 }

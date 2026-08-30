@@ -7,7 +7,7 @@ __all__ = ["KapslClient", "KapslHybridClient", "KapslShmClient", "load_voice", "
 _VOICES_DIR = pathlib.Path(__file__).parent
 
 
-def list_voices() -> list:
+def list_voices() -> list[str]:
     """Return the names of all bundled voice embeddings (without the .bin extension)."""
     return sorted(p.stem for p in _VOICES_DIR.glob("*.bin"))
 
@@ -23,10 +23,9 @@ def load_voice(name: str) -> bytes:
         voices = np.frombuffer(data, dtype=np.float32).reshape(-1, 1, 256)
         style = voices[len(tokens)].reshape(1, 1, 256)
     """
-    path = _VOICES_DIR / f"{name}.bin"
-    if not path.exists():
-        available = list_voices()
+    available = list_voices()
+    if name not in available:
         raise FileNotFoundError(
             f"Voice '{name}' not found. Available: {available}"
         )
-    return path.read_bytes()
+    return (_VOICES_DIR / f"{name}.bin").read_bytes()

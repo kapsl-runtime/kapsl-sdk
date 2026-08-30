@@ -2073,7 +2073,6 @@ dependencies = [
  "kapsl-ipc",
  "kapsl-shm",
  "kapsl-transport",
- "libc",
  "pyo3",
  "tokio",
 ]
