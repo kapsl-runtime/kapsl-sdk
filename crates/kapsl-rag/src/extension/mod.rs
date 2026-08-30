@@ -56,26 +56,90 @@ impl ExtensionRegistry {
         if !self.root.exists() {
             return Ok(extensions);
         }
-        for entry in fs::read_dir(&self.root)? {
-            let entry = entry?;
-            let path = entry.path();
-            if !path.is_dir() {
+        let mut paths = fs::read_dir(&self.root)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<Result<Vec<_>, _>>()?;
+        paths.sort();
+        for path in paths {
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with('.'))
+            {
+                continue;
+            }
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
                 continue;
             }
             if let Ok(manifest) = load_manifest(&path) {
-                extensions.push(InstalledExtension { manifest, path });
+                if resolve_manifest_entrypoint(&path, &manifest).is_ok() {
+                    extensions.push(InstalledExtension { manifest, path });
+                }
             }
         }
         Ok(extensions)
     }
 
     pub fn install_from_dir(&self, source: &Path) -> Result<InstalledExtension, ExtensionError> {
-        let manifest = load_manifest(source)?;
-        let target = self.root.join(&manifest.id);
-        if target.exists() {
-            fs::remove_dir_all(&target)?;
+        let source_metadata = fs::symlink_metadata(source)?;
+        if source_metadata.file_type().is_symlink() || !source_metadata.is_dir() {
+            return Err(ExtensionError::InvalidConfig(
+                "extension source must be a regular directory".to_string(),
+            ));
         }
-        copy_dir_all(source, &target)?;
+        let manifest = load_manifest(source)?;
+        resolve_manifest_entrypoint(source, &manifest)?;
+        fs::create_dir_all(&self.root)?;
+        let source_canonical = fs::canonicalize(source)?;
+        let root_canonical = fs::canonicalize(&self.root)?;
+        if root_canonical.starts_with(&source_canonical) {
+            return Err(ExtensionError::InvalidConfig(
+                "extension source cannot contain the installation root".to_string(),
+            ));
+        }
+        let target = self.root.join(&manifest.id);
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        let staging = self.root.join(format!(
+            ".{}.installing-{}-{timestamp}",
+            manifest.id,
+            std::process::id()
+        ));
+        let backup = self.root.join(format!(
+            ".{}.backup-{}-{timestamp}",
+            manifest.id,
+            std::process::id()
+        ));
+        if fs::symlink_metadata(&staging).is_ok() || fs::symlink_metadata(&backup).is_ok() {
+            return Err(ExtensionError::InvalidConfig(
+                "extension staging path already exists".to_string(),
+            ));
+        }
+        let install_result = copy_dir_all(source, &staging);
+        if let Err(error) = install_result {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(error);
+        }
+        let had_existing_target = match fs::symlink_metadata(&target) {
+            Ok(_) => {
+                fs::rename(&target, &backup)?;
+                true
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        };
+        if let Err(error) = fs::rename(&staging, &target) {
+            if had_existing_target {
+                let _ = fs::rename(&backup, &target);
+            }
+            let _ = remove_path(&staging);
+            return Err(error.into());
+        }
+        if had_existing_target {
+            remove_path(&backup)?;
+        }
         Ok(InstalledExtension {
             manifest,
             path: target,
@@ -83,11 +147,15 @@ impl ExtensionRegistry {
     }
 
     pub fn uninstall(&self, extension_id: &str) -> Result<(), ExtensionError> {
+        crate::validation::extension_id(extension_id).map_err(ExtensionError::InvalidConfig)?;
         let target = self.root.join(extension_id);
-        if !target.exists() {
-            return Err(ExtensionError::NotInstalled(extension_id.to_string()));
+        match fs::symlink_metadata(&target) {
+            Ok(_) => remove_path(&target)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(ExtensionError::NotInstalled(extension_id.to_string()));
+            }
+            Err(error) => return Err(error.into()),
         }
-        fs::remove_dir_all(target)?;
         Ok(())
     }
 }
@@ -112,11 +180,10 @@ impl ExtensionManager {
         extension_id: &str,
         config: &ConnectorConfig,
     ) -> Result<(), ExtensionError> {
-        let dir = self.config_root.join(workspace_id);
-        fs::create_dir_all(&dir)?;
-        let path = dir.join(format!("{extension_id}.json"));
+        let path = self.workspace_config_path(workspace_id, extension_id)?;
+        fs::create_dir_all(path.parent().expect("config path always has a parent"))?;
         let data = serde_json::to_vec_pretty(config)
-            .map_err(|e| ExtensionError::InvalidManifest(e.to_string()))?;
+            .map_err(|e| ExtensionError::InvalidConfig(e.to_string()))?;
         fs::write(path, data)?;
         Ok(())
     }
@@ -126,16 +193,14 @@ impl ExtensionManager {
         workspace_id: &str,
         extension_id: &str,
     ) -> Result<Option<ConnectorConfig>, ExtensionError> {
-        let path = self
-            .config_root
-            .join(workspace_id)
-            .join(format!("{extension_id}.json"));
-        if !path.exists() {
-            return Ok(None);
-        }
-        let data = fs::read_to_string(path)?;
+        let path = self.workspace_config_path(workspace_id, extension_id)?;
+        let data = match fs::read_to_string(path) {
+            Ok(data) => data,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
         let config = serde_json::from_str(&data)
-            .map_err(|e| ExtensionError::InvalidManifest(e.to_string()))?;
+            .map_err(|e| ExtensionError::InvalidConfig(e.to_string()))?;
         Ok(Some(config))
     }
 
@@ -179,6 +244,20 @@ impl ExtensionManager {
             }
         };
         Ok(ConnectorClient::new(runtime))
+    }
+
+    fn workspace_config_path(
+        &self,
+        workspace_id: &str,
+        extension_id: &str,
+    ) -> Result<PathBuf, ExtensionError> {
+        crate::validation::path_component(workspace_id, "workspace id")
+            .map_err(ExtensionError::InvalidConfig)?;
+        crate::validation::extension_id(extension_id).map_err(ExtensionError::InvalidConfig)?;
+        Ok(self
+            .config_root
+            .join(workspace_id)
+            .join(format!("{extension_id}.json")))
     }
 }
 
@@ -233,23 +312,22 @@ fn wasi_permissions_from_config(
         _ => return Ok(WasiPermissions::default()),
     };
 
-    let wasi_value = obj.get("wasi");
-    if wasi_value.is_none() {
+    let Some(wasi_value) = obj.get("wasi") else {
         return Ok(WasiPermissions::default());
-    }
-    let wasi_value = wasi_value.unwrap();
+    };
     let parsed: WasiConfig = serde_json::from_value(wasi_value.clone())
         .map_err(|e| ExtensionError::InvalidConfig(e.to_string()))?;
 
     let mut permissions = WasiPermissions::default();
     for (key, value) in parsed.env {
-        validate_env_kv(&key, &value)?;
+        crate::validation::env_key_value(&key, &value).map_err(ExtensionError::InvalidConfig)?;
         permissions = permissions.with_env(key, value);
     }
 
     for dir in parsed.preopen_dirs {
-        validate_host_path(&dir.host_path)?;
-        validate_guest_path(&dir.guest_path)?;
+        crate::validation::host_path(Path::new(&dir.host_path))
+            .map_err(ExtensionError::InvalidConfig)?;
+        crate::validation::guest_path(&dir.guest_path).map_err(ExtensionError::InvalidConfig)?;
         permissions =
             permissions.allow_dir(PathBuf::from(dir.host_path), dir.guest_path, dir.read_only);
     }
@@ -267,82 +345,73 @@ fn strip_wasi_block(config: ConnectorConfig) -> ConnectorConfig {
     }
 }
 
-fn validate_env_kv(key: &str, value: &str) -> Result<(), ExtensionError> {
-    if key.is_empty() {
-        return Err(ExtensionError::InvalidConfig(
-            "env key cannot be empty".to_string(),
-        ));
-    }
-    if key.contains('\0') || value.contains('\0') {
-        return Err(ExtensionError::InvalidConfig(
-            "env key/value cannot contain NUL".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_guest_path(path: &str) -> Result<(), ExtensionError> {
-    if path.is_empty() || !path.starts_with('/') {
-        return Err(ExtensionError::InvalidConfig(
-            "preopened guest path must be absolute".to_string(),
-        ));
-    }
-    if path.contains('\0') {
-        return Err(ExtensionError::InvalidConfig(
-            "preopened guest path cannot contain NUL".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_host_path(path: &str) -> Result<(), ExtensionError> {
-    let host_path = Path::new(path);
-    if !host_path.is_absolute() {
-        return Err(ExtensionError::InvalidConfig(
-            "preopened host path must be absolute".to_string(),
-        ));
-    }
-    Ok(())
-}
-
 fn load_manifest(dir: &Path) -> Result<ConnectorManifest, ExtensionError> {
     let toml_path = dir.join("rag-extension.toml");
     let json_path = dir.join("rag-extension.json");
 
     if toml_path.exists() {
         let data = fs::read_to_string(&toml_path)?;
-        let manifest =
+        let manifest: ConnectorManifest =
             toml::from_str(&data).map_err(|e| ExtensionError::InvalidManifest(e.to_string()))?;
+        validate_manifest(&manifest)?;
         return Ok(manifest);
     }
 
     if json_path.exists() {
         let data = fs::read_to_string(&json_path)?;
-        let manifest = serde_json::from_str(&data)
+        let manifest: ConnectorManifest = serde_json::from_str(&data)
             .map_err(|e| ExtensionError::InvalidManifest(e.to_string()))?;
+        validate_manifest(&manifest)?;
         return Ok(manifest);
     }
 
     Err(ExtensionError::ManifestMissing(dir.display().to_string()))
 }
 
+fn validate_manifest(manifest: &ConnectorManifest) -> Result<(), ExtensionError> {
+    crate::validation::extension_id(&manifest.id).map_err(ExtensionError::InvalidManifest)?;
+    if manifest.name.trim().is_empty() {
+        return Err(ExtensionError::InvalidManifest(
+            "connector name cannot be empty".to_string(),
+        ));
+    }
+    if manifest.version.trim().is_empty() {
+        return Err(ExtensionError::InvalidManifest(
+            "connector version cannot be empty".to_string(),
+        ));
+    }
+    if let Some(entrypoint) = manifest.entrypoint.as_deref() {
+        crate::validation::relative_path(entrypoint, "connector entrypoint")
+            .map_err(ExtensionError::InvalidManifest)?;
+    }
+    Ok(())
+}
+
 fn resolve_entrypoint(extension: &InstalledExtension) -> Result<PathBuf, ExtensionError> {
-    let entry = extension.manifest.entrypoint.as_deref();
-    let runtime = &extension.manifest.runtime;
-    let default_entry = match runtime {
+    resolve_manifest_entrypoint(&extension.path, &extension.manifest)
+}
+
+fn resolve_manifest_entrypoint(
+    extension_root: &Path,
+    manifest: &ConnectorManifest,
+) -> Result<PathBuf, ExtensionError> {
+    let default_entry = match manifest.runtime {
         ManifestRuntime::Wasm => "connector.wasm",
         ManifestRuntime::Sidecar => "connector",
     };
-    let entry = entry.unwrap_or(default_entry);
-    let path = Path::new(entry);
-    let resolved = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        extension.path.join(entry)
-    };
-    if !resolved.exists() {
+    let entry = manifest.entrypoint.as_deref().unwrap_or(default_entry);
+    crate::validation::relative_path(entry, "connector entrypoint")
+        .map_err(ExtensionError::InvalidConfig)?;
+    let resolved = extension_root.join(entry);
+    let metadata = fs::symlink_metadata(&resolved).map_err(|error| {
+        ExtensionError::InvalidConfig(format!(
+            "cannot inspect entrypoint {}: {error}",
+            resolved.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(ExtensionError::InvalidConfig(format!(
-            "entrypoint not found: {}",
+            "entrypoint must be a regular file inside the extension: {}",
             resolved.display()
         )));
     }
@@ -358,9 +427,161 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<(), ExtensionError> {
         let dst_path = dst.join(entry.file_name());
         if ty.is_dir() {
             copy_dir_all(&src_path, &dst_path)?;
-        } else {
+        } else if ty.is_file() {
             fs::copy(&src_path, &dst_path)?;
+        } else {
+            return Err(ExtensionError::InvalidConfig(format!(
+                "extension contains unsupported filesystem entry: {}",
+                src_path.display()
+            )));
         }
     }
     Ok(())
+}
+
+fn remove_path(path: &Path) -> Result<(), ExtensionError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        fs::remove_dir_all(path)?;
+    } else {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let sequence = NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "kapsl-rag-extension-{}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+
+        fn extension_source(&self, id: &str, entrypoint: &str) -> PathBuf {
+            let source = self.0.join("source");
+            fs::create_dir_all(&source).unwrap();
+            fs::write(
+                source.join("rag-extension.toml"),
+                format!(
+                    "id = {id:?}\nname = \"Test Connector\"\nversion = \"1.0.0\"\nruntime = \"sidecar\"\ncapabilities = [\"sync\"]\nauth = [\"none\"]\npermissions = []\nentrypoint = {entrypoint:?}\n"
+                ),
+            )
+            .unwrap();
+            source
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn registry_installs_discovers_replaces_and_uninstalls() {
+        let directory = TestDirectory::new();
+        let source = directory.extension_source("connector.test", "connector");
+        fs::write(source.join("connector"), "first").unwrap();
+        let registry = ExtensionRegistry::new(directory.path().join("installed"));
+
+        let installed = registry.install_from_dir(&source).unwrap();
+        assert_eq!(installed.manifest.id, "connector.test");
+        assert_eq!(
+            fs::read_to_string(installed.path.join("connector")).unwrap(),
+            "first"
+        );
+        assert_eq!(registry.discover().unwrap().len(), 1);
+
+        fs::write(source.join("connector"), "second").unwrap();
+        let replaced = registry.install_from_dir(&source).unwrap();
+        assert_eq!(
+            fs::read_to_string(replaced.path.join("connector")).unwrap(),
+            "second"
+        );
+
+        registry.uninstall("connector.test").unwrap();
+        assert!(registry.discover().unwrap().is_empty());
+    }
+
+    #[test]
+    fn registry_rejects_unsafe_manifest_paths() {
+        let directory = TestDirectory::new();
+        let unsafe_id = directory.extension_source("../escape", "connector");
+        fs::write(unsafe_id.join("connector"), "connector").unwrap();
+        let registry = ExtensionRegistry::new(directory.path().join("installed"));
+        assert!(matches!(
+            registry.install_from_dir(&unsafe_id),
+            Err(ExtensionError::InvalidManifest(_))
+        ));
+
+        let absolute_entrypoint = directory.extension_source("connector.test", "/bin/connector");
+        assert!(matches!(
+            registry.install_from_dir(&absolute_entrypoint),
+            Err(ExtensionError::InvalidManifest(_))
+        ));
+    }
+
+    #[test]
+    fn workspace_config_separates_connector_values_from_wasi_permissions() {
+        let directory = TestDirectory::new();
+        let manager = ExtensionManager::new(
+            ExtensionRegistry::new(directory.path().join("installed")),
+            directory.path().join("config"),
+        );
+        let config = json!({
+            "token": "secret",
+            "wasi": {
+                "env": {"CONNECTOR_MODE": "test"},
+                "preopen_dirs": [{
+                    "host_path": directory.path().to_string_lossy(),
+                    "guest_path": "/data",
+                    "read_only": true
+                }]
+            }
+        });
+
+        manager
+            .set_workspace_config("workspace", "connector.test", &config)
+            .unwrap();
+
+        let connector_config = manager
+            .get_workspace_connector_config("workspace", "connector.test")
+            .unwrap()
+            .unwrap();
+        assert_eq!(connector_config, json!({"token": "secret"}));
+        let permissions = manager
+            .get_workspace_wasi_permissions("workspace", "connector.test")
+            .unwrap();
+        assert_eq!(
+            permissions.env.get("CONNECTOR_MODE").map(String::as_str),
+            Some("test")
+        );
+        assert_eq!(permissions.preopen_dirs.len(), 1);
+        assert!(permissions.preopen_dirs[0].read_only);
+
+        assert!(manager
+            .set_workspace_config("../escape", "connector.test", &json!({}))
+            .is_err());
+    }
 }

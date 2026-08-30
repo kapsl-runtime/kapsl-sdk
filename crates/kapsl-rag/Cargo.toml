@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Retrieval-augmented generation implementation with vector store and WASM plugins for Kapsl"
+description = "Engine-side RAG storage, ingestion, and connector hosting for Kapsl"
 
 [dependencies]
 kapsl-rag-sdk = { version = "0.3.0", path = "../kapsl-rag-sdk" }
