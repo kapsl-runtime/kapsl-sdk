@@ -1871,7 +1871,7 @@ dependencies = [
 
 [[package]]
 name = "kapsl-backends"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -1900,7 +1900,7 @@ dependencies = [
 
 [[package]]
 name = "kapsl-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "flate2",
  "fs2",
@@ -1919,7 +1919,7 @@ dependencies = [
 
 [[package]]
 name = "kapsl-engine-api"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1934,7 +1934,7 @@ dependencies = [
 
 [[package]]
 name = "kapsl-hal"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cudarc",
  "half",
@@ -1948,7 +1948,7 @@ dependencies = [
 
 [[package]]
 name = "kapsl-ipc"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "bincode",
@@ -1965,7 +1965,7 @@ dependencies = [
 
 [[package]]
 name = "kapsl-kernels"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cudarc",
  "half",
@@ -2010,7 +2010,7 @@ dependencies = [
 
 [[package]]
 name = "kapsl-llm"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2042,7 +2042,7 @@ dependencies = [
 
 [[package]]
 name = "kapsl-loader"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "half",
  "kapsl-hal",
@@ -2056,7 +2056,7 @@ dependencies = [
 
 [[package]]
 name = "kapsl-monitor"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2069,7 +2069,7 @@ dependencies = [
 
 [[package]]
 name = "kapsl-pyo3"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "kapsl-engine-api",
  "kapsl-ipc",
@@ -2082,7 +2082,7 @@ dependencies = [
 
 [[package]]
 name = "kapsl-quantization"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "half",
@@ -2096,7 +2096,7 @@ dependencies = [
 
 [[package]]
 name = "kapsl-rag"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2116,7 +2116,7 @@ dependencies = [
 
 [[package]]
 name = "kapsl-rag-sdk"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -2127,7 +2127,7 @@ dependencies = [
 
 [[package]]
 name = "kapsl-scheduler"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2146,7 +2146,7 @@ dependencies = [
 
 [[package]]
 name = "kapsl-shm"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "bincode",
@@ -2166,7 +2166,7 @@ dependencies = [
 
 [[package]]
 name = "kapsl-transport"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "bincode",

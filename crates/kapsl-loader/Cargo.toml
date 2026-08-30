@@ -7,7 +7,7 @@ repository.workspace = true
 description = "Safetensors weight loader and model config parser for the Kapsl native inference path"
 
 [dependencies]
-kapsl-hal = { version = "0.2.0", path = "../kapsl-hal" }
+kapsl-hal = { version = "0.3.0", path = "../kapsl-hal" }
 half = "2.0"
 safetensors = "0.4"
 memmap2 = "0.9.11"
