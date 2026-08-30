@@ -2056,12 +2056,10 @@ dependencies = [
 name = "kapsl-monitor"
 version = "0.3.0"
 dependencies = [
- "anyhow",
  "async-trait",
  "futures",
  "kapsl-engine-api",
  "prometheus",
- "thiserror 1.0.69",
  "tokio",
 ]
 
