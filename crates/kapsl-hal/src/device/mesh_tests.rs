@@ -1,3 +1,5 @@
+//! Tests for device-mesh topology and grouping.
+
 use crate::device::{Device, DeviceBackend};
 use crate::device_mesh::{DeviceMesh, GroupBackend, MeshTopology};
 

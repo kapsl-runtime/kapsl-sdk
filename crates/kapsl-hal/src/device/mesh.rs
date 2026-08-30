@@ -1,3 +1,5 @@
+//! Multi-device topology and collective communication contracts.
+
 use crate::device::Device;
 use std::collections::HashMap;
 use std::sync::Arc;

@@ -1,4 +1,4 @@
-//! CPU-side KV block storage — the eviction tier below GPU pools.
+//! CPU-side KV block storage used as the eviction tier below GPU pools.
 //!
 //! Blocks evicted from a `GpuBlockPool` under pressure land here. When the
 //! owning session is scheduled again, blocks are uploaded back to GPU.

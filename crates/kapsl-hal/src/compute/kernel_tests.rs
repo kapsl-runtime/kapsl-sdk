@@ -1,3 +1,5 @@
+//! Tests for kernel configuration.
+
 use crate::kernel::AttentionConfig;
 
 #[test]
