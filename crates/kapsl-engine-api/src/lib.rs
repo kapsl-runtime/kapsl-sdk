@@ -365,21 +365,6 @@ impl<'de> Deserialize<'de> for BinaryTensorPacket {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BinaryTensorPacketRef<'a> {
-    pub shape: Vec<i64>,
-    pub dtype: TensorDtype,
-    #[serde(borrow)]
-    pub data: Cow<'a, [u8]>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct TensorView<'a> {
-    pub shape: &'a [i64],
-    pub dtype: TensorDtype,
-    pub data: &'a [u8],
-}
-
 impl BinaryTensorPacket {
     pub fn new(shape: Vec<i64>, dtype: TensorDtype, data: Vec<u8>) -> Result<Self, EngineError> {
         let packet = Self { shape, dtype, data };
@@ -387,16 +372,8 @@ impl BinaryTensorPacket {
         Ok(packet)
     }
 
-    pub fn size_bytes(&self) -> usize {
-        self.data.len()
-    }
-
-    pub fn tensor_elements(&self) -> Result<usize, EngineError> {
-        shape_elements(&self.shape)
-    }
-
     pub fn validate(&self) -> Result<(), EngineError> {
-        let elements = self.tensor_elements()?;
+        let elements = shape_elements(&self.shape)?;
         let expected = elements
             .checked_mul(self.dtype.size_bytes())
             .ok_or_else(|| EngineError::InvalidInput {
@@ -418,34 +395,6 @@ impl BinaryTensorPacket {
         }
 
         Ok(())
-    }
-
-    pub fn view(&self) -> TensorView<'_> {
-        TensorView {
-            shape: &self.shape,
-            dtype: self.dtype,
-            data: &self.data,
-        }
-    }
-}
-
-impl<'a> BinaryTensorPacketRef<'a> {
-    pub fn to_owned(self) -> BinaryTensorPacket {
-        BinaryTensorPacket {
-            shape: self.shape,
-            dtype: self.dtype,
-            data: self.data.into_owned(),
-        }
-    }
-}
-
-impl<'a> From<&'a BinaryTensorPacket> for BinaryTensorPacketRef<'a> {
-    fn from(packet: &'a BinaryTensorPacket) -> Self {
-        Self {
-            shape: packet.shape.clone(),
-            dtype: packet.dtype,
-            data: Cow::Borrowed(&packet.data),
-        }
     }
 }
 
@@ -1001,14 +950,6 @@ impl ExternalDeviceMemoryReport {
             }],
         }
     }
-
-    pub fn bytes_for_device(&self, device_id: usize) -> usize {
-        self.allocations
-            .iter()
-            .filter(|allocation| allocation.device_id == device_id)
-            .map(|allocation| allocation.bytes)
-            .sum()
-    }
 }
 
 /// Physical/accounting domain for backend-owned memory.
@@ -1100,30 +1041,8 @@ impl MemoryReport {
         }
     }
 
-    pub fn runtime(
-        allocation_id: impl Into<String>,
-        domain: MemoryDomain,
-        class: MemoryAllocationClass,
-        bytes: usize,
-    ) -> Self {
-        Self {
-            allocations: vec![MemoryAllocation {
-                allocation_id: allocation_id.into(),
-                domain,
-                class,
-                source: MemoryAllocationSource::RuntimeManaged,
-                bytes,
-            }],
-        }
-    }
-
     pub fn push(&mut self, allocation: MemoryAllocation) -> &mut Self {
         self.allocations.push(allocation);
-        self
-    }
-
-    pub fn extend(&mut self, other: Self) -> &mut Self {
-        self.allocations.extend(other.allocations);
         self
     }
 
