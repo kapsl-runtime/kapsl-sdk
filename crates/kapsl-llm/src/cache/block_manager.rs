@@ -1,3 +1,5 @@
+//! Physical KV-block allocation and ownership tracking.
+
 use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};

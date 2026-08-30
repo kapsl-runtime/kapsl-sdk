@@ -1,3 +1,5 @@
+//! Token-prefix radix tree used by paged KV caching.
+
 use std::collections::HashMap;
 
 /// Node in the Radix Tree

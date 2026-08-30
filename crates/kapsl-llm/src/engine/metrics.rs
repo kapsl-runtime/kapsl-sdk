@@ -1,3 +1,5 @@
+//! Runtime metrics recorded by LLM engines.
+
 #[derive(Default, Clone)]
 pub struct LLMMetrics {
     pub total_inference_time: f64,
