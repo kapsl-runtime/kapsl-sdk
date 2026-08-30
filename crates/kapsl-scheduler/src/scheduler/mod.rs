@@ -1,22 +1,27 @@
 use crate::gpu_executor::{GpuExecutor, WorkQueue};
 use crate::mesh_routing::{MeshRouter, MeshRouterStats};
+use crate::metrics::MetricsAccumulator;
 use crate::priority::{stamp_engine_priority, stamp_openai_wire_priority, Priority};
 use crate::request::Request;
-use futures::Stream;
 use kapsl_engine_api::{
     BatchingMode, BinaryTensorPacket, CancellationToken, EngineError, EngineHandle,
-    EngineModelInfo, EngineStream, InferenceRequest, OpenAiWireFormat, OpenAiWireRequest,
-    OpenAiWireResponse, OpenAiWireStream, OpenAiWireStreamResponse,
+    EngineModelInfo, InferenceRequest, OpenAiWireFormat, OpenAiWireRequest, OpenAiWireResponse,
+    OpenAiWireStreamResponse,
 };
-use parking_lot::{Mutex, RwLock};
-use std::pin::Pin;
+use parking_lot::RwLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::task::{Context, Poll};
-use tokio::sync::{oneshot, Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError};
+use tokio::sync::oneshot;
 
 use kapsl_hal::device_mesh::DeviceMesh;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+mod admission;
+
+use admission::{
+    ActiveCountGuard, PriorityAdmission, PriorityAdmissionPermit, StreamAdmissionGuard,
+    TrackedEngineStream, TrackedOpenAiWireStream,
+};
 
 /// Optional scheduler instrumentation hook. Implementations must remain cheap:
 /// observations are emitted synchronously on request dispatch.
@@ -43,270 +48,6 @@ impl QueueOverflowPolicy {
     }
 }
 
-struct StreamAdmissionGuard {
-    counter: Arc<AtomicUsize>,
-    _permit: Option<PriorityAdmissionPermit>,
-}
-
-impl StreamAdmissionGuard {
-    fn new(counter: Arc<AtomicUsize>, permit: Option<PriorityAdmissionPermit>) -> Self {
-        counter.fetch_add(1, Ordering::Relaxed);
-        Self {
-            counter,
-            _permit: permit,
-        }
-    }
-}
-
-#[derive(Default)]
-struct PriorityAdmissionState {
-    latency_waiters: usize,
-    throughput_waiters: usize,
-}
-
-/// Bounded direct-dispatch admission with strict priority between waiting
-/// classes. The semaphore bounds active work; waiter counters plus `Notify`
-/// avoid an unbounded handoff queue while ensuring a queued throughput request
-/// cannot take a newly released slot while any latency-critical request waits.
-struct PriorityAdmission {
-    slots: Arc<Semaphore>,
-    state: Mutex<PriorityAdmissionState>,
-    changed: Notify,
-}
-
-impl PriorityAdmission {
-    fn new(capacity: usize) -> Arc<Self> {
-        Arc::new(Self {
-            slots: Arc::new(Semaphore::new(capacity)),
-            state: Mutex::new(PriorityAdmissionState::default()),
-            changed: Notify::new(),
-        })
-    }
-
-    async fn acquire(
-        self: &Arc<Self>,
-        priority: Priority,
-        overflow_policy: QueueOverflowPolicy,
-        cancellation: Option<&CancellationToken>,
-    ) -> Result<PriorityAdmissionPermit, EngineError> {
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return Err(EngineError::cancelled(
-                "Request cancelled while awaiting admission",
-            ));
-        }
-        match overflow_policy {
-            QueueOverflowPolicy::Block => self.acquire_blocking(priority, cancellation).await,
-            QueueOverflowPolicy::DropNewest => self.try_acquire().map_err(|error| match error {
-                TryAcquireError::Closed => {
-                    EngineError::overloaded("GPU stream slots closed".to_string())
-                }
-                TryAcquireError::NoPermits => EngineError::overloaded(format!(
-                    "GPU stream slots full (policy={})",
-                    overflow_policy.as_str()
-                )),
-            }),
-            QueueOverflowPolicy::DropOldest => self.try_acquire().map_err(|error| match error {
-                TryAcquireError::Closed => {
-                    EngineError::overloaded("GPU stream slots closed".to_string())
-                }
-                TryAcquireError::NoPermits => EngineError::overloaded(
-                    "GPU stream slots full (policy=drop_oldest; active streams cannot be evicted)"
-                        .to_string(),
-                ),
-            }),
-        }
-    }
-
-    async fn acquire_blocking(
-        self: &Arc<Self>,
-        priority: Priority,
-        cancellation: Option<&CancellationToken>,
-    ) -> Result<PriorityAdmissionPermit, EngineError> {
-        let mut waiter = PriorityAdmissionWaiter::register(Arc::clone(self), priority);
-        loop {
-            if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                waiter.finish();
-                return Err(EngineError::cancelled(
-                    "Request cancelled while awaiting admission",
-                ));
-            }
-            // Register the notification before checking state so a release or
-            // high-priority cancellation cannot be lost between the check and
-            // the await.
-            let notified = self.changed.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-
-            let attempt = {
-                let state = self.state.lock();
-                let may_acquire =
-                    priority == Priority::LatencyCritical || state.latency_waiters == 0;
-                may_acquire.then(|| self.slots.clone().try_acquire_owned())
-            };
-
-            match attempt {
-                Some(Ok(permit)) => {
-                    waiter.finish();
-                    return Ok(PriorityAdmissionPermit::new(Arc::clone(self), permit));
-                }
-                Some(Err(TryAcquireError::Closed)) => {
-                    waiter.finish();
-                    return Err(EngineError::overloaded(
-                        "GPU stream slots closed".to_string(),
-                    ));
-                }
-                Some(Err(TryAcquireError::NoPermits)) | None => {
-                    if let Some(cancellation) = cancellation {
-                        tokio::select! {
-                            _ = &mut notified => {}
-                            _ = cancellation.cancelled() => {
-                                waiter.finish();
-                                return Err(EngineError::cancelled(
-                                    "Request cancelled while awaiting admission",
-                                ));
-                            }
-                        }
-                    } else {
-                        notified.await;
-                    }
-                }
-            }
-        }
-    }
-
-    fn try_acquire(self: &Arc<Self>) -> Result<PriorityAdmissionPermit, TryAcquireError> {
-        self.slots
-            .clone()
-            .try_acquire_owned()
-            .map(|permit| PriorityAdmissionPermit::new(Arc::clone(self), permit))
-    }
-
-    fn unregister_waiter(&self, priority: Priority) {
-        {
-            let mut state = self.state.lock();
-            let waiters = match priority {
-                Priority::LatencyCritical => &mut state.latency_waiters,
-                Priority::Throughput => &mut state.throughput_waiters,
-            };
-            debug_assert!(*waiters > 0, "priority admission waiter underflow");
-            *waiters = waiters.saturating_sub(1);
-        }
-        // In particular, wake throughput waiters when the last queued latency
-        // request is cancelled or admitted.
-        self.changed.notify_waiters();
-    }
-
-    fn close(&self) {
-        self.slots.close();
-        self.changed.notify_waiters();
-    }
-
-    #[cfg(test)]
-    fn waiter_counts(&self) -> (usize, usize) {
-        let state = self.state.lock();
-        (state.latency_waiters, state.throughput_waiters)
-    }
-
-    #[cfg(test)]
-    fn available_permits(&self) -> usize {
-        self.slots.available_permits()
-    }
-}
-
-struct PriorityAdmissionWaiter {
-    admission: Arc<PriorityAdmission>,
-    priority: Priority,
-    registered: bool,
-}
-
-impl PriorityAdmissionWaiter {
-    fn register(admission: Arc<PriorityAdmission>, priority: Priority) -> Self {
-        {
-            let mut state = admission.state.lock();
-            match priority {
-                Priority::LatencyCritical => state.latency_waiters += 1,
-                Priority::Throughput => state.throughput_waiters += 1,
-            }
-        }
-        Self {
-            admission,
-            priority,
-            registered: true,
-        }
-    }
-
-    fn finish(&mut self) {
-        if std::mem::replace(&mut self.registered, false) {
-            self.admission.unregister_waiter(self.priority);
-        }
-    }
-}
-
-impl Drop for PriorityAdmissionWaiter {
-    fn drop(&mut self) {
-        self.finish();
-    }
-}
-
-struct PriorityAdmissionPermit {
-    admission: Arc<PriorityAdmission>,
-    permit: Option<OwnedSemaphorePermit>,
-}
-
-impl PriorityAdmissionPermit {
-    fn new(admission: Arc<PriorityAdmission>, permit: OwnedSemaphorePermit) -> Self {
-        Self {
-            admission,
-            permit: Some(permit),
-        }
-    }
-}
-
-impl Drop for PriorityAdmissionPermit {
-    fn drop(&mut self) {
-        // Return capacity before waking waiters. The state lock in acquisition
-        // then makes the high-priority check and permit claim one atomic choice.
-        drop(self.permit.take());
-        self.admission.changed.notify_waiters();
-    }
-}
-
-impl Drop for StreamAdmissionGuard {
-    fn drop(&mut self) {
-        self.counter.fetch_sub(1, Ordering::Relaxed);
-    }
-}
-
-struct TrackedEngineStream {
-    inner: EngineStream,
-    _guard: StreamAdmissionGuard,
-}
-
-impl Unpin for TrackedEngineStream {}
-
-impl Stream for TrackedEngineStream {
-    type Item = Result<BinaryTensorPacket, EngineError>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.inner.as_mut().poll_next(cx)
-    }
-}
-
-struct TrackedOpenAiWireStream {
-    inner: OpenAiWireStream,
-    _guard: StreamAdmissionGuard,
-}
-
-impl Unpin for TrackedOpenAiWireStream {}
-
-impl Stream for TrackedOpenAiWireStream {
-    type Item = Result<Vec<u8>, EngineError>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.inner.as_mut().poll_next(cx)
-    }
-}
-
 /// Main scheduler that coordinates CPU and GPU execution
 pub struct Scheduler {
     engines: Vec<EngineHandle>,
@@ -314,7 +55,8 @@ pub struct Scheduler {
     // Vector of channels, one pair per worker
     gpu_high_priority_queues: Vec<WorkQueue>,
     gpu_low_priority_queues: Vec<WorkQueue>,
-    _enable_fallback: bool,
+    // Maps each worker/queue index to the engine that owns that worker.
+    worker_engine_indices: Vec<usize>,
     // Track active CPU inferences
     cpu_active_count: Arc<std::sync::atomic::AtomicUsize>,
     // Track in-flight GPU work (requests already dequeued from the channels, but not finished).
@@ -323,8 +65,6 @@ pub struct Scheduler {
     // still need admission/backpressure accounting.
     gpu_stream_in_flight_count: Arc<AtomicUsize>,
     gpu_stream_admission: Arc<PriorityAdmission>,
-    // Device mesh for distributed inference
-    device_mesh: Option<Arc<DeviceMesh>>,
     // Mesh router for topology-aware routing
     router: MeshRouter,
     max_micro_batch: usize,
@@ -349,17 +89,37 @@ impl Drop for Scheduler {
 }
 
 impl Scheduler {
+    /// Builds a scheduler and starts one executor task per configured worker.
+    ///
+    /// The `_enable_fallback` argument is retained for source compatibility;
+    /// replica failover is owned by [`crate::replica_pool::ReplicaPool`].
+    ///
+    /// # Panics
+    ///
+    /// Panics when no engines are supplied, `workers_per_device` is zero, the
+    /// derived capacity overflows, the Rayon pool cannot be built, or this is
+    /// called without an active Tokio runtime. A `cpu_workers` value of zero
+    /// retains Rayon's automatic thread-count selection.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         engines: Vec<EngineHandle>,
         cpu_workers: usize,
         workers_per_device: usize,
         queue_size: usize,
-        enable_fallback: bool,
+        _enable_fallback: bool,
         max_micro_batch: usize,
         queue_delay_ms: u64,
         device_mesh: Option<Arc<DeviceMesh>>,
     ) -> Self {
+        assert!(
+            !engines.is_empty(),
+            "Scheduler requires at least one engine"
+        );
+        assert!(
+            workers_per_device > 0,
+            "Scheduler requires at least one worker per device"
+        );
+
         // Create CPU thread pool
         let cpu_pool = rayon::ThreadPoolBuilder::new()
             .num_threads(cpu_workers)
@@ -367,15 +127,21 @@ impl Scheduler {
             .expect("Failed to create CPU thread pool");
 
         let num_devices = engines.len();
-        let total_workers = num_devices * workers_per_device;
+        let total_workers = num_devices
+            .checked_mul(workers_per_device)
+            .expect("Scheduler worker count overflow");
 
         let mut gpu_high_priority_queues = Vec::with_capacity(total_workers);
         let mut gpu_low_priority_queues = Vec::with_capacity(total_workers);
+        let mut worker_engine_indices = Vec::with_capacity(total_workers);
         let gpu_in_flight_count = Arc::new(AtomicUsize::new(0));
-        let gpu_stream_admission = PriorityAdmission::new(total_workers.max(1) * queue_size.max(1));
+        let stream_capacity = total_workers
+            .checked_mul(queue_size.max(1))
+            .expect("Scheduler stream admission capacity overflow");
+        let gpu_stream_admission = PriorityAdmission::new(stream_capacity);
         let observer: SharedSchedulerObserver = Arc::new(RwLock::new(None));
 
-        for engine in &engines {
+        for (engine_index, engine) in engines.iter().enumerate() {
             for _ in 0..workers_per_device {
                 // Create GPU executor channels for this worker
                 let high_queue = WorkQueue::new_observed(
@@ -393,6 +159,7 @@ impl Scheduler {
 
                 gpu_high_priority_queues.push(high_queue.clone());
                 gpu_low_priority_queues.push(low_queue.clone());
+                worker_engine_indices.push(engine_index);
 
                 // Spawn GPU executor for this worker
                 let gpu_executor = GpuExecutor::new(
@@ -415,12 +182,11 @@ impl Scheduler {
             cpu_pool,
             gpu_high_priority_queues,
             gpu_low_priority_queues,
-            _enable_fallback: enable_fallback,
+            worker_engine_indices,
             cpu_active_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             gpu_in_flight_count,
             gpu_stream_in_flight_count: Arc::new(AtomicUsize::new(0)),
             gpu_stream_admission,
-            device_mesh,
             router,
             max_micro_batch,
             queue_overflow_policy: QueueOverflowPolicy::Block,
@@ -447,14 +213,44 @@ impl Scheduler {
         self.router.route(session_id, None)
     }
 
-    /// Get worker index with TP group hint for tensor parallelism
-    #[allow(dead_code)]
-    fn get_worker_index_with_hint(
-        &self,
-        session_id: &Option<String>,
-        tp_group_hint: Option<usize>,
-    ) -> usize {
-        self.router.route(session_id, tp_group_hint)
+    fn engine_for_worker(&self, worker_index: usize) -> EngineHandle {
+        let engine_index = self.worker_engine_indices[worker_index];
+        self.engines[engine_index].clone()
+    }
+
+    fn try_reserve_cpu_slot(&self) -> bool {
+        let capacity = self.cpu_pool.current_num_threads();
+        self.cpu_active_count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < capacity).then_some(active + 1)
+            })
+            .is_ok()
+    }
+
+    fn dispatch_cpu(&self, request: Request, slot_reserved: bool) {
+        let engine_idx = self.get_worker_index(&None) % self.engines.len();
+        let engine = self.engines[engine_idx].clone();
+        if !slot_reserved {
+            self.cpu_active_count.fetch_add(1, Ordering::AcqRel);
+        }
+        let cpu_active_count = self.cpu_active_count.clone();
+
+        self.cpu_pool.spawn(move || {
+            let _active = ActiveCountGuard {
+                counter: cpu_active_count,
+            };
+            let result = if request
+                .input
+                .cancellation
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+            {
+                Err(EngineError::cancelled("Request cancelled"))
+            } else {
+                engine.infer(&request.input)
+            };
+            let _ = request.response_tx.send(result);
+        });
     }
 
     async fn acquire_gpu_stream_permit(
@@ -480,7 +276,7 @@ impl Scheduler {
 
     /// Get the device mesh if available
     pub fn device_mesh(&self) -> Option<Arc<DeviceMesh>> {
-        self.device_mesh.clone()
+        self.router.device_mesh()
     }
 
     pub async fn infer(
@@ -489,6 +285,13 @@ impl Scheduler {
         priority: Priority,
         force_cpu: bool,
     ) -> Result<BinaryTensorPacket, EngineError> {
+        if input
+            .cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return Err(EngineError::cancelled("Request cancelled"));
+        }
         let (response_tx, response_rx) = oneshot::channel();
 
         // Determine worker index before moving input
@@ -501,21 +304,7 @@ impl Scheduler {
         let request = Request { input, response_tx };
 
         if force_cpu {
-            // Execute on CPU thread pool
-            let engine_idx = self.get_worker_index(&None) % self.engines.len();
-            let engine = self.engines[engine_idx].clone();
-            let cpu_input = request.input.clone();
-            let cpu_response_tx = request.response_tx;
-
-            self.cpu_active_count
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let cpu_active_count = self.cpu_active_count.clone();
-
-            self.cpu_pool.spawn(move || {
-                let result = engine.infer(&cpu_input);
-                let _ = cpu_response_tx.send(result);
-                cpu_active_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            });
+            self.dispatch_cpu(request, false);
 
             response_rx
                 .await
@@ -567,15 +356,31 @@ impl Scheduler {
         force_cpu: bool,
     ) -> Result<BinaryTensorPacket, EngineError> {
         if force_cpu {
-            // Reject immediately when every rayon thread is already busy.
-            let active = self
-                .cpu_active_count
-                .load(std::sync::atomic::Ordering::Relaxed);
-            if active >= self.cpu_pool.current_num_threads() {
+            if input
+                .cancellation
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+            {
+                return Err(EngineError::cancelled("Request cancelled"));
+            }
+            // Atomically reserve capacity so concurrent non-blocking callers
+            // cannot all observe the same free worker and overfill Rayon.
+            if !self.try_reserve_cpu_slot() {
                 return Err(EngineError::overloaded("CPU pool saturated".to_string()));
             }
-            // Pool has capacity — fall through to the normal blocking path.
-            return self.infer(input, priority, true).await;
+            let (response_tx, response_rx) = oneshot::channel();
+            self.dispatch_cpu(Request { input, response_tx }, true);
+            return response_rx
+                .await
+                .map_err(|_| EngineError::overloaded("Scheduler dropped request".to_string()))?;
+        }
+
+        if input
+            .cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return Err(EngineError::cancelled("Request cancelled"));
         }
 
         // GPU path: attempt a non-blocking push.
@@ -602,21 +407,23 @@ impl Scheduler {
             .cpu_active_count
             .load(std::sync::atomic::Ordering::Relaxed);
 
-        let mut gpu_total = 0;
+        let mut gpu_total = 0usize;
         for (high_queue, low_queue) in self
             .gpu_high_priority_queues
             .iter()
             .zip(self.gpu_low_priority_queues.iter())
         {
-            gpu_total += high_queue.len();
-            gpu_total += low_queue.len();
+            gpu_total = gpu_total.saturating_add(high_queue.len());
+            gpu_total = gpu_total.saturating_add(low_queue.len());
         }
-        gpu_total += self
-            .gpu_in_flight_count
-            .load(std::sync::atomic::Ordering::Relaxed);
-        gpu_total += self
-            .gpu_stream_in_flight_count
-            .load(std::sync::atomic::Ordering::Relaxed);
+        gpu_total = gpu_total.saturating_add(
+            self.gpu_in_flight_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        gpu_total = gpu_total.saturating_add(
+            self.gpu_stream_in_flight_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
         (cpu_depth, gpu_total)
     }
 
@@ -654,34 +461,13 @@ impl crate::replica_pool::ReplicaScheduler for Scheduler {
     }
 
     fn get_metrics(&self) -> kapsl_engine_api::EngineMetrics {
-        let mut total_memory = 0;
-        let mut total_gpu_util = 0.0;
-        let mut total_throughput = 0.0;
-        let mut total_kv_bytes_used = 0;
-        let mut total_kv_bytes_capacity = 0;
-        let mut total_kv_blocks_total = 0;
-        let mut total_kv_blocks_free = 0;
-        let mut total_kv_sequences = 0;
-        let mut total_kv_evicted_blocks = 0;
-        let mut total_kv_evicted_sequences = 0;
-        let mut total_kv_packed_layers = 0;
-        let mut total_kv_cpu_offloaded_blocks = 0;
-        let mut total_prompt_tokens = 0;
-        let mut total_generated_tokens = 0;
-        let mut total_decode_steps = 0;
-        let mut total_decode_tokens_evaluated = 0;
-        let mut total_kv_partial_reuse_hits = 0;
-        let mut total_kv_partial_reuse_tokens_saved = 0;
-        let mut total_onnx_session_pool_total = 0;
-        let mut total_onnx_session_pool_idle = 0;
-        let mut total_onnx_session_pool_waits = 0;
-        let mut total_onnx_session_pool_wait_seconds = 0.0;
+        let mut aggregate = MetricsAccumulator::default();
         let mut delegated_capacity = 0usize;
         let mut has_delegated_capacity = false;
-        let count = self.engines.len();
 
         for engine in &self.engines {
-            let m = engine.metrics();
+            let metrics = engine.metrics();
+            aggregate.add(&metrics);
             let batching = engine.batching_policy();
             if matches!(
                 batching.mode,
@@ -690,67 +476,17 @@ impl crate::replica_pool::ReplicaScheduler for Scheduler {
                 has_delegated_capacity = true;
                 delegated_capacity = delegated_capacity.saturating_add(batching.max_requests);
             }
-            total_memory += m.memory_usage;
-            total_gpu_util += m.gpu_utilization;
-            total_throughput += m.throughput;
-            total_kv_bytes_used += m.kv_cache_bytes_used;
-            total_kv_bytes_capacity += m.kv_cache_bytes_capacity;
-            total_kv_blocks_total += m.kv_cache_blocks_total;
-            total_kv_blocks_free += m.kv_cache_blocks_free;
-            total_kv_sequences += m.kv_cache_sequences;
-            total_kv_evicted_blocks += m.kv_cache_evicted_blocks;
-            total_kv_evicted_sequences += m.kv_cache_evicted_sequences;
-            total_kv_packed_layers += m.kv_cache_packed_layers;
-            total_kv_cpu_offloaded_blocks += m.kv_cache_cpu_offloaded_blocks;
-            total_prompt_tokens += m.prompt_tokens_total;
-            total_generated_tokens += m.generated_tokens_total;
-            total_decode_steps += m.decode_steps_total;
-            total_decode_tokens_evaluated += m.decode_tokens_evaluated_total;
-            total_kv_partial_reuse_hits += m.kv_partial_reuse_hits_total;
-            total_kv_partial_reuse_tokens_saved += m.kv_partial_reuse_tokens_saved_total;
-            total_onnx_session_pool_total += m.onnx_session_pool_total;
-            total_onnx_session_pool_idle += m.onnx_session_pool_idle;
-            total_onnx_session_pool_waits += m.onnx_session_pool_waits_total;
-            total_onnx_session_pool_wait_seconds += m.onnx_session_pool_wait_seconds_total;
         }
 
         let (cpu_q, gpu_q) = self.get_queue_depth();
-
-        kapsl_engine_api::EngineMetrics {
-            memory_usage: total_memory,
-            gpu_utilization: if count > 0 {
-                total_gpu_util / count as f64
-            } else {
-                0.0
-            },
-            throughput: total_throughput,
-            batch_size: if has_delegated_capacity {
-                delegated_capacity.max(1)
-            } else {
-                self.max_micro_batch
-            },
-            queue_depth: cpu_q + gpu_q,
-            kv_cache_bytes_used: total_kv_bytes_used,
-            kv_cache_bytes_capacity: total_kv_bytes_capacity,
-            kv_cache_blocks_total: total_kv_blocks_total,
-            kv_cache_blocks_free: total_kv_blocks_free,
-            kv_cache_sequences: total_kv_sequences,
-            kv_cache_evicted_blocks: total_kv_evicted_blocks,
-            kv_cache_evicted_sequences: total_kv_evicted_sequences,
-            kv_cache_packed_layers: total_kv_packed_layers,
-            kv_cache_cpu_offloaded_blocks: total_kv_cpu_offloaded_blocks,
-            prompt_tokens_total: total_prompt_tokens,
-            generated_tokens_total: total_generated_tokens,
-            decode_steps_total: total_decode_steps,
-            decode_tokens_evaluated_total: total_decode_tokens_evaluated,
-            kv_partial_reuse_hits_total: total_kv_partial_reuse_hits,
-            kv_partial_reuse_tokens_saved_total: total_kv_partial_reuse_tokens_saved,
-            onnx_session_pool_total: total_onnx_session_pool_total,
-            onnx_session_pool_idle: total_onnx_session_pool_idle,
-            onnx_session_pool_waits_total: total_onnx_session_pool_waits,
-            onnx_session_pool_wait_seconds_total: total_onnx_session_pool_wait_seconds,
-            ..kapsl_engine_api::EngineMetrics::default()
-        }
+        let mut metrics = aggregate.finish();
+        metrics.batch_size = if has_delegated_capacity {
+            delegated_capacity.max(1)
+        } else {
+            self.max_micro_batch
+        };
+        metrics.queue_depth = cpu_q.saturating_add(gpu_q);
+        metrics
     }
 
     fn model_info(&self) -> Option<EngineModelInfo> {
@@ -794,7 +530,7 @@ impl crate::replica_pool::ReplicaScheduler for Scheduler {
         } else {
             self.get_worker_index(&request.session_id)
         };
-        let engine = self.engines[worker_idx % self.engines.len()].clone();
+        let engine = self.engine_for_worker(worker_idx);
         if !engine.supports_openai_wire() {
             return Err(EngineError::backend(
                 "selected engine does not support protocol-native OpenAI requests",
@@ -865,7 +601,7 @@ impl crate::replica_pool::ReplicaScheduler for Scheduler {
         } else {
             self.get_worker_index(&request.session_id)
         };
-        let engine = self.engines[worker_idx % self.engines.len()].clone();
+        let engine = self.engine_for_worker(worker_idx);
         if !engine.supports_openai_wire() {
             return Err(EngineError::backend(
                 "selected engine does not support protocol-native OpenAI streams",
@@ -943,8 +679,7 @@ impl crate::replica_pool::ReplicaScheduler for Scheduler {
             0
         };
 
-        let engine_idx = worker_idx % self.engines.len();
-        let engine = self.engines[engine_idx].clone();
+        let engine = self.engine_for_worker(worker_idx);
 
         let batching_policy = engine.batching_policy();
         if matches!(
@@ -985,5 +720,4 @@ impl crate::replica_pool::ReplicaScheduler for Scheduler {
 }
 
 #[cfg(test)]
-#[path = "scheduler_tests.rs"]
-mod scheduler_tests;
+mod tests;

@@ -1,5 +1,5 @@
+use super::{determine_priority, RequestMetadata};
 use crate::priority::Priority;
-use crate::request_metadata::{determine_priority, RequestMetadata};
 
 #[test]
 fn priority_override_wins() {
@@ -87,6 +87,19 @@ fn heavy_workload_defaults_to_throughput() {
         batch_size: 8,
         input_size_bytes: Some(10_000_000),
         estimated_flops: Some(10_000_000_000),
+    };
+
+    assert_eq!(determine_priority(&meta), Priority::Throughput);
+}
+
+#[test]
+fn combined_work_estimate_saturates_instead_of_overflowing() {
+    let meta = RequestMetadata {
+        priority: 1,
+        sla_deadline: None,
+        batch_size: usize::MAX,
+        input_size_bytes: Some(usize::MAX),
+        estimated_flops: Some(u64::MAX),
     };
 
     assert_eq!(determine_priority(&meta), Priority::Throughput);

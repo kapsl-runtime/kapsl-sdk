@@ -1,3 +1,5 @@
+//! Periodic inference job scheduling.
+
 use crate::priority::Priority;
 use crate::scheduler::Scheduler;
 use chrono::Utc;
@@ -21,7 +23,8 @@ mod duration_serde {
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
-        f64::deserialize(d).map(Duration::from_secs_f64)
+        let seconds = f64::deserialize(d)?;
+        Duration::try_from_secs_f64(seconds).map_err(serde::de::Error::custom)
     }
 }
 
@@ -38,7 +41,7 @@ pub enum CronOverflowPolicy {
 }
 
 /// A cron job schedule: either a fixed interval or a cron expression.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum CronSchedule {
     /// Fire every fixed duration (e.g. every 30 seconds).
     Interval(#[serde(with = "duration_serde")] Duration),
@@ -71,7 +74,7 @@ pub struct CronJob {
 }
 
 /// A snapshot of a registered job's state.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CronJobInfo {
     pub id: String,
     pub schedule: CronSchedule,
@@ -86,11 +89,11 @@ pub struct CronJobInfo {
 }
 
 /// Errors returned by [`CronScheduler`] operations.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CronError {
     /// A job with the given ID is already registered.
     DuplicateId(String),
-    /// The cron expression could not be parsed.
+    /// The cron expression or fixed interval is invalid.
     InvalidExpression(String),
     /// No job with the given ID exists.
     NotFound(String),
@@ -162,7 +165,7 @@ impl JobEntry {
 /// ```
 pub struct CronScheduler {
     scheduler: Arc<Scheduler>,
-    jobs: Arc<RwLock<HashMap<String, JobEntry>>>,
+    jobs: RwLock<HashMap<String, JobEntry>>,
 }
 
 impl CronScheduler {
@@ -170,26 +173,21 @@ impl CronScheduler {
     pub fn new(scheduler: Arc<Scheduler>) -> Self {
         Self {
             scheduler,
-            jobs: Arc::new(RwLock::new(HashMap::new())),
+            jobs: RwLock::new(HashMap::new()),
         }
     }
 
     /// Register and immediately start a cron job.
     ///
     /// Returns [`CronError::DuplicateId`] if a job with the same ID already
-    /// exists, or [`CronError::InvalidExpression`] for a bad cron expression.
+    /// exists, or [`CronError::InvalidExpression`] for an invalid schedule.
     pub async fn register(&self, job: CronJob) -> Result<(), CronError> {
         let mut jobs = self.jobs.write().await;
 
         if jobs.contains_key(&job.id) {
             return Err(CronError::DuplicateId(job.id));
         }
-
-        // Validate cron expression eagerly so the error surfaces at registration time.
-        if let CronSchedule::Expression(ref expr) = job.schedule {
-            expr.parse::<Schedule>()
-                .map_err(|e| CronError::InvalidExpression(e.to_string()))?;
-        }
+        Self::validate_schedule(&job.schedule)?;
 
         let fired_count = Arc::new(AtomicU64::new(0));
         let missed_count = Arc::new(AtomicU64::new(0));
@@ -226,7 +224,15 @@ impl CronScheduler {
 
     /// Return a snapshot of all registered jobs (including live counters).
     pub async fn list_jobs(&self) -> Vec<CronJobInfo> {
-        self.jobs.read().await.values().map(|e| e.info()).collect()
+        let mut jobs = self
+            .jobs
+            .read()
+            .await
+            .values()
+            .map(JobEntry::info)
+            .collect::<Vec<_>>();
+        jobs.sort_unstable_by(|left, right| left.id.cmp(&right.id));
+        jobs
     }
 
     /// Return info for a single job, or `None` if not found.
@@ -238,7 +244,8 @@ impl CronScheduler {
     ///
     /// Converts the JSON-serializable definition into a live [`CronJob`] and
     /// registers it.  The `on_result` callback is `None`; callers that need
-    /// result notifications should register the job manually via [`register`].
+    /// result notifications should register the job manually via
+    /// [`Self::register`].
     pub async fn register_from_def(&self, def: CronJobDef) -> Result<(), CronError> {
         let schedule = match def.schedule {
             CronScheduleDef::Expression(expr) => CronSchedule::Expression(expr),
@@ -275,7 +282,7 @@ impl CronScheduler {
 
     /// Register all cron jobs declared in a [`Manifest`].
     ///
-    /// Calls [`register_from_def`] for each entry in `manifest.cron_jobs`.
+    /// Calls [`Self::register_from_def`] for each entry in `manifest.cron_jobs`.
     /// Returns the first error encountered, if any.
     pub async fn register_from_manifest(&self, manifest: Manifest) -> Result<(), CronError> {
         for def in manifest.cron_jobs {
@@ -287,6 +294,19 @@ impl CronScheduler {
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
+
+    fn validate_schedule(schedule: &CronSchedule) -> Result<(), CronError> {
+        match schedule {
+            CronSchedule::Interval(interval) if interval.is_zero() => Err(
+                CronError::InvalidExpression("interval must be greater than zero".to_string()),
+            ),
+            CronSchedule::Interval(_) => Ok(()),
+            CronSchedule::Expression(expression) => expression
+                .parse::<Schedule>()
+                .map(|_| ())
+                .map_err(|error| CronError::InvalidExpression(error.to_string())),
+        }
+    }
 
     fn spawn_job(
         &self,
@@ -366,9 +386,9 @@ impl CronScheduler {
         fired_count: &AtomicU64,
         missed_count: &AtomicU64,
     ) {
-        // Unwrap the Arc without cloning when we hold the only reference (the common case),
-        // falling back to a clone only if other Arc handles exist.
-        let request = Arc::try_unwrap(request).unwrap_or_else(|arc| (*arc).clone());
+        // Each firing receives an independent request because engines and
+        // schedulers may stamp metadata or attach cancellation state.
+        let request = (*request).clone();
         let result = match overflow_policy {
             CronOverflowPolicy::SkipIfBusy => {
                 scheduler.try_infer(request, priority, force_cpu).await
@@ -398,252 +418,13 @@ impl CronScheduler {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::scheduler::Scheduler;
-    use crate::test_support::make_request;
-    use async_trait::async_trait;
-    use kapsl_engine_api::{BinaryTensorPacket, Engine, EngineError, InferenceRequest};
-    use std::sync::{Arc, Mutex as StdMutex};
-
-    struct EchoEngine;
-
-    #[async_trait]
-    impl Engine for EchoEngine {
-        async fn load(&mut self, _: &std::path::Path) -> Result<(), EngineError> {
-            Ok(())
+impl Drop for CronScheduler {
+    fn drop(&mut self) {
+        for (_, entry) in self.jobs.get_mut().drain() {
+            entry.handle.abort();
         }
-        fn infer(&self, req: &InferenceRequest) -> Result<BinaryTensorPacket, EngineError> {
-            Ok(req.input.clone())
-        }
-        fn infer_stream(
-            &self,
-            req: &InferenceRequest,
-        ) -> std::pin::Pin<
-            Box<dyn futures::stream::Stream<Item = Result<BinaryTensorPacket, EngineError>> + Send>,
-        > {
-            let result = Ok(req.input.clone());
-            Box::pin(futures::stream::once(async move { result }))
-        }
-        fn unload(&mut self) {}
-        fn metrics(&self) -> kapsl_engine_api::EngineMetrics {
-            kapsl_engine_api::EngineMetrics::default()
-        }
-        fn health_check(&self) -> Result<(), EngineError> {
-            Ok(())
-        }
-    }
-
-    fn make_scheduler() -> Scheduler {
-        let engine: Arc<dyn Engine> = Arc::new(EchoEngine);
-        Scheduler::new(vec![engine], 2, 1, 1000, true, 1, 0, None)
-    }
-
-    #[tokio::test]
-    async fn test_register_and_list() {
-        let cron = CronScheduler::new(Arc::new(make_scheduler()));
-
-        cron.register(CronJob {
-            id: "job1".to_string(),
-            schedule: CronSchedule::Interval(Duration::from_secs(60)),
-            request: Arc::new(make_request()),
-            priority: Priority::Throughput,
-            force_cpu: true,
-            overflow_policy: CronOverflowPolicy::SkipIfBusy,
-            on_result: None,
-        })
-        .await
-        .unwrap();
-
-        let jobs = cron.list_jobs().await;
-        assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].id, "job1");
-        assert!(jobs[0].enabled);
-        assert_eq!(jobs[0].overflow_policy, CronOverflowPolicy::SkipIfBusy);
-    }
-
-    #[tokio::test]
-    async fn test_duplicate_id_rejected() {
-        let cron = CronScheduler::new(Arc::new(make_scheduler()));
-
-        cron.register(CronJob {
-            id: "dup".to_string(),
-            schedule: CronSchedule::Interval(Duration::from_secs(60)),
-            request: Arc::new(make_request()),
-            priority: Priority::Throughput,
-            force_cpu: true,
-            overflow_policy: CronOverflowPolicy::default(),
-            on_result: None,
-        })
-        .await
-        .unwrap();
-
-        let err = cron
-            .register(CronJob {
-                id: "dup".to_string(),
-                schedule: CronSchedule::Interval(Duration::from_secs(60)),
-                request: Arc::new(make_request()),
-                priority: Priority::Throughput,
-                force_cpu: true,
-                overflow_policy: CronOverflowPolicy::default(),
-                on_result: None,
-            })
-            .await;
-
-        assert!(matches!(err, Err(CronError::DuplicateId(_))));
-    }
-
-    #[tokio::test]
-    async fn test_invalid_expression_rejected() {
-        let cron = CronScheduler::new(Arc::new(make_scheduler()));
-
-        let err = cron
-            .register(CronJob {
-                id: "bad".to_string(),
-                schedule: CronSchedule::Expression("not a cron expression".to_string()),
-                request: Arc::new(make_request()),
-                priority: Priority::Throughput,
-                force_cpu: true,
-                overflow_policy: CronOverflowPolicy::default(),
-                on_result: None,
-            })
-            .await;
-
-        assert!(matches!(err, Err(CronError::InvalidExpression(_))));
-    }
-
-    #[tokio::test]
-    async fn test_unregister() {
-        let cron = CronScheduler::new(Arc::new(make_scheduler()));
-
-        cron.register(CronJob {
-            id: "removable".to_string(),
-            schedule: CronSchedule::Interval(Duration::from_secs(60)),
-            request: Arc::new(make_request()),
-            priority: Priority::Throughput,
-            force_cpu: true,
-            overflow_policy: CronOverflowPolicy::default(),
-            on_result: None,
-        })
-        .await
-        .unwrap();
-
-        assert!(cron.unregister("removable").await);
-        assert!(!cron.unregister("removable").await);
-        assert!(cron.list_jobs().await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_interval_fires_callback_and_increments_fired_count() {
-        let cron = CronScheduler::new(Arc::new(make_scheduler()));
-        let call_count = Arc::new(StdMutex::new(0u32));
-        let cc = call_count.clone();
-
-        cron.register(CronJob {
-            id: "fast".to_string(),
-            schedule: CronSchedule::Interval(Duration::from_millis(50)),
-            request: Arc::new(make_request()),
-            priority: Priority::Throughput,
-            force_cpu: true,
-            overflow_policy: CronOverflowPolicy::SkipIfBusy,
-            on_result: Some(Arc::new(move |_id, result| {
-                if result.is_ok() {
-                    *cc.lock().unwrap() += 1;
-                }
-            })),
-        })
-        .await
-        .unwrap();
-
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        cron.unregister("fast").await;
-
-        let info = cron.job_info("fast").await;
-        // job was removed, so job_info returns None — check via the callback counter
-        let count = *call_count.lock().unwrap();
-        assert!(count >= 2, "expected ≥2 firings, got {count}");
-        // job was removed before we could read info, which is fine
-        assert!(info.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_fired_count_tracked() {
-        let cron = CronScheduler::new(Arc::new(make_scheduler()));
-
-        cron.register(CronJob {
-            id: "counter-test".to_string(),
-            schedule: CronSchedule::Interval(Duration::from_millis(40)),
-            request: Arc::new(make_request()),
-            priority: Priority::Throughput,
-            force_cpu: true,
-            overflow_policy: CronOverflowPolicy::SkipIfBusy,
-            on_result: None,
-        })
-        .await
-        .unwrap();
-
-        tokio::time::sleep(Duration::from_millis(180)).await;
-
-        let info = cron.job_info("counter-test").await.unwrap();
-        assert!(
-            info.fired_count >= 2,
-            "expected ≥2 fired, got {}",
-            info.fired_count
-        );
-        // No artificial load — missed_count should be 0 on a healthy scheduler.
-        assert_eq!(info.missed_count, 0);
-
-        cron.unregister("counter-test").await;
-    }
-
-    #[tokio::test]
-    async fn test_valid_cron_expression_accepted() {
-        let cron = CronScheduler::new(Arc::new(make_scheduler()));
-
-        cron.register(CronJob {
-            id: "every-sec".to_string(),
-            schedule: CronSchedule::Expression("* * * * * *".to_string()),
-            request: Arc::new(make_request()),
-            priority: Priority::Throughput,
-            force_cpu: true,
-            overflow_policy: CronOverflowPolicy::default(),
-            on_result: None,
-        })
-        .await
-        .expect("valid expression should be accepted");
-
-        cron.unregister("every-sec").await;
-    }
-
-    #[tokio::test]
-    async fn test_skip_if_busy_increments_missed_count() {
-        use crate::scheduler::QueueOverflowPolicy;
-
-        // Tiny queue (capacity 1) so it fills up immediately.
-        let engine: Arc<dyn Engine> = Arc::new(EchoEngine);
-        let scheduler = Arc::new(
-            Scheduler::new(vec![engine], 1, 1, 1, true, 1, 0, None)
-                .with_queue_overflow_policy(QueueOverflowPolicy::DropNewest),
-        );
-
-        // Saturate the CPU pool by checking try_infer directly: we'll use
-        // force_cpu=false (GPU path) with a tiny queue so try_push returns Err.
-        let cron = CronScheduler::new(scheduler);
-
-        cron.register(CronJob {
-            id: "busy-test".to_string(),
-            schedule: CronSchedule::Interval(Duration::from_millis(10)),
-            request: Arc::new(make_request()),
-            priority: Priority::Throughput,
-            force_cpu: false, // GPU path — tiny queue will fill
-            overflow_policy: CronOverflowPolicy::SkipIfBusy,
-            on_result: None,
-        })
-        .await
-        .unwrap();
-
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        cron.unregister("busy-test").await;
     }
 }
+
+#[cfg(test)]
+mod tests;

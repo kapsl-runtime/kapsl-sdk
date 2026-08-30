@@ -1,7 +1,6 @@
 use super::*;
 use crate::replica_pool::ReplicaScheduler;
 use crate::request::Request;
-use crate::scheduler::QueueOverflowPolicy;
 use async_trait::async_trait;
 use kapsl_engine_api::{
     BatchingPolicy, BinaryTensorPacket, CancellationToken, Engine, EngineError, EngineMetrics,
@@ -9,7 +8,7 @@ use kapsl_engine_api::{
     OpenAiWireRequest, OpenAiWireResponse, OpenAiWireResponseHead, OpenAiWireStreamResponse,
     TensorDtype,
 };
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::oneshot;
 
@@ -408,12 +407,11 @@ fn build_scheduler_for_queue_tests(
         cpu_pool,
         gpu_high_priority_queues: vec![high_queue],
         gpu_low_priority_queues: vec![low_queue],
-        _enable_fallback: false,
+        worker_engine_indices: vec![0],
         cpu_active_count: Arc::new(AtomicUsize::new(cpu_active)),
         gpu_in_flight_count: Arc::new(AtomicUsize::new(0)),
         gpu_stream_in_flight_count: Arc::new(AtomicUsize::new(0)),
         gpu_stream_admission: PriorityAdmission::new(queue_size.max(1)),
-        device_mesh: None,
         router: MeshRouter::new(None, 1),
         max_micro_batch: 1,
         queue_overflow_policy: QueueOverflowPolicy::Block,
@@ -484,6 +482,47 @@ async fn test_get_worker_index_sticky_session() {
 }
 
 #[tokio::test]
+async fn worker_indices_map_to_their_owning_engine() {
+    let first: EngineHandle = Arc::new(MockEngine::new(EngineMetrics::default()));
+    let second: EngineHandle = Arc::new(MockEngine::new(EngineMetrics::default()));
+    let scheduler = Scheduler::new(
+        vec![first.clone(), second.clone()],
+        1,
+        2,
+        8,
+        false,
+        1,
+        0,
+        None,
+    );
+
+    assert!(Arc::ptr_eq(&scheduler.engine_for_worker(0), &first));
+    assert!(Arc::ptr_eq(&scheduler.engine_for_worker(1), &first));
+    assert!(Arc::ptr_eq(&scheduler.engine_for_worker(2), &second));
+    assert!(Arc::ptr_eq(&scheduler.engine_for_worker(3), &second));
+}
+
+#[tokio::test]
+async fn zero_cpu_workers_retains_rayon_auto_selection() {
+    let engine: EngineHandle = Arc::new(MockEngine::new(EngineMetrics::default()));
+    let scheduler = Scheduler::new(vec![engine], 0, 1, 1, false, 1, 0, None);
+
+    assert!(scheduler.cpu_pool.current_num_threads() > 0);
+}
+
+#[test]
+fn non_blocking_cpu_admission_reserves_capacity_atomically() {
+    let engine: EngineHandle = Arc::new(MockEngine::new(EngineMetrics::default()));
+    let scheduler = build_scheduler_for_queue_tests(vec![engine], 1, 0);
+
+    assert!(scheduler.try_reserve_cpu_slot());
+    assert!(!scheduler.try_reserve_cpu_slot());
+    scheduler.cpu_active_count.fetch_sub(1, Ordering::Release);
+    assert!(scheduler.try_reserve_cpu_slot());
+    scheduler.cpu_active_count.fetch_sub(1, Ordering::Release);
+}
+
+#[tokio::test]
 async fn test_drop_scheduler_releases_executor_engine_handles() {
     let engine = Arc::new(MockEngine::new(EngineMetrics::default()));
     let engine_handle: EngineHandle = engine.clone();
@@ -540,6 +579,82 @@ fn test_get_queue_depth_counts_cpu_and_gpu() {
     let (cpu_depth, gpu_depth) = scheduler.get_queue_depth();
     assert_eq!(cpu_depth, 2);
     assert_eq!(gpu_depth, 3);
+}
+
+#[tokio::test]
+async fn blocked_work_queue_honors_request_cancellation() {
+    use crate::gpu_executor::WorkQueue;
+
+    let queue = WorkQueue::new(1);
+    let (first_tx, _first_rx) = oneshot::channel();
+    assert!(queue
+        .try_push_drop_newest(Request {
+            input: make_inference_request(None),
+            response_tx: first_tx,
+        })
+        .is_ok());
+
+    let cancellation = CancellationToken::new();
+    let mut input = make_inference_request(None);
+    input.cancellation = Some(cancellation.clone());
+    let (response_tx, response_rx) = oneshot::channel();
+    let blocked_queue = queue.clone();
+    let blocked = tokio::spawn(async move {
+        blocked_queue
+            .push_block(Request { input, response_tx })
+            .await;
+    });
+
+    tokio::task::yield_now().await;
+    cancellation.cancel();
+    tokio::time::timeout(std::time::Duration::from_secs(1), blocked)
+        .await
+        .expect("cancellation should wake the blocked producer")
+        .expect("blocked producer should not panic");
+    let error = response_rx
+        .await
+        .expect("cancelled request should receive a response")
+        .expect_err("cancelled request must not enter the queue");
+    assert!(matches!(error, EngineError::Cancelled { .. }));
+    assert_eq!(queue.len(), 1);
+}
+
+#[tokio::test]
+async fn closing_work_queue_wakes_item_waiters() {
+    use crate::gpu_executor::WorkQueue;
+
+    let queue = WorkQueue::new(1);
+    let waiting_queue = queue.clone();
+    let waiter = tokio::spawn(async move { waiting_queue.wait_for_item().await });
+    tokio::task::yield_now().await;
+    queue.close();
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+        .await
+        .expect("closing the queue should wake item waiters")
+        .expect("item waiter should not panic");
+}
+
+#[tokio::test]
+async fn closing_work_queue_rejects_queued_requests() {
+    use crate::gpu_executor::WorkQueue;
+
+    let queue = WorkQueue::new(1);
+    let (response_tx, response_rx) = oneshot::channel();
+    assert!(queue
+        .try_push_drop_newest(Request {
+            input: make_inference_request(None),
+            response_tx,
+        })
+        .is_ok());
+
+    queue.close();
+    let error = response_rx
+        .await
+        .expect("queue close should resolve the request")
+        .expect_err("a closed queue cannot execute pending work");
+    assert!(error.is_overloaded());
+    assert_eq!(queue.len(), 0);
 }
 
 #[test]

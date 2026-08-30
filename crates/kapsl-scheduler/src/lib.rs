@@ -8,9 +8,11 @@ pub mod request;
 pub mod request_metadata;
 pub mod scheduler;
 
+mod metrics;
+
 // Re-export main types
 pub use cron_scheduler::{
-    CronCallback, CronError, CronJob, CronJobInfo, CronSchedule, CronScheduler,
+    CronCallback, CronError, CronJob, CronJobInfo, CronOverflowPolicy, CronSchedule, CronScheduler,
 };
 pub use priority::Priority;
 pub use replica_pool::{PoolStrategy, ReplicaPool, ReplicaScheduler, ReplicaStats};
