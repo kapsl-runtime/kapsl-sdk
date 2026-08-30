@@ -1,3 +1,5 @@
+//! Pooled client connections for platform-native IPC transports.
+
 use async_trait::async_trait;
 use kapsl_engine_api::{BinaryTensorPacket, InferenceRequest};
 use kapsl_transport::connection_pool::{ConnectionFactory, ConnectionPool, PoolConfig};
