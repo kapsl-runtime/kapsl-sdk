@@ -180,10 +180,10 @@ gguf-native           Kapsl CUDA kernels and Kapsl-owned KV
 
 Expected Kapsl files:
 
-- `crates/kapsl-hal/src/gpu_arena.rs`: expose stable device base pointer and
-  block geometry for FFI.
-- `crates/kapsl-hal/src/cross_device_scheduler.rs`: provide FFI-safe reserve,
-  release, and touch wrappers around existing scheduler operations.
+- `crates/kapsl-hal/src/memory/gpu_arena.rs`: expose stable device base pointer
+  and block geometry for FFI.
+- `crates/kapsl-hal/src/memory/cross_device_scheduler.rs`: provide FFI-safe
+  reserve, release, and touch wrappers around existing scheduler operations.
 - `crates/kapsl-llm/src/gguf_backend.rs`: create llama contexts with
   `llama_kapsl_kv_pool_desc` when `gguf-cuda-shared-kv` is enabled.
 - `crates/kapsl-backends/Cargo.toml` and `crates/kapsl-llm/Cargo.toml`: patch

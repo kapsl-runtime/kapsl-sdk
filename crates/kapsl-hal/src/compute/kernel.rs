@@ -1,3 +1,5 @@
+//! Backend-neutral kernel contracts and configuration.
+
 use std::fmt::Debug;
 use thiserror::Error;
 

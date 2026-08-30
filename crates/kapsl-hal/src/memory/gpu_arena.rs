@@ -1,4 +1,4 @@
-//! GPU memory arenas and the runtime-owned, geometry-neutral device pool.
+//! GPU arenas and the runtime-owned, geometry-neutral device pool.
 //!
 //! The arena owns one `cudaMalloc` and hands out typed sub-slices via a
 //! bump-pointer allocator. This avoids the per-tensor fragmentation that

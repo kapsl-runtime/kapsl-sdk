@@ -1,3 +1,5 @@
+//! Tests for hardware discovery data and device selection.
+
 use crate::device::{Device, DeviceBackend, DeviceInfo, GpuPreference};
 
 fn make_device(id: usize, backend: DeviceBackend, memory_mb: u64) -> Device {

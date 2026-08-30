@@ -1,3 +1,5 @@
+//! Borrowed CPU tensor views used by kernel interfaces.
+
 use std::fmt::Debug;
 
 #[derive(Debug, Clone)]

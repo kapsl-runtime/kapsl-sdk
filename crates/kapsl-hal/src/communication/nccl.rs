@@ -1,4 +1,4 @@
-//! NCCL Communication Backend
+//! NCCL communication backend.
 //!
 //! Provides real GPU-based distributed communication using NVIDIA NCCL
 //! via the cudarc crate. This module is only available when the `nccl`
