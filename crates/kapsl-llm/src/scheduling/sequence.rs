@@ -1,6 +1,9 @@
+//! Sequence state and sampling parameters shared by LLM schedulers.
+
 use kapsl_engine_api::CancellationToken;
 use std::collections::HashMap;
 use std::sync::Arc;
+#[cfg(feature = "onnx")]
 use tokenizers::Tokenizer;
 use tokio::sync::mpsc;
 
@@ -33,6 +36,7 @@ pub struct Sequence {
     pub rng_state: u64,
     /// Text emitted during the current generation turn.
     pub decode_stream_prefix: String,
+    #[cfg(feature = "onnx")]
     pub(crate) decode_stream: IncrementalDecodeState,
 }
 
@@ -43,6 +47,7 @@ pub struct Sequence {
 /// by newer tokenizers releases, so each decode only revisits the small unstable
 /// suffix instead of every token generated so far.
 #[derive(Debug, Clone, Default)]
+#[cfg(feature = "onnx")]
 pub(crate) struct IncrementalDecodeState {
     ids: Vec<u32>,
     prefix: String,
@@ -50,6 +55,7 @@ pub(crate) struct IncrementalDecodeState {
     cumulative_fallback: bool,
 }
 
+#[cfg(feature = "onnx")]
 impl IncrementalDecodeState {
     pub(crate) fn step(
         &mut self,
@@ -120,6 +126,7 @@ impl Sequence {
             kv_cached_len: 0,
             rng_state: 0x4d595df4d0f33173,
             decode_stream_prefix: String::new(),
+            #[cfg(feature = "onnx")]
             decode_stream: IncrementalDecodeState::default(),
         }
     }
@@ -140,6 +147,7 @@ impl Sequence {
 
     pub fn reset_decode_stream(&mut self) {
         self.decode_stream_prefix.clear();
+        #[cfg(feature = "onnx")]
         self.decode_stream.reset();
     }
 }

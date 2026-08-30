@@ -1,3 +1,5 @@
+//! Per-engine sequence scheduling and local KV preemption.
+
 use crate::block_manager::BlockManager;
 use crate::sequence::{FinishReason, Sequence, SequenceGroup, SequenceGroupOutput, SequenceStatus};
 use std::collections::VecDeque;
@@ -15,14 +17,17 @@ pub struct SchedulerOutputs {
     /// Sequence KV stores invalidated by local priority preemption this round.
     /// The engine owns the concrete host/device KV cache and must release these
     /// entries before executing the newly admitted work.
+    #[cfg(any(feature = "onnx", test))]
     pub(crate) preempted_sequence_ids: Vec<u64>,
     /// Cross-engine pressure that could not be satisfied locally. The engine
     /// routes this through `GlobalKvScheduler` after publishing its own donor
     /// state, and retries the waiting request on a later loop iteration.
+    #[cfg(any(feature = "onnx", test))]
     pub(crate) preemption_request: Option<SchedulerPreemptionRequest>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(any(feature = "onnx", test))]
 pub(crate) struct SchedulerPreemptionRequest {
     pub(crate) blocks_needed: usize,
     /// Internal sequence priority: larger values are more important.
@@ -109,7 +114,9 @@ impl LLMScheduler {
     pub fn schedule(&mut self) -> SchedulerOutputs {
         // Calculate current running tokens (decode): 1 token per running sequence.
         let mut num_batched_tokens = 0usize;
+        #[cfg(any(feature = "onnx", test))]
         let mut preempted_sequence_ids = Vec::new();
+        #[cfg(any(feature = "onnx", test))]
         let mut preemption_request = None;
 
         for group in &self.running_queue {
@@ -299,13 +306,19 @@ impl LLMScheduler {
                 let shortage =
                     total_additional_blocks.saturating_sub(self.block_manager.allocatable_blocks());
                 let outcome = self.preempt_lower_priority(shortage, request_priority);
+                #[cfg(any(feature = "onnx", test))]
                 preempted_sequence_ids.extend(outcome.sequence_ids);
+                #[cfg(not(any(feature = "onnx", test)))]
+                let _ = outcome;
                 if !self.block_manager.can_allocate(total_additional_blocks) {
-                    preemption_request = Some(SchedulerPreemptionRequest {
-                        blocks_needed: total_additional_blocks
-                            .saturating_sub(self.block_manager.allocatable_blocks()),
-                        request_priority,
-                    });
+                    #[cfg(any(feature = "onnx", test))]
+                    {
+                        preemption_request = Some(SchedulerPreemptionRequest {
+                            blocks_needed: total_additional_blocks
+                                .saturating_sub(self.block_manager.allocatable_blocks()),
+                            request_priority,
+                        });
+                    }
                     break; // Not enough memory even after preemption
                 }
             }
@@ -345,7 +358,9 @@ impl LLMScheduler {
 
         SchedulerOutputs {
             scheduled_seq_groups,
+            #[cfg(any(feature = "onnx", test))]
             preempted_sequence_ids,
+            #[cfg(any(feature = "onnx", test))]
             preemption_request,
         }
     }
@@ -468,6 +483,7 @@ impl LLMScheduler {
     /// can understate what a very high-priority requester could reclaim across
     /// several tiers, but never promises blocks that the donor would then have
     /// to take from equal- or higher-priority work.
+    #[cfg(feature = "onnx")]
     pub(crate) fn preemption_state(&self) -> (Option<u8>, usize) {
         let mut lowest_priority = None;
         let mut freeable_blocks = 0usize;

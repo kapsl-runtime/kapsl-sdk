@@ -1,3 +1,5 @@
+//! Chat-template detection and prompt rendering for supported model families.
+
 /// One turn of a conversation, as sent by an OpenAI-style chat client.
 ///
 /// `role` is matched case-insensitively against `system`, `user`, and

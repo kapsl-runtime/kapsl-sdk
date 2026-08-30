@@ -1,3 +1,5 @@
+//! Dense and paged host KV-cache implementations.
+
 use crate::radix_tree::RadixTree;
 use half::f16;
 use kapsl_quantization::kv_cache::{KvCacheConfig as TqConfig, KvCacheQuantizer};
