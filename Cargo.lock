@@ -1899,6 +1899,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "kapsl-communication"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "kapsl-ipc",
+ "kapsl-scheduler",
+ "kapsl-shm",
+ "kapsl-transport",
+ "prometheus",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "kapsl-core"
 version = "0.3.0"
 dependencies = [
@@ -2067,10 +2080,8 @@ dependencies = [
 name = "kapsl-pyo3"
 version = "0.3.0"
 dependencies = [
+ "kapsl-communication",
  "kapsl-engine-api",
- "kapsl-ipc",
- "kapsl-shm",
- "kapsl-transport",
  "pyo3",
  "tokio",
 ]
@@ -2162,6 +2173,7 @@ version = "0.3.0"
 dependencies = [
  "async-trait",
  "bincode",
+ "futures",
  "kapsl-engine-api",
  "log",
  "serde",

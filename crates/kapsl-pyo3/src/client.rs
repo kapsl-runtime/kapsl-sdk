@@ -1,7 +1,7 @@
-use kapsl_engine_api::{BinaryTensorPacket, InferenceRequest, NamedTensor, TensorDtype};
-use kapsl_transport::protocol::{
+use kapsl_communication::transport::protocol::{
     blocking, CodecError, StreamResponse, DEFAULT_MAX_FRAME_PAYLOAD_BYTES, OP_INFER_STREAM,
 };
+use kapsl_engine_api::{BinaryTensorPacket, InferenceRequest, NamedTensor, TensorDtype};
 use pyo3::prelude::*;
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};

@@ -1,11 +1,11 @@
-use kapsl_engine_api::TensorDtype;
-use kapsl_ipc::protocol::{HybridRequest, HybridResponse};
-use kapsl_shm::allocator::TieredShmAllocator;
-use kapsl_shm::memory::ShmManager;
-use kapsl_transport::protocol::{
+use kapsl_communication::ipc::protocol::{HybridRequest, HybridResponse};
+use kapsl_communication::shm::allocator::TieredShmAllocator;
+use kapsl_communication::shm::memory::ShmManager;
+use kapsl_communication::transport::protocol::{
     asynchronous, DEFAULT_MAX_FRAME_PAYLOAD_BYTES, OP_HYBRID_INFER, STATUS_OK,
 };
-use kapsl_transport::RequestMetadata;
+use kapsl_communication::RequestMetadata;
+use kapsl_engine_api::TensorDtype;
 use pyo3::prelude::*;
 use std::path::PathBuf;
 use std::sync::Arc;

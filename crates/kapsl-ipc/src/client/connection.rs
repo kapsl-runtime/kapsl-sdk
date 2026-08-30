@@ -101,4 +101,52 @@ impl TransportClient for IpcClient {
     ) -> Result<BinaryTensorPacket, TransportError> {
         IpcClient::infer_request(self, model_id, request).await
     }
+
+    #[cfg(feature = "streaming")]
+    async fn infer_stream(
+        &self,
+        model_id: u32,
+        input: BinaryTensorPacket,
+    ) -> Result<
+        std::pin::Pin<
+            Box<dyn futures::Stream<Item = Result<BinaryTensorPacket, TransportError>> + Send>,
+        >,
+        TransportError,
+    > {
+        let mut connection = self
+            .pool
+            .get()
+            .await
+            .map_err(|error| TransportError::Connection(error.to_string()))?;
+        connection.discard_on_drop();
+        let request = InferenceRequest::new(input);
+        kapsl_transport::protocol::asynchronous::write_request_value(
+            &mut *connection,
+            model_id,
+            kapsl_transport::protocol::OP_INFER_STREAM,
+            &request,
+        )
+        .await
+        .map_err(TransportError::from)?;
+
+        let responses = futures::stream::unfold(Some(connection), |state| async move {
+            let mut connection = state?;
+            match kapsl_transport::protocol::asynchronous::read_stream_packet(
+                &mut *connection,
+                kapsl_transport::protocol::DEFAULT_MAX_FRAME_PAYLOAD_BYTES,
+            )
+            .await
+            {
+                Ok(kapsl_transport::protocol::StreamResponse::Chunk(packet)) => {
+                    Some((Ok(packet), Some(connection)))
+                }
+                Ok(kapsl_transport::protocol::StreamResponse::End) => {
+                    connection.recycle_on_drop();
+                    None
+                }
+                Err(error) => Some((Err(TransportError::from(error)), None)),
+            }
+        });
+        Ok(Box::pin(responses))
+    }
 }

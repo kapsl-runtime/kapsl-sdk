@@ -73,6 +73,26 @@ where
 {
     pool: Arc<ConnectionPool<C, F>>,
     connection: Option<C>,
+    reusable: bool,
+}
+
+impl<C, F> PooledConnection<C, F>
+where
+    C: Send + Sync + 'static,
+    F: ConnectionFactory<Connection = C> + Send + Sync + 'static,
+{
+    /// Close this connection instead of returning it to the pool when dropped.
+    ///
+    /// Streaming clients use this while a response is incomplete so dropping
+    /// the stream cannot return a connection with unread frames to the pool.
+    pub fn discard_on_drop(&mut self) {
+        self.reusable = false;
+    }
+
+    /// Return a previously guarded connection to the pool when dropped.
+    pub fn recycle_on_drop(&mut self) {
+        self.reusable = true;
+    }
 }
 
 impl<C, F> std::ops::Deref for PooledConnection<C, F>
@@ -104,6 +124,11 @@ where
 {
     fn drop(&mut self) {
         if let Some(conn) = self.connection.take() {
+            if !self.reusable {
+                drop(conn);
+                self.pool.sem.add_permits(1);
+                return;
+            }
             let pool = self.pool.clone();
             tokio::spawn(async move {
                 pool.return_connection(conn).await;
@@ -143,6 +168,7 @@ where
                     return Ok(PooledConnection {
                         pool: Arc::new(self.clone()),
                         connection: Some(idle_conn.connection),
+                        reusable: true,
                     });
                 }
             }
@@ -173,6 +199,7 @@ where
         Ok(PooledConnection {
             pool: Arc::new(self.clone()),
             connection: Some(conn),
+            reusable: true,
         })
     }
 
