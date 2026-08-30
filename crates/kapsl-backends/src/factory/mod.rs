@@ -1077,5 +1077,5 @@ impl BackendFactory {
     }
 }
 
-#[path = "factory_tests.rs"]
+#[path = "tests.rs"]
 mod factory_tests;

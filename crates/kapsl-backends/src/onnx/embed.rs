@@ -251,5 +251,5 @@ fn packet_to_f32(packet: &BinaryTensorPacket) -> Vec<f32> {
 }
 
 #[cfg(test)]
-#[path = "onnx_embed_tests.rs"]
+#[path = "embed_tests.rs"]
 mod onnx_embed_tests;

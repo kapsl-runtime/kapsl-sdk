@@ -358,5 +358,5 @@ fn iou(a: &Candidate, b: &Candidate) -> f32 {
 }
 
 #[cfg(test)]
-#[path = "onnx_detect_tests.rs"]
+#[path = "detect_tests.rs"]
 mod onnx_detect_tests;

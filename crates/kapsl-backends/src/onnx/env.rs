@@ -1,4 +1,4 @@
-//! Environment-variable parsing shared across the backend crate.
+//! Environment-variable parsing shared by the ONNX backends.
 
 /// Read a boolean-ish env var, falling back to `default` when unset or unparseable.
 ///

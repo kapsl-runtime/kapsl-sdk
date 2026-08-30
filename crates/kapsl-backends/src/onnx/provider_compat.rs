@@ -1,3 +1,5 @@
+//! ONNX execution-provider compatibility and selection helpers.
+
 use crate::env_util::read_env_flag;
 use kapsl_core::{
     accelerator_provider_pack_installed, AcceleratorProviderPack, ALLOW_UNMANAGED_PROVIDERS_ENV,

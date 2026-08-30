@@ -1,3 +1,5 @@
+//! Tests for the shared ONNX backend.
+
 #[cfg(test)]
 mod tests {
     use super::super::*;

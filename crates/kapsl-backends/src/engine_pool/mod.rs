@@ -286,5 +286,5 @@ impl EnginePool {
 }
 
 #[cfg(test)]
-#[path = "engine_pool_tests.rs"]
+#[path = "tests.rs"]
 mod engine_pool_tests;

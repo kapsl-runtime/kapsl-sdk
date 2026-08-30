@@ -1,3 +1,5 @@
+//! Tests for ONNX classification post-processing.
+
 use super::*;
 use async_trait::async_trait;
 use kapsl_engine_api::{
