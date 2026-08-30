@@ -1,7 +1,13 @@
+//! CPU reference implementations and optional CUDA kernels for Kapsl inference.
+
+#[path = "cpu/attention.rs"]
 pub mod attention;
+#[path = "cpu/backend.rs"]
 pub mod backend;
+#[path = "cpu/mlp.rs"]
 pub mod mlp;
 #[cfg(feature = "cuda")]
+#[path = "cuda/compiler.rs"]
 mod nvrtc_util;
 pub mod quant;
 

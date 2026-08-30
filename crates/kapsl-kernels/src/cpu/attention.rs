@@ -1,6 +1,9 @@
+//! CPU attention reference implementation.
+
 use kapsl_hal::kernel::{AttentionConfig, AttentionKernel, KernelError};
 use kapsl_hal::tensor::{TensorView, TensorViewMut};
 
+/// Portable CPU implementation of the attention kernel contract.
 #[derive(Debug)]
 pub struct CpuAttention;
 
@@ -100,6 +103,7 @@ impl AttentionKernel for CpuAttention {
 }
 
 #[cfg(feature = "cuda")]
+#[path = "../cuda/attention.rs"]
 pub mod cuda;
 
 struct AttentionDims {
