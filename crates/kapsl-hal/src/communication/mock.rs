@@ -1,4 +1,4 @@
-//! Mock Communication Backend for Testing
+//! Mock communication backend for tests.
 //!
 //! Provides a single-process implementation of `MeshComm` that simulates
 //! distributed operations for testing without requiring real multi-GPU setup.

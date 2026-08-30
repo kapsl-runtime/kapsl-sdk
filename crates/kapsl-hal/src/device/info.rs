@@ -1,3 +1,5 @@
+//! Hardware discovery and device selection.
+
 use serde::{Deserialize, Serialize};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;

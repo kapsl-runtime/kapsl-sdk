@@ -1,3 +1,5 @@
+//! IPC protocol types and shared transport framing constants.
+
 pub use kapsl_transport::protocol::{
     RequestHeader, ResponseHeader, OP_HYBRID_INFER, OP_INFER, OP_INFER_STREAM, OP_METRICS,
     OP_OPENAI_WIRE, OP_OPENAI_WIRE_STREAM, STATUS_ERR, STATUS_OK, STATUS_OPENAI_WIRE_CHUNK,

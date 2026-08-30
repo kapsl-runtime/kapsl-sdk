@@ -1,3 +1,5 @@
+//! Tests for borrowed tensor views.
+
 use crate::tensor::{TensorView, TensorViewMut};
 
 #[test]

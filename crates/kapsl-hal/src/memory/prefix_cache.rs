@@ -1,4 +1,4 @@
-//! Prefix KV-block cache for prompt-prefix reuse.
+//! KV-block cache for prompt-prefix reuse.
 //!
 //! When multiple requests share the same prompt prefix (system prompt, few-shot
 //! examples, document context), their KV blocks for that prefix are identical.

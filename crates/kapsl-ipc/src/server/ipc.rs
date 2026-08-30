@@ -1,3 +1,5 @@
+//! Platform-native IPC server and inference request dispatch.
+
 use crate::protocol::{
     HybridRequest, HybridResponse, OP_HYBRID_INFER, OP_INFER, OP_INFER_STREAM, OP_OPENAI_WIRE,
     OP_OPENAI_WIRE_STREAM, STATUS_ERR, STATUS_OK, STATUS_OPENAI_WIRE_CHUNK,
