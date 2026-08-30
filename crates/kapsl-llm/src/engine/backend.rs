@@ -1,3 +1,5 @@
+//! Engine API adapter for the ONNX LLM runtime.
+
 use crate::block_manager::SharedBlockAllocator;
 use crate::engine::LLMEngine;
 use crate::global_scheduler::GlobalKvScheduler;

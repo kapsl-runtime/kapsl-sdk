@@ -1,3 +1,5 @@
+//! Resolution of model roots and neighboring model assets.
+
 use std::path::{Path, PathBuf};
 
 pub fn find_model_root(model_path: &Path) -> PathBuf {

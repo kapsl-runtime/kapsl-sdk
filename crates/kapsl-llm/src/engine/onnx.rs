@@ -1,3 +1,5 @@
+//! ONNX Runtime LLM execution and KV-state management.
+
 /*
 Reworked LLMEngine to detect model KV geometry at load time and use dynamic
 num_layers / num_heads / head_dim instead of hard-coded constants.

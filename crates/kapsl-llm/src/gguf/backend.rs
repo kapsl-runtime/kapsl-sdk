@@ -1,23 +1,37 @@
+//! GGUF inference through llama.cpp with optional shared-KV integration.
+
+#[cfg(feature = "gguf")]
 use crate::prompt_adapter::{chat_template_from_model_identifiers, prompt_is_explicitly_formatted};
 use async_stream::stream;
 use async_trait::async_trait;
+#[cfg(feature = "gguf")]
 use kapsl_engine_api::{
-    BatchingPolicy, BinaryTensorPacket, Engine, EngineError, EngineMetrics, EngineModelInfo,
-    EngineStream, ExternalDeviceMemory, ExternalDeviceMemoryReport, InferenceRequest,
+    BatchingPolicy, EngineModelInfo, ExternalDeviceMemory, ExternalDeviceMemoryReport,
     MemoryAllocation, MemoryAllocationClass, MemoryAllocationSource, MemoryDomain, MemoryReport,
     RequestMemoryAdmission, RequestMemoryAdmissionGuard, TensorDtype,
 };
+use kapsl_engine_api::{
+    BinaryTensorPacket, Engine, EngineError, EngineMetrics, EngineStream, InferenceRequest,
+};
 #[cfg(feature = "gguf-cuda-shared-kv")]
 use kapsl_kv_abi::KvFeature;
+#[cfg(feature = "gguf")]
 use kapsl_kv_abi::{KvBackendCapabilities, KvTopology};
-#[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv", test))]
+#[cfg(any(
+    feature = "gguf-cuda-shared-kv",
+    feature = "gguf-external-kv",
+    all(test, feature = "gguf")
+))]
 use kapsl_kv_abi::{
     KvCacheGeometry, KvCacheGroup, KvCachePolicy, KvElementType, KvLayerId, KvShard,
     KvTensorLayout, KAPSL_KV_ABI_VERSION,
 };
+#[cfg(feature = "gguf")]
 use std::collections::VecDeque;
+#[cfg(feature = "gguf")]
 use std::num::NonZeroU32;
 use std::path::Path;
+#[cfg(feature = "gguf")]
 use std::sync::mpsc as std_mpsc;
 #[cfg(feature = "gguf")]
 use std::sync::{
@@ -25,6 +39,7 @@ use std::sync::{
     OnceLock,
 };
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "gguf")]
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "gguf-cuda-shared-kv")]
@@ -56,17 +71,27 @@ use llama_cpp_sys_2::{llama_kapsl_kv_pool_desc, LLAMA_KAPSL_KV_DTYPE_F16};
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 
+#[cfg(feature = "gguf")]
 const MAX_CONCURRENT_DEFAULT: usize = 32;
+#[cfg(feature = "gguf")]
 const N_CTX_PER_SEQ_DEFAULT: u32 = 2048;
+#[cfg(feature = "gguf")]
 const GGUF_N_GPU_LAYERS_ENV: &str = "KAPSL_GGUF_N_GPU_LAYERS";
+#[cfg(feature = "gguf")]
 const GGUF_TARGET_CONCURRENCY_ENV: &str = "KAPSL_GGUF_TARGET_CONCURRENCY";
+#[cfg(feature = "gguf")]
 const GGUF_QUEUE_DELAY_US_DEFAULT: u64 = 1_000;
+#[cfg(feature = "gguf")]
 const GGUF_PREFILL_CHUNK_SIZE_DEFAULT: usize = 512;
+#[cfg(feature = "gguf")]
 const GGUF_TIMING_ENV: &str = "KAPSL_GGUF_TIMING";
+#[cfg(feature = "gguf")]
 const GGUF_TIMING_LOG_EVERY_ENV: &str = "KAPSL_GGUF_TIMING_LOG_EVERY";
+#[cfg(feature = "gguf")]
 const GGUF_TIMING_LOG_EVERY_DEFAULT: u64 = 512;
 // llama.cpp sequence-copy asserts unless the context uses a full/unified KV buffer.
 // Keep this opt-in until we can detect that mode safely at runtime.
+#[cfg(feature = "gguf")]
 const GGUF_EXACT_PROMPT_KV_REUSE_DEFAULT: bool = false;
 
 #[cfg(feature = "gguf")]
@@ -190,7 +215,7 @@ fn gguf_exact_prompt_kv_reuse() -> bool {
         .unwrap_or(GGUF_EXACT_PROMPT_KV_REUSE_DEFAULT)
 }
 
-#[cfg(any(feature = "gguf-cuda-shared-kv", test))]
+#[cfg(any(feature = "gguf-cuda-shared-kv", all(test, feature = "gguf")))]
 fn gguf_cross_session_prefix_cache_opt_in(value: Option<&str>) -> bool {
     value
         .map(|value| {
@@ -572,14 +597,14 @@ impl GgufWindowedKvConfig {
 ///
 /// Only the shared-KV pool sizes rings, so outside that feature this is
 /// compiled solely for its unit tests.
-#[cfg(any(feature = "gguf-cuda-shared-kv", test))]
+#[cfg(any(feature = "gguf-cuda-shared-kv", all(test, feature = "gguf")))]
 fn swa_window_blocks(n_swa: usize, n_ubatch: usize, block_size: usize) -> usize {
     (n_swa + n_ubatch).div_ceil(block_size.max(1)) + 1
 }
 
 /// Physical blocks a layer needs to cover `logical` logical blocks: capped at
 /// the ring size on windowed layers, uncapped on full-attention layers.
-#[cfg(any(feature = "gguf-cuda-shared-kv", test))]
+#[cfg(any(feature = "gguf-cuda-shared-kv", all(test, feature = "gguf")))]
 fn windowed_layer_capacity(logical: usize, layer_window: Option<usize>) -> usize {
     match layer_window {
         Some(window_blocks) => logical.min(window_blocks),
@@ -642,7 +667,11 @@ fn gguf_windowed_kv_config(
 /// Translate llama.cpp's current shared-pool geometry into Kapsl's neutral KV
 /// topology. Other adapters can describe heterogeneous cache groups without
 /// adopting the fork's uniform raw-pointer descriptor.
-#[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv", test))]
+#[cfg(any(
+    feature = "gguf-cuda-shared-kv",
+    feature = "gguf-external-kv",
+    all(test, feature = "gguf")
+))]
 fn gguf_shared_kv_topology(
     model_fingerprint: u64,
     n_layers: usize,
@@ -869,7 +898,11 @@ fn gguf_shared_kv_disable_reason(model: &LlamaModel) -> Option<String> {
 /// the same structure. Cohere2 (and other SWA families) are excluded — cohere2's
 /// NoPE global-attention layers degenerate on the paged path, and the rest are
 /// not yet eval-checked. Extend this as more families are verified.
-#[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv", test))]
+#[cfg(any(
+    feature = "gguf-cuda-shared-kv",
+    feature = "gguf-external-kv",
+    all(test, feature = "gguf")
+))]
 fn swa_shared_kv_arch_verified(arch: &str) -> bool {
     matches!(arch, "gemma2" | "gemma3" | "gemma3n" | "gemma4")
 }
@@ -884,7 +917,11 @@ fn swa_shared_kv_arch_verified(arch: &str) -> bool {
 /// gated by `KAPSL_GGUF_ENABLE_SWA_SHARED_KV`); `has_key`/`pos_int` look up
 /// architecture-scoped GGUF metadata (already prefixed with `<arch>.` by the
 /// caller) — presence, and positive-integer value, respectively.
-#[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv", test))]
+#[cfg(any(
+    feature = "gguf-cuda-shared-kv",
+    feature = "gguf-external-kv",
+    all(test, feature = "gguf")
+))]
 fn classify_shared_kv_support(
     arch: &str,
     n_swa: u32,
@@ -958,7 +995,7 @@ fn classify_shared_kv_support(
 /// memory regardless of which KV backend feature is enabled, so callers that
 /// need to reason about their memory shape (e.g. KV metrics) need this
 /// outside the shared-KV-only code paths too.
-#[cfg(any(feature = "gguf", test))]
+#[cfg(feature = "gguf")]
 fn gguf_uses_state_space_memory(has_key: impl Fn(&str) -> bool) -> bool {
     has_key("ssm.state_size") || has_key("ssm.conv_kernel") || has_key("wkv.head_size")
 }
@@ -3389,6 +3426,7 @@ pub struct GgufBackend {
     #[cfg(feature = "gguf")]
     inner: Option<GgufInner>,
     metrics: Arc<Mutex<EngineMetrics>>,
+    #[cfg(feature = "gguf")]
     device_id: usize,
     #[cfg(feature = "gguf-cuda-shared-kv")]
     pool_slot: Arc<Mutex<Option<GpuPoolHandle>>>,
@@ -3432,6 +3470,7 @@ impl GgufBackend {
             #[cfg(feature = "gguf")]
             inner: None,
             metrics: Arc::new(Mutex::new(EngineMetrics::new())),
+            #[cfg(feature = "gguf")]
             device_id: 0,
             #[cfg(feature = "gguf-cuda-shared-kv")]
             pool_slot: Arc::new(Mutex::new(None)),
@@ -3455,7 +3494,10 @@ impl GgufBackend {
     }
 
     pub fn new_on_device(device_id: usize) -> Self {
+        #[cfg(not(feature = "gguf"))]
+        let _ = device_id;
         Self {
+            #[cfg(feature = "gguf")]
             device_id,
             ..Self::new()
         }
@@ -3561,11 +3603,13 @@ impl GgufBackend {
         None
     }
 
+    #[cfg(feature = "gguf")]
     fn extract_prompt(request: &InferenceRequest) -> Result<String, EngineError> {
         String::from_utf8(request.input.data.clone())
             .map_err(|e| EngineError::invalid_input(format!("Input is not valid UTF-8: {e}")))
     }
 
+    #[cfg(feature = "gguf")]
     fn max_new_tokens(request: &InferenceRequest) -> i32 {
         let value = request
             .metadata
@@ -3575,6 +3619,7 @@ impl GgufBackend {
         i32::try_from(value).unwrap_or(i32::MAX)
     }
 
+    #[cfg(feature = "gguf")]
     fn min_new_tokens(request: &InferenceRequest) -> i32 {
         let value = request
             .metadata
@@ -3588,6 +3633,7 @@ impl GgufBackend {
     /// scheduler stamps this on the request's metadata before dispatch; the
     /// internal `run_scheduler` promotes lower values ahead of the FIFO order.
     /// Defaults to 1 (throughput) when unset.
+    #[cfg(feature = "gguf")]
     fn priority(request: &InferenceRequest) -> u8 {
         request
             .metadata
