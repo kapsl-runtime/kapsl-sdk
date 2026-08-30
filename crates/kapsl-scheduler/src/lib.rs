@@ -15,7 +15,7 @@ pub use cron_scheduler::{
 pub use priority::Priority;
 pub use replica_pool::{PoolStrategy, ReplicaPool, ReplicaScheduler, ReplicaStats};
 pub use request_metadata::{determine_priority, RequestMetadata};
-pub use scheduler::{QueueOverflowPolicy, Scheduler};
+pub use scheduler::{QueueOverflowPolicy, Scheduler, SchedulerObserver};
 
 #[cfg(test)]
 pub(crate) mod test_support {

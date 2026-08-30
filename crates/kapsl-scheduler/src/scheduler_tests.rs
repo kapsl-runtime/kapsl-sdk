@@ -4,8 +4,10 @@ use crate::request::Request;
 use crate::scheduler::QueueOverflowPolicy;
 use async_trait::async_trait;
 use kapsl_engine_api::{
-    BatchingPolicy, BinaryTensorPacket, Engine, EngineError, EngineMetrics, EngineStream,
-    InferenceRequest, TensorDtype,
+    BatchingPolicy, BinaryTensorPacket, CancellationToken, Engine, EngineError, EngineMetrics,
+    EngineStream, InferenceRequest, OpenAiWireEndpoint, OpenAiWireFormat, OpenAiWireMetadata,
+    OpenAiWireRequest, OpenAiWireResponse, OpenAiWireResponseHead, OpenAiWireStreamResponse,
+    TensorDtype,
 };
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
@@ -262,6 +264,45 @@ impl Engine for PriorityRecordingEngine {
         true
     }
 
+    fn supports_openai_wire(&self) -> bool {
+        true
+    }
+
+    async fn infer_openai_wire(
+        &self,
+        request: &OpenAiWireRequest,
+    ) -> Result<OpenAiWireResponse, EngineError> {
+        self.seen.lock().unwrap().push(
+            request
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.priority),
+        );
+        Ok(OpenAiWireResponse {
+            head: OpenAiWireResponseHead::new(200, Vec::new())?,
+            body: request.body.clone(),
+        })
+    }
+
+    async fn infer_openai_wire_stream(
+        &self,
+        request: &OpenAiWireRequest,
+    ) -> Result<OpenAiWireStreamResponse, EngineError> {
+        self.seen.lock().unwrap().push(
+            request
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.priority),
+        );
+        Ok(OpenAiWireStreamResponse {
+            head: OpenAiWireResponseHead::new(200, Vec::new())?,
+            body: Box::pin(futures::stream::iter(vec![
+                Ok(b"data: one\n\n".to_vec()),
+                Ok(b"data: [DONE]\n\n".to_vec()),
+            ])),
+        })
+    }
+
     fn batching_policy(&self) -> BatchingPolicy {
         self.policy
     }
@@ -326,6 +367,19 @@ fn make_inference_request(session_id: Option<&str>) -> InferenceRequest {
     }
 }
 
+fn make_openai_wire_request(format: OpenAiWireFormat) -> OpenAiWireRequest {
+    OpenAiWireRequest::new(
+        OpenAiWireEndpoint::ChatCompletions,
+        format,
+        br#"{"model":"test","messages":[]}"#.to_vec(),
+    )
+    .with_session_id("wire-session")
+    .with_metadata(OpenAiWireMetadata {
+        request_id: Some("wire-request".to_string()),
+        ..Default::default()
+    })
+}
+
 fn make_request(session_id: Option<&str>) -> Request {
     let (response_tx, _response_rx) = oneshot::channel();
     Request {
@@ -358,12 +412,50 @@ fn build_scheduler_for_queue_tests(
         cpu_active_count: Arc::new(AtomicUsize::new(cpu_active)),
         gpu_in_flight_count: Arc::new(AtomicUsize::new(0)),
         gpu_stream_in_flight_count: Arc::new(AtomicUsize::new(0)),
-        gpu_stream_slots: Arc::new(tokio::sync::Semaphore::new(queue_size.max(1))),
+        gpu_stream_admission: PriorityAdmission::new(queue_size.max(1)),
         device_mesh: None,
         router: MeshRouter::new(None, 1),
         max_micro_batch: 1,
         queue_overflow_policy: QueueOverflowPolicy::Block,
+        observer: Arc::new(parking_lot::RwLock::new(None)),
     }
+}
+
+struct RecordingSchedulerObserver {
+    observations: Arc<std::sync::Mutex<Vec<(Priority, &'static str)>>>,
+}
+
+impl SchedulerObserver for RecordingSchedulerObserver {
+    fn observe_queue_wait(
+        &self,
+        priority: Priority,
+        operation: &'static str,
+        _elapsed: std::time::Duration,
+    ) {
+        self.observations
+            .lock()
+            .unwrap()
+            .push((priority, operation));
+    }
+}
+
+async fn wait_for_wire_admission_waiters(scheduler: &Scheduler, expected: (usize, usize)) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if scheduler.gpu_stream_admission.waiter_counts() == expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "timed out waiting for wire admission state {:?}; observed {:?}",
+            expected,
+            scheduler.gpu_stream_admission.waiter_counts()
+        )
+    });
 }
 
 #[tokio::test]
@@ -882,6 +974,259 @@ async fn test_scheduler_stream_stamps_priority_for_delegated_backend() {
         "delegated streams must carry the resolved scheduler priority, got {:?}",
         recorded
     );
+}
+
+#[tokio::test]
+async fn test_scheduler_wire_paths_stamp_priority_and_hold_bounded_stream_admission() {
+    use futures::StreamExt;
+
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<Option<u8>>::new()));
+    let engine: EngineHandle = Arc::new(PriorityRecordingEngine::delegated(seen.clone()));
+    let scheduler = build_scheduler_for_queue_tests(vec![engine], 1, 0)
+        .with_queue_overflow_policy(QueueOverflowPolicy::DropNewest);
+
+    let response = ReplicaScheduler::infer_openai_wire(
+        &scheduler,
+        make_openai_wire_request(OpenAiWireFormat::Json),
+        Priority::Throughput,
+        false,
+    )
+    .await
+    .expect("wire request should be admitted");
+    assert_eq!(response.body, br#"{"model":"test","messages":[]}"#);
+    assert_eq!(scheduler.get_queue_depth(), (0, 0));
+
+    let mut response = ReplicaScheduler::infer_openai_wire_stream(
+        &scheduler,
+        make_openai_wire_request(OpenAiWireFormat::ServerSentEvents),
+        Priority::LatencyCritical,
+        false,
+    )
+    .await
+    .expect("wire stream should be admitted");
+    assert_eq!(scheduler.get_queue_depth(), (0, 1));
+    assert_eq!(
+        response.body.next().await.unwrap().unwrap(),
+        b"data: one\n\n"
+    );
+
+    let second = ReplicaScheduler::infer_openai_wire_stream(
+        &scheduler,
+        make_openai_wire_request(OpenAiWireFormat::ServerSentEvents),
+        Priority::Throughput,
+        false,
+    )
+    .await;
+    match second {
+        Ok(_) => panic!("second wire stream should be rejected while its slot is held"),
+        Err(error) => assert!(error.is_overloaded()),
+    }
+    drop(response);
+    assert_eq!(scheduler.get_queue_depth(), (0, 0));
+
+    assert_eq!(*seen.lock().unwrap(), vec![Some(1), Some(0)]);
+}
+
+#[tokio::test]
+async fn scheduler_observer_covers_translated_and_wire_admission() {
+    let seen_priorities = Arc::new(std::sync::Mutex::new(Vec::<Option<u8>>::new()));
+    let engine: EngineHandle = Arc::new(PriorityRecordingEngine::delegated(seen_priorities));
+    let observations = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let scheduler = Scheduler::new(vec![engine], 1, 1, 8, true, 1, 0, None).with_observer(
+        Arc::new(RecordingSchedulerObserver {
+            observations: observations.clone(),
+        }),
+    );
+
+    scheduler
+        .infer(make_inference_request(None), Priority::Throughput, false)
+        .await
+        .expect("translated request should complete");
+    ReplicaScheduler::infer_openai_wire(
+        &scheduler,
+        make_openai_wire_request(OpenAiWireFormat::Json),
+        Priority::LatencyCritical,
+        false,
+    )
+    .await
+    .expect("wire request should complete");
+
+    let observations = observations.lock().unwrap().clone();
+    assert!(observations.contains(&(Priority::Throughput, "translated")));
+    assert!(observations.contains(&(Priority::LatencyCritical, "wire")));
+}
+
+#[tokio::test]
+async fn delegated_scheduler_metrics_publish_backend_concurrency_capacity() {
+    let mut policy = BatchingPolicy::delegated();
+    policy.max_requests = 7;
+    let engine: EngineHandle = Arc::new(PriorityRecordingEngine {
+        seen: Arc::new(std::sync::Mutex::new(Vec::new())),
+        policy,
+    });
+    let scheduler = Scheduler::new(vec![engine], 1, 1, 8, true, 1, 0, None);
+
+    assert_eq!(ReplicaScheduler::get_metrics(&scheduler).batch_size, 7);
+}
+
+#[tokio::test]
+async fn test_scheduler_wire_admission_prioritizes_latency_over_queued_throughput() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<Option<u8>>::new()));
+    let engine: EngineHandle = Arc::new(PriorityRecordingEngine::delegated(seen.clone()));
+    let scheduler = Arc::new(build_scheduler_for_queue_tests(vec![engine], 1, 0));
+
+    let held = ReplicaScheduler::infer_openai_wire_stream(
+        scheduler.as_ref(),
+        make_openai_wire_request(OpenAiWireFormat::ServerSentEvents),
+        Priority::Throughput,
+        false,
+    )
+    .await
+    .expect("first stream should hold the only admission slot");
+    assert_eq!(scheduler.gpu_stream_admission.available_permits(), 0);
+
+    let low_scheduler = Arc::clone(&scheduler);
+    let low = tokio::spawn(async move {
+        ReplicaScheduler::infer_openai_wire(
+            low_scheduler.as_ref(),
+            make_openai_wire_request(OpenAiWireFormat::Json),
+            Priority::Throughput,
+            false,
+        )
+        .await
+    });
+    wait_for_wire_admission_waiters(scheduler.as_ref(), (0, 1)).await;
+
+    let high_scheduler = Arc::clone(&scheduler);
+    let high = tokio::spawn(async move {
+        ReplicaScheduler::infer_openai_wire_stream(
+            high_scheduler.as_ref(),
+            make_openai_wire_request(OpenAiWireFormat::ServerSentEvents),
+            Priority::LatencyCritical,
+            false,
+        )
+        .await
+    });
+    wait_for_wire_admission_waiters(scheduler.as_ref(), (1, 1)).await;
+
+    drop(held);
+    let high_response = tokio::time::timeout(std::time::Duration::from_secs(5), high)
+        .await
+        .expect("latency-critical request should receive the released slot")
+        .expect("latency-critical task should not panic")
+        .expect("latency-critical request should be admitted");
+    assert!(
+        !low.is_finished(),
+        "queued throughput request must remain blocked while the high-priority stream owns the slot"
+    );
+    assert_eq!(*seen.lock().unwrap(), vec![Some(1), Some(0)]);
+
+    drop(high_response);
+    tokio::time::timeout(std::time::Duration::from_secs(5), low)
+        .await
+        .expect("throughput request should run after the high-priority stream drops")
+        .expect("throughput task should not panic")
+        .expect("throughput request should be admitted");
+    assert_eq!(*seen.lock().unwrap(), vec![Some(1), Some(0), Some(1)]);
+    assert_eq!(scheduler.gpu_stream_admission.available_permits(), 1);
+}
+
+#[tokio::test]
+async fn test_scheduler_wire_admission_cancellation_and_drop_do_not_leak_capacity() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<Option<u8>>::new()));
+    let engine: EngineHandle = Arc::new(PriorityRecordingEngine::delegated(seen));
+    let scheduler = Arc::new(build_scheduler_for_queue_tests(vec![engine], 1, 0));
+
+    let held = ReplicaScheduler::infer_openai_wire_stream(
+        scheduler.as_ref(),
+        make_openai_wire_request(OpenAiWireFormat::ServerSentEvents),
+        Priority::Throughput,
+        false,
+    )
+    .await
+    .expect("first stream should hold the only admission slot");
+
+    let cancelled_scheduler = Arc::clone(&scheduler);
+    let cancelled = tokio::spawn(async move {
+        ReplicaScheduler::infer_openai_wire(
+            cancelled_scheduler.as_ref(),
+            make_openai_wire_request(OpenAiWireFormat::Json),
+            Priority::Throughput,
+            false,
+        )
+        .await
+    });
+    wait_for_wire_admission_waiters(scheduler.as_ref(), (0, 1)).await;
+    cancelled.abort();
+    assert!(
+        cancelled
+            .await
+            .expect_err("queued task should be cancelled")
+            .is_cancelled(),
+        "aborted admission task should report cancellation"
+    );
+    wait_for_wire_admission_waiters(scheduler.as_ref(), (0, 0)).await;
+    assert_eq!(scheduler.gpu_stream_admission.available_permits(), 0);
+
+    drop(held);
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        ReplicaScheduler::infer_openai_wire(
+            scheduler.as_ref(),
+            make_openai_wire_request(OpenAiWireFormat::Json),
+            Priority::LatencyCritical,
+            false,
+        ),
+    )
+    .await
+    .expect("capacity should be reusable after cancellation and stream drop")
+    .expect("replacement request should be admitted");
+    assert_eq!(response.head.status, 200);
+    assert_eq!(scheduler.gpu_stream_admission.available_permits(), 1);
+}
+
+#[tokio::test]
+async fn test_scheduler_wire_token_cancelled_while_queued_never_dispatches() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<Option<u8>>::new()));
+    let engine: EngineHandle = Arc::new(PriorityRecordingEngine::delegated(seen.clone()));
+    let scheduler = Arc::new(build_scheduler_for_queue_tests(vec![engine], 1, 0));
+
+    let held = ReplicaScheduler::infer_openai_wire_stream(
+        scheduler.as_ref(),
+        make_openai_wire_request(OpenAiWireFormat::ServerSentEvents),
+        Priority::Throughput,
+        false,
+    )
+    .await
+    .expect("first stream should hold the only admission slot");
+
+    let cancellation = CancellationToken::new();
+    let mut request = make_openai_wire_request(OpenAiWireFormat::Json);
+    request.cancellation = Some(cancellation.clone());
+    let queued_scheduler = Arc::clone(&scheduler);
+    let queued = tokio::spawn(async move {
+        ReplicaScheduler::infer_openai_wire(
+            queued_scheduler.as_ref(),
+            request,
+            Priority::Throughput,
+            false,
+        )
+        .await
+    });
+    wait_for_wire_admission_waiters(scheduler.as_ref(), (0, 1)).await;
+
+    cancellation.cancel();
+    let error = tokio::time::timeout(std::time::Duration::from_secs(5), queued)
+        .await
+        .expect("cancellation should wake the queued admission immediately")
+        .expect("queued task should not panic")
+        .expect_err("a token cancelled while queued must not dispatch");
+
+    assert!(matches!(error, EngineError::Cancelled { .. }));
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    assert_eq!(scheduler.gpu_stream_admission.available_permits(), 0);
+    drop(held);
+    assert_eq!(scheduler.gpu_stream_admission.available_permits(), 1);
 }
 
 #[tokio::test]

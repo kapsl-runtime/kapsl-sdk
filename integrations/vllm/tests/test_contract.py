@@ -7,10 +7,14 @@ from kapsl_vllm_connector.contract import (
     ABI_VERSION,
     ContractValidationError,
     make_reserve_request,
+    make_resize_ack_request,
+    make_resize_poll_request,
     make_shared_pool_attachment,
     opaque_registration,
     shared_pool_registration,
     validate_registration,
+    validate_registration_receipt,
+    validate_resize_operation,
     validate_reserve_request,
 )
 
@@ -61,6 +65,107 @@ PROFILE = {
 
 
 class ContractTests(unittest.TestCase):
+    def test_cuda_vmm_receipt_and_resize_stages_are_fail_closed(self) -> None:
+        receipt = {
+            "participant_id": "vllm-0",
+            "participant_epoch": 3,
+            "shared_pools": [
+                {
+                    "binding_id": "cuda:0",
+                    "capacity_pool_id": "vllm.pool.0",
+                    "generation": 1,
+                    "group_ids": ["vllm.group.0"],
+                    "memory_domain": {"kind": "cuda", "device_id": 0},
+                    "block_count": 64,
+                    "bytes_per_block": 4096,
+                    "allocation_mode": "participant_managed",
+                    "transport": {"kind": "cuda_vmm"},
+                    "descriptor": "scm_rights:cuda-vmm-v1",
+                    "elastic": {
+                        "minimum_block_count": 16,
+                        "mapped_block_count": 32,
+                        "maximum_block_count": 64,
+                        "allocation_granularity_bytes": 65536,
+                        "resize_alignment_blocks": 16,
+                        "segments": [
+                            {
+                                "segment_id": "initial-0",
+                                "offset_bytes": 0,
+                                "length_bytes": 131072,
+                                "handle_index": 0,
+                            }
+                        ],
+                    },
+                }
+            ],
+        }
+        validate_registration_receipt(receipt, "vllm-0")
+        for invalid_minimum in (0, 17, 48):
+            malformed_receipt = deepcopy(receipt)
+            malformed_receipt["shared_pools"][0]["elastic"][
+                "minimum_block_count"
+            ] = invalid_minimum
+            with self.assertRaises(ContractValidationError):
+                validate_registration_receipt(malformed_receipt, "vllm-0")
+
+        operation = {
+            "participant_epoch": 3,
+            "resize_generation": 7,
+            "binding_id": "cuda:0",
+            "stage": "map_workers",
+            "from_block_count": 32,
+            "target_block_count": 48,
+            "bytes_per_block": 4096,
+            "allocation_granularity_bytes": 65536,
+            "segments": [
+                {
+                    "segment_id": "grow-7-0",
+                    "offset_bytes": 131072,
+                    "length_bytes": 65536,
+                    "handle_index": 0,
+                }
+            ],
+        }
+        self.assertEqual(validate_resize_operation(operation), operation)
+
+        malformed = deepcopy(operation)
+        malformed["stage"] = "retire_scheduler"
+        with self.assertRaisesRegex(ContractValidationError, "direction"):
+            validate_resize_operation(malformed)
+
+        poll = make_resize_poll_request(
+            participant_epoch=3,
+            actor={"role": "worker", "shard": TOPOLOGY["shard"]},
+            applied_generation=0,
+        )
+        self.assertEqual(poll["actor"]["role"], "worker")
+        ack = make_resize_ack_request(
+            participant_epoch=3,
+            actor={"role": "scheduler"},
+            binding_id="cuda:0",
+            resize_generation=7,
+            stage="activate_scheduler",
+            applied_block_count=48,
+        )
+        self.assertEqual(ack["stage"], "activate_scheduler")
+
+    def test_live_resize_registration_uses_only_cuda_vmm(self) -> None:
+        registration = shared_pool_registration(
+            "vllm-0",
+            "sha256:model",
+            CAPACITY_GROUPS,
+            TOPOLOGY,
+            PROFILE,
+            live_resize=True,
+        )
+        self.assertIn(
+            "live_pool_resize", registration["capabilities"]["features"]
+        )
+        self.assertEqual(
+            registration["capabilities"]["transports"], [{"kind": "cuda_vmm"}]
+        )
+        validate_registration(registration)
+
     def test_shared_attachment_rejects_views_outside_the_imported_pool(self) -> None:
         with self.assertRaisesRegex(ContractValidationError, "exceeds"):
             make_shared_pool_attachment(
@@ -163,6 +268,39 @@ class ContractTests(unittest.TestCase):
         missing_profile.pop("adapter_profile")
         with self.assertRaisesRegex(ContractValidationError, "adapter profile"):
             validate_registration(missing_profile)
+
+    def test_shared_pool_provisioning_grant_is_versioned_and_fail_closed(self) -> None:
+        grant = {
+            "token": "kvg1_" + "ab" * 32,
+            "geometry_digest": "sha256:" + "cd" * 32,
+            "authority_generation": 7,
+            "expires_at_unix_ms": 1_800_000_000_000,
+        }
+        registration = shared_pool_registration(
+            "vllm-0",
+            "sha256:model",
+            CAPACITY_GROUPS,
+            TOPOLOGY,
+            PROFILE,
+            provisioning_grant=grant,
+        )
+
+        self.assertEqual(registration["provisioning_grant"], grant)
+        self.assertIn(
+            "provisioning_grant",
+            registration["capabilities"]["features"],
+        )
+        validate_registration(registration)
+
+        missing_feature = deepcopy(registration)
+        missing_feature["capabilities"]["features"].remove("provisioning_grant")
+        with self.assertRaisesRegex(ContractValidationError, "present together"):
+            validate_registration(missing_feature)
+
+        malformed = deepcopy(registration)
+        malformed["provisioning_grant"]["geometry_digest"] = "SHA256:not-canonical"
+        with self.assertRaisesRegex(ContractValidationError, "canonical sha256"):
+            validate_registration(malformed)
 
     def test_shared_pool_topology_and_capacity_groups_must_match(self) -> None:
         topology = dict(TOPOLOGY)

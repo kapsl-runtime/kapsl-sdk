@@ -1,0 +1,135 @@
+name: Publish vLLM Connector
+
+on:
+  push:
+    tags:
+      # This deliberately does not start with "v", so it cannot trigger the
+      # root Python package's existing "v*" release workflow.
+      - "kapsl-vllm-connector-v*"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish to PyPI (requires selecting the matching connector tag)
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-vllm-connector-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Test and build connector
+    runs-on: ubuntu-latest
+    outputs:
+      publish: ${{ steps.release.outputs.publish }}
+      version: ${{ steps.release.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate release ref and package version
+        id: release
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REQUESTED_PUBLISH: ${{ inputs.publish || false }}
+        run: |
+          python - <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+
+          pyproject = Path("integrations/vllm/pyproject.toml")
+          with pyproject.open("rb") as handle:
+              version = tomllib.load(handle)["project"]["version"]
+
+          expected_tag = f"kapsl-vllm-connector-v{version}"
+          event_name = os.environ["EVENT_NAME"]
+          ref_name = os.environ["REF_NAME"]
+          ref_type = os.environ["REF_TYPE"]
+          requested_publish = os.environ["REQUESTED_PUBLISH"].lower() == "true"
+          should_publish = event_name == "push" or requested_publish
+
+          if ref_type == "tag" and ref_name != expected_tag:
+              raise SystemExit(
+                  f"release tag {ref_name!r} does not match package version; "
+                  f"expected {expected_tag!r}"
+              )
+          if should_publish and (ref_type != "tag" or ref_name != expected_tag):
+              raise SystemExit(
+                  "PyPI publication requires running from the exact matching "
+                  f"tag {expected_tag!r}"
+              )
+
+          output = Path(os.environ["GITHUB_OUTPUT"])
+          with output.open("a", encoding="utf-8") as handle:
+              handle.write(f"version={version}\n")
+              handle.write(f"publish={'true' if should_publish else 'false'}\n")
+          PY
+
+      - name: Install release tooling
+        run: python -m pip install --disable-pip-version-check "build==1.5.0" "twine==6.2.0"
+
+      - name: Run connector host tests
+        env:
+          PYTHONPATH: integrations/vllm/src
+        run: python -m unittest discover -s integrations/vllm/tests -v
+
+      - name: Build wheel and source distribution
+        run: python -m build --outdir dist integrations/vllm
+
+      - name: Validate distribution metadata and contents
+        run: |
+          python -m twine check --strict dist/*
+          python integrations/vllm/scripts/check_dist_artifacts.py dist
+
+      - name: Smoke-test built wheel
+        run: |
+          python -m pip install --disable-pip-version-check --no-deps --force-reinstall dist/*.whl
+          schema_file="$(mktemp)"
+          kapsl-vllm-plan --print-schema > "$schema_file"
+          python -m json.tool "$schema_file" >/dev/null
+
+      - name: Upload connector distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: kapsl-vllm-connector-${{ steps.release.outputs.version }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish-pypi:
+    name: Publish connector to PyPI
+    if: needs.build.outputs.publish == 'true'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi-vllm-connector
+      url: https://pypi.org/p/kapsl-vllm-connector
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Download connector distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: kapsl-vllm-connector-${{ needs.build.outputs.version }}
+          path: dist
+
+      - name: Publish connector distributions
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          verbose: true

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import array
+import os
 import socket
 import tempfile
 import threading
@@ -8,10 +10,16 @@ import unittest
 from pathlib import Path
 from typing import Any
 
-from kapsl_vllm_connector.client import KapslKvControlClient, KapslKvControlError
+from kapsl_vllm_connector.client import (
+    KapslKvControlClient,
+    KapslKvControlError,
+    _read_frame_with_handles,
+)
 from kapsl_vllm_connector.contract import (
     ABI_VERSION,
     make_reserve_request,
+    make_resize_ack_request,
+    make_resize_poll_request,
     make_shared_pool_attachment,
     make_shared_pool_detach_request,
     opaque_registration,
@@ -160,10 +168,87 @@ class FakeCoordinator:
                     ],
                 },
             }
+        if request["operation"] == "resize_poll":
+            return {
+                **base,
+                "result": "resize",
+                "pending": True,
+                "operations": [
+                    {
+                        "participant_epoch": 1,
+                        "resize_generation": 2,
+                        "binding_id": "binding-0",
+                        "stage": "activate_scheduler",
+                        "from_block_count": 32,
+                        "target_block_count": 48,
+                        "bytes_per_block": 4096,
+                        "allocation_granularity_bytes": 65536,
+                        "segments": [],
+                    }
+                ],
+            }
         return {**base, "result": "ack"}
 
 
 class ClientTests(unittest.TestCase):
+    def test_unix_response_receives_vmm_handles_out_of_band(self) -> None:
+        sender, receiver = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        read_fd, write_fd = os.pipe()
+        try:
+            descriptors = array.array("i", [read_fd])
+            sender.sendmsg(
+                [b'{"result":"resize"}\n'],
+                [(socket.SOL_SOCKET, socket.SCM_RIGHTS, descriptors)],
+            )
+            frame, handles = _read_frame_with_handles(receiver, 1024)
+            self.assertEqual(frame, b'{"result":"resize"}')
+            self.assertEqual(len(handles), 1)
+            os.fstat(handles[0])
+            os.close(handles[0])
+        finally:
+            sender.close()
+            receiver.close()
+            os.close(read_fd)
+            os.close(write_fd)
+
+    def test_resize_poll_and_ack_preserve_actor_and_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            socket_path = Path(directory) / "kv.sock"
+            server = FakeCoordinator(socket_path, 2)
+            server.start()
+            request_ids = iter(("rpc-resize-poll", "rpc-resize-ack"))
+            client = KapslKvControlClient(
+                f"unix://{socket_path}",
+                "vllm-shared",
+                request_id_factory=lambda: next(request_ids),
+            )
+            operations = client.poll_resize(
+                make_resize_poll_request(
+                    participant_epoch=1,
+                    actor={"role": "scheduler"},
+                    applied_generation=0,
+                )
+            )
+            self.assertEqual(operations[0]["resize_generation"], 2)
+            client.ack_resize(
+                make_resize_ack_request(
+                    participant_epoch=1,
+                    actor={"role": "scheduler"},
+                    binding_id="binding-0",
+                    resize_generation=2,
+                    stage="activate_scheduler",
+                    applied_block_count=48,
+                )
+            )
+            server.join()
+            self.assertEqual(
+                [request["operation"] for request in server.requests],
+                ["resize_poll", "resize_ack"],
+            )
+            self.assertEqual(
+                server.requests[1]["request"]["actor"], {"role": "scheduler"}
+            )
+
     def test_lifecycle_uses_versioned_flat_envelopes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             socket_path = Path(directory) / "kv.sock"

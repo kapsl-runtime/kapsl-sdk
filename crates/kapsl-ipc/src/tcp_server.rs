@@ -41,6 +41,8 @@ impl TcpServer {
 
     /// Require an inference metadata token for every request handled by this
     /// server. A non-loopback listener is rejected unless this is configured.
+    /// Protocol-native OpenAI operations remain disabled on non-loopback
+    /// plaintext TCP even when native tensor inference is authenticated.
     pub fn with_auth_token(mut self, auth_token: impl Into<String>) -> Self {
         let auth_token = auth_token.into();
         if !auth_token.is_empty() {
@@ -52,12 +54,20 @@ impl TcpServer {
     async fn run_internal(&self) -> std::io::Result<()> {
         let addr = format!("{}:{}", self.bind_addr, self.port);
         let listener = TcpListener::bind(&addr).await?;
-        validate_tcp_exposure(listener.local_addr()?.ip(), self.auth_token.is_some())?;
+        let bind_ip = listener.local_addr()?.ip();
+        validate_tcp_exposure(bind_ip, self.auth_token.is_some())?;
+        let wire_policy = openai_wire_policy(bind_ip);
         let scheduler_lookup = self.scheduler_lookup.clone();
         let auth_token = self.auth_token.clone();
 
         log::info!("TCP Server listening on {}", addr);
         log::info!("TCP Server bound to {}", addr);
+        if wire_policy == crate::server::OpenAiWireTransportPolicy::PlaintextRemote {
+            log::warn!(
+                "Protocol-native OpenAI operations are disabled on non-loopback plaintext TCP listener {}",
+                addr
+            );
+        }
 
         loop {
             let (stream, peer_addr) = listener.accept().await?;
@@ -67,15 +77,28 @@ impl TcpServer {
             log::info!("New TCP connection from {}", peer_addr);
 
             tokio::spawn(async move {
-                if let Err(e) =
-                    crate::server::handle_connection(stream, scheduler_lookup, None, auth_token)
-                        .await
+                if let Err(e) = crate::server::handle_connection_with_wire_policy(
+                    stream,
+                    scheduler_lookup,
+                    None,
+                    auth_token,
+                    wire_policy,
+                )
+                .await
                 {
                     log::error!("Connection error: {}", e);
                 }
                 log::info!("TCP connection closed from {}", peer_addr);
             });
         }
+    }
+}
+
+fn openai_wire_policy(bind_ip: IpAddr) -> crate::server::OpenAiWireTransportPolicy {
+    if bind_ip.is_loopback() {
+        crate::server::OpenAiWireTransportPolicy::Local
+    } else {
+        crate::server::OpenAiWireTransportPolicy::PlaintextRemote
     }
 }
 
@@ -106,7 +129,8 @@ impl TransportServer for TcpServer {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_tcp_exposure;
+    use super::{openai_wire_policy, validate_tcp_exposure};
+    use crate::server::OpenAiWireTransportPolicy;
 
     #[test]
     fn unauthenticated_tcp_is_limited_to_loopback() {
@@ -119,5 +143,25 @@ mod tests {
     #[test]
     fn authenticated_tcp_may_bind_non_loopback() {
         assert!(validate_tcp_exposure("0.0.0.0".parse().unwrap(), true).is_ok());
+    }
+
+    #[test]
+    fn openai_wire_is_limited_to_loopback_tcp() {
+        assert_eq!(
+            openai_wire_policy("127.0.0.1".parse().unwrap()),
+            OpenAiWireTransportPolicy::Local
+        );
+        assert_eq!(
+            openai_wire_policy("::1".parse().unwrap()),
+            OpenAiWireTransportPolicy::Local
+        );
+        assert_eq!(
+            openai_wire_policy("0.0.0.0".parse().unwrap()),
+            OpenAiWireTransportPolicy::PlaintextRemote
+        );
+        assert_eq!(
+            openai_wire_policy("192.0.2.10".parse().unwrap()),
+            OpenAiWireTransportPolicy::PlaintextRemote
+        );
     }
 }

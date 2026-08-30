@@ -3,22 +3,32 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from importlib import metadata
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from .client import KapslKvControlClient, KapslKvControlError
 from .contract import (
     ABI_VERSION,
+    make_resize_ack_request,
+    make_resize_poll_request,
     make_shared_pool_attachment,
     make_reserve_request,
     opaque_registration,
     shared_pool_registration,
 )
+from .planning import (
+    UINT64_MAX,
+    extract_cache_group_topologies,
+    shared_pool_block_stride,
+    validate_certified_shared_pool_execution,
+)
 from .shared_pool import (
     SharedPoolImportError,
+    VllmElasticBlockPool,
     VllmSharedPoolHook,
     select_cuda_binding,
     vllm_backing_geometry,
@@ -59,9 +69,13 @@ else:
     _VLLM_IMPORT_ERROR = None
 
 
-logger = logging.getLogger(__name__)
-ADAPTER_VERSION = "0.5.0"
+# vLLM installs its output handler on the ``vllm`` logger rather than the
+# process root logger. Keep connector records below that namespace so worker
+# evidence and lifecycle diagnostics reach the managed child log.
+logger = logging.getLogger(f"vllm.{__name__}")
+ADAPTER_VERSION = "0.7.0"
 ADAPTER_PROFILE_ID = "vllm-v1-packed-cuda-ipc/flash-attn"
+ELASTIC_ADAPTER_PROFILE_ID = "vllm-v1-packed-cuda-vmm/flash-attn-blnhc"
 
 
 @dataclass
@@ -81,6 +95,16 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
     @property
     def requires_kv_delivery(self) -> bool:
         return False
+
+    @classmethod
+    def get_required_kvcache_layout(cls, vllm_config: Any) -> str | None:
+        transfer = getattr(vllm_config, "kv_transfer_config", None)
+        if transfer is None:
+            return None
+        raw = _extra(transfer, "kapsl_live_resize", False)
+        if not isinstance(raw, bool):
+            raise ValueError("kapsl_live_resize must be a boolean")
+        return "BLNHC" if raw else None
 
     def __init__(
         self,
@@ -120,12 +144,26 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
         ).strip().lower()
         if self._mode not in {"opaque", "shared_pool"}:
             raise ValueError("kapsl_kv_mode must be 'opaque' or 'shared_pool'")
+        raw_live_resize = _extra(
+            self._kv_transfer_config, "kapsl_live_resize", False
+        )
+        if not isinstance(raw_live_resize, bool):
+            raise ValueError("kapsl_live_resize must be a boolean")
+        self._live_resize = raw_live_resize
+        if self._live_resize and self._mode != "shared_pool":
+            raise ValueError("kapsl_live_resize requires shared_pool mode")
+        self._vmm_conformance = _validated_vmm_conformance(
+            self._kv_transfer_config, self._live_resize
+        )
         parallel_config = getattr(vllm_config, "parallel_config", None)
         tensor_parallel_size = int(
             getattr(parallel_config, "tensor_parallel_size", 1) or 1
         )
         if self._mode == "shared_pool":
-            _validate_shared_pool_execution(vllm_config)
+            if self._live_resize:
+                _validate_elastic_shared_pool_execution(vllm_config, kv_cache_config)
+            else:
+                _validate_shared_pool_execution(vllm_config)
         self._participant_id = (
             f"{participant_base}:{engine_id}"
             if self._mode == "shared_pool"
@@ -161,7 +199,12 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
             else None
         )
         shared_profile = (
-            _vllm_adapter_profile(vllm_config)
+            _vllm_adapter_profile(vllm_config, live_resize=self._live_resize)
+            if self._mode == "shared_pool"
+            else None
+        )
+        provisioning_grant = (
+            _provisioning_grant(self._kv_transfer_config)
             if self._mode == "shared_pool"
             else None
         )
@@ -173,6 +216,8 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
                 shared_topology,
                 shared_profile,
                 backend="vllm",
+                provisioning_grant=provisioning_grant,
+                live_resize=self._live_resize,
             )
             if self._mode == "shared_pool"
             else opaque_registration(
@@ -201,46 +246,87 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
         self._shared_attached = False
         self._shared_active = False
         self._activation_lock = threading.Lock()
+        self._resize_lock = threading.RLock()
+        self._resize_pending = False
+        self._resize_applied_generation = 0
+        self._pending_scheduler_operations: list[dict[str, Any]] = []
+        self._elastic_block_pool: VllmElasticBlockPool | None = None
+        self._worker_forward_lock = threading.Lock()
+        self._worker_forward_active = False
         if self._is_scheduler or self._mode == "shared_pool":
             self._client = KapslKvControlClient(
                 endpoint,
                 self._participant_id,
                 timeout_seconds=timeout_ms / 1000.0,
             )
-            receipt = self._client.register(registration)
-            self._participant_epoch = int(receipt["participant_epoch"])
-            if self._mode == "shared_pool" and not self._is_scheduler:
-                global_rank = (
-                    0 if tensor_parallel_size == 1 else vllm_distributed_rank()
+            received_handles: list[int] = []
+            if self._live_resize and not self._is_scheduler:
+                receipt, received_handles = self._client.register_with_handles(
+                    registration
                 )
-                binding = select_cuda_binding(
-                    receipt,
-                    kv_cache_config,
-                    rank_device_map,
-                    global_rank=global_rank,
-                )
-                self._shared_pool_hook = VllmSharedPoolHook(
-                    binding, kv_cache_config
-                )
-                if shared_topology is None:
-                    raise AssertionError("shared topology was not constructed")
-                self._shared_shard = dict(shared_topology["shard"])
-                self._shared_shard["tensor_parallel_rank"] = global_rank
+            else:
+                receipt = self._client.register(registration)
+            try:
+                self._participant_epoch = int(receipt["participant_epoch"])
+                if self._live_resize:
+                    initial_blocks, maximum_blocks = _elastic_receipt_block_counts(
+                        receipt
+                    )
+                    if self._is_scheduler:
+                        self._elastic_block_pool = VllmElasticBlockPool(
+                            initial_blocks, maximum_blocks
+                        )
+                if self._mode == "shared_pool" and not self._is_scheduler:
+                    global_rank = (
+                        0 if tensor_parallel_size == 1 else vllm_distributed_rank()
+                    )
+                    binding = select_cuda_binding(
+                        receipt,
+                        kv_cache_config,
+                        rank_device_map,
+                        global_rank=global_rank,
+                        live_resize=self._live_resize,
+                    )
+                    self._shared_pool_hook = VllmSharedPoolHook(
+                        binding,
+                        kv_cache_config,
+                        handles=received_handles if self._live_resize else None,
+                        conformance=self._vmm_conformance,
+                    )
+                    if shared_topology is None:
+                        raise AssertionError("shared topology was not constructed")
+                    self._shared_shard = dict(shared_topology["shard"])
+                    self._shared_shard["tensor_parallel_rank"] = global_rank
+            finally:
+                _close_os_handles(received_handles)
             logger.info(
                 "registered Kapsl KV participant %s in %s mode (%s role)",
                 self._participant_id,
                 self._mode,
                 role_name,
             )
-        if self._is_scheduler:
-            self._heartbeat_thread = threading.Thread(
-                target=self._heartbeat_loop,
-                name=f"kapsl-kv-heartbeat-{engine_id}",
-                daemon=True,
-            )
-            self._heartbeat_thread.start()
+        self._start_scheduler_control(engine_id)
 
     # Scheduler-side lifecycle -------------------------------------------------
+
+    def _start_scheduler_control(self, engine_id: str) -> None:
+        if not self._is_scheduler:
+            return
+        # The pinned vLLM build constructs its scheduler connector only after
+        # every worker has initialized and registered its KV tensors. Activate
+        # here so Kapsl can publish the fully attached participant as Routable;
+        # deferring activation until on_new_request creates a readiness cycle
+        # because Kapsl deliberately will not route that first request yet.
+        # Coordinator activation still verifies the complete binding set and
+        # therefore fails startup closed if vLLM's construction order drifts.
+        if self._mode == "shared_pool":
+            self._ensure_shared_active()
+        self._heartbeat_thread = threading.Thread(
+            target=self._heartbeat_loop,
+            name=f"kapsl-kv-heartbeat-{engine_id}",
+            daemon=True,
+        )
+        self._heartbeat_thread.start()
 
     def on_new_request(self, request: "Request") -> None:
         if not self._is_scheduler:
@@ -293,7 +379,37 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
     ) -> KapslConnectorMetadata:
         del scheduler_output
         self._raise_if_control_failed()
+        self._apply_scheduler_resizes()
         return KapslConnectorMetadata()
+
+    def bind_gpu_block_pool(self, gpu_block_pool: Any) -> None:
+        if not self._is_scheduler or not self._live_resize:
+            return
+        elastic = self._elastic_block_pool
+        if elastic is None:
+            raise SharedPoolImportError(
+                "elastic scheduler has no negotiated block-pool geometry"
+            )
+        elastic.bind(gpu_block_pool)
+
+    def has_pending_push_work(self) -> bool:
+        with self._resize_lock:
+            pending = self._resize_pending or bool(
+                self._pending_scheduler_operations
+            )
+            elastic = self._elastic_block_pool
+            # The pinned vLLM core blocks on its request queue after the last
+            # request finishes. A shrink is normally requested immediately
+            # after that transition, so keep the connector's supported
+            # zero-token push-work loop alive while capacity is still above
+            # the startup minimum. Otherwise the background control poll can
+            # discover retire_scheduler work but cannot wake the sleeping
+            # scheduler thread to apply and acknowledge it.
+            above_initial_capacity = (
+                elastic is not None
+                and elastic.current_blocks > elastic.initial_blocks
+            )
+            return pending or above_initial_capacity
 
     def request_finished(
         self,
@@ -335,7 +451,24 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
     # Worker-side interface ----------------------------------------------------
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
-        del forward_context, kwargs
+        del kwargs
+        if self._is_scheduler or not self._live_resize:
+            return
+        has_model_forward = getattr(forward_context, "attn_metadata", None) is not None
+        self._worker_forward_lock.acquire()
+        self._worker_forward_active = True
+        try:
+            self._apply_worker_resizes()
+            if not has_model_forward:
+                # Pinned vLLM uses a zero-token connector step to drain
+                # has_pending_push_work() while idle. There is no attention
+                # forward to fence in that path and wait_for_save is skipped.
+                self._worker_forward_active = False
+                self._worker_forward_lock.release()
+        except Exception:
+            self._worker_forward_active = False
+            self._worker_forward_lock.release()
+            raise
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         del layer_name
@@ -350,6 +483,12 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
         del layer_name, kv_layer, attn_metadata, kwargs
 
     def wait_for_save(self) -> None:
+        if self._worker_forward_active:
+            self._worker_forward_active = False
+            self._worker_forward_lock.release()
+        return None
+
+    def build_connector_worker_meta(self) -> None:
         return None
 
     def register_kv_caches(self, kv_caches: dict[str, "torch.Tensor"]) -> None:
@@ -376,6 +515,7 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
             shard=self._shared_shard,
             profile=self._shared_profile,
             imported_bytes=hook.imported_bytes,
+            mapped_bytes=hook.mapped_bytes if self._live_resize else None,
             views=hook.attachment_views(kv_caches),
         )
         self._control_client().attach(attachment)
@@ -387,6 +527,9 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
         )
 
     def shutdown(self) -> None:
+        if self._worker_forward_active:
+            self._worker_forward_active = False
+            self._worker_forward_lock.release()
         if self._shared_pool_hook is not None:
             self._shared_pool_hook.shutdown()
             self._shared_pool_hook = None
@@ -406,8 +549,21 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
                 logger.warning("failed to release KV lease %s at shutdown: %s", lease_id, error)
 
     def _heartbeat_loop(self) -> None:
-        interval_seconds = max(0.25, self._lease_ttl_ms / 3000.0)
+        interval_seconds = (
+            0.25 if self._live_resize else max(0.25, self._lease_ttl_ms / 3000.0)
+        )
         while not self._heartbeat_stop.wait(interval_seconds):
+            if self._live_resize:
+                try:
+                    self._poll_scheduler_resizes()
+                except KapslKvControlError as error:
+                    with self._lease_lock:
+                        self._control_failure = error
+                    logger.error(
+                        "lost Kapsl live-resize authority; scheduler will fail closed: %s",
+                        error,
+                    )
+                    return
             with self._lease_lock:
                 has_live_leases = bool(self._leases)
             if not has_live_leases:
@@ -424,6 +580,105 @@ class KapslConnectorV1(KVConnectorBase_V1, SupportsHMA):
                     error,
                 )
                 return
+
+    def _poll_scheduler_resizes(self) -> None:
+        if self._participant_epoch is None:
+            raise SharedPoolImportError("elastic scheduler has no participant epoch")
+        operations, handles, pending = self._control_client().poll_resize_state_with_handles(
+            make_resize_poll_request(
+                participant_epoch=self._participant_epoch,
+                actor={"role": "scheduler"},
+                applied_generation=self._resize_applied_generation,
+            )
+        )
+        try:
+            if handles:
+                raise SharedPoolImportError(
+                    "scheduler resize phase received CUDA allocation handles"
+                )
+            with self._resize_lock:
+                known = {
+                    int(operation["resize_generation"])
+                    for operation in self._pending_scheduler_operations
+                }
+                self._pending_scheduler_operations.extend(
+                    operation
+                    for operation in operations
+                    if int(operation["resize_generation"])
+                    > self._resize_applied_generation
+                    and int(operation["resize_generation"]) not in known
+                )
+                self._resize_pending = pending
+        finally:
+            _close_os_handles(handles)
+
+    def _apply_scheduler_resizes(self) -> None:
+        if not self._live_resize:
+            return
+        elastic = self._elastic_block_pool
+        if elastic is None:
+            raise SharedPoolImportError("elastic scheduler block pool is unavailable")
+        with self._resize_lock:
+            operations = list(self._pending_scheduler_operations)
+            self._pending_scheduler_operations.clear()
+        for operation in operations:
+            stage = str(operation["stage"])
+            if stage not in {"activate_scheduler", "retire_scheduler"}:
+                raise SharedPoolImportError("scheduler received a worker resize stage")
+            target = int(operation["target_block_count"])
+            elastic.apply(target)
+            generation = int(operation["resize_generation"])
+            self._control_client().ack_resize(
+                make_resize_ack_request(
+                    participant_epoch=int(operation["participant_epoch"]),
+                    actor={"role": "scheduler"},
+                    binding_id=str(operation["binding_id"]),
+                    resize_generation=generation,
+                    stage=stage,
+                    applied_block_count=target,
+                )
+            )
+            self._resize_applied_generation = max(
+                self._resize_applied_generation, generation
+            )
+
+    def _apply_worker_resizes(self) -> None:
+        if (
+            not self._live_resize
+            or self._participant_epoch is None
+            or self._shared_shard is None
+        ):
+            return
+        hook = self._shared_pool_hook
+        if hook is None:
+            raise SharedPoolImportError("elastic worker has no shared-pool hook")
+        operations, handles, _ = self._control_client().poll_resize_state_with_handles(
+            make_resize_poll_request(
+                participant_epoch=self._participant_epoch,
+                actor={"role": "worker", "shard": self._shared_shard},
+                applied_generation=self._resize_applied_generation,
+            )
+        )
+        try:
+            for operation in operations:
+                hook.apply_worker_resize(operation, handles)
+                target = int(operation["target_block_count"])
+                generation = int(operation["resize_generation"])
+                self._control_client().ack_resize(
+                    make_resize_ack_request(
+                        participant_epoch=int(operation["participant_epoch"]),
+                        actor={"role": "worker", "shard": self._shared_shard},
+                        binding_id=str(operation["binding_id"]),
+                        resize_generation=generation,
+                        stage=str(operation["stage"]),
+                        applied_block_count=target,
+                    )
+                )
+                self._resize_applied_generation = max(
+                    self._resize_applied_generation, generation
+                )
+        finally:
+            _close_os_handles(handles)
 
     def _ensure_shared_active(self) -> None:
         if self._mode != "shared_pool" or self._shared_active:
@@ -473,49 +728,39 @@ def _required_extra(config: Any, key: str) -> str:
     return value
 
 
+def _validated_vmm_conformance(config: Any, live_resize: bool) -> bool:
+    value = _extra(config, "kapsl_vmm_conformance", False)
+    if not isinstance(value, bool):
+        raise ValueError("kapsl_vmm_conformance must be a boolean")
+    if value and not live_resize:
+        raise ValueError("kapsl_vmm_conformance requires live resize")
+    return value
+
+
 def _validate_shared_pool_execution(vllm_config: Any) -> None:
-    parallel_config = getattr(vllm_config, "parallel_config", None)
-    unsupported_parallelism = {
-        name: int(getattr(parallel_config, name, 1) or 1)
-        for name in (
-            "pipeline_parallel_size",
-            "data_parallel_size",
-            "decode_context_parallel_size",
-        )
-    }
-    enabled = [
-        name for name, size in unsupported_parallelism.items() if size != 1
-    ]
-    if enabled:
-        raise ValueError(
-            "vLLM shared_pool does not yet support " + ", ".join(enabled)
-        )
+    validate_certified_shared_pool_execution(vllm_config)
 
-    model_config = getattr(vllm_config, "model_config", None)
-    if bool(getattr(model_config, "enable_sleep_mode", False)):
-        raise ValueError(
-            "vLLM shared_pool does not yet support sleep mode because the "
-            "Kapsl-owned CUDA allocation must remain exported"
-        )
 
-    attention_config = getattr(vllm_config, "attention_config", None)
-    backend = getattr(attention_config, "backend", None)
-    backend_name = str(getattr(backend, "name", backend or "")).strip().upper()
-    if backend_name != "FLASH_ATTN":
-        raise ValueError(
-            "vLLM shared_pool currently requires the explicitly selected "
-            "FLASH_ATTN backend; automatic or different attention backends "
-            "need their own conformance profile"
+def _validate_elastic_shared_pool_execution(
+    vllm_config: Any, kv_cache_config: Any
+) -> None:
+    _validate_shared_pool_execution(vllm_config)
+    if str(getattr(kv_cache_config, "kv_cache_layout", "")).strip().upper() != "BLNHC":
+        raise SharedPoolImportError(
+            "live-resize shared_pool requires vLLM's block-outermost BLNHC layout"
         )
-    backend_per_kind = getattr(attention_config, "backend_per_kind", None) or {}
-    if backend_per_kind:
-        raise ValueError(
-            "vLLM shared_pool does not yet support per-cache-kind attention "
-            "backend overrides"
+    concurrent_batches = getattr(vllm_config, "max_concurrent_batches", 1)
+    if not isinstance(concurrent_batches, int) or isinstance(concurrent_batches, bool):
+        raise SharedPoolImportError("vLLM max_concurrent_batches must be an integer")
+    if concurrent_batches != 1:
+        raise SharedPoolImportError(
+            "live-resize shared_pool requires one in-flight model batch per worker"
         )
 
 
-def _vllm_adapter_profile(vllm_config: Any) -> dict[str, str]:
+def _vllm_adapter_profile(
+    vllm_config: Any, *, live_resize: bool = False
+) -> dict[str, str]:
     # Keep the production profile coupled to the same constraints exercised by
     # the hardware probe.  A generic "vLLM" profile would accidentally allow a
     # build to switch from FlashAttention to another reader at startup.
@@ -539,7 +784,9 @@ def _vllm_adapter_profile(vllm_config: Any) -> dict[str, str]:
         "adapter_id": "kapsl-vllm-connector",
         "adapter_version": ADAPTER_VERSION,
         "backend_version": backend_version,
-        "profile_id": ADAPTER_PROFILE_ID,
+        "profile_id": (
+            ELASTIC_ADAPTER_PROFILE_ID if live_resize else ADAPTER_PROFILE_ID
+        ),
     }
 
 
@@ -587,48 +834,128 @@ def _required_memory_domains(config: Any) -> list[dict[str, Any]]:
     return domains
 
 
+def _provisioning_grant(config: Any) -> dict[str, Any] | None:
+    raw_grant = _extra(config, "kapsl_provisioning_grant", None)
+    if raw_grant is None:
+        return None
+    if not isinstance(raw_grant, Mapping):
+        raise ValueError("kapsl_provisioning_grant must be an object")
+    return dict(raw_grant)
+
+
+def _elastic_receipt_block_counts(receipt: Mapping[str, Any]) -> tuple[int, int]:
+    pools = receipt.get("shared_pools")
+    if not isinstance(pools, list) or not pools:
+        raise SharedPoolImportError("elastic registration returned no shared pools")
+    shapes: set[tuple[int, int, int]] = set()
+    for pool in pools:
+        if not isinstance(pool, Mapping):
+            raise SharedPoolImportError("elastic shared pool must be an object")
+        elastic = pool.get("elastic")
+        if not isinstance(elastic, Mapping):
+            raise SharedPoolImportError("elastic shared pool metadata is missing")
+        shapes.add(
+            (
+                _positive_integer(
+                    elastic.get("minimum_block_count"), "minimum_block_count"
+                ),
+                _positive_integer(
+                    elastic.get("mapped_block_count"), "mapped_block_count"
+                ),
+                _positive_integer(
+                    elastic.get("maximum_block_count"), "maximum_block_count"
+                ),
+            )
+        )
+    if len(shapes) != 1:
+        raise SharedPoolImportError(
+            "tensor-parallel elastic bindings must share one block-count state"
+        )
+    minimum, initial, maximum = shapes.pop()
+    if minimum > initial or initial > maximum:
+        raise SharedPoolImportError(
+            "elastic minimum/mapped capacity exceeds its next capacity bound"
+        )
+    return initial, maximum
+
+
+def _close_os_handles(handles: Sequence[int]) -> None:
+    for descriptor in handles:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+
+def _positive_integer(value: Any, field: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ValueError(f"{field} must be a positive integer")
+    return value
+
+
 def _vllm_capacity_groups(
     kv_cache_config: Any,
     memory_domains: Sequence[Mapping[str, Any]],
     *,
     shared_pool: bool = False,
+    spec_kind_classifier: Callable[[Any], Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Extract byte-accounting hints without exposing vLLM block handles."""
 
     groups = getattr(kv_cache_config, "kv_cache_groups", None)
-    max_allocations = int(getattr(kv_cache_config, "num_blocks", 0) or 0)
-    if not groups or max_allocations <= 0:
+    raw_max_allocations = getattr(kv_cache_config, "num_blocks", None)
+    if not groups or raw_max_allocations is None:
         raise ValueError(
             "vLLM KVCacheConfig must expose non-empty kv_cache_groups and num_blocks"
         )
-
-    group_shapes: list[tuple[int, int]] = []
-    for index, group in enumerate(groups):
-        spec = getattr(group, "kv_cache_spec", None)
-        layer_names = getattr(group, "layer_names", None)
-        if spec is None or not layer_names:
-            raise ValueError(f"vLLM KV cache group {index} has no spec or layers")
-        block_size = int(getattr(spec, "block_size", 0) or 0)
-        page_size = int(getattr(spec, "page_size_bytes", 0) or 0)
-        # UniformTypeKVCacheSpecs.page_size_bytes already sums its per-layer
-        # specs; an ordinary merged spec describes one layer and must be scaled
-        # by the number of layers sharing the block table.
-        group_bytes = (
-            page_size
-            if getattr(spec, "kv_cache_specs", None) is not None
-            else page_size * len(layer_names)
-        )
-        if block_size <= 0 or group_bytes <= 0:
-            raise ValueError(f"vLLM KV cache group {index} has invalid page accounting")
-        group_shapes.append((block_size, group_bytes))
+    max_allocations = _positive_integer(raw_max_allocations, "vLLM num_blocks")
 
     # Modern packed layouts publish the exact shared allocation size. Opaque
     # compatibility keeps the page-derived fallback for older vLLM releases.
     if shared_pool:
+        topologies = extract_cache_group_topologies(
+            kv_cache_config,
+            spec_kind_classifier=spec_kind_classifier,
+        )
+        group_shapes = [
+            (group.block_size_tokens, group.bytes_per_group_block)
+            for group in topologies
+        ]
+        certified_pool_stride = shared_pool_block_stride(topologies)
         _, configured_blocks, pool_stride = vllm_backing_geometry(kv_cache_config)
         if configured_blocks != max_allocations:
             raise AssertionError("vLLM backing geometry changed during extraction")
+        if pool_stride != certified_pool_stride:
+            raise ValueError(
+                "resolved packed allocation block stride disagrees with "
+                "certified cache-group page accounting"
+            )
     else:
+        group_shapes = []
+        for index, group in enumerate(groups):
+            spec = getattr(group, "kv_cache_spec", None)
+            layer_names = getattr(group, "layer_names", None)
+            if spec is None or not layer_names:
+                raise ValueError(
+                    f"vLLM KV cache group {index} has no spec or layers"
+                )
+            block_size = _positive_integer(
+                getattr(spec, "block_size", None),
+                f"vLLM KV cache group {index} block_size",
+            )
+            page_size = _positive_integer(
+                getattr(spec, "page_size_bytes", None),
+                f"vLLM KV cache group {index} page_size_bytes",
+            )
+            # UniformTypeKVCacheSpecs.page_size_bytes already sums its per-layer
+            # specs; an ordinary merged spec describes one layer and must be
+            # scaled by the number of layers sharing the block table.
+            group_bytes = (
+                page_size
+                if getattr(spec, "kv_cache_specs", None) is not None
+                else page_size * len(layer_names)
+            )
+            group_shapes.append((block_size, group_bytes))
         # vLLM HMA groups alias one backing block pool; a shared pool ID tells
         # Kapsl to charge the maximum reservation rather than summing groups.
         pool_stride = max(group_bytes for _, group_bytes in group_shapes)
@@ -652,66 +979,44 @@ def _vllm_topology(
     model_fingerprint: str,
     *,
     tensor_parallel_world_size: int = 1,
+    spec_kind_classifier: Callable[[Any], Any] | None = None,
 ) -> dict[str, Any]:
     """Translate supported vLLM attention specs into ABI topology metadata."""
 
-    layout_id = str(
-        getattr(kv_cache_config, "kv_cache_layout", None) or "packed"
-    ).strip()
+    raw_layout_id = getattr(kv_cache_config, "kv_cache_layout", None)
+    if not isinstance(raw_layout_id, str) or not raw_layout_id.strip():
+        raise ValueError("resolved vLLM KVCacheConfig must expose kv_cache_layout")
+    layout_id = raw_layout_id.strip()
+    resolved_groups = extract_cache_group_topologies(
+        kv_cache_config,
+        spec_kind_classifier=spec_kind_classifier,
+    )
     cache_groups: list[dict[str, Any]] = []
     next_layer_index = 0
-    for group_index, group in enumerate(kv_cache_config.kv_cache_groups):
-        layer_names = list(getattr(group, "layer_names", None) or [])
-        if not layer_names:
-            raise ValueError(f"vLLM KV cache group {group_index} has no layers")
-        spec = getattr(group, "kv_cache_spec", None)
-        per_layer_specs = getattr(spec, "kv_cache_specs", None)
-        if isinstance(per_layer_specs, Mapping):
-            spec = per_layer_specs.get(layer_names[0])
-        if spec is None:
-            raise ValueError(f"vLLM KV cache group {group_index} has no usable spec")
-
-        block_size = int(getattr(spec, "block_size", 0) or 0)
-        kv_heads = int(
-            getattr(spec, "num_kv_heads", None)
-            or getattr(spec, "num_heads", 0)
-            or 0
-        )
-        key_head_dim = int(getattr(spec, "head_size", 0) or 0)
-        value_head_dim = int(
-            getattr(spec, "head_size_v", None) or key_head_dim
-        )
-        if min(block_size, kv_heads, key_head_dim, value_head_dim) <= 0:
-            raise ValueError(
-                f"vLLM KV cache group {group_index} is not a supported attention spec"
-            )
-        attention_chunk = getattr(spec, "attention_chunk_size", None)
-        if attention_chunk is not None:
-            raise ValueError(
-                "vLLM shared_pool does not yet support chunked-local attention"
-            )
-        sliding_window = getattr(spec, "sliding_window", None)
-        policy = (
-            {"kind": "sliding_window", "window_tokens": int(sliding_window)}
-            if sliding_window is not None
-            else {"kind": "full_attention"}
-        )
+    for group in resolved_groups:
+        if group.policy_kind == "sliding_window":
+            policy = {
+                "kind": "sliding_window",
+                "window_tokens": group.window_tokens,
+            }
+        else:
+            policy = {"kind": "full_attention"}
         layers = [
             {"index": next_layer_index + offset, "name": str(layer_name)}
-            for offset, layer_name in enumerate(layer_names)
+            for offset, layer_name in enumerate(group.layers)
         ]
         next_layer_index += len(layers)
         cache_groups.append(
             {
-                "group_id": f"vllm.group.{group_index}",
+                "group_id": group.group_id,
                 "layers": layers,
                 "geometry": {
                     "kind": "paged_attention",
-                    "block_size_tokens": block_size,
-                    "kv_heads": kv_heads,
-                    "key_head_dim": key_head_dim,
-                    "value_head_dim": value_head_dim,
-                    "element_type": _element_type(getattr(spec, "dtype", None)),
+                    "block_size_tokens": group.block_size_tokens,
+                    "kv_heads": group.kv_heads,
+                    "key_head_dim": group.key_head_dim,
+                    "value_head_dim": group.value_head_dim,
+                    "element_type": _element_type(group.element_type.name),
                     "layout": {
                         "kind": "backend_native",
                         "layout_id": f"vllm:{layout_id}",
@@ -754,6 +1059,38 @@ def _element_type(dtype: Any) -> dict[str, Any]:
     return {"kind": "custom", "name": name}
 
 
+def _strict_nonnegative_integer(value: Any, field: str) -> int:
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or value < 0
+        or value > UINT64_MAX
+    ):
+        raise ValueError(
+            f"{field} must be a non-negative unsigned 64-bit integer"
+        )
+    return value
+
+
+def _canonical_rank(value: Any) -> int:
+    if isinstance(value, int) and not isinstance(value, bool):
+        return _strict_nonnegative_integer(value, "kapsl_rank_device_map rank")
+    if isinstance(value, str) and (
+        value == "0"
+        or (
+            value
+            and value[0] in "123456789"
+            and all(character in "0123456789" for character in value[1:])
+        )
+    ):
+        return _strict_nonnegative_integer(
+            int(value), "kapsl_rank_device_map rank"
+        )
+    raise ValueError(
+        "kapsl_rank_device_map ranks must be canonical non-negative integers"
+    )
+
+
 def _rank_device_map(config: Any) -> dict[int, int] | None:
     raw_map = _extra(config, "kapsl_rank_device_map", None)
     if raw_map is None:
@@ -762,15 +1099,14 @@ def _rank_device_map(config: Any) -> dict[int, int] | None:
         raise ValueError("kapsl_rank_device_map must be an object")
     result: dict[int, int] = {}
     for raw_rank, raw_device_id in raw_map.items():
-        try:
-            rank = int(raw_rank)
-            device_id = int(raw_device_id)
-        except (TypeError, ValueError) as error:
+        rank = _canonical_rank(raw_rank)
+        device_id = _strict_nonnegative_integer(
+            raw_device_id, "kapsl_rank_device_map device ID"
+        )
+        if rank in result:
             raise ValueError(
-                "kapsl_rank_device_map keys and values must be integers"
-            ) from error
-        if rank < 0 or device_id < 0:
-            raise ValueError("kapsl_rank_device_map values cannot be negative")
+                "kapsl_rank_device_map contains duplicate or colliding ranks"
+            )
         result[rank] = device_id
     if not result:
         raise ValueError("kapsl_rank_device_map must not be empty")
@@ -782,10 +1118,20 @@ def _validated_shared_rank_device_map(
     memory_domains: Sequence[Mapping[str, Any]],
     tensor_parallel_size: int,
 ) -> dict[int, int] | None:
-    if tensor_parallel_size <= 0:
-        raise ValueError("vLLM tensor_parallel_size must be positive")
-    device_ids = [int(domain.get("device_id", -1)) for domain in memory_domains]
-    if len(device_ids) != tensor_parallel_size or len(set(device_ids)) != len(device_ids):
+    tensor_parallel_size = _positive_integer(
+        tensor_parallel_size, "vLLM tensor_parallel_size"
+    )
+    device_ids = [
+        _strict_nonnegative_integer(
+            domain.get("device_id"),
+            f"kapsl_memory_domains[{index}].device_id",
+        )
+        for index, domain in enumerate(memory_domains)
+    ]
+    if (
+        len(device_ids) != tensor_parallel_size
+        or len(set(device_ids)) != len(device_ids)
+    ):
         raise ValueError(
             "vLLM shared_pool requires exactly one distinct CUDA domain per tensor-parallel rank"
         )

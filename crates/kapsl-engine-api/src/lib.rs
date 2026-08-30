@@ -4,10 +4,12 @@ use futures::{stream::Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::fmt;
+use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
@@ -513,24 +515,102 @@ pub struct NamedTensor {
     pub tensor: BinaryTensorPacket,
 }
 
+#[derive(Debug, Default)]
+struct CancellationState {
+    cancelled: AtomicBool,
+    next_waiter_id: AtomicU64,
+    waiters: Mutex<Vec<(u64, Waker)>>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct CancellationToken {
-    cancelled: Arc<AtomicBool>,
+    state: Arc<CancellationState>,
 }
 
 impl CancellationToken {
     pub fn new() -> Self {
-        Self {
-            cancelled: Arc::new(AtomicBool::new(false)),
-        }
+        Self::default()
     }
 
     pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::SeqCst);
+        if self.state.cancelled.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let waiters = {
+            let mut waiters = self
+                .state
+                .waiters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::take(&mut *waiters)
+        };
+        for (_, waiter) in waiters {
+            waiter.wake();
+        }
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::SeqCst)
+        self.state.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// Wait until cancellation without polling or retaining a dropped task.
+    pub fn cancelled(&self) -> impl Future<Output = ()> + Send + 'static {
+        CancellationWaiter {
+            state: Arc::clone(&self.state),
+            waiter_id: self.state.next_waiter_id.fetch_add(1, Ordering::Relaxed),
+            registered: false,
+        }
+    }
+}
+
+struct CancellationWaiter {
+    state: Arc<CancellationState>,
+    waiter_id: u64,
+    registered: bool,
+}
+
+impl Future for CancellationWaiter {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.state.cancelled.load(Ordering::SeqCst) {
+            return Poll::Ready(());
+        }
+        let mut waiters = self
+            .state
+            .waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.state.cancelled.load(Ordering::SeqCst) {
+            return Poll::Ready(());
+        }
+        if let Some((_, waiter)) = waiters
+            .iter_mut()
+            .find(|(waiter_id, _)| *waiter_id == self.waiter_id)
+        {
+            if !waiter.will_wake(context.waker()) {
+                *waiter = context.waker().clone();
+            }
+        } else {
+            waiters.push((self.waiter_id, context.waker().clone()));
+        }
+        drop(waiters);
+        self.registered = true;
+        Poll::Pending
+    }
+}
+
+impl Drop for CancellationWaiter {
+    fn drop(&mut self) {
+        if !self.registered {
+            return;
+        }
+        let mut waiters = self
+            .state
+            .waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        waiters.retain(|(waiter_id, _)| *waiter_id != self.waiter_id);
     }
 }
 
@@ -647,6 +727,230 @@ impl InferenceRequest {
             tensor,
         });
     }
+}
+
+/// Version of the protocol-native OpenAI request/response contract.
+///
+/// This protocol is carried by dedicated transport operation codes. It is not
+/// appended to [`InferenceRequest`], whose sequence-serialized bincode layout
+/// must remain readable by older clients and servers.
+pub const OPENAI_WIRE_PROTOCOL_VERSION: u16 = 1;
+
+/// Private managed-backend endpoint selected by Kapsl.
+///
+/// An enum deliberately prevents a caller from smuggling an arbitrary host or
+/// path through the protocol-native fast path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OpenAiWireEndpoint {
+    ChatCompletions,
+    Completions,
+}
+
+impl OpenAiWireEndpoint {
+    pub const fn path(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "/v1/chat/completions",
+            Self::Completions => "/v1/completions",
+        }
+    }
+}
+
+/// Expected upstream representation. Streaming responses are relayed as raw
+/// SSE bytes and are never assumed to align with network chunks or events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OpenAiWireFormat {
+    Json,
+    ServerSentEvents,
+}
+
+/// Internal policy metadata for a protocol-native OpenAI operation.
+///
+/// This deliberately excludes authorization and sampling fields. Transport
+/// credentials live in a transport-specific envelope and are consumed before
+/// this engine-facing type crosses the scheduler boundary.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenAiWireMetadata {
+    #[serde(default)]
+    pub request_id: Option<String>,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub priority: Option<u8>,
+}
+
+/// A validated OpenAI operation after public ingress policy has run.
+///
+/// The body is the one normalized serialization forwarded to the managed
+/// backend. Client authorization is absent from this type and is never placed
+/// in `body`; the engine chooses its own private endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenAiWireRequest {
+    pub version: u16,
+    pub endpoint: OpenAiWireEndpoint,
+    pub format: OpenAiWireFormat,
+    pub body: Vec<u8>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub metadata: Option<OpenAiWireMetadata>,
+    #[serde(skip, default)]
+    pub cancellation: Option<CancellationToken>,
+}
+
+impl OpenAiWireRequest {
+    pub fn new(endpoint: OpenAiWireEndpoint, format: OpenAiWireFormat, body: Vec<u8>) -> Self {
+        Self {
+            version: OPENAI_WIRE_PROTOCOL_VERSION,
+            endpoint,
+            format,
+            body,
+            session_id: None,
+            metadata: None,
+            cancellation: None,
+        }
+    }
+
+    pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = Some(session_id.into());
+        self
+    }
+
+    pub fn with_metadata(mut self, metadata: OpenAiWireMetadata) -> Self {
+        self.metadata = Some(metadata);
+        self
+    }
+
+    pub fn validate(&self, maximum_body_bytes: usize) -> Result<(), EngineError> {
+        if self.version != OPENAI_WIRE_PROTOCOL_VERSION {
+            return Err(EngineError::invalid_input(format!(
+                "unsupported OpenAI wire protocol version {}; expected {}",
+                self.version, OPENAI_WIRE_PROTOCOL_VERSION
+            )));
+        }
+        if self.body.is_empty() {
+            return Err(EngineError::invalid_input(
+                "OpenAI wire request body must not be empty",
+            ));
+        }
+        if self.body.len() > maximum_body_bytes {
+            return Err(EngineError::resource_exhausted(format!(
+                "OpenAI wire request body is {} bytes; maximum is {} bytes",
+                self.body.len(),
+                maximum_body_bytes
+            )));
+        }
+        if self
+            .session_id
+            .as_deref()
+            .is_some_and(|session| session.trim().is_empty())
+        {
+            return Err(EngineError::invalid_input(
+                "OpenAI wire session ID must not be empty when present",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Response headers that may cross the private managed-backend boundary.
+/// Hop-by-hop and security-sensitive headers have no representation here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OpenAiWireHeaderName {
+    ContentType,
+    CacheControl,
+    RequestId,
+    RetryAfter,
+    ProcessingMilliseconds,
+}
+
+impl OpenAiWireHeaderName {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ContentType => "content-type",
+            Self::CacheControl => "cache-control",
+            Self::RequestId => "x-request-id",
+            Self::RetryAfter => "retry-after",
+            Self::ProcessingMilliseconds => "openai-processing-ms",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenAiWireHeader {
+    pub name: OpenAiWireHeaderName,
+    pub value: Vec<u8>,
+}
+
+impl OpenAiWireHeader {
+    pub fn new(name: OpenAiWireHeaderName, value: impl Into<Vec<u8>>) -> Result<Self, EngineError> {
+        let value = value.into();
+        if value.iter().any(|byte| matches!(byte, b'\r' | b'\n')) {
+            return Err(EngineError::invalid_input(format!(
+                "OpenAI wire response header '{}' contains a line break",
+                name.as_str()
+            )));
+        }
+        Ok(Self { name, value })
+    }
+}
+
+/// Status and allowlisted headers emitted before either a JSON body or an SSE
+/// byte stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenAiWireResponseHead {
+    pub version: u16,
+    pub status: u16,
+    pub headers: Vec<OpenAiWireHeader>,
+}
+
+impl OpenAiWireResponseHead {
+    pub fn new(status: u16, headers: Vec<OpenAiWireHeader>) -> Result<Self, EngineError> {
+        if !(100..=599).contains(&status) {
+            return Err(EngineError::invalid_input(format!(
+                "OpenAI wire response status {status} is outside the HTTP range"
+            )));
+        }
+        Ok(Self {
+            version: OPENAI_WIRE_PROTOCOL_VERSION,
+            status,
+            headers,
+        })
+    }
+
+    pub fn validate(&self) -> Result<(), EngineError> {
+        if self.version != OPENAI_WIRE_PROTOCOL_VERSION {
+            return Err(EngineError::invalid_input(format!(
+                "unsupported OpenAI wire response version {}; expected {}",
+                self.version, OPENAI_WIRE_PROTOCOL_VERSION
+            )));
+        }
+        if !(100..=599).contains(&self.status) {
+            return Err(EngineError::invalid_input(format!(
+                "OpenAI wire response status {} is outside the HTTP range",
+                self.status
+            )));
+        }
+        for header in &self.headers {
+            OpenAiWireHeader::new(header.name, header.value.clone())?;
+        }
+        Ok(())
+    }
+}
+
+/// Complete protocol-native response used for non-streaming operations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenAiWireResponse {
+    pub head: OpenAiWireResponseHead,
+    pub body: Vec<u8>,
+}
+
+/// Raw response body chunks for a protocol-native streaming operation.
+pub type OpenAiWireStream =
+    Pin<Box<dyn Stream<Item = Result<Vec<u8>, EngineError>> + Send + 'static>>;
+
+pub struct OpenAiWireStreamResponse {
+    pub head: OpenAiWireResponseHead,
+    pub body: OpenAiWireStream,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1027,6 +1331,79 @@ pub trait Engine: Send + Sync {
     /// Run a single inference request and return the output tensor.
     fn infer(&self, request: &InferenceRequest) -> Result<BinaryTensorPacket, EngineError>;
 
+    /// Whether this engine accepts protocol-native OpenAI wire operations.
+    fn supports_openai_wire(&self) -> bool {
+        false
+    }
+
+    /// Report transient memory held while one protocol-native OpenAI request
+    /// is active. The default accounts for the normalized serialized body;
+    /// managed backends can add staging, block-table, or request-scoped KV
+    /// rows when those are not already covered by persistent capacity.
+    fn planned_openai_wire_request_memory(&self, request: &OpenAiWireRequest) -> MemoryReport {
+        MemoryReport::single(
+            "request:openai-wire-body",
+            MemoryDomain::Host,
+            MemoryAllocationClass::RequestTransient,
+            request.body.len(),
+        )
+    }
+
+    /// Run one protocol-native OpenAI request under a runtime-provided memory
+    /// admission hook. The guard remains live until the complete response has
+    /// been received from the backend.
+    async fn infer_openai_wire_with_memory_admission(
+        &self,
+        request: &OpenAiWireRequest,
+        admission: RequestMemoryAdmission,
+    ) -> Result<OpenAiWireResponse, EngineError> {
+        let _guard = admission.acquire()?;
+        self.infer_openai_wire(request).await
+    }
+
+    /// Forward one validated OpenAI operation without translating its JSON
+    /// response into tensors. Public ingress policy and replica selection run
+    /// before this engine boundary.
+    async fn infer_openai_wire(
+        &self,
+        _request: &OpenAiWireRequest,
+    ) -> Result<OpenAiWireResponse, EngineError> {
+        Err(EngineError::backend(
+            "engine does not support protocol-native OpenAI requests",
+        ))
+    }
+
+    /// Start one OpenAI SSE relay. Returning the response head separately lets
+    /// the public route preserve an upstream non-2xx status before committing
+    /// the downstream body stream.
+    async fn infer_openai_wire_stream(
+        &self,
+        _request: &OpenAiWireRequest,
+    ) -> Result<OpenAiWireStreamResponse, EngineError> {
+        Err(EngineError::backend(
+            "engine does not support protocol-native OpenAI streams",
+        ))
+    }
+
+    /// Start one protocol-native OpenAI stream under a runtime-provided memory
+    /// admission hook. The guard is captured by the returned stream and is
+    /// released only on completion or downstream cancellation/drop.
+    async fn infer_openai_wire_stream_with_memory_admission(
+        &self,
+        request: &OpenAiWireRequest,
+        admission: RequestMemoryAdmission,
+    ) -> Result<OpenAiWireStreamResponse, EngineError> {
+        let guard = admission.acquire()?;
+        let response = self.infer_openai_wire_stream(request).await?;
+        Ok(OpenAiWireStreamResponse {
+            head: response.head,
+            body: Box::pin(response.body.map(move |item| {
+                let _hold = &guard;
+                item
+            })),
+        })
+    }
+
     /// Run a batch of inference requests.
     fn infer_batch(
         &self,
@@ -1192,6 +1569,48 @@ impl Engine for Box<dyn Engine> {
         (**self).infer(request)
     }
 
+    fn supports_openai_wire(&self) -> bool {
+        (**self).supports_openai_wire()
+    }
+
+    fn planned_openai_wire_request_memory(&self, request: &OpenAiWireRequest) -> MemoryReport {
+        (**self).planned_openai_wire_request_memory(request)
+    }
+
+    async fn infer_openai_wire_with_memory_admission(
+        &self,
+        request: &OpenAiWireRequest,
+        admission: RequestMemoryAdmission,
+    ) -> Result<OpenAiWireResponse, EngineError> {
+        (**self)
+            .infer_openai_wire_with_memory_admission(request, admission)
+            .await
+    }
+
+    async fn infer_openai_wire(
+        &self,
+        request: &OpenAiWireRequest,
+    ) -> Result<OpenAiWireResponse, EngineError> {
+        (**self).infer_openai_wire(request).await
+    }
+
+    async fn infer_openai_wire_stream(
+        &self,
+        request: &OpenAiWireRequest,
+    ) -> Result<OpenAiWireStreamResponse, EngineError> {
+        (**self).infer_openai_wire_stream(request).await
+    }
+
+    async fn infer_openai_wire_stream_with_memory_admission(
+        &self,
+        request: &OpenAiWireRequest,
+        admission: RequestMemoryAdmission,
+    ) -> Result<OpenAiWireStreamResponse, EngineError> {
+        (**self)
+            .infer_openai_wire_stream_with_memory_admission(request, admission)
+            .await
+    }
+
     fn infer_batch(
         &self,
         requests: &[InferenceRequest],
@@ -1265,6 +1684,50 @@ pub type EngineHandle = Arc<dyn Engine>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct WireAdmissionTestEngine;
+
+    #[async_trait]
+    impl Engine for WireAdmissionTestEngine {
+        async fn load(&mut self, _model_path: &std::path::Path) -> Result<(), EngineError> {
+            Ok(())
+        }
+
+        fn infer(&self, _request: &InferenceRequest) -> Result<BinaryTensorPacket, EngineError> {
+            Err(EngineError::backend("tensor path is not used"))
+        }
+
+        fn supports_openai_wire(&self) -> bool {
+            true
+        }
+
+        async fn infer_openai_wire_stream(
+            &self,
+            _request: &OpenAiWireRequest,
+        ) -> Result<OpenAiWireStreamResponse, EngineError> {
+            Ok(OpenAiWireStreamResponse {
+                head: OpenAiWireResponseHead::new(200, Vec::new())?,
+                body: Box::pin(futures::stream::iter(vec![
+                    Ok(b"first".to_vec()),
+                    Ok(b"second".to_vec()),
+                ])),
+            })
+        }
+
+        fn infer_stream(&self, _request: &InferenceRequest) -> EngineStream {
+            Box::pin(futures::stream::empty())
+        }
+
+        fn unload(&mut self) {}
+
+        fn metrics(&self) -> EngineMetrics {
+            EngineMetrics::default()
+        }
+
+        fn health_check(&self) -> Result<(), EngineError> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn binary_tensor_packet_deserializes_from_data_array() {
@@ -1405,6 +1868,69 @@ mod tests {
     }
 
     #[test]
+    fn openai_wire_request_has_an_independent_bincode_layout() {
+        let cancellation = CancellationToken::new();
+        let mut request = OpenAiWireRequest::new(
+            OpenAiWireEndpoint::ChatCompletions,
+            OpenAiWireFormat::ServerSentEvents,
+            br#"{"model":"served","messages":[{"role":"user","content":"hello"}]}"#.to_vec(),
+        )
+        .with_session_id("principal:session")
+        .with_metadata(OpenAiWireMetadata {
+            request_id: Some("req-internal".to_string()),
+            timeout_ms: Some(5000),
+            priority: Some(1),
+        });
+        request.cancellation = Some(cancellation);
+        request.validate(4096).unwrap();
+
+        let encoded = bincode::serialize(&request).expect("wire request should serialize");
+        let decoded: OpenAiWireRequest =
+            bincode::deserialize(&encoded).expect("wire request should deserialize");
+        assert_eq!(decoded.endpoint.path(), "/v1/chat/completions");
+        assert_eq!(decoded.format, OpenAiWireFormat::ServerSentEvents);
+        assert_eq!(decoded.body, request.body);
+        assert_eq!(decoded.session_id.as_deref(), Some("principal:session"));
+        assert_eq!(
+            decoded.metadata.as_ref().and_then(|value| value.priority),
+            Some(1)
+        );
+        let metadata_json = serde_json::to_value(decoded.metadata.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            metadata_json
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["priority", "request_id", "timeout_ms"]
+                .into_iter()
+                .collect()
+        );
+        assert!(metadata_json.get("auth_token").is_none());
+        assert!(metadata_json.get("temperature").is_none());
+        assert!(decoded.cancellation.is_none());
+    }
+
+    #[test]
+    fn openai_wire_headers_are_allowlisted_and_reject_response_splitting() {
+        let content_type = OpenAiWireHeader::new(
+            OpenAiWireHeaderName::ContentType,
+            b"text/event-stream".to_vec(),
+        )
+        .unwrap();
+        let head = OpenAiWireResponseHead::new(429, vec![content_type]).unwrap();
+        head.validate().unwrap();
+
+        assert!(OpenAiWireHeader::new(
+            OpenAiWireHeaderName::RequestId,
+            b"safe\r\nx-injected: true".to_vec(),
+        )
+        .is_err());
+        assert!(OpenAiWireResponseHead::new(42, Vec::new()).is_err());
+    }
+
+    #[test]
     fn request_memory_admission_is_one_shot_and_guard_owns_lease() {
         struct DropMarker(Arc<std::sync::atomic::AtomicUsize>);
 
@@ -1434,6 +1960,38 @@ mod tests {
         assert_eq!(acquisitions.load(Ordering::SeqCst), 1);
 
         drop(guard);
+        assert_eq!(releases.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn openai_wire_stream_admission_guard_lives_until_stream_drop() {
+        struct DropMarker(Arc<std::sync::atomic::AtomicUsize>);
+
+        impl Drop for DropMarker {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let releases = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let admission = RequestMemoryAdmission::new({
+            let releases = Arc::clone(&releases);
+            move || Ok(DropMarker(Arc::clone(&releases)))
+        });
+        let request = OpenAiWireRequest::new(
+            OpenAiWireEndpoint::ChatCompletions,
+            OpenAiWireFormat::ServerSentEvents,
+            b"{}".to_vec(),
+        );
+        let mut response = WireAdmissionTestEngine
+            .infer_openai_wire_stream_with_memory_admission(&request, admission)
+            .await
+            .unwrap();
+
+        assert_eq!(releases.load(Ordering::SeqCst), 0);
+        assert_eq!(response.body.next().await.unwrap().unwrap(), b"first");
+        assert_eq!(releases.load(Ordering::SeqCst), 0);
+        drop(response);
         assert_eq!(releases.load(Ordering::SeqCst), 1);
     }
 

@@ -4,11 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kapsl-vllm-connector"
-version = "0.5.0"
+version = "0.7.0"
 description = "Out-of-tree vLLM KV participant connector for Kapsl"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
 authors = [{ name = "Kapsl contributors" }]
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -16,6 +17,7 @@ classifiers = [
 
 [project.scripts]
 kapsl-vllm-flash-attn-probe = "kapsl_vllm_connector.flash_attn_probe:main"
+kapsl-vllm-plan = "kapsl_vllm_connector.plan:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

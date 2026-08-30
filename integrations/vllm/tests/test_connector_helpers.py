@@ -10,6 +10,7 @@ from kapsl_vllm_connector.connector import (
     _element_type,
     _vllm_adapter_profile,
     _validate_shared_pool_execution,
+    _validated_vmm_conformance,
     _validated_shared_rank_device_map,
     _vllm_topology,
     _request_computed_tokens,
@@ -20,6 +21,86 @@ from kapsl_vllm_connector.connector import (
 
 
 class ConnectorHelperTests(unittest.TestCase):
+    def test_vmm_conformance_requires_an_explicit_elastic_boolean(self) -> None:
+        self.assertFalse(_validated_vmm_conformance(SimpleNamespace(), False))
+        config = SimpleNamespace(
+            kv_connector_extra_config={"kapsl_vmm_conformance": True}
+        )
+        self.assertTrue(_validated_vmm_conformance(config, True))
+        with self.assertRaisesRegex(ValueError, "requires live resize"):
+            _validated_vmm_conformance(config, False)
+        with self.assertRaisesRegex(ValueError, "must be a boolean"):
+            _validated_vmm_conformance(
+                SimpleNamespace(
+                    kv_connector_extra_config={"kapsl_vmm_conformance": 1}
+                ),
+                True,
+            )
+
+    def test_worker_resize_lock_spans_target_and_deferred_draft_forwards(self) -> None:
+        connector = KapslConnectorV1.__new__(KapslConnectorV1)
+        connector._is_scheduler = False
+        connector._live_resize = True
+        connector._worker_forward_lock = threading.Lock()
+        connector._worker_forward_active = False
+        applied: list[str] = []
+        connector._apply_worker_resizes = lambda: applied.append("resize")
+
+        connector.start_load_kv(SimpleNamespace(attn_metadata={}))
+        self.assertEqual(applied, ["resize"])
+        self.assertTrue(connector._worker_forward_active)
+        self.assertTrue(connector._worker_forward_lock.locked())
+
+        # Pinned vLLM calls this before its deferred speculative/draft forward.
+        # It must not permit a physical unmap yet.
+        connector.build_connector_worker_meta()
+        self.assertTrue(connector._worker_forward_lock.locked())
+
+        connector.wait_for_save()
+        self.assertFalse(connector._worker_forward_active)
+        self.assertFalse(connector._worker_forward_lock.locked())
+
+    def test_worker_resize_zero_token_step_releases_without_wait_for_save(self) -> None:
+        connector = KapslConnectorV1.__new__(KapslConnectorV1)
+        connector._is_scheduler = False
+        connector._live_resize = True
+        connector._worker_forward_lock = threading.Lock()
+        connector._worker_forward_active = False
+        applied: list[str] = []
+        connector._apply_worker_resizes = lambda: applied.append("resize")
+
+        connector.start_load_kv(SimpleNamespace(attn_metadata=None))
+
+        self.assertEqual(applied, ["resize"])
+        self.assertFalse(connector._worker_forward_active)
+        self.assertFalse(connector._worker_forward_lock.locked())
+
+    def test_scheduler_stays_awake_until_grown_capacity_returns_to_initial(self) -> None:
+        connector = KapslConnectorV1.__new__(KapslConnectorV1)
+        connector._resize_lock = threading.RLock()
+        connector._resize_pending = False
+        connector._pending_scheduler_operations = []
+        connector._elastic_block_pool = SimpleNamespace(
+            initial_blocks=4,
+            current_blocks=4,
+        )
+
+        self.assertFalse(connector.has_pending_push_work())
+
+        # A completed grow can race the supervisor's follow-up shrink after
+        # the last request finishes. Keeping vLLM's supported push-work loop
+        # active lets the scheduler receive and acknowledge that shrink.
+        connector._elastic_block_pool.current_blocks = 8
+        self.assertTrue(connector.has_pending_push_work())
+
+        connector._elastic_block_pool.current_blocks = 4
+        connector._resize_pending = True
+        self.assertTrue(connector.has_pending_push_work())
+
+        connector._resize_pending = False
+        connector._pending_scheduler_operations = [{"resize_generation": 2}]
+        self.assertTrue(connector.has_pending_push_work())
+
     def test_scheduler_activates_shared_pool_once_before_admission(self) -> None:
         class FakeClient:
             def __init__(self) -> None:
@@ -40,6 +121,66 @@ class ConnectorHelperTests(unittest.TestCase):
         connector._ensure_shared_active()
 
         self.assertEqual(connector._client.epochs, [7])
+
+    def test_scheduler_startup_activates_before_heartbeat(self) -> None:
+        events: list[str] = []
+
+        class FakeThread:
+            def __init__(self, *, target, name: str, daemon: bool) -> None:
+                self.target = target
+                self.name = name
+                self.daemon = daemon
+
+            def start(self) -> None:
+                events.append("heartbeat")
+
+        connector = KapslConnectorV1.__new__(KapslConnectorV1)
+        connector._is_scheduler = True
+        connector._mode = "shared_pool"
+        connector._heartbeat_loop = lambda: None
+        connector._ensure_shared_active = lambda: events.append("activate")
+
+        with patch(
+            "kapsl_vllm_connector.connector.threading.Thread", FakeThread
+        ):
+            connector._start_scheduler_control("engine-7")
+
+        self.assertEqual(events, ["activate", "heartbeat"])
+        self.assertEqual(
+            connector._heartbeat_thread.name, "kapsl-kv-heartbeat-engine-7"
+        )
+        self.assertTrue(connector._heartbeat_thread.daemon)
+
+    def test_worker_startup_does_not_activate_or_start_heartbeat(self) -> None:
+        connector = KapslConnectorV1.__new__(KapslConnectorV1)
+        connector._is_scheduler = False
+        connector._mode = "shared_pool"
+        connector._heartbeat_thread = None
+        connector._ensure_shared_active = lambda: self.fail("worker activated pool")
+
+        with patch("kapsl_vllm_connector.connector.threading.Thread") as thread:
+            connector._start_scheduler_control("engine-7")
+
+        thread.assert_not_called()
+        self.assertIsNone(connector._heartbeat_thread)
+
+    def test_scheduler_startup_fails_before_heartbeat_when_activation_fails(
+        self,
+    ) -> None:
+        def fail_activation() -> None:
+            raise KapslKvControlError("worker binding is missing")
+
+        connector = KapslConnectorV1.__new__(KapslConnectorV1)
+        connector._is_scheduler = True
+        connector._mode = "shared_pool"
+        connector._heartbeat_loop = lambda: None
+        connector._ensure_shared_active = fail_activation
+
+        with patch("kapsl_vllm_connector.connector.threading.Thread") as thread:
+            with self.assertRaisesRegex(KapslKvControlError, "binding is missing"):
+                connector._start_scheduler_control("engine-7")
+
+        thread.assert_not_called()
 
     def test_shared_pool_rejects_vllm_sleep_mode(self) -> None:
         config = SimpleNamespace(
@@ -156,8 +297,8 @@ class ConnectorHelperTests(unittest.TestCase):
             block_size=16,
             page_size_bytes=1024,
             num_kv_heads=4,
-            head_size=64,
-            head_size_v=64,
+            head_size=4,
+            head_size_v=4,
             dtype="float16",
             sliding_window=None,
             attention_chunk_size=None,
@@ -167,7 +308,7 @@ class ConnectorHelperTests(unittest.TestCase):
             kv_cache_layout="BHLNC",
             kv_cache_tensors=[
                 SimpleNamespace(
-                    size=32 * 8192,
+                    size=32 * 2048,
                     layers=["model.layers.0.attn", "model.layers.1.attn"],
                 )
             ],
@@ -183,9 +324,14 @@ class ConnectorHelperTests(unittest.TestCase):
             config,
             [{"kind": "cuda", "device_id": 0}],
             shared_pool=True,
+            spec_kind_classifier=lambda _spec: "full_attention",
         )
-        self.assertEqual(groups[0]["bytes_per_allocation"], 8192)
-        topology = _vllm_topology(config, "sha256:model")
+        self.assertEqual(groups[0]["bytes_per_allocation"], 2048)
+        topology = _vllm_topology(
+            config,
+            "sha256:model",
+            spec_kind_classifier=lambda _spec: "full_attention",
+        )
         self.assertEqual(
             topology["cache_groups"][0]["geometry"]["layout"]["layout_id"],
             "vllm:BHLNC",
@@ -195,6 +341,14 @@ class ConnectorHelperTests(unittest.TestCase):
             {"kind": "f16"},
         )
         self.assertEqual(len(topology["cache_groups"][0]["layers"]), 2)
+
+        spec.block_size = 16.5
+        with self.assertRaisesRegex(ValueError, "must be an integer"):
+            _vllm_topology(
+                config,
+                "sha256:model",
+                spec_kind_classifier=lambda _spec: "full_attention",
+            )
 
     def test_element_types_use_the_rust_internally_tagged_shape(self) -> None:
         self.assertEqual(_element_type("torch.float16"), {"kind": "f16"})
@@ -227,6 +381,64 @@ class ConnectorHelperTests(unittest.TestCase):
                 domains,
                 2,
             )
+
+    def test_shared_rank_map_rejects_noncanonical_and_nonintegral_values(self) -> None:
+        domains = [
+            {"kind": "cuda", "device_id": 0},
+            {"kind": "cuda", "device_id": 2},
+        ]
+        invalid_maps = (
+            ({"00": 0, "1": 2}, "canonical"),
+            ({"+0": 0, "1": 2}, "canonical"),
+            ({" 0": 0, "1": 2}, "canonical"),
+            ({0.0: 0, "1": 2}, "canonical"),
+            ({True: 0, "1": 2}, "canonical"),
+            ({"0": False, "1": 2}, "unsigned 64-bit integer"),
+            ({"0": 0.0, "1": 2}, "unsigned 64-bit integer"),
+            ({"0": "0", "1": 2}, "unsigned 64-bit integer"),
+        )
+        for rank_map, message in invalid_maps:
+            with self.subTest(rank_map=rank_map), self.assertRaisesRegex(
+                ValueError, message
+            ):
+                _validated_shared_rank_device_map(
+                    SimpleNamespace(
+                        kv_connector_extra_config={
+                            "kapsl_rank_device_map": rank_map
+                        }
+                    ),
+                    domains,
+                    2,
+                )
+
+        with self.assertRaisesRegex(ValueError, "duplicate or colliding ranks"):
+            _validated_shared_rank_device_map(
+                SimpleNamespace(
+                    kv_connector_extra_config={
+                        "kapsl_rank_device_map": {
+                            0: 0,
+                            "0": 2,
+                            1: 2,
+                        }
+                    }
+                ),
+                domains,
+                2,
+            )
+
+    def test_shared_rank_map_rejects_nonintegral_memory_domain_ids(self) -> None:
+        config = SimpleNamespace(
+            kv_connector_extra_config={"kapsl_rank_device_map": {"0": 0}}
+        )
+        for device_id in (True, 0.0, "0", None):
+            with self.subTest(device_id=device_id), self.assertRaisesRegex(
+                ValueError, "unsigned 64-bit integer"
+            ):
+                _validated_shared_rank_device_map(
+                    config,
+                    [{"kind": "cuda", "device_id": device_id}],
+                    1,
+                )
 
     def test_heartbeat_failure_is_a_fail_closed_scheduler_error(self) -> None:
         connector = KapslConnectorV1.__new__(KapslConnectorV1)
