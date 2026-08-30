@@ -19,7 +19,6 @@ use kapsl_core::{accelerator_provider_pack_installed, AcceleratorProviderPack, P
 use kapsl_engine_api::EngineError;
 #[cfg(feature = "onnx-cuda-pool")]
 use kapsl_hal::gpu_arena::{PoolAllocationClass, PoolBackend, PoolOwner, PoolOwnerScope};
-use kapsl_hal::kernel::KernelBackend;
 use ndarray::{Array2, Array4, ArrayD, IxDyn};
 #[cfg(target_os = "windows")]
 use ort::execution_providers::DirectMLExecutionProvider;
@@ -1206,7 +1205,6 @@ struct BatchItem {
 /// required past_key_values inputs exist (even as zero-length tensors) to satisfy graph ops.
 pub struct LLMEngine {
     scheduler: LLMScheduler,
-    _kernel_backend: Box<dyn KernelBackend>,
     request_rx: mpsc::Receiver<SequenceGroup>,
     sessions: HashMap<String, Arc<Mutex<Sequence>>>,
     session: Option<Session>,
@@ -1427,7 +1425,6 @@ impl LLMEngine {
     ) -> Self {
         let block_manager = BlockManager::new(num_gpu_blocks, block_size, 0);
         let scheduler = LLMScheduler::new(scheduler_config, block_manager);
-        let kernel_backend = kapsl_kernels::create_backend();
 
         // Initialize kv_cache with defaults; will be replaced in load() if we detect geometry.
         let kv_cache = KvCache::new(
@@ -1439,7 +1436,6 @@ impl LLMEngine {
 
         Self {
             scheduler,
-            _kernel_backend: kernel_backend,
             request_rx,
             sessions: HashMap::new(),
             session: None,

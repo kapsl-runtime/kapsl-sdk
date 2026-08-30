@@ -1,11 +1,16 @@
+//! CPU fused-MLP reference implementation.
+
 use kapsl_hal::{
     kernel::{KernelError, MlpKernel},
     tensor::{TensorView, TensorViewMut},
 };
 
+/// Portable CPU implementation of fused SwiGLU.
 #[derive(Debug)]
 pub struct CpuMlp;
+/// Reserved marker for a future trait-based CUDA MLP implementation.
 pub struct CudaMlp;
+/// Reserved marker for a future trait-based ROCm MLP implementation.
 pub struct RocmMlp;
 
 use rayon::prelude::*;

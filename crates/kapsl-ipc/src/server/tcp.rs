@@ -1,3 +1,5 @@
+//! Authenticated TCP server for remote inference clients.
+
 use async_trait::async_trait;
 use kapsl_scheduler::ReplicaScheduler;
 use kapsl_transport::{TransportError, TransportServer};
