@@ -91,3 +91,45 @@ impl ModelConfig {
         self.num_key_value_heads.unwrap_or(self.num_attention_heads)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn applies_defaults_and_derives_attention_dimensions() {
+        let config: ModelConfig = serde_json::from_str(
+            r#"{
+                "hidden_size": 4096,
+                "intermediate_size": 11008,
+                "num_hidden_layers": 32,
+                "num_attention_heads": 32,
+                "vocab_size": 32000
+            }"#,
+        )
+        .expect("parse model config");
+
+        assert_eq!(config.head_dim(), 128);
+        assert_eq!(config.num_kv_heads(), 32);
+        assert_eq!(config.rms_norm_eps, 1e-5);
+        assert_eq!(config.rope_theta, 10_000.0);
+        assert_eq!(config.max_position_embeddings, 4096);
+    }
+
+    #[test]
+    fn honors_grouped_query_attention_head_count() {
+        let config: ModelConfig = serde_json::from_str(
+            r#"{
+                "hidden_size": 4096,
+                "intermediate_size": 14336,
+                "num_hidden_layers": 32,
+                "num_attention_heads": 32,
+                "num_key_value_heads": 8,
+                "vocab_size": 32000
+            }"#,
+        )
+        .expect("parse grouped-query model config");
+
+        assert_eq!(config.num_kv_heads(), 8);
+    }
+}

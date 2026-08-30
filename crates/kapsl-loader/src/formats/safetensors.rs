@@ -1,10 +1,11 @@
 //! Safetensors weight loader.
 //!
-//! Maps the file into memory and pulls tensors by name into `TensorData`
-//! structures. The file stays mapped for the lifetime of the returned
-//! `ModelWeights`; no heap copies are made for the raw bytes.
+//! Each shard is mapped temporarily, validated with the upstream
+//! `safetensors` parser, and copied into owned `TensorData` buffers. Returning
+//! owned buffers keeps the model independent of the shard files after loading.
 
 use memmap2::Mmap;
+use safetensors::{Dtype as SafetensorsDtype, SafeTensors};
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
@@ -27,38 +28,17 @@ pub enum LoadError {
     NoSafetensors(String),
 }
 
-// ── Safetensors on-disk structures ──────────────────────────────────────────
+// ── Safetensors dtype mapping ────────────────────────────────────────────────
 
-#[derive(Debug, serde::Deserialize)]
-struct TensorHeader {
-    dtype: String,
-    shape: Vec<usize>,
-    data_offsets: [usize; 2],
-}
-
-/// Parse the safetensors header JSON and return a map of name → header.
-fn parse_header(mmap: &Mmap) -> Result<HashMap<String, TensorHeader>, LoadError> {
-    if mmap.len() < 8 {
-        return Err(LoadError::Parse("file too small".into()));
+fn supported_dtype(dtype: SafetensorsDtype) -> Option<DType> {
+    match dtype {
+        SafetensorsDtype::F32 => Some(DType::F32),
+        SafetensorsDtype::F16 => Some(DType::F16),
+        SafetensorsDtype::BF16 => Some(DType::BF16),
+        SafetensorsDtype::I8 => Some(DType::I8),
+        SafetensorsDtype::U8 => Some(DType::U8),
+        _ => None,
     }
-    let header_len = u64::from_le_bytes(mmap[..8].try_into().unwrap()) as usize;
-    if 8 + header_len > mmap.len() {
-        return Err(LoadError::Parse("header length exceeds file size".into()));
-    }
-    let json_bytes = &mmap[8..8 + header_len];
-    let mut map: HashMap<String, serde_json::Value> = serde_json::from_slice(json_bytes)
-        .map_err(|e| LoadError::Parse(format!("JSON parse: {e}")))?;
-
-    // Remove the special __metadata__ key if present.
-    map.remove("__metadata__");
-
-    let mut headers = HashMap::with_capacity(map.len());
-    for (name, val) in map {
-        let h: TensorHeader = serde_json::from_value(val)
-            .map_err(|e| LoadError::Parse(format!("tensor header '{name}': {e}")))?;
-        headers.insert(name, h);
-    }
-    Ok(headers)
 }
 
 // ── Public API ───────────────────────────────────────────────────────────────
@@ -104,28 +84,28 @@ pub fn load_safetensors(model_dir: &Path) -> Result<ModelWeights, LoadError> {
         let file = File::open(shard_path)?;
         // SAFETY: the mmap is read-only and the file is not modified during loading.
         let mmap = unsafe { Mmap::map(&file)? };
-        let header_len = u64::from_le_bytes(mmap[..8].try_into().unwrap()) as usize;
-        let data_base = 8 + header_len;
-        let headers = parse_header(&mmap)?;
+        let tensors =
+            SafeTensors::deserialize(&mmap).map_err(|error| LoadError::Parse(error.to_string()))?;
 
-        for (name, h) in &headers {
+        for (name, view) in tensors.iter() {
             if all.contains_key(name) {
                 continue; // dedup across shards
             }
-            let dtype = match DType::from_str(&h.dtype) {
+            let dtype = match supported_dtype(view.dtype()) {
                 Some(d) => d,
                 None => {
                     log::warn!(
-                        "Skipping tensor '{}' with unsupported dtype '{}'",
+                        "Skipping tensor '{}' with unsupported dtype '{:?}'",
                         name,
-                        h.dtype
+                        view.dtype()
                     );
                     continue;
                 }
             };
-            let [start, end] = h.data_offsets;
-            let bytes = mmap[data_base + start..data_base + end].to_vec();
-            all.insert(name.clone(), TensorData::new(bytes, dtype, h.shape.clone()));
+            all.insert(
+                name.to_string(),
+                TensorData::new(view.data().to_vec(), dtype, view.shape().to_vec()),
+            );
         }
     }
 
@@ -185,4 +165,89 @@ fn assemble_weights(
         norm,
         lm_head,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use safetensors::tensor::TensorView;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    static NEXT_FIXTURE_ID: AtomicUsize = AtomicUsize::new(0);
+
+    struct ModelFixture {
+        path: std::path::PathBuf,
+    }
+
+    impl ModelFixture {
+        fn new() -> Self {
+            let id = NEXT_FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
+            let path =
+                std::env::temp_dir().join(format!("kapsl-loader-test-{}-{id}", std::process::id()));
+            std::fs::create_dir_all(&path).expect("create model fixture directory");
+            std::fs::write(
+                path.join("config.json"),
+                r#"{
+                    "hidden_size": 2,
+                    "intermediate_size": 4,
+                    "num_hidden_layers": 0,
+                    "num_attention_heads": 1,
+                    "vocab_size": 2
+                }"#,
+            )
+            .expect("write model config");
+            Self { path }
+        }
+    }
+
+    impl Drop for ModelFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn rejects_a_truncated_safetensors_file_without_panicking() {
+        let fixture = ModelFixture::new();
+        std::fs::write(fixture.path.join("model.safetensors"), [0_u8; 3])
+            .expect("write truncated shard");
+
+        assert!(matches!(
+            load_safetensors(&fixture.path),
+            Err(LoadError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn loads_valid_weights_and_ties_a_missing_lm_head() {
+        let fixture = ModelFixture::new();
+        let embeddings = [0_u8, 0, 0, 0, 0, 0, 0, 0];
+        let norm = [0_u8, 0, 0, 0];
+        let tensors = [
+            (
+                "model.embed_tokens.weight",
+                TensorView::new(SafetensorsDtype::F16, vec![2, 2], &embeddings)
+                    .expect("build embeddings view"),
+            ),
+            (
+                "model.norm.weight",
+                TensorView::new(SafetensorsDtype::F16, vec![2], &norm).expect("build norm view"),
+            ),
+        ];
+        let serialized = safetensors::serialize(tensors, &None).expect("serialize model weights");
+        std::fs::write(fixture.path.join("model.safetensors"), serialized)
+            .expect("write model shard");
+
+        let weights = load_safetensors(&fixture.path).expect("load model weights");
+
+        assert_eq!(weights.num_layers(), 0);
+        assert_eq!(weights.embed_tokens.shape, vec![2, 2]);
+        assert!(Arc::ptr_eq(
+            &weights.embed_tokens.bytes,
+            &weights.lm_head.bytes
+        ));
+    }
 }
