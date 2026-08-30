@@ -1,9 +1,7 @@
-use super::ModelLoader;
+use super::{decode_f32_scalar, decode_i32_scalar, visit_safetensor_files, ModelLoader};
 use crate::tensor::{Int8Tensor, QuantizedTensor};
-use anyhow::{Context, Result};
-use safetensors::SafeTensors;
+use anyhow::{bail, Result};
 use std::collections::HashMap;
-use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -13,54 +11,50 @@ impl ModelLoader for Int8Loader {
     fn load(&self, model_path: &Path) -> Result<HashMap<String, QuantizedTensor>> {
         let mut tensors = HashMap::new();
 
-        let entries = fs::read_dir(model_path).context("Failed to read model directory")?;
-        for entry in entries {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "safetensors") {
-                let file_content = fs::read(&path)?;
-                let safetensors = SafeTensors::deserialize(&file_content)?;
+        visit_safetensor_files(model_path, |path, safetensors| {
+            for name in safetensors.names() {
+                let Some(base_name) = name.strip_suffix(".weight") else {
+                    continue;
+                };
+                let tensor = safetensors.tensor(name)?;
+                if tensor.dtype() != safetensors::Dtype::I8 {
+                    continue;
+                }
 
-                for name in safetensors.names() {
-                    // Assuming standard naming convention or metadata indicates int8
-                    // For P0, we look for .weight and check dtype or metadata
-                    // This is a simplified implementation
-                    if name.ends_with(".weight") {
-                        let tensor = safetensors.tensor(name)?;
-                        if tensor.dtype() == safetensors::Dtype::I8 {
-                            let data: Vec<i8> = tensor.data().iter().map(|&x| x as i8).collect();
+                let scale_name = format!("{}.scale", base_name);
+                let zero_point_name = format!("{}.zero_point", base_name);
+                let scale = safetensors
+                    .tensor(&scale_name)
+                    .ok()
+                    .map(|tensor| decode_f32_scalar(&tensor, &scale_name))
+                    .transpose()?
+                    .unwrap_or(1.0);
+                if !scale.is_finite() || scale <= 0.0 {
+                    bail!("tensor {scale_name} must contain a positive finite scale");
+                }
+                let zero_point = safetensors
+                    .tensor(&zero_point_name)
+                    .ok()
+                    .map(|tensor| decode_i32_scalar(&tensor, &zero_point_name))
+                    .transpose()?
+                    .unwrap_or(0);
+                let quantized = QuantizedTensor::Int8(Int8Tensor {
+                    weight: Arc::new(tensor.data().iter().map(|&byte| byte as i8).collect()),
+                    scale,
+                    zero_point,
+                    symmetric: zero_point == 0,
+                    shape: tensor.shape().to_vec(),
+                });
 
-                            // Look for scale and zero_point
-                            let base_name = name.trim_end_matches(".weight");
-                            let scale_name = format!("{}.scale", base_name);
-                            let zp_name = format!("{}.zero_point", base_name);
-
-                            let scale = if let Ok(s) = safetensors.tensor(&scale_name) {
-                                f32::from_le_bytes(s.data().try_into().unwrap_or([0; 4]))
-                            } else {
-                                1.0
-                            };
-
-                            let zero_point = if let Ok(z) = safetensors.tensor(&zp_name) {
-                                i32::from_le_bytes(z.data().try_into().unwrap_or([0; 4]))
-                            } else {
-                                0
-                            };
-
-                            let q_tensor = QuantizedTensor::Int8(Int8Tensor {
-                                weight: Arc::new(data),
-                                scale,
-                                zero_point,
-                                symmetric: zero_point == 0,
-                                shape: tensor.shape().to_vec(),
-                            });
-
-                            tensors.insert(base_name.to_string(), q_tensor);
-                        }
-                    }
+                if tensors.insert(base_name.to_string(), quantized).is_some() {
+                    bail!(
+                        "duplicate Int8 tensor {base_name} while loading {}",
+                        path.display()
+                    );
                 }
             }
-        }
+            Ok(())
+        })?;
 
         Ok(tensors)
     }
