@@ -12,22 +12,6 @@ impl Connector for EchoConnector {
         Ok(())
     }
 
-    async fn auth_start(&self, _config: ConnectorConfig) -> Result<String, ConnectorError> {
-        Err(ConnectorError::Unsupported(
-            "auth not implemented".to_string(),
-        ))
-    }
-
-    async fn auth_callback(
-        &self,
-        _code: String,
-        _state: Option<String>,
-    ) -> Result<(), ConnectorError> {
-        Err(ConnectorError::Unsupported(
-            "auth not implemented".to_string(),
-        ))
-    }
-
     async fn list_sources(
         &self,
         _config: ConnectorConfig,

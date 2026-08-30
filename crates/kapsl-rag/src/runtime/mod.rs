@@ -1,10 +1,11 @@
 use std::collections::HashMap;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use bytes::Bytes;
 use kapsl_rag_sdk::protocol::{ConnectorRequest, ConnectorRequestKind, ConnectorResponse};
+use kapsl_rag_sdk::read_frame;
 use wasmtime::{Engine, Linker, Module, Store};
 use wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe};
 use wasmtime_wasi::preview1::{add_to_linker_sync, WasiP1Ctx};
@@ -39,7 +40,7 @@ pub trait ConnectorRuntime {
     fn close(&mut self) -> Result<(), RuntimeError>;
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WasiPermissions {
     pub preopen_dirs: Vec<PreopenDir>,
     pub env: HashMap<String, String>,
@@ -66,7 +67,7 @@ impl WasiPermissions {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreopenDir {
     pub host_path: PathBuf,
     pub guest_path: String,
@@ -91,9 +92,19 @@ impl<R: ConnectorRuntime> ConnectorClient<R> {
         kind: ConnectorRequestKind,
     ) -> Result<ConnectorResponse, RuntimeError> {
         let id = format!("req-{}", self.next_id);
-        self.next_id += 1;
-        let request = ConnectorRequest { id, kind };
-        self.runtime.send(request)
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .ok_or_else(|| RuntimeError::Serialization("request id space exhausted".to_string()))?;
+        let request = ConnectorRequest::new(id.clone(), kind);
+        let response = self.runtime.send(request)?;
+        if response.id != id {
+            return Err(RuntimeError::Serialization(format!(
+                "response id {:?} does not match request id {id:?}",
+                response.id
+            )));
+        }
+        Ok(response)
     }
 
     pub fn shutdown(&mut self) -> Result<(), RuntimeError> {
@@ -132,21 +143,33 @@ impl ConnectorRuntime for SidecarConnectorRuntime {
         self.stdin.write_all(b"\n")?;
         self.stdin.flush()?;
 
-        let mut line = String::new();
-        let bytes = self.stdout.read_line(&mut line)?;
-        if bytes == 0 {
+        let Some(frame) = read_frame(&mut self.stdout)
+            .map_err(|error| RuntimeError::Serialization(error.to_string()))?
+        else {
             return Err(RuntimeError::ConnectorExited);
-        }
-        let response = serde_json::from_str(&line)?;
+        };
+        let response = serde_json::from_slice(&frame)?;
         Ok(response)
     }
 
     fn close(&mut self) -> Result<(), RuntimeError> {
-        let _ = self.child.id();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        terminate_child(&mut self.child)?;
         Ok(())
     }
+}
+
+impl Drop for SidecarConnectorRuntime {
+    fn drop(&mut self) {
+        let _ = terminate_child(&mut self.child);
+    }
+}
+
+fn terminate_child(child: &mut Child) -> io::Result<()> {
+    if child.try_wait()?.is_none() {
+        child.kill()?;
+        let _ = child.wait()?;
+    }
+    Ok(())
 }
 
 pub struct WasmConnectorRuntime {
@@ -191,12 +214,13 @@ impl WasmConnectorRuntime {
         let _ = builder.stderr(stderr.clone());
 
         for (key, value) in &self.permissions.env {
-            validate_env_kv(key, value)?;
+            crate::validation::env_key_value(key, value).map_err(RuntimeError::Wasm)?;
             let _ = builder.env(key, value);
         }
 
         for dir in &self.permissions.preopen_dirs {
-            validate_guest_path(&dir.guest_path)?;
+            crate::validation::guest_path(&dir.guest_path).map_err(RuntimeError::Wasm)?;
+            crate::validation::host_path(&dir.host_path).map_err(RuntimeError::Wasm)?;
             let (dir_perms, file_perms) = perms_for(dir.read_only);
             builder
                 .preopened_dir(&dir.host_path, &dir.guest_path, dir_perms, file_perms)
@@ -244,32 +268,6 @@ impl ConnectorRuntime for WasmConnectorRuntime {
     }
 }
 
-fn validate_env_kv(key: &str, value: &str) -> Result<(), RuntimeError> {
-    if key.is_empty() {
-        return Err(RuntimeError::Wasm("env key cannot be empty".to_string()));
-    }
-    if key.contains('\0') || value.contains('\0') {
-        return Err(RuntimeError::Wasm(
-            "env key/value cannot contain NUL".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_guest_path(path: &str) -> Result<(), RuntimeError> {
-    if path.is_empty() || !path.starts_with('/') {
-        return Err(RuntimeError::Wasm(
-            "preopened guest path must be absolute".to_string(),
-        ));
-    }
-    if path.contains('\0') {
-        return Err(RuntimeError::Wasm(
-            "preopened guest path cannot contain NUL".to_string(),
-        ));
-    }
-    Ok(())
-}
-
 fn perms_for(read_only: bool) -> (DirPerms, FilePerms) {
     let dir_perms = if read_only {
         DirPerms::READ
@@ -282,4 +280,63 @@ fn perms_for(read_only: bool) -> (DirPerms, FilePerms) {
         FilePerms::READ | FilePerms::WRITE
     };
     (dir_perms, file_perms)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kapsl_rag_sdk::protocol::{ConnectorResponseKind, ConnectorResult};
+
+    struct EchoRuntime {
+        response_id: Option<String>,
+    }
+
+    impl EchoRuntime {
+        fn new() -> Self {
+            Self { response_id: None }
+        }
+    }
+
+    impl ConnectorRuntime for EchoRuntime {
+        fn send(&mut self, request: ConnectorRequest) -> Result<ConnectorResponse, RuntimeError> {
+            Ok(ConnectorResponse::ok(
+                self.response_id
+                    .clone()
+                    .unwrap_or_else(|| request.id.clone()),
+                ConnectorResult::Health("ok".to_string()),
+            ))
+        }
+
+        fn close(&mut self) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn client_assigns_monotonic_request_ids() {
+        let mut client = ConnectorClient::new(EchoRuntime::new());
+
+        let first = client.request(ConnectorRequestKind::Health).unwrap();
+        let second = client.request(ConnectorRequestKind::Health).unwrap();
+
+        assert_eq!(first.id, "req-1");
+        assert_eq!(second.id, "req-2");
+        assert!(matches!(
+            second.kind,
+            ConnectorResponseKind::Ok(ConnectorResult::Health(_))
+        ));
+    }
+
+    #[test]
+    fn client_rejects_uncorrelated_responses() {
+        let runtime = EchoRuntime {
+            response_id: Some("wrong-request".to_string()),
+        };
+        let mut client = ConnectorClient::new(runtime);
+
+        assert!(matches!(
+            client.request(ConnectorRequestKind::Health),
+            Err(RuntimeError::Serialization(_))
+        ));
+    }
 }

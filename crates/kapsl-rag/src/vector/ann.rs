@@ -32,7 +32,7 @@ pub struct ScopeIndex {
 
 impl ScopeIndex {
     pub fn new(dim: usize, capacity_hint: usize) -> Self {
-        let capacity = capacity_hint.max(DEFAULT_ANN_THRESHOLD) * 2;
+        let capacity = capacity_hint.max(DEFAULT_ANN_THRESHOLD).saturating_mul(2);
         Self {
             hnsw: Hnsw::new(
                 HNSW_MAX_NB_CONNECTION,
@@ -87,11 +87,13 @@ impl ScopeIndex {
 
     /// Return up to `k` live candidate chunk ids, nearest first.
     pub fn search(&self, query: &[f32], k: usize) -> Vec<String> {
-        if query.len() != self.dim {
+        if query.len() != self.dim || k == 0 {
             return Vec::new();
         }
         // Over-fetch so tombstones don't eat into the requested k.
-        let fetch = k + self.tombstones.len().min(k);
+        let fetch = k
+            .saturating_add(self.tombstones.len().min(k))
+            .min(self.ids.len());
         // Search beam width. A small ef can miss an obvious nearest neighbor when
         // it sits among unrelated vectors (the greedy traversal never routes to
         // its node), and nondeterministic graph construction makes that flaky
@@ -103,7 +105,7 @@ impl ScopeIndex {
             .into_iter()
             .filter(|n| !self.tombstones.contains(&n.d_id))
             .take(k)
-            .map(|n| self.ids[n.d_id].clone())
+            .filter_map(|neighbor| self.ids.get(neighbor.d_id).cloned())
             .collect()
     }
 }
