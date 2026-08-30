@@ -1,9 +1,16 @@
+#[path = "scaling/auto_scaler.rs"]
 pub mod auto_scaler;
+#[path = "model/engine_kind.rs"]
 pub mod engine_kind;
+#[path = "package/loader.rs"]
 pub mod loader;
+#[path = "model/registry.rs"]
 pub mod model_registry;
+#[path = "provider/pack.rs"]
 pub mod provider_pack;
+#[path = "provider/policy.rs"]
 pub mod provider_policy;
+#[path = "model/requirements.rs"]
 pub mod requirements;
 
 pub use auto_scaler::{AutoScaler, ScalingPolicy};

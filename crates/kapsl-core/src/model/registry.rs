@@ -1,3 +1,5 @@
+//! Thread-safe model registration, status, and metrics state.
+
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -439,5 +441,5 @@ impl Default for ModelRegistry {
     }
 }
 
-#[path = "model_registry_tests.rs"]
+#[path = "registry_tests.rs"]
 mod model_registry_tests;

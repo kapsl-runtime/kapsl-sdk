@@ -1,3 +1,5 @@
+//! Hardware requirements declared by model packages.
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

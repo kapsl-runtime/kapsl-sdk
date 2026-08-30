@@ -1,3 +1,5 @@
+//! Tests for manifest framework and task classification.
+
 use super::*;
 
 #[test]

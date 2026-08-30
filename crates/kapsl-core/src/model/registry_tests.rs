@@ -1,3 +1,5 @@
+//! Tests for the model registry.
+
 #[cfg(test)]
 mod tests {
     use super::super::*;

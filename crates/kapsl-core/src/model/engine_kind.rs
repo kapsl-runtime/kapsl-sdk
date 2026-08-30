@@ -1,4 +1,4 @@
-//! Centralized classification of a manifest's `framework` string into the
+//! Classification of a manifest's `framework` string into the
 //! runtime engine family it selects.
 //!
 //! Historically the `framework` field was compared against string literals
