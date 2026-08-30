@@ -1,7 +1,7 @@
 use crate::priority::Priority;
 
 /// Metadata for determining request priority
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestMetadata {
     pub priority: u8,                    // 0 = high, 1+ = low (explicit override)
     pub sla_deadline: Option<u64>,       // Deadline in ms from now
@@ -49,10 +49,11 @@ pub fn determine_priority(metadata: &RequestMetadata) -> Priority {
     }
 
     // 2. SLA deadline - strict latency requirements
-    if let Some(deadline_ms) = metadata.sla_deadline {
-        if deadline_ms < SLA_LATENCY_CRITICAL_MS {
-            return Priority::LatencyCritical;
-        }
+    if metadata
+        .sla_deadline
+        .is_some_and(|deadline_ms| deadline_ms < SLA_LATENCY_CRITICAL_MS)
+    {
+        return Priority::LatencyCritical;
     }
 
     // 3. Workload-based priority - light tasks get high priority
@@ -77,22 +78,24 @@ pub fn determine_priority(metadata: &RequestMetadata) -> Priority {
 /// - Combined metric (total data to process)
 fn is_light_workload(metadata: &RequestMetadata) -> bool {
     // Strategy 1: Input size-based
-    if let Some(size) = metadata.input_size_bytes {
-        if size <= LIGHT_TASK_SIZE_BYTES {
-            return true; // Small input → likely quick inference
-        }
+    if metadata
+        .input_size_bytes
+        .is_some_and(|size| size <= LIGHT_TASK_SIZE_BYTES)
+    {
+        return true; // Small input → likely quick inference
     }
 
     // Strategy 2: Estimated FLOPs (if available)
-    if let Some(flops) = metadata.estimated_flops {
-        if flops <= LIGHT_TASK_FLOPS {
-            return true; // Low compute → quick task
-        }
+    if metadata
+        .estimated_flops
+        .is_some_and(|flops| flops <= LIGHT_TASK_FLOPS)
+    {
+        return true; // Low compute → quick task
     }
 
     // Strategy 3: Combined heuristic (input size × batch size)
     if let Some(size) = metadata.input_size_bytes {
-        let total_work = size * metadata.batch_size;
+        let total_work = size.saturating_mul(metadata.batch_size);
         if total_work <= COMBINED_WORK_THRESHOLD {
             return true; // Total work is manageable
         }
@@ -102,5 +105,5 @@ fn is_light_workload(metadata: &RequestMetadata) -> bool {
 }
 
 #[cfg(test)]
-#[path = "request_metadata_tests.rs"]
+#[path = "request_metadata/tests.rs"]
 mod request_metadata_tests;
