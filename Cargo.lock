@@ -1972,7 +1972,6 @@ dependencies = [
  "kapsl-hal",
  "log",
  "rayon",
- "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -2021,7 +2020,6 @@ dependencies = [
  "kapsl-core",
  "kapsl-engine-api",
  "kapsl-hal",
- "kapsl-kernels",
  "kapsl-kv-abi",
  "kapsl-llama-cpp-2",
  "kapsl-llama-cpp-sys-2",

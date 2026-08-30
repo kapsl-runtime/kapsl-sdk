@@ -341,8 +341,6 @@ mod inner {
     // ── Batch decode scratch ──────────────────────────────────────────────
 
     struct BatchDecodeScratch {
-        /// Capacity in sequences.
-        cap: usize,
         hidden: GpuBuffer<f16>,     // [cap * h]
         norm: GpuBuffer<f16>,       // [cap * h]
         residual: GpuBuffer<f16>,   // [cap * h]
@@ -379,7 +377,6 @@ mod inner {
                     .map_err(|e| EngineError::backend(format!("batch scratch: {e}")))
             };
             Ok(Self {
-                cap,
                 hidden: a(cap * h)?,
                 norm: a(cap * h)?,
                 residual: a(cap * h)?,
