@@ -211,15 +211,21 @@ impl<'a> Reader<'a> {
     }
 
     fn read_bytes(&mut self, n: usize) -> Result<&'a [u8], GgufError> {
-        if self.pos + n > self.data.len() {
+        let end = self.pos.checked_add(n).ok_or_else(|| GgufError::Parse {
+            offset: self.pos,
+            msg: format!("byte range overflow while reading {n} bytes"),
+        })?;
+        let Some(bytes) = self.data.get(self.pos..end) else {
             return Err(GgufError::Parse {
                 offset: self.pos,
-                msg: format!("need {n} bytes, {} remain", self.data.len() - self.pos),
+                msg: format!(
+                    "need {n} bytes, {} remain",
+                    self.data.len().saturating_sub(self.pos)
+                ),
             });
-        }
-        let s = &self.data[self.pos..self.pos + n];
-        self.pos += n;
-        Ok(s)
+        };
+        self.pos = end;
+        Ok(bytes)
     }
 
     fn u8(&mut self) -> Result<u8, GgufError> {
@@ -254,10 +260,15 @@ impl<'a> Reader<'a> {
     }
 
     fn string(&mut self) -> Result<String, GgufError> {
-        let len = self.u64()? as usize;
+        let offset = self.pos;
+        let encoded_len = self.u64()?;
+        let len = usize::try_from(encoded_len).map_err(|_| GgufError::Parse {
+            offset,
+            msg: format!("string length {encoded_len} does not fit in memory"),
+        })?;
         let bytes = self.read_bytes(len)?;
         String::from_utf8(bytes.to_vec()).map_err(|e| GgufError::Parse {
-            offset: self.pos,
+            offset,
             msg: format!("non-UTF8 string: {e}"),
         })
     }
@@ -283,7 +294,12 @@ impl<'a> Reader<'a> {
                         offset: self.pos,
                         msg: format!("unknown array element type {elem_type_raw}"),
                     })?;
-                let count = self.u64()? as usize;
+                let offset = self.pos;
+                let encoded_count = self.u64()?;
+                let count = usize::try_from(encoded_count).map_err(|_| GgufError::Parse {
+                    offset,
+                    msg: format!("array length {encoded_count} does not fit in memory"),
+                })?;
                 let mut items = Vec::with_capacity(count.min(1 << 20));
                 for _ in 0..count {
                     items.push(self.value(elem_type)?);
@@ -329,10 +345,18 @@ impl GgufFile {
         if !(1..=3).contains(&version) {
             return Err(GgufError::UnsupportedVersion(version));
         }
-        let tensor_count = r.u64()? as usize;
-        let kv_count = r.u64()? as usize;
+        let tensor_count_raw = r.u64()?;
+        let tensor_count = usize::try_from(tensor_count_raw).map_err(|_| GgufError::Parse {
+            offset: r.pos,
+            msg: format!("tensor count {tensor_count_raw} does not fit in memory"),
+        })?;
+        let kv_count_raw = r.u64()?;
+        let kv_count = usize::try_from(kv_count_raw).map_err(|_| GgufError::Parse {
+            offset: r.pos,
+            msg: format!("metadata count {kv_count_raw} does not fit in memory"),
+        })?;
 
-        let mut metadata = HashMap::with_capacity(kv_count);
+        let mut metadata = HashMap::with_capacity(kv_count.min(1 << 20));
         for _ in 0..kv_count {
             let key = r.string()?;
             let vtype_raw = r.u32()?;
@@ -344,13 +368,21 @@ impl GgufFile {
             metadata.insert(key, val);
         }
 
-        let mut tensors = HashMap::with_capacity(tensor_count);
+        let mut tensors = HashMap::with_capacity(tensor_count.min(1 << 20));
         for _ in 0..tensor_count {
             let name = r.string()?;
-            let n_dims = r.u32()? as usize;
+            let n_dims = usize::try_from(r.u32()?).map_err(|_| GgufError::Parse {
+                offset: r.pos,
+                msg: "tensor dimension count does not fit in memory".to_string(),
+            })?;
             let mut dims_gguf = Vec::with_capacity(n_dims);
             for _ in 0..n_dims {
-                dims_gguf.push(r.u64()? as usize);
+                let dimension_raw = r.u64()?;
+                let dimension = usize::try_from(dimension_raw).map_err(|_| GgufError::Parse {
+                    offset: r.pos,
+                    msg: format!("tensor dimension {dimension_raw} does not fit in memory"),
+                })?;
+                dims_gguf.push(dimension);
             }
 
             let dtype_raw = r.u32()?;
@@ -360,7 +392,13 @@ impl GgufFile {
 
             // GGUF stores dims innermost-first; reverse for PyTorch convention.
             let shape: Vec<usize> = dims_gguf.into_iter().rev().collect();
-            let numel: usize = shape.iter().product();
+            let numel = shape
+                .iter()
+                .try_fold(1usize, |count, dimension| count.checked_mul(*dimension))
+                .ok_or_else(|| GgufError::Parse {
+                    offset: r.pos,
+                    msg: format!("tensor '{name}' element count overflows usize"),
+                })?;
 
             tensors.insert(
                 name,
@@ -374,7 +412,10 @@ impl GgufFile {
         }
 
         // Data section is 32-byte aligned after all tensor infos.
-        let data_start = (r.pos + 31) & !31;
+        let data_start = r.pos.checked_add(31).ok_or_else(|| GgufError::Parse {
+            offset: r.pos,
+            msg: "data-section alignment overflow".to_string(),
+        })? & !31;
 
         Ok(Self {
             mmap,
@@ -397,7 +438,11 @@ impl GgufFile {
             })
     }
     fn meta_u32(&self, key: &str) -> Result<u32, GgufError> {
-        self.meta_u64(key).map(|v| v as u32)
+        let value = self.meta_u64(key)?;
+        u32::try_from(value).map_err(|_| GgufError::Parse {
+            offset: 0,
+            msg: format!("key '{key}' value {value} does not fit in u32"),
+        })
     }
     fn meta_f32(&self, key: &str) -> Option<f32> {
         self.metadata.get(key)?.as_f32()
@@ -458,9 +503,58 @@ impl GgufFile {
 
     // ── Tensor dequantization ────────────────────────────────────────────────
 
-    fn dequantize(&self, info: &TensorInfo) -> Result<Vec<u8>, GgufError> {
-        let start = self.data_start + info.offset as usize;
-        let raw = &self.mmap[start..];
+    fn tensor_bytes<'a>(&'a self, name: &str, info: &TensorInfo) -> Result<&'a [u8], GgufError> {
+        let (elements_per_block, bytes_per_block) = info.dtype.block_params();
+        if !info.numel.is_multiple_of(elements_per_block) {
+            return Err(GgufError::Parse {
+                offset: self.data_start,
+                msg: format!(
+                    "tensor '{name}' has {} elements, which is not divisible by the {}-element {:?} block size",
+                    info.numel, elements_per_block, info.dtype
+                ),
+            });
+        }
+
+        let block_count = info.numel / elements_per_block;
+        let byte_count =
+            block_count
+                .checked_mul(bytes_per_block)
+                .ok_or_else(|| GgufError::Parse {
+                    offset: self.data_start,
+                    msg: format!("tensor '{name}' byte count overflows usize"),
+                })?;
+        let relative_offset = usize::try_from(info.offset).map_err(|_| GgufError::Parse {
+            offset: self.data_start,
+            msg: format!(
+                "tensor '{name}' offset {} does not fit in memory",
+                info.offset
+            ),
+        })?;
+        let start = self
+            .data_start
+            .checked_add(relative_offset)
+            .ok_or_else(|| GgufError::Parse {
+                offset: self.data_start,
+                msg: format!("tensor '{name}' start offset overflows usize"),
+            })?;
+        let end = start
+            .checked_add(byte_count)
+            .ok_or_else(|| GgufError::Parse {
+                offset: start,
+                msg: format!("tensor '{name}' end offset overflows usize"),
+            })?;
+
+        self.mmap.get(start..end).ok_or_else(|| GgufError::Parse {
+            offset: start,
+            msg: format!(
+                "tensor '{name}' requires bytes {start}..{end}, but file length is {}",
+                self.mmap.len()
+            ),
+        })
+    }
+
+    fn dequantize(&self, name: &str, info: &TensorInfo) -> Result<Vec<u8>, GgufError> {
+        let raw = self.tensor_bytes(name, info)?;
         let n = info.numel;
 
         let f16s: Vec<f16> = match info.dtype {
@@ -490,7 +584,7 @@ impl GgufFile {
             .tensors
             .get(name)
             .ok_or_else(|| GgufError::MissingTensor(name.into()))?;
-        let bytes = self.dequantize(info)?;
+        let bytes = self.dequantize(name, info)?;
         Ok(TensorData::new(bytes, DType::F16, info.shape.clone()))
     }
 
@@ -501,17 +595,13 @@ impl GgufFile {
             .tensors
             .get(name)
             .ok_or_else(|| GgufError::MissingTensor(name.into()))?;
-        let (elems_per_blk, bytes_per_blk) = info.dtype.block_params();
-        let start = self.data_start + info.offset as usize;
         match info.dtype {
             GgmlType::Q8_0 => {
-                let nbytes = (info.numel / elems_per_blk) * bytes_per_blk;
-                let raw = self.mmap[start..start + nbytes].to_vec();
+                let raw = self.tensor_bytes(name, info)?.to_vec();
                 Ok(TensorData::new(raw, DType::Q8_0, info.shape.clone()))
             }
             GgmlType::Q4K => {
-                let nbytes = (info.numel / elems_per_blk) * bytes_per_blk;
-                let raw = self.mmap[start..start + nbytes].to_vec();
+                let raw = self.tensor_bytes(name, info)?.to_vec();
                 Ok(TensorData::new(raw, DType::Q4_K, info.shape.clone()))
             }
             _ => self.tensor(name),
@@ -526,9 +616,11 @@ impl GgufFile {
         let embed_tokens = self.tensor("token_embd.weight")?;
         let norm = self.tensor("output_norm.weight")?;
         // Some models tie lm_head with embed_tokens (output.weight absent).
-        let lm_head = self
-            .tensor("output.weight")
-            .unwrap_or_else(|_| embed_tokens.clone());
+        let lm_head = match self.tensor("output.weight") {
+            Ok(weights) => weights,
+            Err(GgufError::MissingTensor(_)) => embed_tokens.clone(),
+            Err(error) => return Err(error),
+        };
 
         let mut layers = Vec::with_capacity(n);
         for i in 0..n {
@@ -558,7 +650,10 @@ impl GgufFile {
     }
 }
 
-/// Open a GGUF file, extract config, dequantize all weights to f16.
+/// Open a GGUF file, extract its config, and load its model weights.
+///
+/// Q8_0 and Q4_K projection matrices remain quantized for device-side
+/// dequantization. Other supported tensors are converted to f16.
 pub fn load_gguf_weights(path: &Path) -> Result<ModelWeights, GgufError> {
     let gguf = GgufFile::open(path)?;
     let config = gguf.extract_config()?;
@@ -595,9 +690,12 @@ fn deq_q4_0(data: &[u8], n: usize) -> Vec<f16> {
     let mut out = Vec::with_capacity(n);
     for blk in data.chunks_exact(BY).take(n / B) {
         let d = f16::from_bits(u16::from_le_bytes([blk[0], blk[1]])).to_f32();
-        for &q in &blk[2..18] {
-            out.push(f16::from_f32(((q & 0xf) as i8 - 8) as f32 * d));
-            out.push(f16::from_f32(((q >> 4) as i8 - 8) as f32 * d));
+        let start = out.len();
+        out.resize(start + B, f16::ZERO);
+        let values = &mut out[start..];
+        for (index, &q) in blk[2..18].iter().enumerate() {
+            values[index] = f16::from_f32(((q & 0xf) as i8 - 8) as f32 * d);
+            values[index + B / 2] = f16::from_f32(((q >> 4) as i8 - 8) as f32 * d);
         }
     }
     out
@@ -611,9 +709,12 @@ fn deq_q4_1(data: &[u8], n: usize) -> Vec<f16> {
     for blk in data.chunks_exact(BY).take(n / B) {
         let d = f16::from_bits(u16::from_le_bytes([blk[0], blk[1]])).to_f32();
         let m = f16::from_bits(u16::from_le_bytes([blk[2], blk[3]])).to_f32();
-        for &q in &blk[4..20] {
-            out.push(f16::from_f32((q & 0xf) as f32 * d + m));
-            out.push(f16::from_f32((q >> 4) as f32 * d + m));
+        let start = out.len();
+        out.resize(start + B, f16::ZERO);
+        let values = &mut out[start..];
+        for (index, &q) in blk[4..20].iter().enumerate() {
+            values[index] = f16::from_f32((q & 0xf) as f32 * d + m);
+            values[index + B / 2] = f16::from_f32((q >> 4) as f32 * d + m);
         }
     }
     out
@@ -765,5 +866,79 @@ fn scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
             (q[j + 4] & 0x0f) | ((q[j - 4] >> 6) << 4),
             (q[j + 4] >> 4) | ((q[j] >> 6) << 4),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reader_reports_truncated_and_overflowing_ranges() {
+        let mut truncated = Reader::new(&[1, 2, 3]);
+        assert!(matches!(
+            truncated.read_bytes(4),
+            Err(GgufError::Parse { offset: 0, .. })
+        ));
+
+        let mut overflowing = Reader {
+            data: &[],
+            pos: usize::MAX,
+        };
+        assert!(matches!(
+            overflowing.read_bytes(1),
+            Err(GgufError::Parse {
+                offset: usize::MAX,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn q4_0_uses_ggml_low_half_then_high_half_order() {
+        let mut block = vec![0_u8; 18];
+        block[..2].copy_from_slice(&f16::from_f32(1.0).to_bits().to_le_bytes());
+        for (index, byte) in block[2..].iter_mut().enumerate() {
+            *byte = (((15 - index) as u8) << 4) | index as u8;
+        }
+
+        let values = deq_q4_0(&block, 32);
+        let decoded: Vec<f32> = values.into_iter().map(f16::to_f32).collect();
+
+        assert_eq!(
+            decoded[..16],
+            (-8..=7).map(|value| value as f32).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            decoded[16..],
+            (-8..=7).rev().map(|value| value as f32).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn q4_1_uses_ggml_low_half_then_high_half_order() {
+        let mut block = vec![0_u8; 20];
+        block[..2].copy_from_slice(&f16::from_f32(2.0).to_bits().to_le_bytes());
+        block[2..4].copy_from_slice(&f16::from_f32(1.0).to_bits().to_le_bytes());
+        for (index, byte) in block[4..].iter_mut().enumerate() {
+            *byte = (((15 - index) as u8) << 4) | index as u8;
+        }
+
+        let values = deq_q4_1(&block, 32);
+        let decoded: Vec<f32> = values.into_iter().map(f16::to_f32).collect();
+
+        assert_eq!(
+            decoded[..16],
+            (0..16)
+                .map(|value| value as f32 * 2.0 + 1.0)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            decoded[16..],
+            (0..16)
+                .rev()
+                .map(|value| value as f32 * 2.0 + 1.0)
+                .collect::<Vec<_>>()
+        );
     }
 }
