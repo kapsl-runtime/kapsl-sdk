@@ -1,4 +1,4 @@
-//! Cross-device KV block pool scheduler.
+//! Scheduling for KV block pools spanning multiple devices.
 //!
 //! Manages a fleet of `GpuBlockPool`s across multiple CUDA devices plus a
 //! per-geometry CPU eviction tier, presenting a single admission interface to

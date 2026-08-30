@@ -1,4 +1,4 @@
-//! Free-list for a pool of fixed-size blocks with contiguous-run allocation.
+//! Contiguous free-list allocation for a pool of fixed-size blocks.
 //!
 //! `GpuBlockPool` historically tracked free blocks with a LIFO stack, which is
 //! enough for the paged KV cache (single-block grain). Sharing the pool with
