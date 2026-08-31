@@ -5,6 +5,7 @@
 
 static_assert(KAPSL_BACKEND_ABI_VERSION == 1u, "unexpected backend ABI version");
 static_assert(KAPSL_BACKEND_ENTRYPOINT_MAGIC == 0x4b424e44u, "unexpected magic");
+static_assert(KAPSL_DTYPE_UTF8 == 14u, "unexpected UTF-8 dtype value");
 static_assert(offsetof(kapsl_backend_api_v1, describe) == 24u,
               "function table prefix changed");
 

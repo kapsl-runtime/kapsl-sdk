@@ -8,7 +8,7 @@ The backend-neutral `KapslBackendApiV1` contract covers:
 
 - adapter discovery and capability negotiation;
 - model planning, load, health, unload, and shutdown;
-- borrowed tensor inputs and adapter-owned tensor results;
+- borrowed numeric or UTF-8 tensor inputs and adapter-owned tensor results;
 - batching, streaming, and cancellation when advertised;
 - structured memory, metrics, model, batching, and optional KV reports;
 - runtime-owned device allocations supplied through host callbacks.

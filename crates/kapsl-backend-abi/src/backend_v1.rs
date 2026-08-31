@@ -40,6 +40,7 @@ pub const KAPSL_DTYPE_F16: u32 = 10;
 pub const KAPSL_DTYPE_BF16: u32 = 11;
 pub const KAPSL_DTYPE_F32: u32 = 12;
 pub const KAPSL_DTYPE_F64: u32 = 13;
+pub const KAPSL_DTYPE_UTF8: u32 = 14;
 
 pub const KAPSL_TENSOR_FLAG_CONTIGUOUS: u32 = 1 << 0;
 pub const KAPSL_TENSOR_FLAG_READ_ONLY: u32 = 1 << 1;
@@ -622,6 +623,29 @@ mod tests {
         assert_eq!(result.output_count, 0);
         assert!(result.outputs.is_null());
         assert!(result.owner_context.is_null());
+    }
+
+    #[test]
+    fn public_dtype_values_remain_unique() {
+        let values = [
+            KAPSL_DTYPE_BOOL,
+            KAPSL_DTYPE_U8,
+            KAPSL_DTYPE_I8,
+            KAPSL_DTYPE_U16,
+            KAPSL_DTYPE_I16,
+            KAPSL_DTYPE_U32,
+            KAPSL_DTYPE_I32,
+            KAPSL_DTYPE_U64,
+            KAPSL_DTYPE_I64,
+            KAPSL_DTYPE_F16,
+            KAPSL_DTYPE_BF16,
+            KAPSL_DTYPE_F32,
+            KAPSL_DTYPE_F64,
+            KAPSL_DTYPE_UTF8,
+        ];
+        let mut sorted = values;
+        sorted.sort_unstable();
+        assert!(sorted.windows(2).all(|pair| pair[0] != pair[1]));
     }
 
     #[test]

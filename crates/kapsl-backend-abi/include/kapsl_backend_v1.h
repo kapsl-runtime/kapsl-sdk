@@ -50,6 +50,7 @@ extern "C" {
 #define KAPSL_DTYPE_BF16 11u
 #define KAPSL_DTYPE_F32 12u
 #define KAPSL_DTYPE_F64 13u
+#define KAPSL_DTYPE_UTF8 14u
 
 #define KAPSL_TENSOR_FLAG_CONTIGUOUS (UINT32_C(1) << 0)
 #define KAPSL_TENSOR_FLAG_READ_ONLY (UINT32_C(1) << 1)
@@ -273,6 +274,9 @@ typedef struct kapsl_backend_api_v1 {
 } kapsl_backend_api_v1;
 
 typedef const kapsl_backend_api_v1 *(*kapsl_backend_entrypoint_v1_fn)(void);
+
+/* Every native backend pack exports this symbol with default visibility. */
+const kapsl_backend_api_v1 *kapsl_backend_v1(void);
 
 #ifdef __cplusplus
 }
