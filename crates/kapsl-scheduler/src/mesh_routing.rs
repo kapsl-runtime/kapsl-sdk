@@ -56,6 +56,10 @@ impl MeshRouter {
         }
     }
 
+    pub(crate) fn device_mesh(&self) -> Option<Arc<DeviceMesh>> {
+        self.mesh.clone()
+    }
+
     /// Route a request to an appropriate worker index
     ///
     /// # Arguments
@@ -69,16 +73,10 @@ impl MeshRouter {
             return 0;
         }
 
-        // For any strategy, if a session_id is provided, use sticky routing
-        // This ensures consistent routing for stateful sessions regardless of topology
-        if let Some(ref id) = session_id {
-            return self.route_by_session(id);
-        }
-
         match self.strategy() {
-            RoutingStrategy::RoundRobin | RoutingStrategy::SessionAffinity => {
-                self.route_round_robin()
-            }
+            RoutingStrategy::RoundRobin | RoutingStrategy::SessionAffinity => session_id
+                .as_deref()
+                .map_or_else(|| self.route_round_robin(), |id| self.route_by_session(id)),
             RoutingStrategy::TensorParallel => {
                 self.route_tensor_parallel(session_id, tp_group_hint)
             }
@@ -164,10 +162,14 @@ impl MeshRouter {
             _ => return vec![],
         };
 
-        let start = tp_group * tp_degree;
-        (start..start + tp_degree)
-            .filter(|&i| i < self.num_workers)
-            .collect()
+        let Some(start) = tp_group.checked_mul(tp_degree) else {
+            return Vec::new();
+        };
+        if start >= self.num_workers {
+            return Vec::new();
+        }
+        let end = start.saturating_add(tp_degree).min(self.num_workers);
+        (start..end).collect()
     }
 
     /// Get mesh statistics if available
@@ -183,7 +185,7 @@ impl MeshRouter {
 }
 
 /// Statistics about the mesh router
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MeshRouterStats {
     pub world_size: usize,
     pub topology: String,
@@ -259,6 +261,14 @@ mod tests {
 
         let idx = router.route(&None, Some(1));
         assert!((4..8).contains(&idx)); // Should be in second TP group
+
+        // Sticky sessions select a stable TP group leader, not an arbitrary
+        // worker in the middle of a collective group.
+        let session = Some("tp-session".to_string());
+        let first = router.route(&session, None);
+        let second = router.route(&session, None);
+        assert_eq!(first, second);
+        assert_eq!(first % 4, 0);
     }
 
     #[test]
@@ -274,6 +284,7 @@ mod tests {
         for _ in 0..10 {
             assert_eq!(router.route(&None, None), 0);
         }
+        assert_eq!(router.route(&Some("sticky".to_string()), None), 0);
     }
 
     #[test]
@@ -291,6 +302,7 @@ mod tests {
 
         assert_eq!(group0, vec![0, 1, 2, 3]);
         assert_eq!(group1, vec![4, 5, 6, 7]);
+        assert!(router.get_tp_group_workers(usize::MAX).is_empty());
     }
 
     #[test]

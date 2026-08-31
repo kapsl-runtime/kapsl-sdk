@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/kapsl-backends",
+    "crates/kapsl-communication",
     "crates/kapsl-core",
     "crates/kapsl-engine-api",
     "crates/kapsl-hal",
@@ -25,6 +26,7 @@ exclude = [
 ]
 default-members = [
     "crates/kapsl-backends",
+    "crates/kapsl-communication",
     "crates/kapsl-core",
     "crates/kapsl-engine-api",
     "crates/kapsl-hal",
@@ -54,5 +56,6 @@ kapsl-llama-cpp-2 = { path = "patches/llama-cpp-2" }
 [workspace.package]
 version = "0.3.0"
 edition = "2021"
+rust-version = "1.92"
 license = "Apache-2.0"
 repository = "https://github.com/kapsl-runtime/kapsl-sdk"

@@ -42,8 +42,8 @@ pub struct Int8Tensor {
 /// Int4 grouped-quantization tensor.
 ///
 /// Two 4-bit values are packed per byte (lo nibble = first, hi nibble = second).
-/// Each group of `group_size` weights shares one f16 scale centered at 8
-/// (i.e. the unsigned range [0, 15] is shifted to [-7.5, 7.5]).
+/// Each group of `group_size` weights shares one f16 scale. Quantized values
+/// use the unsigned range [0, 15], shifted by 7.5 to represent [-7.5, 7.5].
 #[derive(Debug, Clone)]
 pub struct Int4Tensor {
     /// Packed 4-bit weights: two values per byte.

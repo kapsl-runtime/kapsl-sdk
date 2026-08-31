@@ -2,6 +2,7 @@
 name = "kapsl-scheduler"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Request scheduling and batching for the Kapsl inference engine"
@@ -9,7 +10,7 @@ description = "Request scheduling and batching for the Kapsl inference engine"
 [dependencies]
 kapsl-engine-api = { version = "0.3.0", path = "../kapsl-engine-api" }
 kapsl-core = { version = "0.3.0", path = "../kapsl-core" }
-tokio = { version = "1.0", features = ["full"] }
+tokio = { version = "1.0", features = ["macros", "rt-multi-thread", "sync", "time"] }
 log = "0.4"
 parking_lot = "0.12"
 rayon = "1.11.0"
@@ -22,8 +23,6 @@ cron = "0.12"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["async_tokio"] }
-tokio = { version = "1.0", features = ["full"] }
-async-trait = "0.1"
 
 [[bench]]
 name = "cron_scheduler"

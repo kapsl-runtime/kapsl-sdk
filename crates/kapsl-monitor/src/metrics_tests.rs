@@ -48,6 +48,44 @@ fn set_engine_metrics_exports_cache_and_session_fields() {
 }
 
 #[test]
+fn set_engine_metrics_saturates_unsigned_values_for_prometheus() {
+    let registry = Arc::new(Registry::new());
+    let metrics = KapslMetrics::new(&registry);
+
+    metrics.set_engine_metrics(
+        "oversized",
+        &EngineMetrics {
+            kv_cache_bytes_used: usize::MAX,
+            prompt_tokens_total: u64::MAX,
+            onnx_session_pool_waits_total: u64::MAX,
+            ..EngineMetrics::default()
+        },
+    );
+
+    assert_eq!(
+        metrics
+            .kv_cache_bytes_used
+            .with_label_values(&["oversized"])
+            .get(),
+        i64::MAX
+    );
+    assert_eq!(
+        metrics
+            .prompt_tokens_total
+            .with_label_values(&["oversized"])
+            .get(),
+        i64::MAX
+    );
+    assert_eq!(
+        metrics
+            .onnx_session_pool_waits_total
+            .with_label_values(&["oversized"])
+            .get(),
+        i64::MAX
+    );
+}
+
+#[test]
 fn set_gpu_device_pool_metrics_exports_pool_and_owner_fields() {
     let registry = Arc::new(Registry::new());
     let metrics = KapslMetrics::new(&registry);

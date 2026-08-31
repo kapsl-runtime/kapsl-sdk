@@ -68,4 +68,24 @@ mod tests {
         let conn3 = pool.get().await.unwrap();
         assert_eq!(conn3.id, 0); // Should be the reused one
     }
+
+    #[tokio::test]
+    async fn discarded_connection_is_not_reused() {
+        let config = PoolConfig {
+            max_size: 1,
+            ..Default::default()
+        };
+        let factory = MockFactory {
+            counter: AtomicUsize::new(0),
+        };
+        let pool = ConnectionPool::new(config, factory);
+
+        let mut first = pool.get().await.unwrap();
+        assert_eq!(first.id, 0);
+        first.discard_on_drop();
+        drop(first);
+
+        let replacement = pool.get().await.unwrap();
+        assert_eq!(replacement.id, 1);
+    }
 }

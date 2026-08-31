@@ -130,10 +130,11 @@ Shared-memory inference client.
 ```python
 from kapsl_sdk import KapslShmClient
 
-client = KapslShmClient(shm_name: str)
+client = KapslShmClient(shm_name="kapsl-shm-default")
 ```
 
-Exposes the same `infer`, `infer_tensor`, and `infer_stream` methods as `KapslClient`.
+`infer(shape, dtype, data, *, model_id=0)` returns the output bytes. Streaming,
+session metadata, and additional named inputs use `KapslClient` instead.
 
 ---
 
@@ -144,10 +145,14 @@ Hybrid IPC + shared-memory client.
 ```python
 from kapsl_sdk import KapslHybridClient
 
-client = KapslHybridClient(shm_name: str, socket_path: str)
+client = KapslHybridClient(
+    shm_name="kapsl-shm-default",
+    socket_path="/tmp/kapsl.sock",
+)
 ```
 
-Exposes the same `infer`, `infer_tensor`, and `infer_stream` methods as `KapslClient`.
+`infer(shape, dtype, data, *, model_id=0)` returns the output bytes. Streaming,
+session metadata, and additional named inputs use `KapslClient` instead.
 
 ---
 

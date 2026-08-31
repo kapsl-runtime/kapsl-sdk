@@ -5,7 +5,6 @@ pub use ann::DEFAULT_ANN_THRESHOLD;
 use async_trait::async_trait;
 use rusqlite::{params, Connection, Row};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
@@ -26,7 +25,7 @@ impl From<rusqlite::Error> for VectorStoreError {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct AccessControl {
     pub allow_users: Vec<String>,
     pub allow_groups: Vec<String>,
@@ -34,7 +33,7 @@ pub struct AccessControl {
     pub deny_groups: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EmbeddedChunk {
     pub id: String,
     pub tenant_id: String,
@@ -48,7 +47,7 @@ pub struct EmbeddedChunk {
     pub acl: AccessControl,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct VectorQuery {
     pub query_embedding: Vec<f32>,
     pub top_k: usize,
@@ -60,7 +59,7 @@ pub struct VectorQuery {
     pub min_score: f32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct VectorSearchResult {
     pub chunk: EmbeddedChunk,
     pub score: f32,
@@ -95,8 +94,12 @@ pub struct SqliteVectorStore {
 }
 
 const SELECT_COLUMNS: &str =
-    "id, tenant_id, workspace_id, source_id, doc_id, chunk_index, text, embedding,
+    "storage_id, id, tenant_id, workspace_id, source_id, doc_id, chunk_index, text, embedding,
      metadata_json, acl_allow_users, acl_allow_groups, acl_deny_users, acl_deny_groups";
+const MAX_SOURCE_FILTERS: usize = 512;
+// Stay below SQLite's conservative 999 bound-parameter limit after the two
+// scope parameters are included.
+const MAX_ANN_CANDIDATES: usize = 900;
 
 impl SqliteVectorStore {
     pub fn open(path: &Path) -> Result<Self, VectorStoreError> {
@@ -117,13 +120,22 @@ impl SqliteVectorStore {
     }
 
     fn init(&self) -> Result<(), VectorStoreError> {
-        let conn = self
+        let mut conn = self
             .conn
             .lock()
             .map_err(|_| VectorStoreError::Db("vector store mutex poisoned".to_string()))?;
+        let table_exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'rag_chunks')",
+            [],
+            |row| row.get(0),
+        )?;
+        if table_exists && !table_has_column(&conn, "rag_chunks", "storage_id")? {
+            migrate_legacy_schema(&mut conn)?;
+        }
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS rag_chunks (
-                id TEXT PRIMARY KEY,
+                storage_id TEXT PRIMARY KEY,
+                id TEXT NOT NULL,
                 tenant_id TEXT NOT NULL,
                 workspace_id TEXT NOT NULL,
                 source_id TEXT NOT NULL,
@@ -131,11 +143,11 @@ impl SqliteVectorStore {
                 chunk_index INTEGER NOT NULL,
                 text TEXT NOT NULL,
                 embedding BLOB NOT NULL,
-                metadata_json TEXT,
-                acl_allow_users TEXT,
-                acl_allow_groups TEXT,
-                acl_deny_users TEXT,
-                acl_deny_groups TEXT,
+                metadata_json TEXT NOT NULL,
+                acl_allow_users TEXT NOT NULL,
+                acl_allow_groups TEXT NOT NULL,
+                acl_deny_users TEXT NOT NULL,
+                acl_deny_groups TEXT NOT NULL,
                 updated_at INTEGER
             );
             CREATE INDEX IF NOT EXISTS idx_rag_chunks_scope
@@ -181,8 +193,9 @@ impl SqliteVectorStore {
 
         let mut rows = stmt.query(params_vec.as_slice())?;
         let mut results = Vec::new();
+        let principal = QueryPrincipal::new(request);
         while let Some(row) = rows.next()? {
-            if let Some(result) = score_row(row, request)? {
+            if let Some(result) = score_row(row, request, &principal)? {
                 results.push(result);
             }
         }
@@ -222,7 +235,12 @@ impl SqliteVectorStore {
 
         // Over-fetch so source/ACL/min_score filtering can't silently shrink
         // the result set below top_k without triggering the exact fallback.
-        let fetch = request.top_k * 4 + 16;
+        let fetch = request
+            .top_k
+            .saturating_mul(4)
+            .saturating_add(16)
+            .min(index.live_count())
+            .min(MAX_ANN_CANDIDATES);
         let candidate_ids = index.search(&request.query_embedding, fetch);
         if candidate_ids.is_empty() {
             return Ok(None);
@@ -259,14 +277,15 @@ impl SqliteVectorStore {
         }
 
         let mut stmt = conn.prepare(
-            "SELECT id, embedding FROM rag_chunks WHERE tenant_id = ?1 AND workspace_id = ?2",
+            "SELECT storage_id, embedding FROM rag_chunks WHERE tenant_id = ?1 AND workspace_id = ?2",
         )?;
         let mut rows = stmt.query(params![request.tenant_id, request.workspace_id])?;
         let mut index = ScopeIndex::new(request.query_embedding.len(), count);
         while let Some(row) = rows.next()? {
             let id: String = row.get(0)?;
             let blob: Vec<u8> = row.get(1)?;
-            index.upsert(&id, &deserialize_embedding(&blob));
+            let embedding = deserialize_embedding(&blob)?;
+            index.upsert(&id, &embedding);
         }
         log::debug!(
             "[vector] built HNSW index for {}/{}: {} vectors",
@@ -292,7 +311,7 @@ impl SqliteVectorStore {
         let placeholders = vec!["?"; candidate_ids.len()].join(", ");
         let sql = format!(
             "SELECT {SELECT_COLUMNS} FROM rag_chunks
-             WHERE tenant_id = ? AND workspace_id = ? AND id IN ({placeholders})"
+             WHERE tenant_id = ? AND workspace_id = ? AND storage_id IN ({placeholders})"
         );
         let mut stmt = conn.prepare(&sql)?;
         let mut params_vec: Vec<&dyn rusqlite::ToSql> = Vec::new();
@@ -310,14 +329,15 @@ impl SqliteVectorStore {
 
         let mut rows = stmt.query(params_vec.as_slice())?;
         let mut results = Vec::new();
+        let principal = QueryPrincipal::new(request);
         while let Some(row) = rows.next()? {
             if let Some(filter) = &source_filter {
-                let source_id: String = row.get(3)?;
+                let source_id: String = row.get(4)?;
                 if !filter.contains(&source_id) {
                     continue;
                 }
             }
-            if let Some(result) = score_row(row, request)? {
+            if let Some(result) = score_row(row, request, &principal)? {
                 results.push(result);
             }
         }
@@ -325,9 +345,94 @@ impl SqliteVectorStore {
     }
 }
 
+fn table_has_column(
+    conn: &Connection,
+    table: &str,
+    expected_column: &str,
+) -> Result<bool, VectorStoreError> {
+    let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let column: String = row.get(1)?;
+        if column == expected_column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn migrate_legacy_schema(conn: &mut Connection) -> Result<(), VectorStoreError> {
+    let transaction = conn.transaction()?;
+    transaction.execute_batch(
+        "CREATE TABLE rag_chunks_v2 (
+            storage_id TEXT PRIMARY KEY,
+            id TEXT NOT NULL,
+            tenant_id TEXT NOT NULL,
+            workspace_id TEXT NOT NULL,
+            source_id TEXT NOT NULL,
+            doc_id TEXT NOT NULL,
+            chunk_index INTEGER NOT NULL,
+            text TEXT NOT NULL,
+            embedding BLOB NOT NULL,
+            metadata_json TEXT NOT NULL,
+            acl_allow_users TEXT NOT NULL,
+            acl_allow_groups TEXT NOT NULL,
+            acl_deny_users TEXT NOT NULL,
+            acl_deny_groups TEXT NOT NULL,
+            updated_at INTEGER
+        );
+        INSERT INTO rag_chunks_v2 (
+            storage_id, id, tenant_id, workspace_id, source_id, doc_id, chunk_index,
+            text, embedding, metadata_json, acl_allow_users, acl_allow_groups,
+            acl_deny_users, acl_deny_groups, updated_at
+        )
+        SELECT
+            lower(hex(tenant_id)) || ':' || lower(hex(workspace_id)) || ':' ||
+                lower(hex(source_id)) || ':' || lower(hex(id)),
+            id, tenant_id, workspace_id, source_id, doc_id, chunk_index, text, embedding,
+            coalesce(metadata_json, '{}'), coalesce(acl_allow_users, '[]'),
+            coalesce(acl_allow_groups, '[]'), coalesce(acl_deny_users, '[]'),
+            coalesce(acl_deny_groups, '[]'), updated_at
+        FROM rag_chunks;
+        DROP TABLE rag_chunks;
+        ALTER TABLE rag_chunks_v2 RENAME TO rag_chunks;",
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn storage_id(chunk: &EmbeddedChunk) -> String {
+    storage_id_for(
+        &chunk.tenant_id,
+        &chunk.workspace_id,
+        &chunk.source_id,
+        &chunk.id,
+    )
+}
+
+fn storage_id_for(tenant_id: &str, workspace_id: &str, source_id: &str, id: &str) -> String {
+    [tenant_id, workspace_id, source_id, id]
+        .into_iter()
+        .map(hex_string)
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+fn hex_string(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len().saturating_mul(2));
+    for byte in value.as_bytes() {
+        use std::fmt::Write as _;
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
+}
+
 #[async_trait]
 impl VectorStore for SqliteVectorStore {
     async fn upsert(&self, chunks: Vec<EmbeddedChunk>) -> Result<(), VectorStoreError> {
+        for chunk in &chunks {
+            validate_chunk(chunk)?;
+        }
         {
             let mut conn = self
                 .conn
@@ -346,13 +451,15 @@ impl VectorStore for SqliteVectorStore {
                 let acl_deny_groups = serde_json::to_string(&chunk.acl.deny_groups)
                     .map_err(|e| VectorStoreError::Serialization(e.to_string()))?;
                 let embedding_blob = serialize_embedding(&chunk.embedding);
+                let storage_id = storage_id(chunk);
                 tx.execute(
                     "INSERT OR REPLACE INTO rag_chunks (
-                        id, tenant_id, workspace_id, source_id, doc_id, chunk_index,
+                        storage_id, id, tenant_id, workspace_id, source_id, doc_id, chunk_index,
                         text, embedding, metadata_json, acl_allow_users, acl_allow_groups,
                         acl_deny_users, acl_deny_groups, updated_at
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, strftime('%s','now'))",
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, strftime('%s','now'))",
                     params![
+                        storage_id,
                         chunk.id,
                         chunk.tenant_id,
                         chunk.workspace_id,
@@ -380,7 +487,7 @@ impl VectorStore for SqliteVectorStore {
         for chunk in &chunks {
             let key: ScopeKey = (chunk.tenant_id.clone(), chunk.workspace_id.clone());
             if let Some(index) = indexes.get_mut(&key) {
-                index.upsert(&chunk.id, &chunk.embedding);
+                index.upsert(&storage_id(chunk), &chunk.embedding);
             }
         }
         Ok(())
@@ -399,7 +506,7 @@ impl VectorStore for SqliteVectorStore {
                 .lock()
                 .map_err(|_| VectorStoreError::Db("vector store mutex poisoned".to_string()))?;
             let mut stmt = conn.prepare(
-                "SELECT id FROM rag_chunks WHERE tenant_id = ?1 AND workspace_id = ?2 AND source_id = ?3 AND doc_id = ?4",
+                "SELECT storage_id FROM rag_chunks WHERE tenant_id = ?1 AND workspace_id = ?2 AND source_id = ?3 AND doc_id = ?4",
             )?;
             let ids = stmt
                 .query_map(params![tenant_id, workspace_id, source_id, doc_id], |row| {
@@ -432,15 +539,96 @@ impl VectorStore for SqliteVectorStore {
         &self,
         request: VectorQuery,
     ) -> Result<Vec<VectorSearchResult>, VectorStoreError> {
-        if request.query_embedding.is_empty() {
-            return Err(VectorStoreError::InvalidInput(
-                "query embedding is empty".to_string(),
-            ));
-        }
+        validate_query(&request)?;
         if let Some(results) = self.query_ann(&request)? {
             return Ok(results);
         }
         self.scan_exact(&request)
+    }
+}
+
+fn validate_chunk(chunk: &EmbeddedChunk) -> Result<(), VectorStoreError> {
+    for (value, label) in [
+        (&chunk.id, "chunk id"),
+        (&chunk.tenant_id, "tenant id"),
+        (&chunk.workspace_id, "workspace id"),
+        (&chunk.source_id, "source id"),
+        (&chunk.doc_id, "document id"),
+    ] {
+        if value.trim().is_empty() {
+            return Err(VectorStoreError::InvalidInput(format!(
+                "{label} cannot be empty"
+            )));
+        }
+    }
+    validate_embedding(&chunk.embedding, "chunk embedding")
+}
+
+fn validate_query(request: &VectorQuery) -> Result<(), VectorStoreError> {
+    validate_embedding(&request.query_embedding, "query embedding")?;
+    if request.top_k == 0 {
+        return Err(VectorStoreError::InvalidInput(
+            "top_k must be greater than zero".to_string(),
+        ));
+    }
+    if !request.min_score.is_finite() {
+        return Err(VectorStoreError::InvalidInput(
+            "min_score must be finite".to_string(),
+        ));
+    }
+    for (value, label) in [
+        (&request.tenant_id, "tenant id"),
+        (&request.workspace_id, "workspace id"),
+    ] {
+        if value.trim().is_empty() {
+            return Err(VectorStoreError::InvalidInput(format!(
+                "{label} cannot be empty"
+            )));
+        }
+    }
+    if let Some(source_ids) = &request.source_ids {
+        if source_ids.len() > MAX_SOURCE_FILTERS {
+            return Err(VectorStoreError::InvalidInput(format!(
+                "source filter exceeds {MAX_SOURCE_FILTERS} entries"
+            )));
+        }
+        if source_ids
+            .iter()
+            .any(|source_id| source_id.trim().is_empty())
+        {
+            return Err(VectorStoreError::InvalidInput(
+                "source filter contains an empty id".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_embedding(embedding: &[f32], label: &str) -> Result<(), VectorStoreError> {
+    if embedding.is_empty() {
+        return Err(VectorStoreError::InvalidInput(format!(
+            "{label} cannot be empty"
+        )));
+    }
+    if !embedding.iter().all(|value| value.is_finite()) {
+        return Err(VectorStoreError::InvalidInput(format!(
+            "{label} must contain only finite values"
+        )));
+    }
+    Ok(())
+}
+
+struct QueryPrincipal<'a> {
+    users: HashSet<&'a str>,
+    groups: HashSet<&'a str>,
+}
+
+impl<'a> QueryPrincipal<'a> {
+    fn new(request: &'a VectorQuery) -> Self {
+        Self {
+            users: request.allowed_users.iter().map(String::as_str).collect(),
+            groups: request.allowed_groups.iter().map(String::as_str).collect(),
+        }
     }
 }
 
@@ -449,30 +637,38 @@ impl VectorStore for SqliteVectorStore {
 fn score_row(
     row: &Row<'_>,
     request: &VectorQuery,
+    principal: &QueryPrincipal<'_>,
 ) -> Result<Option<VectorSearchResult>, VectorStoreError> {
-    let embedding_blob: Vec<u8> = row.get(7)?;
-    let embedding = deserialize_embedding(&embedding_blob);
+    let embedding_blob: Vec<u8> = row.get(8)?;
+    let embedding = deserialize_embedding(&embedding_blob)?;
     if embedding.len() != request.query_embedding.len() {
         return Ok(None);
     }
 
-    let acl_allow_users: String = row.get(9)?;
-    let acl_allow_groups: String = row.get(10)?;
-    let acl_deny_users: String = row.get(11)?;
-    let acl_deny_groups: String = row.get(12)?;
+    let acl_allow_users: String = row.get(10)?;
+    let acl_allow_groups: String = row.get(11)?;
+    let acl_deny_users: String = row.get(12)?;
+    let acl_deny_groups: String = row.get(13)?;
 
-    let allow_users: Vec<String> = parse_json_list(&acl_allow_users);
-    let allow_groups: Vec<String> = parse_json_list(&acl_allow_groups);
-    let deny_users: Vec<String> = parse_json_list(&acl_deny_users);
-    let deny_groups: Vec<String> = parse_json_list(&acl_deny_groups);
+    let allow_users = parse_json_list(&acl_allow_users, "acl_allow_users")?;
+    let allow_groups = parse_json_list(&acl_allow_groups, "acl_allow_groups")?;
+    let deny_users = parse_json_list(&acl_deny_users, "acl_deny_users")?;
+    let deny_groups = parse_json_list(&acl_deny_groups, "acl_deny_groups")?;
 
-    let allowed_users: HashSet<String> = request.allowed_users.iter().cloned().collect();
-    let allowed_groups: HashSet<String> = request.allowed_groups.iter().cloned().collect();
-
-    if !is_allowed(&allowed_users, &allowed_groups, &allow_users, &allow_groups) {
+    if !is_allowed(
+        &principal.users,
+        &principal.groups,
+        &allow_users,
+        &allow_groups,
+    ) {
         return Ok(None);
     }
-    if is_denied(&allowed_users, &allowed_groups, &deny_users, &deny_groups) {
+    if is_denied(
+        &principal.users,
+        &principal.groups,
+        &deny_users,
+        &deny_groups,
+    ) {
         return Ok(None);
     }
 
@@ -481,18 +677,18 @@ fn score_row(
         return Ok(None);
     }
 
-    let metadata_json: String = row.get(8)?;
-    let metadata: HashMap<String, String> =
-        serde_json::from_str(&metadata_json).unwrap_or_else(|_| HashMap::new());
+    let metadata_json: String = row.get(9)?;
+    let metadata: HashMap<String, String> = serde_json::from_str(&metadata_json)
+        .map_err(|error| VectorStoreError::Serialization(error.to_string()))?;
 
     let chunk = EmbeddedChunk {
-        id: row.get(0)?,
-        tenant_id: row.get(1)?,
-        workspace_id: row.get(2)?,
-        source_id: row.get(3)?,
-        doc_id: row.get(4)?,
-        chunk_index: row.get(5)?,
-        text: row.get(6)?,
+        id: row.get(1)?,
+        tenant_id: row.get(2)?,
+        workspace_id: row.get(3)?,
+        source_id: row.get(4)?,
+        doc_id: row.get(5)?,
+        chunk_index: row.get(6)?,
+        text: row.get(7)?,
         embedding,
         metadata,
         acl: AccessControl {
@@ -516,51 +712,64 @@ fn rank_and_truncate(results: &mut Vec<VectorSearchResult>, top_k: usize) {
 }
 
 fn serialize_embedding(embedding: &[f32]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(embedding.len() * 4);
+    let mut bytes = Vec::with_capacity(embedding.len().saturating_mul(4));
     for val in embedding {
         bytes.extend_from_slice(&val.to_le_bytes());
     }
     bytes
 }
 
-fn deserialize_embedding(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-        .collect()
+fn deserialize_embedding(bytes: &[u8]) -> Result<Vec<f32>, VectorStoreError> {
+    if !bytes.len().is_multiple_of(4) {
+        return Err(VectorStoreError::Serialization(format!(
+            "embedding byte length {} is not divisible by four",
+            bytes.len()
+        )));
+    }
+    let embedding = bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
+        .collect::<Vec<_>>();
+    validate_embedding(&embedding, "stored embedding")?;
+    Ok(embedding)
 }
 
-fn parse_json_list(value: &str) -> Vec<String> {
-    match serde_json::from_str::<Value>(value) {
-        Ok(Value::Array(items)) => items
-            .into_iter()
-            .filter_map(|v| v.as_str().map(|s| s.to_string()))
-            .collect(),
-        _ => Vec::new(),
-    }
+fn parse_json_list(value: &str, column: &str) -> Result<Vec<String>, VectorStoreError> {
+    serde_json::from_str(value)
+        .map_err(|error| VectorStoreError::Serialization(format!("invalid {column}: {error}")))
 }
 
 fn is_allowed(
-    allowed_users: &HashSet<String>,
-    allowed_groups: &HashSet<String>,
+    allowed_users: &HashSet<&str>,
+    allowed_groups: &HashSet<&str>,
     acl_users: &[String],
     acl_groups: &[String],
 ) -> bool {
     if acl_users.is_empty() && acl_groups.is_empty() {
         return true;
     }
-    acl_users.iter().any(|u| allowed_users.contains(u))
-        || acl_groups.iter().any(|g| allowed_groups.contains(g))
+    acl_users
+        .iter()
+        .any(|user| allowed_users.contains(user.as_str()))
+        || acl_groups
+            .iter()
+            .any(|group| allowed_groups.contains(group.as_str()))
 }
 
 fn is_denied(
-    allowed_users: &HashSet<String>,
-    allowed_groups: &HashSet<String>,
+    allowed_users: &HashSet<&str>,
+    allowed_groups: &HashSet<&str>,
     deny_users: &[String],
     deny_groups: &[String],
 ) -> bool {
-    deny_users.iter().any(|u| allowed_users.contains(u))
-        || deny_groups.iter().any(|g| allowed_groups.contains(g))
+    deny_users
+        .iter()
+        .any(|user| allowed_users.contains(user.as_str()))
+        || deny_groups
+            .iter()
+            .any(|group| allowed_groups.contains(group.as_str()))
 }
 
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
@@ -626,14 +835,8 @@ mod tests {
         }
     }
 
-    fn temp_store(name: &str, ann_threshold: usize) -> SqliteVectorStore {
-        let path = std::env::temp_dir().join(format!(
-            "kapsl_vec_test_{}_{}.sqlite3",
-            name,
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&path);
-        SqliteVectorStore::open(&path)
+    fn temp_store(_name: &str, ann_threshold: usize) -> SqliteVectorStore {
+        SqliteVectorStore::open(Path::new(":memory:"))
             .expect("open store")
             .with_ann_threshold(ann_threshold)
     }
@@ -756,5 +959,136 @@ mod tests {
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].chunk.id, "c3");
         assert!(results[0].score > 0.999);
+    }
+
+    #[tokio::test]
+    async fn logical_chunk_ids_are_isolated_by_tenant_and_source() {
+        let store = temp_store("scoped_ids", usize::MAX);
+        let embedding = pseudo_vec(7);
+        let mut source_two = chunk("shared", "doc", embedding.clone());
+        source_two.source_id = "s2".to_string();
+        source_two.text = "source two".to_string();
+        let mut tenant_two = chunk("shared", "doc", embedding.clone());
+        tenant_two.tenant_id = "t2".to_string();
+        tenant_two.text = "tenant two".to_string();
+
+        store
+            .upsert(vec![
+                chunk("shared", "doc", embedding.clone()),
+                source_two,
+                tenant_two,
+            ])
+            .await
+            .unwrap();
+
+        let tenant_one = store.query(query(embedding.clone(), 10)).await.unwrap();
+        assert_eq!(tenant_one.len(), 2);
+        assert!(tenant_one
+            .iter()
+            .any(|result| result.chunk.source_id == "s1"));
+        assert!(tenant_one
+            .iter()
+            .any(|result| result.chunk.source_id == "s2"));
+
+        let mut tenant_two_query = query(embedding, 10);
+        tenant_two_query.tenant_id = "t2".to_string();
+        let tenant_two = store.query(tenant_two_query).await.unwrap();
+        assert_eq!(tenant_two.len(), 1);
+        assert_eq!(tenant_two[0].chunk.text, "tenant two");
+    }
+
+    #[tokio::test]
+    async fn query_and_upsert_reject_invalid_embeddings_and_limits() {
+        let store = temp_store("invalid_input", usize::MAX);
+        let mut invalid_chunk = chunk("invalid", "doc", vec![f32::NAN; DIM]);
+        assert!(matches!(
+            store.upsert(vec![invalid_chunk.clone()]).await,
+            Err(VectorStoreError::InvalidInput(_))
+        ));
+
+        invalid_chunk.embedding = pseudo_vec(1);
+        store.upsert(vec![invalid_chunk]).await.unwrap();
+        let mut invalid_query = query(pseudo_vec(1), 0);
+        assert!(matches!(
+            store.query(invalid_query.clone()).await,
+            Err(VectorStoreError::InvalidInput(_))
+        ));
+        invalid_query.top_k = 1;
+        invalid_query.min_score = f32::NAN;
+        assert!(matches!(
+            store.query(invalid_query).await,
+            Err(VectorStoreError::InvalidInput(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn malformed_acl_data_fails_closed() {
+        let store = temp_store("malformed_acl", usize::MAX);
+        store
+            .upsert(vec![chunk("chunk", "doc", pseudo_vec(1))])
+            .await
+            .unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE rag_chunks SET acl_allow_users = 'not-json'", [])
+            .unwrap();
+
+        assert!(matches!(
+            store.query(query(pseudo_vec(1), 1)).await,
+            Err(VectorStoreError::Serialization(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn legacy_database_schema_is_migrated_without_losing_chunks() {
+        let path = std::env::temp_dir().join(format!(
+            "kapsl_vec_test_legacy_migration_{}.sqlite3",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let legacy = Connection::open(&path).unwrap();
+        legacy
+            .execute_batch(
+                "CREATE TABLE rag_chunks (
+                    id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
+                    workspace_id TEXT NOT NULL,
+                    source_id TEXT NOT NULL,
+                    doc_id TEXT NOT NULL,
+                    chunk_index INTEGER NOT NULL,
+                    text TEXT NOT NULL,
+                    embedding BLOB NOT NULL,
+                    metadata_json TEXT,
+                    acl_allow_users TEXT,
+                    acl_allow_groups TEXT,
+                    acl_deny_users TEXT,
+                    acl_deny_groups TEXT,
+                    updated_at INTEGER
+                );",
+            )
+            .unwrap();
+        let embedding = pseudo_vec(17);
+        legacy
+            .execute(
+                "INSERT INTO rag_chunks (
+                    id, tenant_id, workspace_id, source_id, doc_id, chunk_index, text,
+                    embedding, metadata_json, acl_allow_users, acl_allow_groups,
+                    acl_deny_users, acl_deny_groups
+                ) VALUES (?1, 't1', 'w1', 's1', 'doc', 0, 'legacy', ?2, '{}', '[]', '[]', '[]', '[]')",
+                params!["legacy", serialize_embedding(&embedding)],
+            )
+            .unwrap();
+        drop(legacy);
+
+        let store = SqliteVectorStore::open(&path).unwrap();
+        assert!(table_has_column(&store.conn.lock().unwrap(), "rag_chunks", "storage_id").unwrap());
+        let results = store.query(query(embedding, 1)).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].chunk.id, "legacy");
+        assert_eq!(results[0].chunk.text, "legacy");
+        drop(store);
+        let _ = std::fs::remove_file(path);
     }
 }

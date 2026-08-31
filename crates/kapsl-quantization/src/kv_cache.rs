@@ -28,7 +28,7 @@ use turboquant_rs::{QuantizedKVCache, TurboQuantConfig};
 // ---------------------------------------------------------------------------
 
 /// Configuration for the TurboQuant KV-cache.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KvCacheConfig {
     /// Bits per value: 2, 3, or 4.
     pub bits: u8,
@@ -76,9 +76,8 @@ pub struct KvCacheQuantizer {
 impl KvCacheQuantizer {
     /// Create a new quantizer.
     ///
-    /// `rotation_seed` controls the PolarQuant sign pattern; `qjl_seed`
-    /// controls the Rademacher projection matrix. Using fixed seeds gives
-    /// reproducible results.
+    /// `qjl_seed` controls the Rademacher projection matrix. Using a fixed seed
+    /// gives reproducible results.
     pub fn new(config: KvCacheConfig, qjl_seed: u64) -> Self {
         let tq_config = TurboQuantConfig::new(config.bits, config.head_dim)
             .expect("KvCacheConfig already validated bits and head_dim");
@@ -105,6 +104,13 @@ impl KvCacheQuantizer {
     /// Compute approximate attention scores for `query` against all stored
     /// keys in `layer`. Returns one score per cached position.
     pub fn attention_scores(&self, layer: usize, query: &[f32]) -> Result<Vec<f32>> {
+        if query.len() != self.config.head_dim {
+            return Err(anyhow!(
+                "attention query dimension {} does not match configured dimension {}",
+                query.len(),
+                self.config.head_dim
+            ));
+        }
         self.inner
             .attention_scores(layer, query)
             .map_err(|e| anyhow!("kv_cache attention_scores failed: {e}"))
@@ -112,6 +118,9 @@ impl KvCacheQuantizer {
 
     /// Number of cached positions in `layer`.
     pub fn entry_count(&self, layer: usize) -> usize {
+        if layer >= self.config.num_layers {
+            return 0;
+        }
         self.inner.entry_count(layer)
     }
 
@@ -161,7 +170,14 @@ impl KvCacheQuantizer {
         value_f16: &[f16],
     ) -> Result<()> {
         // Convert f16 head-first layout → per-position f32 vectors of dim num_heads*head_dim
-        let total_dim = num_heads * head_dim;
+        let (total_dim, expected_len) = self.validate_packed_layout(length, num_heads, head_dim)?;
+        if key_f16.len() != expected_len || value_f16.len() != expected_len {
+            return Err(anyhow!(
+                "packed KV length mismatch: key={}, value={}, expected={expected_len}",
+                key_f16.len(),
+                value_f16.len()
+            ));
+        }
         let mut keys: Vec<Vec<f32>> = Vec::with_capacity(length);
         let mut values: Vec<Vec<f32>> = Vec::with_capacity(length);
 
@@ -195,6 +211,7 @@ impl KvCacheQuantizer {
         num_heads: usize,
         head_dim: usize,
     ) -> Result<(Vec<f16>, Vec<f16>, usize)> {
+        let (total_dim, _) = self.validate_packed_layout(0, num_heads, head_dim)?;
         let keys_f32 = self
             .inner
             .dequantize_all_keys(layer)
@@ -205,7 +222,23 @@ impl KvCacheQuantizer {
             .map_err(|e| anyhow!("dequantize values failed: {e}"))?;
 
         let length = keys_f32.len();
-        let total = num_heads * length * head_dim;
+        if values_f32.len() != length {
+            return Err(anyhow!(
+                "dequantized key/value entry count mismatch: keys={}, values={}",
+                length,
+                values_f32.len()
+            ));
+        }
+        if keys_f32.iter().any(|entry| entry.len() != total_dim)
+            || values_f32.iter().any(|entry| entry.len() != total_dim)
+        {
+            return Err(anyhow!(
+                "dequantized KV entry dimension does not match configured dimension {total_dim}"
+            ));
+        }
+        let total = total_dim
+            .checked_mul(length)
+            .ok_or_else(|| anyhow!("dequantized packed KV size overflow"))?;
         let mut key_out = vec![f16::ZERO; total];
         let mut val_out = vec![f16::ZERO; total];
 
@@ -222,6 +255,27 @@ impl KvCacheQuantizer {
         }
 
         Ok((key_out, val_out, length))
+    }
+
+    fn validate_packed_layout(
+        &self,
+        length: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) -> Result<(usize, usize)> {
+        let total_dim = num_heads.checked_mul(head_dim).ok_or_else(|| {
+            anyhow!("packed KV dimension overflow: num_heads={num_heads}, head_dim={head_dim}")
+        })?;
+        if total_dim != self.config.head_dim {
+            return Err(anyhow!(
+                "packed KV dimension {total_dim} does not match configured dimension {}",
+                self.config.head_dim
+            ));
+        }
+        let expected_len = total_dim
+            .checked_mul(length)
+            .ok_or_else(|| anyhow!("packed KV length overflow"))?;
+        Ok((total_dim, expected_len))
     }
 }
 
@@ -322,5 +376,49 @@ mod tests {
         let value = vec![0.2f32; DIM];
         cache.push(0, &key, &value).unwrap();
         assert!(cache.compression_ratio() > 1.0);
+    }
+
+    #[test]
+    fn packed_layer_roundtrip_preserves_layout() {
+        let mut cache = make_cache();
+        let length = 3;
+        let num_heads = 2;
+        let head_dim = DIM / num_heads;
+        let values: Vec<f16> = (0..length * DIM)
+            .map(|index| f16::from_f32(index as f32 / 100.0))
+            .collect();
+
+        cache
+            .push_packed_layer(0, length, num_heads, head_dim, &values, &values)
+            .unwrap();
+        let (keys, stored_values, stored_length) = cache
+            .dequantize_packed_layer(0, num_heads, head_dim)
+            .unwrap();
+
+        assert_eq!(stored_length, length);
+        assert_eq!(keys.len(), values.len());
+        assert_eq!(stored_values.len(), values.len());
+    }
+
+    #[test]
+    fn packed_layer_rejects_mismatched_dimensions_and_lengths() {
+        let mut cache = make_cache();
+        let values = vec![f16::ZERO; DIM];
+
+        assert!(cache
+            .push_packed_layer(0, 1, 3, DIM / 2, &values, &values)
+            .is_err());
+        assert!(cache
+            .push_packed_layer(0, 2, 2, DIM / 2, &values, &values)
+            .is_err());
+        assert!(cache.dequantize_packed_layer(0, 3, DIM / 2).is_err());
+    }
+
+    #[test]
+    fn invalid_layer_count_and_query_dimension_are_safe() {
+        let cache = make_cache();
+
+        assert_eq!(cache.entry_count(LAYERS), 0);
+        assert!(cache.attention_scores(0, &[0.0; DIM / 2]).is_err());
     }
 }

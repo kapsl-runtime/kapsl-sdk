@@ -7,6 +7,16 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/kapsl-runtime/kapsl-sdk"
 links = "llama"
 
+[package.metadata.cargo-machete]
+ignored = [
+    "bindgen",
+    "cc",
+    "cmake",
+    "find_cuda_helper",
+    "glob",
+    "walkdir",
+] # Build-script-only dependencies.
+
 include = [
     "wrapper.h",
     "wrapper_common.h",

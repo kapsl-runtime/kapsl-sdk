@@ -5,7 +5,7 @@ use std::collections::HashMap;
 pub type ConnectorConfig = Value;
 pub type Metadata = HashMap<String, String>;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceDescriptor {
     pub id: String,
     pub name: String,
@@ -13,14 +13,14 @@ pub struct SourceDescriptor {
     pub metadata: Metadata,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum DeltaOp {
     Upsert,
     Delete,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DocumentDelta {
     pub id: String,
     pub op: DeltaOp,
@@ -30,7 +30,7 @@ pub struct DocumentDelta {
     pub acl: ExternalAcl,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DocumentPayload {
     pub id: String,
     pub content_type: String,
@@ -39,12 +39,12 @@ pub struct DocumentPayload {
     pub acl: ExternalAcl,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PromptTransformResult {
     pub prompt: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ExternalAcl {
     pub allow_users: Vec<String>,
     pub allow_groups: Vec<String>,
@@ -52,12 +52,12 @@ pub struct ExternalAcl {
     pub deny_groups: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncCursor {
     pub value: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncRequest {
     pub source_id: String,
     pub cursor: Option<SyncCursor>,

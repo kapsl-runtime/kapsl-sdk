@@ -28,8 +28,10 @@ fn frame(id: usize, vocab: usize) -> Vec<f32> {
 fn decode_ids(out: &BinaryTensorPacket) -> Vec<i32> {
     assert_eq!(out.dtype, TensorDtype::Int32);
     out.data
-        .chunks_exact(4)
-        .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| i32::from_le_bytes(*b))
         .collect()
 }
 

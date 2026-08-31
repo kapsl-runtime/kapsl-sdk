@@ -25,7 +25,7 @@ impl From<VectorStoreError> for IngestionError {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedDocument {
     pub id: String,
     pub text: String,
@@ -33,7 +33,7 @@ pub struct ParsedDocument {
     pub content_type: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chunk {
     pub id: String,
     pub index: i64,
@@ -110,9 +110,16 @@ where
                 "embedding count mismatch".to_string(),
             ));
         }
+        if embeddings.iter().any(|embedding| {
+            embedding.is_empty() || !embedding.iter().all(|value| value.is_finite())
+        }) {
+            return Err(IngestionError::Embedding(
+                "embeddings must be non-empty and contain only finite values".to_string(),
+            ));
+        }
 
         let mut embedded = Vec::with_capacity(chunks.len());
-        for (chunk, embedding) in chunks.into_iter().zip(embeddings.into_iter()) {
+        for (chunk, embedding) in chunks.into_iter().zip(embeddings) {
             embedded.push(EmbeddedChunk {
                 id: chunk.id,
                 tenant_id: ctx.tenant_id.clone(),
@@ -155,9 +162,20 @@ pub struct SimpleChunker {
     pub overlap: usize,
 }
 
+impl SimpleChunker {
+    pub fn new(chunk_size: usize, overlap: usize) -> Result<Self, IngestionError> {
+        validate_chunk_window(chunk_size, overlap)?;
+        Ok(Self {
+            chunk_size,
+            overlap,
+        })
+    }
+}
+
 #[async_trait]
 impl Chunker for SimpleChunker {
     async fn chunk(&self, document: &ParsedDocument) -> Result<Vec<Chunk>, IngestionError> {
+        validate_chunk_window(self.chunk_size, self.overlap)?;
         let tokens: Vec<&str> = document.text.split_whitespace().collect();
         if tokens.is_empty() {
             return Ok(Vec::new());
@@ -179,12 +197,25 @@ impl Chunker for SimpleChunker {
             if end == tokens.len() {
                 break;
             }
-            let overlap = self.overlap.min(self.chunk_size);
-            start = end.saturating_sub(overlap);
+            start = end - self.overlap;
             index += 1;
         }
         Ok(chunks)
     }
+}
+
+fn validate_chunk_window(chunk_size: usize, overlap: usize) -> Result<(), IngestionError> {
+    if chunk_size == 0 {
+        return Err(IngestionError::InvalidInput(
+            "chunk_size must be greater than zero".to_string(),
+        ));
+    }
+    if overlap >= chunk_size {
+        return Err(IngestionError::InvalidInput(
+            "overlap must be smaller than chunk_size".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 pub struct DummyEmbedder {
@@ -194,10 +225,64 @@ pub struct DummyEmbedder {
 #[async_trait]
 impl Embedder for DummyEmbedder {
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, IngestionError> {
+        if self.dimension == 0 {
+            return Err(IngestionError::InvalidInput(
+                "embedding dimension must be greater than zero".to_string(),
+            ));
+        }
         let mut embeddings = Vec::with_capacity(texts.len());
         for _ in texts {
             embeddings.push(vec![0.0; self.dimension]);
         }
         Ok(embeddings)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn document(text: &str) -> ParsedDocument {
+        ParsedDocument {
+            id: "doc".to_string(),
+            text: text.to_string(),
+            metadata: HashMap::new(),
+            content_type: "text/plain".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn chunker_rejects_non_advancing_windows() {
+        assert!(SimpleChunker::new(0, 0).is_err());
+        assert!(SimpleChunker::new(4, 4).is_err());
+
+        let invalid = SimpleChunker {
+            chunk_size: 4,
+            overlap: 5,
+        };
+        assert!(invalid.chunk(&document("one two three")).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn chunker_builds_deterministic_overlapping_windows() {
+        let chunker = SimpleChunker::new(3, 1).unwrap();
+
+        let chunks = chunker
+            .chunk(&document("one two three four five"))
+            .await
+            .unwrap();
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].text, "one two three");
+        assert_eq!(chunks[1].text, "three four five");
+        assert_eq!(chunks[0].id, "doc:0");
+        assert_eq!(chunks[1].id, "doc:1");
+    }
+
+    #[tokio::test]
+    async fn dummy_embedder_rejects_zero_dimension() {
+        let embedder = DummyEmbedder { dimension: 0 };
+
+        assert!(embedder.embed(&["text".to_string()]).await.is_err());
     }
 }

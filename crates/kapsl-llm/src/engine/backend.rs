@@ -1,0 +1,1658 @@
+//! Engine API adapter for the ONNX LLM runtime.
+
+use crate::block_manager::SharedBlockAllocator;
+use crate::engine::LLMEngine;
+use crate::global_scheduler::GlobalKvScheduler;
+// parking_lot::Mutex does not poison on panic, so a crash in one engine's
+// thread cannot propagate to other engines waiting on the scheduler lock.
+type GlobalSchedulerMutex = parking_lot::Mutex<GlobalKvScheduler>;
+use crate::llm_metrics::LLMMetrics;
+use crate::model_paths::{find_model_asset, find_model_root};
+use crate::prompt_adapter::{
+    chat_template_from_explicit_name, chat_template_from_model_identifiers,
+    chat_template_from_template_source, ChatPromptTemplate,
+};
+use crate::scheduler::SchedulerConfig;
+use crate::sequence::{SamplingParams, SequenceGroup};
+use async_stream::stream;
+use async_trait::async_trait;
+use futures::stream::{self, Stream, StreamExt};
+use kapsl_engine_api::{
+    BatchingPolicy, BinaryTensorPacket, Engine, EngineError, EngineMetrics, ExternalDeviceMemory,
+    ExternalDeviceMemoryReport, InferenceRequest, MemoryAllocation, MemoryAllocationClass,
+    MemoryAllocationSource, MemoryDomain, MemoryReport, TensorDtype,
+};
+use serde_json::Value;
+use std::fs;
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use tokio::runtime::Runtime;
+use tokio::runtime::RuntimeFlavor;
+use tokio::sync::{mpsc, oneshot};
+
+fn shared_runtime() -> &'static Runtime {
+    static SHARED_RT: OnceLock<Runtime> = OnceLock::new();
+    SHARED_RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build shared runtime")
+    })
+}
+
+static NEXT_LLM_EXTERNAL_ALLOCATION_ID: AtomicU64 = AtomicU64::new(1);
+
+/// LLM Backend that bridges the Engine trait to the asynchronous LLMEngine loop
+pub struct LLMBackend {
+    request_tx: RwLock<Option<mpsc::Sender<SequenceGroup>>>,
+    engine_done_rx: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    metrics: Arc<Mutex<LLMMetrics>>,
+    model_config: Arc<Mutex<ModelRuntimeConfig>>,
+    provider_override: Option<String>,
+    device_id_override: Option<i32>,
+    device_ids_override: Option<Vec<i32>>,
+    /// Opt CUDA/TensorRT sessions into allocators registered on the ORT environment.
+    use_env_allocators: bool,
+    /// Runtime model/replica identity propagated into ORT allocator scopes.
+    memory_owner: Option<(u32, u32)>,
+    /// Optional shared block pool.  When set, the engine draws from this pool
+    /// instead of a private allocator, enabling unified KV memory across models.
+    shared_pool: Option<SharedBlockAllocator>,
+    /// Optional per-replica cap on KV cache total_blocks. Set by the runtime
+    /// when scaling to multiple replicas to divide the block budget fairly.
+    kv_blocks_cap: Option<usize>,
+    /// TurboQuant KV-cache compression bit-width (2, 3, or 4). When set,
+    /// overrides any value from metadata.json / KAPSL_LLM_KV_COMPRESSION_BITS.
+    kv_compression_bits: Option<u8>,
+    /// Global KV admission gate shared across all backends on the same runtime.
+    /// When set, every `infer_stream` call must successfully reserve tokens
+    /// before the request is enqueued.  Tokens are released when the stream
+    /// completes (naturally, on error, or on drop/cancellation).
+    global_scheduler: Option<Arc<GlobalSchedulerMutex>>,
+    /// Stable engine ID assigned by `SharedKvStateInner::attach_engine`.
+    /// Used as the key for `GlobalKvScheduler::try_reserve_tokens`.
+    engine_id: u32,
+    /// Live per-engine KV block cap shared with the runtime scheduler.
+    /// The runtime updates this atomic when engines are added or removed so
+    /// that block-level limits rebalance without requiring engine restarts.
+    live_kv_cap: Option<Arc<AtomicUsize>>,
+    /// Optional callback invoked with this backend's `engine_id` when its engine
+    /// task ends (drops), so the runtime can fully deregister the dead engine.
+    on_engine_death: Option<Arc<dyn Fn(u32) + Send + Sync>>,
+    external_allocation_id: String,
+    loaded_model_bytes: AtomicUsize,
+}
+
+#[derive(Clone)]
+struct ModelRuntimeConfig {
+    prompt_template: Option<ChatPromptTemplate>,
+    sampling: SamplingParams,
+}
+
+fn default_sampling_params() -> SamplingParams {
+    SamplingParams {
+        max_tokens: 512,
+        min_tokens: 0,
+        temperature: 0.7,
+        top_p: 0.9,
+        top_k: 40,
+        stop_token_ids: Vec::new(),
+        repetition_penalty: 1.15,
+        seed: None,
+    }
+}
+
+/// Estimate KV bytes that are physically materialized while the model loads.
+/// Dense/device KV stays request-elastic; paged host KV owns its full backing
+/// vectors immediately, so it must appear in the pre-load authority plan.
+fn planned_host_kv_backing_bytes(model_path: &Path, block_cap: Option<usize>) -> usize {
+    const DEFAULT_LAYERS: usize = 32;
+    const DEFAULT_HEADS: usize = 32;
+    const DEFAULT_HEAD_DIM: usize = 128;
+    const DEFAULT_MAX_SEQ_LEN: usize = 4096;
+
+    let model_config =
+        find_model_asset(model_path, "config.json").and_then(|path| read_json(&path));
+    let metadata = read_json(&find_model_root(model_path).join("metadata.json"));
+    let llm = metadata
+        .as_ref()
+        .and_then(|value| value.get("metadata"))
+        .and_then(|value| value.get("llm"));
+    let kv = llm.and_then(|value| value.get("kv_cache"));
+
+    let from_json = |value: Option<&Value>, keys: &[&str]| {
+        keys.iter().find_map(|key| {
+            value
+                .and_then(|value| value.get(*key))
+                .and_then(Value::as_u64)
+                .filter(|value| *value > 0)
+                .map(|value| value as usize)
+        })
+    };
+    let layers = from_json(llm, &["num_layers"])
+        .or_else(|| from_json(model_config.as_ref(), &["num_hidden_layers", "n_layer"]))
+        .unwrap_or(DEFAULT_LAYERS);
+    let attention_heads = from_json(model_config.as_ref(), &["num_attention_heads", "n_head"])
+        .unwrap_or(DEFAULT_HEADS);
+    let kv_heads = from_json(llm, &["num_kv_heads", "num_key_value_heads"])
+        .or_else(|| {
+            from_json(
+                model_config.as_ref(),
+                &["num_key_value_heads", "num_attention_heads", "n_head"],
+            )
+        })
+        .unwrap_or(attention_heads);
+    let head_dim = from_json(llm, &["head_dim"])
+        .or_else(|| from_json(model_config.as_ref(), &["head_dim"]))
+        .or_else(|| {
+            from_json(model_config.as_ref(), &["hidden_size", "n_embd"])
+                .map(|hidden| hidden / attention_heads.max(1))
+        })
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_HEAD_DIM);
+    let max_seq_len = from_json(llm, &["max_sequence_length", "max_seq_len"])
+        .or_else(|| {
+            from_json(
+                model_config.as_ref(),
+                &["max_position_embeddings", "n_positions"],
+            )
+        })
+        .unwrap_or(DEFAULT_MAX_SEQ_LEN);
+
+    let env_usize = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+    };
+    let mode = std::env::var("KAPSL_LLM_KV_CACHE_MODE")
+        .ok()
+        .or_else(|| {
+            kv.and_then(|value| value.get("mode"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "dense".to_string());
+    let block_size = env_usize("KAPSL_LLM_KV_CACHE_BLOCK_SIZE")
+        .or_else(|| from_json(kv, &["block_size"]))
+        .unwrap_or(16);
+    let total_blocks = env_usize("KAPSL_LLM_KV_CACHE_TOTAL_BLOCKS")
+        .or_else(|| from_json(kv, &["total_blocks"]))
+        .unwrap_or(2048);
+    let total_blocks = block_cap
+        .filter(|cap| *cap > 0)
+        .map_or(total_blocks, |cap| total_blocks.min(cap));
+    let dense_free_list_cap = env_usize("KAPSL_LLM_KV_FREE_LIST_CAP")
+        .or_else(|| {
+            kv.and_then(|value| value.get("dense_free_list_cap"))
+                .and_then(Value::as_u64)
+                .map(|value| value as usize)
+        })
+        .unwrap_or(0);
+    let bytes_per_token = layers
+        .saturating_mul(kv_heads)
+        .saturating_mul(head_dim)
+        .saturating_mul(2)
+        .saturating_mul(std::mem::size_of::<half::f16>());
+
+    if mode.eq_ignore_ascii_case("paged") {
+        total_blocks
+            .saturating_mul(block_size)
+            .saturating_mul(bytes_per_token)
+    } else {
+        dense_free_list_cap
+            .saturating_mul(max_seq_len)
+            .saturating_mul(bytes_per_token)
+    }
+}
+
+fn read_json(path: &Path) -> Option<Value> {
+    let content = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+fn extract_bos_token(tokenizer_json: &Value) -> Option<String> {
+    let post_processor = tokenizer_json.get("post_processor")?;
+    if let Some(single) = post_processor.get("single").and_then(|v| v.as_array()) {
+        if let Some(first) = single.first() {
+            if let Some(id) = first
+                .get("SpecialToken")
+                .and_then(|v| v.get("id"))
+                .and_then(|v| v.as_str())
+            {
+                return Some(id.to_string());
+            }
+        }
+    }
+    post_processor
+        .get("special_tokens")
+        .and_then(|v| v.as_object())
+        .and_then(|map| map.keys().next())
+        .map(|k| k.to_string())
+}
+
+fn extract_added_token_content_by_id(tokenizer_json: &Value, token_id: u32) -> Option<String> {
+    tokenizer_json
+        .get("added_tokens")
+        .and_then(|v| v.as_array())
+        .and_then(|tokens| {
+            tokens.iter().find_map(|entry| {
+                let id = entry.get("id").and_then(|v| v.as_u64())? as u32;
+                if id != token_id {
+                    return None;
+                }
+                entry
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            })
+        })
+}
+
+fn extract_tag(template: &str, label: &str) -> Option<String> {
+    let label_lower = label.to_ascii_lowercase();
+    let mut search_start = 0usize;
+    while let Some(found) = template[search_start..].find('<') {
+        let start = search_start + found;
+        let rest = &template[start..];
+        let end_rel = rest.find('>')?;
+        let end = start + end_rel;
+        let tag = &template[start..=end];
+        if tag.to_ascii_lowercase().contains(&label_lower) {
+            return Some(tag.to_string());
+        }
+        search_start = end + 1;
+    }
+    None
+}
+
+fn load_model_runtime_config(model_path: &Path) -> ModelRuntimeConfig {
+    let mut config = ModelRuntimeConfig {
+        prompt_template: None,
+        sampling: default_sampling_params(),
+    };
+
+    let mut cfg_json: Option<Value> = None;
+    let manifest_llm_json = read_manifest_llm_metadata(model_path);
+    let manifest_model_identifiers = read_manifest_model_identifiers(model_path);
+    if let Some(gen_path) = find_model_asset(model_path, "generation_config.json") {
+        if let Some(gen) = read_json(&gen_path) {
+            if let Some(temp) = gen.get("temperature").and_then(|v| v.as_f64()) {
+                config.sampling.temperature = temp as f32;
+            }
+            if let Some(max_new) = gen.get("max_new_tokens").and_then(|v| v.as_u64()) {
+                if max_new > 0 {
+                    config.sampling.max_tokens = max_new as usize;
+                }
+            } else if let Some(max_len) = gen.get("max_length").and_then(|v| v.as_u64()) {
+                if max_len > 0 {
+                    config.sampling.max_tokens = max_len as usize;
+                }
+            }
+            if let Some(top_p) = gen.get("top_p").and_then(|v| v.as_f64()) {
+                config.sampling.top_p = top_p as f32;
+            }
+            if let Some(top_k) = gen.get("top_k").and_then(|v| v.as_u64()) {
+                config.sampling.top_k = top_k as usize;
+            }
+            if let Some(penalty) = gen.get("repetition_penalty").and_then(|v| v.as_f64()) {
+                config.sampling.repetition_penalty = penalty as f32;
+            }
+            let mut stop_ids = Vec::new();
+
+            let mut push_stop_id = |id: u64| {
+                let id = id as u32;
+                if !stop_ids.contains(&id) {
+                    stop_ids.push(id);
+                }
+            };
+
+            if let Some(ids) = gen.get("eos_token_ids").and_then(|v| v.as_array()) {
+                for id in ids {
+                    if let Some(val) = id.as_u64() {
+                        push_stop_id(val);
+                    }
+                }
+            }
+
+            // HF configs may encode eos_token_id as either a scalar or an array.
+            if let Some(eos_token_id) = gen.get("eos_token_id") {
+                if let Some(eos) = eos_token_id.as_u64() {
+                    push_stop_id(eos);
+                } else if let Some(ids) = eos_token_id.as_array() {
+                    for id in ids {
+                        if let Some(val) = id.as_u64() {
+                            push_stop_id(val);
+                        }
+                    }
+                }
+            }
+            if let Some(bos) = gen.get("bos_token_id").and_then(|v| v.as_u64()) {
+                push_stop_id(bos);
+            }
+            if !stop_ids.is_empty() {
+                config.sampling.stop_token_ids = stop_ids;
+            }
+        }
+    }
+
+    if let Some(cfg_path) = find_model_asset(model_path, "config.json") {
+        if let Some(cfg) = read_json(&cfg_path) {
+            cfg_json = Some(cfg.clone());
+        }
+    }
+
+    let template_path = find_model_asset(model_path, "chat_template.jinja");
+    let template_text = template_path
+        .as_ref()
+        .and_then(|p| fs::read_to_string(p).ok());
+
+    let tokenizer_path = find_model_asset(model_path, "tokenizer.json");
+    let tokenizer_json = tokenizer_path.as_ref().and_then(|p| read_json(p));
+    let tokenizer_config_json = find_model_asset(model_path, "tokenizer_config.json")
+        .as_ref()
+        .and_then(|p| read_json(p));
+    let embedded_chat_template = tokenizer_config_json
+        .as_ref()
+        .and_then(tokenizer_config_chat_template);
+
+    if config.sampling.stop_token_ids.is_empty() {
+        if let Some(cfg) = cfg_json.as_ref() {
+            let mut stop_ids = Vec::new();
+
+            let mut push_stop_id = |id: u64| {
+                let id = id as u32;
+                if !stop_ids.contains(&id) {
+                    stop_ids.push(id);
+                }
+            };
+
+            // HF config.json may encode eos_token_id as either a scalar or an array.
+            if let Some(eos_token_id) = cfg.get("eos_token_id") {
+                if let Some(eos) = eos_token_id.as_u64() {
+                    push_stop_id(eos);
+                } else if let Some(ids) = eos_token_id.as_array() {
+                    for id in ids {
+                        if let Some(val) = id.as_u64() {
+                            push_stop_id(val);
+                        }
+                    }
+                }
+            }
+
+            if let Some(bos) = cfg.get("bos_token_id").and_then(|v| v.as_u64()) {
+                push_stop_id(bos);
+            }
+
+            if !stop_ids.is_empty() {
+                config.sampling.stop_token_ids = stop_ids;
+            }
+        }
+    }
+
+    // Added special tokens are not user-visible when the tokenizer decodes
+    // with skip_special_tokens=true. Treat them like the configured EOS ids so
+    // min_tokens suppresses them instead of counting an invisible token toward
+    // the requested output floor.
+    if let Some(tokenizer) = tokenizer_json.as_ref() {
+        if let Some(added_tokens) = tokenizer.get("added_tokens").and_then(|v| v.as_array()) {
+            for entry in added_tokens {
+                if entry.get("special").and_then(|v| v.as_bool()) != Some(true) {
+                    continue;
+                }
+                let Some(id) = entry.get("id").and_then(|v| v.as_u64()) else {
+                    continue;
+                };
+                let id = id as u32;
+                if !config.sampling.stop_token_ids.contains(&id) {
+                    config.sampling.stop_token_ids.push(id);
+                }
+            }
+        }
+    }
+
+    if template_text.is_some() {
+        let think_suffix = template_text
+            .as_deref()
+            .filter(|t| t.contains("<think>"))
+            .map(|_| "<think>\n".to_string())
+            .unwrap_or_default();
+
+        let template_uses_role_header_format = template_text
+            .as_deref()
+            .map(|t| {
+                t.contains("<|start_header_id|>")
+                    && t.contains("<|end_header_id|>")
+                    && t.contains("<|eot_id|>")
+            })
+            .unwrap_or(false);
+
+        if template_uses_role_header_format {
+            // Role-header templates use:
+            //   <|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n...<|eot_id|>
+            //   <|start_header_id|>assistant<|end_header_id|>\n\n
+            let bos_token_id = cfg_json
+                .as_ref()
+                .and_then(|cfg| cfg.get("bos_token_id"))
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32);
+            let bos_token = bos_token_id
+                .and_then(|id| {
+                    tokenizer_json
+                        .as_ref()
+                        .and_then(|tok| extract_added_token_content_by_id(tok, id))
+                })
+                .unwrap_or_default();
+
+            config.prompt_template = Some(ChatPromptTemplate::Boundary {
+                prefix: format!("{}<|start_header_id|>user<|end_header_id|>\n\n", bos_token),
+                suffix: format!(
+                    "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n{}",
+                    think_suffix
+                ),
+            });
+        } else {
+            let bos_token_id = cfg_json
+                .as_ref()
+                .and_then(|cfg| cfg.get("bos_token_id"))
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32);
+            let bos_token = tokenizer_json
+                .as_ref()
+                .and_then(extract_bos_token)
+                .or_else(|| {
+                    bos_token_id.and_then(|id| {
+                        tokenizer_json
+                            .as_ref()
+                            .and_then(|tok| extract_added_token_content_by_id(tok, id))
+                    })
+                })
+                .unwrap_or_default();
+
+            let user_tag = template_text
+                .as_deref()
+                .and_then(|t| extract_tag(t, "User"))
+                .unwrap_or_else(|| "<|user|>".to_string());
+            let assistant_tag = template_text
+                .as_deref()
+                .and_then(|t| extract_tag(t, "Assistant"))
+                .unwrap_or_else(|| "<|assistant|>".to_string());
+
+            config.prompt_template = Some(ChatPromptTemplate::Boundary {
+                prefix: format!("{}{}", bos_token, user_tag),
+                suffix: format!("{}{}", assistant_tag, think_suffix),
+            });
+        }
+    } else if let Some(template) =
+        embedded_chat_template.and_then(chat_template_from_template_source)
+    {
+        config.prompt_template = Some(template);
+    } else {
+        config.prompt_template = prompt_template_from_manifest_or_config(
+            manifest_llm_json.as_ref(),
+            cfg_json.as_ref(),
+            &manifest_model_identifiers,
+        );
+    }
+
+    config
+}
+
+fn read_manifest_llm_metadata(model_path: &Path) -> Option<Value> {
+    let meta_path = find_model_root(model_path).join("metadata.json");
+    read_json(&meta_path).and_then(|meta| meta.get("metadata").and_then(|m| m.get("llm")).cloned())
+}
+
+fn read_manifest_model_identifiers(model_path: &Path) -> Vec<String> {
+    let meta_path = find_model_root(model_path).join("metadata.json");
+    let Some(meta) = read_json(&meta_path) else {
+        return Vec::new();
+    };
+    ["project_name", "model_type"]
+        .into_iter()
+        .filter_map(|key| json_string_field(&meta, key).map(str::to_string))
+        .collect()
+}
+
+fn json_string_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+    value.get(key).and_then(|v| v.as_str()).map(str::trim)
+}
+
+fn tokenizer_config_chat_template(config: &Value) -> Option<&str> {
+    let template = config.get("chat_template")?;
+    template
+        .as_str()
+        .or_else(|| template.get("default").and_then(Value::as_str))
+}
+
+fn prompt_template_from_manifest_or_config(
+    llm_meta: Option<&Value>,
+    cfg_json: Option<&Value>,
+    manifest_identifiers: &[String],
+) -> Option<ChatPromptTemplate> {
+    if let Some(llm) = llm_meta {
+        for key in ["chat_template", "prompt_template", "model_family"] {
+            if let Some(template) =
+                json_string_field(llm, key).and_then(chat_template_from_explicit_name)
+            {
+                return Some(template);
+            }
+        }
+    }
+
+    let mut identifiers = manifest_identifiers.to_vec();
+    if let Some(cfg) = cfg_json {
+        if let Some(name_or_path) = json_string_field(cfg, "_name_or_path") {
+            identifiers.push(name_or_path.to_string());
+        }
+        if let Some(model_type) = json_string_field(cfg, "model_type") {
+            identifiers.push(model_type.to_string());
+        }
+        if let Some(architectures) = cfg.get("architectures").and_then(|v| v.as_array()) {
+            identifiers.extend(
+                architectures
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .map(str::to_string),
+            );
+        }
+    }
+
+    chat_template_from_model_identifiers(identifiers.iter().map(String::as_str))
+}
+
+/// RAII guard that returns a token reservation to `GlobalKvScheduler` when
+/// dropped.  Created in `infer_stream` and held for the stream's lifetime, so
+/// the budget is reclaimed whether the stream ends normally, errors, or is
+/// cancelled by the caller dropping the future.
+struct GlobalTokenGuard {
+    scheduler: Arc<GlobalSchedulerMutex>,
+    engine_id: u32,
+    tokens: usize,
+}
+
+impl Drop for GlobalTokenGuard {
+    fn drop(&mut self) {
+        self.scheduler
+            .lock()
+            .complete_tokens(self.engine_id, self.tokens);
+    }
+}
+
+impl LLMBackend {
+    /// Translate the engine metadata convention (smaller values are more
+    /// important) into the ONNX sequence scheduler convention (larger values
+    /// are more important). Unstamped direct SDK calls retain the historical
+    /// normal-priority value of zero.
+    fn sequence_priority(request: &InferenceRequest) -> u8 {
+        request
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.priority)
+            .map(|priority| u8::MAX.saturating_sub(priority))
+            .unwrap_or(0)
+    }
+
+    pub fn new() -> Self {
+        Self {
+            request_tx: RwLock::new(None),
+            engine_done_rx: Mutex::new(None),
+            metrics: Arc::new(Mutex::new(LLMMetrics::default())),
+            model_config: Arc::new(Mutex::new(ModelRuntimeConfig {
+                prompt_template: None,
+                sampling: default_sampling_params(),
+            })),
+            provider_override: None,
+            device_id_override: None,
+            device_ids_override: None,
+            use_env_allocators: false,
+            memory_owner: None,
+            shared_pool: None,
+            kv_blocks_cap: None,
+            kv_compression_bits: None,
+            global_scheduler: None,
+            engine_id: 0,
+            live_kv_cap: None,
+            on_engine_death: None,
+            external_allocation_id: format!(
+                "llm-ort:{}",
+                NEXT_LLM_EXTERNAL_ALLOCATION_ID.fetch_add(1, Ordering::Relaxed)
+            ),
+            loaded_model_bytes: AtomicUsize::new(0),
+        }
+    }
+
+    /// Register a callback invoked with this backend's `engine_id` when its
+    /// engine task ends, so the runtime can deregister the dead engine.
+    pub fn with_on_engine_death(mut self, cb: Arc<dyn Fn(u32) + Send + Sync>) -> Self {
+        self.on_engine_death = Some(cb);
+        self
+    }
+
+    /// Attach a shared block allocator so this backend draws from a unified
+    /// KV pool shared with other `LLMBackend` instances on the same device.
+    pub fn with_shared_pool(mut self, allocator: SharedBlockAllocator) -> Self {
+        self.shared_pool = Some(allocator);
+        self
+    }
+
+    /// Set a per-replica cap on KV cache total_blocks. The runtime calls this
+    /// when spawning additional replicas so the block budget is divided fairly
+    /// across all engines on the same device.
+    pub fn with_kv_blocks_cap(mut self, cap: usize) -> Self {
+        self.kv_blocks_cap = Some(cap);
+        self
+    }
+
+    /// Enable TurboQuant KV-cache compression at `bits` bits per value (2–4).
+    /// Overrides the value in `metadata.json` and `KAPSL_LLM_KV_COMPRESSION_BITS`.
+    pub fn with_kv_compression_bits(mut self, bits: u8) -> Self {
+        self.kv_compression_bits = Some(bits);
+        self
+    }
+
+    /// Make CUDA/TensorRT sessions use allocators registered on the shared ORT
+    /// environment. The runtime enables this only after registering its stable
+    /// device pool.
+    pub fn with_env_allocators(mut self, enabled: bool) -> Self {
+        self.use_env_allocators = enabled;
+        self
+    }
+
+    /// Attribute ONNX provider allocations to a stable model replica.
+    pub fn with_memory_owner(mut self, model_id: u32, replica_id: u32) -> Self {
+        self.memory_owner = Some((model_id, replica_id));
+        self
+    }
+
+    /// Attach a live KV block cap updated by the runtime on engine join/leave.
+    ///
+    /// When set, `infer_stream` reads the current cap value and injects it into
+    /// the `GlobalKvScheduler` budget calculation on each admission check, so
+    /// that the effective block limit tracks the live fleet without an engine
+    /// restart.
+    pub fn with_live_kv_cap(mut self, cap: Arc<AtomicUsize>) -> Self {
+        if let Some(scheduler) = self.global_scheduler.as_ref() {
+            scheduler
+                .lock()
+                .register_block_cap(self.engine_id, cap.clone());
+        }
+        self.live_kv_cap = Some(cap);
+        self
+    }
+
+    /// Attach the global KV admission gate.
+    ///
+    /// Once set, every call to `infer_stream` will call
+    /// `GlobalKvScheduler::try_reserve_tokens` before enqueuing the request.
+    /// If the global budget is exhausted the request is rejected immediately
+    /// with `EngineError::overloaded` rather than silently queuing and
+    /// potentially OOM-ing the device.
+    pub fn with_global_scheduler(
+        mut self,
+        scheduler: Arc<GlobalSchedulerMutex>,
+        engine_id: u32,
+    ) -> Self {
+        self.global_scheduler = Some(scheduler);
+        self.engine_id = engine_id;
+        if let (Some(scheduler), Some(cap)) =
+            (self.global_scheduler.as_ref(), self.live_kv_cap.as_ref())
+        {
+            scheduler
+                .lock()
+                .register_block_cap(self.engine_id, cap.clone());
+        }
+        self
+    }
+
+    /// This engine's current health as the `EngineMetrics` code: 0 = healthy,
+    /// 1 = degraded, 2 = dead. Reads the cross-model scheduler's per-engine
+    /// health; defaults to healthy when no scheduler is attached.
+    fn engine_health_code(&self) -> u8 {
+        use crate::global_scheduler::EngineHealth;
+        match self
+            .global_scheduler
+            .as_ref()
+            .and_then(|s| s.lock().health_of(self.engine_id))
+        {
+            Some(EngineHealth::Degraded) => 1,
+            Some(EngineHealth::Dead) => 2,
+            _ => 0,
+        }
+    }
+
+    pub fn with_device(provider: String, device_id: i32) -> Self {
+        let mut backend = Self::new();
+        backend.provider_override = Some(provider);
+        backend.device_id_override = Some(device_id);
+        backend
+    }
+
+    pub fn with_devices(provider: String, device_ids: Vec<i32>) -> Self {
+        let mut backend = Self::new();
+        backend.provider_override = Some(provider);
+        backend.device_ids_override = Some(device_ids);
+        backend
+    }
+
+    pub fn with_device_id(device_id: i32) -> Self {
+        let mut backend = Self::new();
+        backend.device_id_override = Some(device_id);
+        backend
+    }
+
+    pub fn with_device_ids(device_ids: Vec<i32>) -> Self {
+        let mut backend = Self::new();
+        backend.device_ids_override = Some(device_ids);
+        backend
+    }
+
+    fn cuda_device_ids(&self) -> Vec<usize> {
+        let uses_cuda = self
+            .provider_override
+            .as_deref()
+            .map(|provider| {
+                provider.eq_ignore_ascii_case("cuda") || provider.eq_ignore_ascii_case("tensorrt")
+            })
+            .unwrap_or_else(|| {
+                self.device_id_override.is_some() || self.device_ids_override.is_some()
+            });
+        if !uses_cuda {
+            return Vec::new();
+        }
+        let mut devices = self
+            .device_ids_override
+            .clone()
+            .or_else(|| self.device_id_override.map(|device_id| vec![device_id]))
+            .unwrap_or_else(|| vec![0]);
+        devices.retain(|device_id| *device_id >= 0);
+        devices.sort_unstable();
+        devices.dedup();
+        devices
+            .into_iter()
+            .map(|device_id| device_id as usize)
+            .collect()
+    }
+}
+
+impl Default for LLMBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl Engine for LLMBackend {
+    fn planned_memory(&self, model_path: &Path) -> Result<MemoryReport, EngineError> {
+        let model_bytes = fs::metadata(model_path)
+            .map_err(|source| EngineError::ModelLoadError {
+                path: model_path.display().to_string(),
+                source: Box::new(source),
+            })?
+            .len() as usize;
+        let mut report = MemoryReport::single(
+            format!("{}:host-session", self.external_allocation_id),
+            MemoryDomain::Host,
+            MemoryAllocationClass::ModelSession,
+            model_bytes,
+        );
+        let host_kv_backing = planned_host_kv_backing_bytes(model_path, self.kv_blocks_cap);
+        let devices = self.cuda_device_ids();
+        if devices.is_empty() {
+            report.push(MemoryAllocation {
+                allocation_id: format!("{}:host-weights", self.external_allocation_id),
+                domain: MemoryDomain::Host,
+                class: MemoryAllocationClass::PersistentWeights,
+                source: MemoryAllocationSource::BackendManaged,
+                bytes: model_bytes,
+            });
+            report.push(MemoryAllocation {
+                allocation_id: format!("{}:host-kv", self.external_allocation_id),
+                domain: MemoryDomain::Host,
+                class: MemoryAllocationClass::KvCache,
+                source: MemoryAllocationSource::BackendManaged,
+                bytes: host_kv_backing,
+            });
+            return Ok(report);
+        }
+
+        let per_device_bytes =
+            model_bytes.saturating_add(devices.len().saturating_sub(1)) / devices.len().max(1);
+        let source = if self.use_env_allocators {
+            MemoryAllocationSource::RuntimeManaged
+        } else {
+            MemoryAllocationSource::BackendManaged
+        };
+        for device_id in devices {
+            report.push(MemoryAllocation {
+                allocation_id: self.external_allocation_id.clone(),
+                domain: MemoryDomain::Cuda { device_id },
+                class: MemoryAllocationClass::PersistentWeights,
+                source,
+                bytes: per_device_bytes,
+            });
+            report.push(MemoryAllocation {
+                allocation_id: format!("{}:workspace", self.external_allocation_id),
+                domain: MemoryDomain::Cuda { device_id },
+                class: MemoryAllocationClass::TransientWorkspace,
+                source,
+                bytes: (per_device_bytes / 4).max(64 * 1024 * 1024),
+            });
+            report.push(MemoryAllocation {
+                allocation_id: format!("{}:kv", self.external_allocation_id),
+                domain: if self.use_env_allocators {
+                    MemoryDomain::Cuda { device_id }
+                } else {
+                    MemoryDomain::Host
+                },
+                class: MemoryAllocationClass::KvCache,
+                source: if self.use_env_allocators {
+                    source
+                } else {
+                    MemoryAllocationSource::BackendManaged
+                },
+                bytes: 0,
+            });
+        }
+        if host_kv_backing > 0 {
+            report.push(MemoryAllocation {
+                allocation_id: format!("{}:host-kv", self.external_allocation_id),
+                domain: MemoryDomain::Host,
+                class: MemoryAllocationClass::KvCache,
+                source: MemoryAllocationSource::BackendManaged,
+                bytes: host_kv_backing,
+            });
+        }
+        Ok(report)
+    }
+
+    fn planned_external_device_memory(
+        &self,
+        model_path: &Path,
+    ) -> Result<ExternalDeviceMemoryReport, EngineError> {
+        if self.use_env_allocators {
+            return Ok(ExternalDeviceMemoryReport::default());
+        }
+        let device_ids = self.cuda_device_ids();
+        if device_ids.is_empty() {
+            return Ok(ExternalDeviceMemoryReport::default());
+        }
+
+        let model_bytes = fs::metadata(model_path)
+            .map_err(|source| EngineError::ModelLoadError {
+                path: model_path.display().to_string(),
+                source: Box::new(source),
+            })?
+            .len() as usize;
+        let per_device_bytes = model_bytes.saturating_add(device_ids.len().saturating_sub(1))
+            / device_ids.len().max(1);
+        Ok(ExternalDeviceMemoryReport {
+            allocations: device_ids
+                .into_iter()
+                .map(|device_id| ExternalDeviceMemory {
+                    allocation_id: self.external_allocation_id.clone(),
+                    device_id,
+                    bytes: per_device_bytes,
+                })
+                .collect(),
+        })
+    }
+
+    fn actual_external_device_memory(&self) -> ExternalDeviceMemoryReport {
+        if self.use_env_allocators {
+            return ExternalDeviceMemoryReport::default();
+        }
+        let model_bytes = self.loaded_model_bytes.load(Ordering::Acquire);
+        let devices = self.cuda_device_ids();
+        if model_bytes == 0 || devices.is_empty() {
+            return ExternalDeviceMemoryReport::default();
+        }
+        let per_device_bytes =
+            model_bytes.saturating_add(devices.len().saturating_sub(1)) / devices.len().max(1);
+        ExternalDeviceMemoryReport {
+            allocations: devices
+                .into_iter()
+                .map(|device_id| ExternalDeviceMemory {
+                    allocation_id: self.external_allocation_id.clone(),
+                    device_id,
+                    bytes: per_device_bytes,
+                })
+                .collect(),
+        }
+    }
+
+    fn actual_memory(&self) -> MemoryReport {
+        let model_bytes = self.loaded_model_bytes.load(Ordering::Acquire);
+        if model_bytes == 0 {
+            return MemoryReport::default();
+        }
+        let mut report = MemoryReport::single(
+            format!("{}:host-session", self.external_allocation_id),
+            MemoryDomain::Host,
+            MemoryAllocationClass::ModelSession,
+            model_bytes,
+        );
+        let devices = self.cuda_device_ids();
+        if devices.is_empty() {
+            report.push(MemoryAllocation {
+                allocation_id: format!("{}:host-weights", self.external_allocation_id),
+                domain: MemoryDomain::Host,
+                class: MemoryAllocationClass::PersistentWeights,
+                source: MemoryAllocationSource::BackendManaged,
+                bytes: model_bytes,
+            });
+        } else {
+            let per_device_bytes =
+                model_bytes.saturating_add(devices.len().saturating_sub(1)) / devices.len().max(1);
+            let source = if self.use_env_allocators {
+                MemoryAllocationSource::RuntimeManaged
+            } else {
+                MemoryAllocationSource::BackendManaged
+            };
+            for device_id in devices.iter().copied() {
+                report.push(MemoryAllocation {
+                    allocation_id: self.external_allocation_id.clone(),
+                    domain: MemoryDomain::Cuda { device_id },
+                    class: MemoryAllocationClass::PersistentWeights,
+                    source,
+                    bytes: per_device_bytes,
+                });
+                report.push(MemoryAllocation {
+                    allocation_id: format!("{}:workspace", self.external_allocation_id),
+                    domain: MemoryDomain::Cuda { device_id },
+                    class: MemoryAllocationClass::TransientWorkspace,
+                    source,
+                    bytes: (per_device_bytes / 4).max(64 * 1024 * 1024),
+                });
+            }
+        }
+
+        let metrics = self.metrics.lock().unwrap();
+        if metrics.kv_cache_host_bytes_retained > 0 || !metrics.kv_cache_device_resident {
+            report.push(MemoryAllocation {
+                allocation_id: format!("{}:host-kv", self.external_allocation_id),
+                domain: MemoryDomain::Host,
+                class: MemoryAllocationClass::KvCache,
+                source: MemoryAllocationSource::BackendManaged,
+                bytes: metrics.kv_cache_host_bytes_retained,
+            });
+        }
+        if metrics.kv_cache_device_resident {
+            if let Some(device_id) = devices.first().copied() {
+                report.push(MemoryAllocation {
+                    allocation_id: format!("{}:kv", self.external_allocation_id),
+                    domain: MemoryDomain::Cuda { device_id },
+                    class: MemoryAllocationClass::KvCache,
+                    source: MemoryAllocationSource::RuntimeManaged,
+                    bytes: metrics.kv_cache_device_bytes_retained,
+                });
+            }
+        }
+        report
+    }
+
+    fn planned_request_memory(&self, request: &InferenceRequest) -> MemoryReport {
+        let bytes = request
+            .additional_inputs
+            .iter()
+            .map(|input| input.tensor.data.len())
+            .fold(request.input.data.len(), usize::saturating_add);
+        let mut report = MemoryReport::single(
+            "request:materialized-inputs",
+            MemoryDomain::Host,
+            MemoryAllocationClass::RequestTransient,
+            bytes,
+        );
+        if let Some(device_id) = self.cuda_device_ids().first().copied() {
+            report.push(MemoryAllocation {
+                allocation_id: "request:cuda-staging".to_string(),
+                domain: MemoryDomain::HostPinned {
+                    provider: "cuda".to_string(),
+                    device_id: Some(device_id),
+                },
+                class: MemoryAllocationClass::RequestTransient,
+                source: MemoryAllocationSource::BackendManaged,
+                bytes,
+            });
+            report.push(MemoryAllocation {
+                allocation_id: "request:cuda-input-output".to_string(),
+                domain: MemoryDomain::Cuda { device_id },
+                class: MemoryAllocationClass::RequestTransient,
+                source: if self.use_env_allocators {
+                    MemoryAllocationSource::RuntimeManaged
+                } else {
+                    MemoryAllocationSource::BackendManaged
+                },
+                bytes,
+            });
+        }
+        let metrics = self.metrics.lock().unwrap();
+        let kv_bytes = metrics.kv_cache_request_reservation_bytes;
+        if kv_bytes > 0 {
+            if metrics.kv_cache_device_resident {
+                if let Some(device_id) = self.cuda_device_ids().first().copied() {
+                    report.push(MemoryAllocation {
+                        allocation_id: "request:cuda-kv".to_string(),
+                        domain: MemoryDomain::Cuda { device_id },
+                        class: MemoryAllocationClass::KvCache,
+                        source: MemoryAllocationSource::RuntimeManaged,
+                        bytes: kv_bytes,
+                    });
+                    // Device-to-host fallback briefly holds both copies. Admit
+                    // the destination up front so migration never allocates
+                    // ungoverned host KV after a provider failure.
+                    report.push(MemoryAllocation {
+                        allocation_id: "request:host-kv-fallback".to_string(),
+                        domain: MemoryDomain::Host,
+                        class: MemoryAllocationClass::KvCache,
+                        source: MemoryAllocationSource::BackendManaged,
+                        bytes: metrics.kv_cache_host_fallback_reservation_bytes,
+                    });
+                }
+            } else {
+                report.push(MemoryAllocation {
+                    allocation_id: "request:host-kv".to_string(),
+                    domain: MemoryDomain::Host,
+                    class: MemoryAllocationClass::KvCache,
+                    source: MemoryAllocationSource::BackendManaged,
+                    bytes: kv_bytes,
+                });
+            }
+        }
+        report
+    }
+
+    async fn load(&mut self, model_path: &Path) -> Result<(), EngineError> {
+        log::info!("Starting LLMEngine for model: {}", model_path.display());
+        let loaded_model_bytes = fs::metadata(model_path)
+            .map_err(|source| EngineError::ModelLoadError {
+                path: model_path.display().to_string(),
+                source: Box::new(source),
+            })?
+            .len() as usize;
+
+        let runtime_cfg = load_model_runtime_config(model_path);
+        {
+            let mut cfg_guard = self.model_config.lock().unwrap();
+            *cfg_guard = runtime_cfg;
+        }
+
+        let (request_tx, request_rx) = mpsc::channel(100);
+        let (load_tx, load_rx) = oneshot::channel::<Result<(), EngineError>>();
+        let (engine_done_tx, engine_done_rx) = std::sync::mpsc::channel::<()>();
+        *self.engine_done_rx.lock().unwrap() = Some(engine_done_rx);
+
+        // Read per-model tuning hints from metadata.json before constructing LLMEngine.
+        // This ensures BlockManager and SchedulerConfig are sized for the actual model
+        // rather than using one-size-fits-all defaults.
+        struct ManifestHints {
+            max_seq_len: usize,
+            max_num_seqs: usize,
+            max_paddings: usize,
+            block_size: usize,
+            num_gpu_blocks: usize,
+        }
+        let hints: ManifestHints = {
+            let model_root = find_model_root(model_path);
+            let meta_path = model_root.join("metadata.json");
+            let llm_meta = std::fs::File::open(&meta_path)
+                .ok()
+                .and_then(|f| serde_json::from_reader::<_, serde_json::Value>(f).ok())
+                .and_then(|meta| meta.get("metadata").and_then(|m| m.get("llm")).cloned());
+
+            let get_usize = |llm: &serde_json::Value, key: &str| -> Option<usize> {
+                llm.get(key)
+                    .and_then(|v| v.as_u64())
+                    .filter(|&v| v > 0)
+                    .map(|v| v as usize)
+            };
+
+            if let Some(llm) = llm_meta.as_ref() {
+                let max_seq_len = get_usize(llm, "max_sequence_length")
+                    .or_else(|| get_usize(llm, "max_seq_len"))
+                    .unwrap_or(2048);
+                let sched = llm.get("scheduler");
+                let kv = llm.get("kv_cache");
+                ManifestHints {
+                    max_seq_len,
+                    max_num_seqs: sched
+                        .and_then(|s| get_usize(s, "max_num_seqs"))
+                        .unwrap_or(16),
+                    max_paddings: sched
+                        .and_then(|s| get_usize(s, "max_paddings"))
+                        .unwrap_or(32),
+                    block_size: kv.and_then(|k| get_usize(k, "block_size")).unwrap_or(16),
+                    num_gpu_blocks: kv.and_then(|k| get_usize(k, "total_blocks")).unwrap_or(128),
+                }
+            } else {
+                ManifestHints {
+                    max_seq_len: 2048,
+                    max_num_seqs: 16,
+                    max_paddings: 32,
+                    block_size: 16,
+                    num_gpu_blocks: 128,
+                }
+            }
+        };
+        let config = SchedulerConfig {
+            max_num_batched_tokens: hints.max_seq_len,
+            max_num_seqs: hints.max_num_seqs,
+            max_paddings: hints.max_paddings,
+        };
+
+        let engine_path = model_path.to_path_buf();
+        let metrics = self.metrics.clone();
+        let provider_override = self.provider_override.clone();
+        let device_id_override = self.device_id_override;
+        let device_ids_override = self.device_ids_override.clone();
+        let use_env_allocators = self.use_env_allocators;
+        let memory_owner = self.memory_owner;
+        let engine_block_size = hints.block_size;
+        let engine_num_gpu_blocks = hints.num_gpu_blocks;
+        let shared_pool = self.shared_pool.clone();
+        let kv_blocks_cap = self.kv_blocks_cap;
+        let kv_compression_bits = self.kv_compression_bits;
+        let global_scheduler_for_engine = self.global_scheduler.clone();
+        let engine_id_for_engine = self.engine_id;
+        let on_engine_death = self.on_engine_death.clone();
+        let live_kv_cap_for_engine = self.live_kv_cap.clone();
+        shared_runtime().spawn(async move {
+            let engine = LLMEngine::new(
+                config,
+                engine_block_size,
+                engine_num_gpu_blocks,
+                request_rx,
+                metrics,
+                provider_override,
+                device_id_override,
+                device_ids_override,
+                use_env_allocators,
+            );
+            let mut engine = engine;
+            if let Some((model_id, replica_id)) = memory_owner {
+                engine.set_memory_owner(model_id, replica_id);
+            }
+            // If a shared pool was attached, replace the private allocator.
+            let mut engine = if let Some(pool) = shared_pool {
+                engine.with_shared_pool(pool)
+            } else {
+                engine
+            };
+            // Apply per-replica block cap if set.
+            if let Some(cap) = kv_blocks_cap {
+                engine.set_kv_blocks_cap(cap);
+            }
+            // Attach the live per-engine KV quota so the (shared-pool) block
+            // manager hard-enforces this engine's fair share. Must come after
+            // with_shared_pool, which rebuilds the scheduler/block manager.
+            if let Some(cap) = live_kv_cap_for_engine {
+                engine.set_live_kv_cap(cap);
+            }
+            // Apply TurboQuant KV-cache compression bit-width if set.
+            if let Some(bits) = kv_compression_bits {
+                engine.set_kv_compression_bits(bits);
+            }
+            // Attach the cross-model health reporter and start the stall
+            // watchdog so circuit-breaker / hang transitions reach the global
+            // scheduler and a stuck engine cannot starve healthy ones.
+            if let Some(sched) = global_scheduler_for_engine {
+                // Stamp block ownership with the real engine id assigned by the
+                // runtime so shared-pool blocks are traceable to this engine.
+                engine.set_block_engine_id(engine_id_for_engine);
+                engine = engine.with_health_reporter(sched, engine_id_for_engine);
+                engine.spawn_watchdog();
+            }
+            // Fire the runtime's deregistration callback when this engine drops
+            // (load failure or run_loop exit), so dead engines don't leave stale
+            // registry / cap entries behind.
+            if let Some(cb) = on_engine_death {
+                engine = engine.with_death_notifier(Box::new(move || cb(engine_id_for_engine)));
+            }
+            let load_result = engine.load(&engine_path).await;
+            if let Err(e) = load_tx.send(load_result) {
+                log::error!("Failed to send load result: {:?}", e);
+            }
+
+            // Only run the loop if loading was successful
+            if engine.is_loaded() {
+                engine.run_loop().await;
+            }
+            // Destroy ORT sessions and CUDA allocations before acknowledging
+            // teardown to the runtime-owned device-memory lease.
+            drop(engine);
+            let _ = engine_done_tx.send(());
+        });
+
+        // Await the oneshot receiver instead of blocking the current runtime
+        match load_rx.await {
+            Ok(Ok(_)) => {
+                let mut tx_guard = self.request_tx.write().unwrap();
+                *tx_guard = Some(request_tx);
+                self.loaded_model_bytes
+                    .store(loaded_model_bytes, Ordering::Release);
+                Ok(())
+            }
+            Ok(Err(e)) => Err(e),
+            Err(e) => Err(EngineError::backend(format!(
+                "Failed to receive load status: {}",
+                e
+            ))),
+        }
+    }
+
+    fn infer(&self, request: &InferenceRequest) -> Result<BinaryTensorPacket, EngineError> {
+        let stream = self.infer_stream(request);
+        let mut pinned_stream = Box::pin(stream);
+
+        // Run the async stream to completion, reusing a shared runtime when possible.
+        enum ExecMode {
+            BlockInPlace(tokio::runtime::Handle),
+            SharedRuntime,
+            SpawnThread,
+        }
+
+        let exec_mode = match tokio::runtime::Handle::try_current() {
+            Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::CurrentThread => {
+                ExecMode::SpawnThread
+            }
+            Ok(handle) => ExecMode::BlockInPlace(handle),
+            Err(_) => ExecMode::SharedRuntime,
+        };
+
+        let run_stream = async move {
+            let mut all_text = String::new();
+            let mut last_packet = None;
+            while let Some(packet_res) = pinned_stream.next().await {
+                match packet_res {
+                    Ok(packet) => {
+                        if let Ok(text) = std::str::from_utf8(&packet.data) {
+                            all_text.push_str(text);
+                        }
+                        last_packet = Some(packet);
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+            Ok::<_, EngineError>((all_text, last_packet))
+        };
+
+        let result = match exec_mode {
+            ExecMode::BlockInPlace(handle) => {
+                Ok(tokio::task::block_in_place(|| handle.block_on(run_stream)))
+            }
+            ExecMode::SharedRuntime => Ok(shared_runtime().block_on(run_stream)),
+            ExecMode::SpawnThread => {
+                std::thread::spawn(move || shared_runtime().block_on(run_stream))
+                    .join()
+                    .map_err(|e| EngineError::backend(format!("Failed to join thread: {:?}", e)))
+            }
+        };
+        let (all_text, last_packet) = result??;
+
+        if let Some(mut packet) = last_packet {
+            packet.data = all_text.into_bytes();
+            packet.shape = vec![1, packet.data.len() as i64];
+            Ok(packet)
+        } else {
+            Err(EngineError::backend("No output from LLM engine"))
+        }
+    }
+
+    fn infer_stream(
+        &self,
+        request: &InferenceRequest,
+    ) -> std::pin::Pin<Box<dyn Stream<Item = Result<BinaryTensorPacket, EngineError>> + Send>> {
+        let (response_tx, mut response_rx) = mpsc::channel(100);
+
+        if request.input.dtype != TensorDtype::Utf8 {
+            return Box::pin(stream::once(async {
+                Err(EngineError::invalid_input("LLM backend expects Utf8 input"))
+            }));
+        }
+
+        let prompt = match String::from_utf8(request.input.data.clone()) {
+            Ok(text) => text,
+            Err(err) => {
+                return Box::pin(stream::once(async {
+                    Err(EngineError::invalid_input_with_source(
+                        "Invalid UTF-8 input",
+                        err,
+                    ))
+                }))
+            }
+        };
+
+        let runtime_cfg = self.model_config.lock().unwrap().clone();
+        let prompt = runtime_cfg
+            .prompt_template
+            .as_ref()
+            .map(|template| template.render(&prompt))
+            .unwrap_or(prompt);
+
+        let mut sampling_params = runtime_cfg.sampling;
+        if let Some(meta) = request.metadata.as_ref() {
+            if let Some(max_new) = meta.max_new_tokens {
+                if max_new > 0 {
+                    sampling_params.max_tokens = max_new as usize;
+                }
+            }
+            if let Some(min_new) = meta.min_new_tokens {
+                sampling_params.min_tokens = min_new as usize;
+            }
+            if let Some(temp) = meta.temperature {
+                sampling_params.temperature = temp;
+            }
+            if let Some(top_p) = meta.top_p {
+                sampling_params.top_p = top_p;
+            }
+            if let Some(top_k) = meta.top_k {
+                sampling_params.top_k = top_k as usize;
+            }
+            if let Some(penalty) = meta.repetition_penalty {
+                sampling_params.repetition_penalty = penalty;
+            }
+            if let Some(seed) = meta.seed {
+                sampling_params.seed = Some(seed);
+            }
+            if let Some(extra_stop) = meta.stop_token_ids.as_ref() {
+                if !extra_stop.is_empty() {
+                    for id in extra_stop {
+                        if !sampling_params.stop_token_ids.contains(id) {
+                            sampling_params.stop_token_ids.push(*id);
+                        }
+                    }
+                }
+            }
+        }
+        let request_id = request
+            .metadata
+            .as_ref()
+            .and_then(|meta| meta.request_id.clone())
+            .or_else(|| request.session_id.clone())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let cancellation = request.cancellation.clone();
+
+        // Estimate tokens before prompt and sampling_params are consumed.
+        // prompt.len()/4 is a conservative byte→token heuristic; actual
+        // tokenisation happens inside the engine after the request is queued.
+        let estimated_tokens = sampling_params
+            .max_tokens
+            .saturating_add(prompt.len() / 4 + 1);
+
+        // If a live cap is set, clamp estimated_tokens to the current block cap
+        // (blocks can hold at most block_size tokens each; the live cap is in
+        // blocks).  This prevents the admission estimate from being stale when
+        // the runtime has already reduced the cap due to new models loading.
+        let estimated_tokens = if let Some(ref cap_atom) = self.live_kv_cap {
+            let cap_blocks = cap_atom.load(Ordering::Relaxed);
+            // Assume block_size=16 as a safe lower bound; over-estimates are
+            // harmless (more conservative) and avoid a runtime query for the
+            // actual block size.
+            let cap_tokens = cap_blocks.saturating_mul(16);
+            estimated_tokens.min(cap_tokens.max(1))
+        } else {
+            estimated_tokens
+        };
+
+        let mut seq_group = SequenceGroup::new(
+            request_id,
+            request.session_id.clone(),
+            prompt,
+            vec![],
+            sampling_params,
+            cancellation.clone(),
+            response_tx,
+        );
+        seq_group.priority = Self::sequence_priority(request);
+
+        // Hard admission gate: reserve against the global budget.  If the budget
+        // is exhausted we reject immediately rather than queuing silently.
+        let global_guard: Option<GlobalTokenGuard> = if let Some(ref sched) = self.global_scheduler
+        {
+            let admitted = sched
+                .lock()
+                .try_reserve_tokens(self.engine_id, estimated_tokens);
+            if !admitted {
+                return Box::pin(stream::once(async {
+                    Err(EngineError::overloaded(
+                        "Global KV admission rejected: budget exhausted across all models",
+                    ))
+                }));
+            }
+            Some(GlobalTokenGuard {
+                scheduler: sched.clone(),
+                engine_id: self.engine_id,
+                tokens: estimated_tokens,
+            })
+        } else {
+            None
+        };
+
+        let tx_guard = self.request_tx.read().unwrap();
+        if let Some(tx) = tx_guard.as_ref() {
+            // A returned stream can outlive the backend (and may remain stored
+            // even after it has yielded its final item).  Holding a strong
+            // sender in that stream would keep the engine's request channel
+            // open forever and prevent `unload` from observing task teardown.
+            // Upgrade only while enqueueing the request, then release the
+            // strong sender before awaiting response chunks.
+            let tx = tx.downgrade();
+            drop(tx_guard);
+
+            let stream = stream! {
+                // Hold the reservation for the entire lifetime of this stream.
+                // Dropped (and tokens released) when the stream completes,
+                // errors, or is cancelled.
+                let _guard = global_guard;
+
+                let mut emitted = String::new();
+                if let Some(token) = cancellation.as_ref() {
+                    if token.is_cancelled() {
+                        yield Err(EngineError::cancelled("Request cancelled"));
+                        return;
+                    }
+                }
+
+                // Per-model backpressure: reject immediately when this model's
+                // queue is full rather than blocking (which would build latency
+                // and hold the admission reservation indefinitely).
+                let Some(tx) = tx.upgrade() else {
+                    yield Err(EngineError::ModelNotLoaded);
+                    return;
+                };
+                match tx.try_send(seq_group) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        yield Err(EngineError::overloaded(
+                            "Model queue full: too many pending requests for this model",
+                        ));
+                        return;
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        yield Err(EngineError::backend("Failed to send request to engine"));
+                        return;
+                    }
+                }
+                drop(tx);
+
+                let mut saw_finish = false;
+                loop {
+                    if let Some(token) = cancellation.as_ref() {
+                        if token.is_cancelled() {
+                            yield Err(EngineError::cancelled("Request cancelled"));
+                            return;
+                        }
+                    }
+
+                    let Some(output) = response_rx.recv().await else {
+                        break;
+                    };
+
+                    if let Some(token) = cancellation.as_ref() {
+                        if token.is_cancelled() {
+                            yield Err(EngineError::cancelled("Request cancelled"));
+                            return;
+                        }
+                    }
+
+                    let output_text = output.text;
+                    let chunk = if output_text.starts_with(&emitted) && output_text.len() >= emitted.len() {
+                        let delta = output_text[emitted.len()..].to_string();
+                        emitted = output_text;
+                        delta
+                    } else {
+                        emitted.push_str(&output_text);
+                        output_text
+                    };
+
+                    if !chunk.is_empty() {
+                        yield Ok(BinaryTensorPacket {
+                            shape: vec![1, (chunk.len() as i64)],
+                            dtype: TensorDtype::Utf8,
+                            data: chunk.into_bytes(),
+                        });
+                    }
+                    if output.finish_reason.is_some() {
+                        saw_finish = true;
+                        break;
+                    }
+                }
+
+                if !saw_finish {
+                    if let Some(token) = cancellation.as_ref() {
+                        if token.is_cancelled() {
+                            yield Err(EngineError::cancelled("Request cancelled"));
+                            return;
+                        }
+                    }
+                    yield Err(EngineError::backend("LLM response channel closed"));
+                }
+            };
+            Box::pin(stream)
+        } else {
+            Box::pin(stream::once(async { Err(EngineError::ModelNotLoaded) }))
+        }
+    }
+
+    fn unload(&mut self) {
+        *self.request_tx.write().unwrap() = None;
+        if let Some(done) = self.engine_done_rx.lock().unwrap().take() {
+            // The runtime's device-memory lease cannot be released until the
+            // engine task has dropped its ORT sessions and CUDA allocations.
+            // A disconnected channel also confirms task teardown after panic.
+            let _ = done.recv();
+        }
+        self.loaded_model_bytes.store(0, Ordering::Release);
+    }
+
+    fn metrics(&self) -> EngineMetrics {
+        let m = self.metrics.lock().unwrap();
+        EngineMetrics {
+            inference_time: m.total_inference_time,
+            kv_cache_bytes_used: m.kv_cache_bytes_used,
+            kv_cache_bytes_capacity: m.kv_cache_bytes_capacity,
+            kv_cache_blocks_total: m.kv_cache_blocks_total,
+            kv_cache_blocks_free: m.kv_cache_blocks_free,
+            kv_cache_sequences: m.kv_cache_sequences,
+            kv_cache_evicted_blocks: m.kv_cache_evicted_blocks,
+            kv_cache_evicted_sequences: m.kv_cache_evicted_sequences,
+            kv_cache_packed_layers: m.kv_cache_packed_layers,
+            kv_cache_cpu_offloaded_blocks: m.kv_cache_cpu_offloaded_blocks,
+            // Paged prefix-cache reuse, reported through the same fields the
+            // GGUF path uses so the existing Prometheus gauges cover both.
+            kv_partial_reuse_hits_total: m.kv_cache_prefix_reuse_hits,
+            kv_partial_reuse_tokens_saved_total: m.kv_cache_prefix_reuse_tokens_saved,
+            engine_health: self.engine_health_code(),
+            ..EngineMetrics::default()
+        }
+    }
+
+    fn batching_policy(&self) -> BatchingPolicy {
+        // The outer scheduler stamps its resolved queue priority into request
+        // metadata; `infer_stream` translates it into the ONNX sequence and KV
+        // eviction ordering above.
+        BatchingPolicy::continuous(1).with_priority_support()
+    }
+
+    fn health_check(&self) -> Result<(), EngineError> {
+        let tx_guard = self.request_tx.read().unwrap();
+        if tx_guard.is_some() {
+            Ok(())
+        } else {
+            Err(EngineError::ModelNotLoaded)
+        }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_tokenizer_standalone() {
+        let tokenizer_path = PathBuf::from("../../models/deepseek/tokenizer.json");
+        if !tokenizer_path.exists() {
+            return;
+        }
+        use tokenizers::Tokenizer;
+        let tokenizer = Tokenizer::from_file(&tokenizer_path).expect("Failed to load tokenizer");
+        let prompt = "Explain quantum physics in one sentence.";
+        let encoded = tokenizer.encode(prompt, true).expect("Failed to tokenize");
+        let ids = encoded.get_ids();
+        let tokens = encoded.get_tokens();
+        println!("Prompt: {}", prompt);
+        println!("IDs: {:?}", ids);
+        println!("Tokens: {:?}", tokens);
+        assert!(ids.len() > 1);
+    }
+
+    #[tokio::test]
+    async fn test_llm_backend_load() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        // Only run if model exists
+        let model_path = PathBuf::from("../../models/deepseek/model_q4f16.onnx");
+        if !model_path.exists() {
+            log::warn!(
+                "Skipping test because model does not exist at {:?}",
+                model_path
+            );
+            return;
+        }
+
+        let mut backend = LLMBackend::new();
+        let result = backend.load(&model_path).await;
+        assert!(result.is_ok());
+
+        // Test health check
+        assert!(backend.health_check().is_ok());
+
+        // Test inference stream
+        let request = InferenceRequest {
+            input: BinaryTensorPacket {
+                shape: vec![1, 1],
+                dtype: TensorDtype::Utf8,
+                data: "H".as_bytes().to_vec(),
+            },
+            additional_inputs: Vec::new(),
+            session_id: None,
+            metadata: None,
+            cancellation: None,
+        };
+
+        let mut stream = backend.infer_stream(&request);
+        let mut text = String::new();
+        while let Some(packet_res) = stream.next().await {
+            assert!(packet_res.is_ok());
+            let packet = packet_res.unwrap();
+            let chunk = String::from_utf8_lossy(&packet.data);
+            print!("{}", chunk);
+            text.push_str(&chunk);
+        }
+
+        assert!(!text.is_empty());
+        println!("\nGenerated text: {}", text);
+    }
+}
+
+#[path = "llm_backend_tests.rs"]
+mod llm_backend_tests;
