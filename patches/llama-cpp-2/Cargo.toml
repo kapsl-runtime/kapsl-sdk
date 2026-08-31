@@ -89,12 +89,6 @@ version = "0.1"
 [dev-dependencies.encoding_rs]
 version = "0.8.35"
 
-[dev-dependencies.hf-hub]
-version = "0.5.0"
-
-[dev-dependencies.serde_json]
-version = "1.0"
-
 [dev-dependencies.tracing-subscriber]
 version = "0.3"
 features = ["json"]

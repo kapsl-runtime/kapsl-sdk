@@ -143,6 +143,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "kapsl-llama-cpp-sys-2"
+version = "0.1.146-kapsl.1"
+dependencies = [
+ "bindgen",
+ "cc",
+ "cmake",
+ "find_cuda_helper",
+ "glob",
+ "walkdir",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.182"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -156,18 +168,6 @@ checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
 dependencies = [
  "cfg-if",
  "windows-link",
-]
-
-[[package]]
-name = "llama-cpp-sys-2"
-version = "0.1.146"
-dependencies = [
- "bindgen",
- "cc",
- "cmake",
- "find_cuda_helper",
- "glob",
- "walkdir",
 ]
 
 [[package]]
