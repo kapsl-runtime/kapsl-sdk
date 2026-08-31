@@ -171,8 +171,10 @@ mod tests {
         assert_eq!(packet.dtype, TensorDtype::Float32);
         let values: Vec<f32> = packet
             .data
-            .chunks_exact(4)
-            .map(|chunk| f32::from_ne_bytes(chunk.try_into().expect("f32 bytes")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_ne_bytes(*chunk))
             .collect();
         assert_eq!(values, vec![1.0, 4.0, 3.0, 3.5]);
     }
@@ -187,8 +189,10 @@ mod tests {
         assert_eq!(packet.shape, vec![3, 2]);
         let values: Vec<f32> = packet
             .data
-            .chunks_exact(4)
-            .map(|chunk| f32::from_ne_bytes(chunk.try_into().expect("f32 bytes")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_ne_bytes(*chunk))
             .collect();
         assert_eq!(values, vec![1.0, 2.0, 2.0, 1.0, 0.0, 0.5]);
     }

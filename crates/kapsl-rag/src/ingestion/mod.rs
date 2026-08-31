@@ -119,7 +119,7 @@ where
         }
 
         let mut embedded = Vec::with_capacity(chunks.len());
-        for (chunk, embedding) in chunks.into_iter().zip(embeddings.into_iter()) {
+        for (chunk, embedding) in chunks.into_iter().zip(embeddings) {
             embedded.push(EmbeddedChunk {
                 id: chunk.id,
                 tenant_id: ctx.tenant_id.clone(),

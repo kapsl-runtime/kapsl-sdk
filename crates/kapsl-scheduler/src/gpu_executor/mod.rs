@@ -190,7 +190,7 @@ impl GpuExecutor {
                         return;
                     }
 
-                    for (request, output) in active.into_iter().zip(outputs.into_iter()) {
+                    for (request, output) in active.into_iter().zip(outputs) {
                         let _ = request.response_tx.send(Ok(output));
                     }
                 }

@@ -238,13 +238,17 @@ fn packet_to_f32(packet: &BinaryTensorPacket) -> Vec<f32> {
         TensorDtype::Float32 => bytes_to_f32(&packet.data),
         TensorDtype::Int64 => packet
             .data
-            .chunks_exact(8)
-            .map(|b| i64::from_le_bytes(b.try_into().unwrap()) as f32)
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|b| i64::from_le_bytes(*b) as f32)
             .collect(),
         TensorDtype::Int32 => packet
             .data
-            .chunks_exact(4)
-            .map(|b| i32::from_le_bytes(b.try_into().unwrap()) as f32)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| i32::from_le_bytes(*b) as f32)
             .collect(),
         _ => Vec::new(),
     }

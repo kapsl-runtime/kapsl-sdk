@@ -663,23 +663,29 @@ pub fn load_gguf_weights(path: &Path) -> Result<ModelWeights, GgufError> {
 // ─── Dequantization implementations ──────────────────────────────────────────
 
 fn deq_f32(data: &[u8], n: usize) -> Vec<f16> {
-    data.chunks_exact(4)
+    data.as_chunks::<4>()
+        .0
+        .iter()
         .take(n)
-        .map(|b| f16::from_f32(f32::from_le_bytes(b.try_into().unwrap())))
+        .map(|b| f16::from_f32(f32::from_le_bytes(*b)))
         .collect()
 }
 
 fn deq_f16(data: &[u8], n: usize) -> Vec<f16> {
-    data.chunks_exact(2)
+    data.as_chunks::<2>()
+        .0
+        .iter()
         .take(n)
-        .map(|b| f16::from_bits(u16::from_le_bytes(b.try_into().unwrap())))
+        .map(|b| f16::from_bits(u16::from_le_bytes(*b)))
         .collect()
 }
 
 fn deq_bf16(data: &[u8], n: usize) -> Vec<f16> {
-    data.chunks_exact(2)
+    data.as_chunks::<2>()
+        .0
+        .iter()
         .take(n)
-        .map(|b| f16::from_f32(bf16::from_bits(u16::from_le_bytes(b.try_into().unwrap())).to_f32()))
+        .map(|b| f16::from_f32(bf16::from_bits(u16::from_le_bytes(*b)).to_f32()))
         .collect()
 }
 
@@ -688,7 +694,7 @@ fn deq_q4_0(data: &[u8], n: usize) -> Vec<f16> {
     const B: usize = 32;
     const BY: usize = 18;
     let mut out = Vec::with_capacity(n);
-    for blk in data.chunks_exact(BY).take(n / B) {
+    for blk in data.as_chunks::<BY>().0.iter().take(n / B) {
         let d = f16::from_bits(u16::from_le_bytes([blk[0], blk[1]])).to_f32();
         let start = out.len();
         out.resize(start + B, f16::ZERO);
@@ -706,7 +712,7 @@ fn deq_q4_1(data: &[u8], n: usize) -> Vec<f16> {
     const B: usize = 32;
     const BY: usize = 20;
     let mut out = Vec::with_capacity(n);
-    for blk in data.chunks_exact(BY).take(n / B) {
+    for blk in data.as_chunks::<BY>().0.iter().take(n / B) {
         let d = f16::from_bits(u16::from_le_bytes([blk[0], blk[1]])).to_f32();
         let m = f16::from_bits(u16::from_le_bytes([blk[2], blk[3]])).to_f32();
         let start = out.len();
@@ -725,7 +731,7 @@ fn deq_q8_0(data: &[u8], n: usize) -> Vec<f16> {
     const B: usize = 32;
     const BY: usize = 34;
     let mut out = Vec::with_capacity(n);
-    for blk in data.chunks_exact(BY).take(n / B) {
+    for blk in data.as_chunks::<BY>().0.iter().take(n / B) {
         let d = f16::from_bits(u16::from_le_bytes([blk[0], blk[1]])).to_f32();
         for &q in &blk[2..34] {
             out.push(f16::from_f32(q as i8 as f32 * d));
@@ -739,7 +745,7 @@ fn deq_q4_k(data: &[u8], n: usize) -> Vec<f16> {
     const QK: usize = 256;
     const BY: usize = 144;
     let mut out = Vec::with_capacity(n);
-    for blk in data.chunks_exact(BY).take(n / QK) {
+    for blk in data.as_chunks::<BY>().0.iter().take(n / QK) {
         let d = f16::from_bits(u16::from_le_bytes([blk[0], blk[1]])).to_f32();
         let dmin = f16::from_bits(u16::from_le_bytes([blk[2], blk[3]])).to_f32();
         let sc = &blk[4..16];
@@ -776,7 +782,7 @@ fn deq_q5_k(data: &[u8], n: usize) -> Vec<f16> {
     const QK: usize = 256;
     const BY: usize = 176;
     let mut out = Vec::with_capacity(n);
-    for blk in data.chunks_exact(BY).take(n / QK) {
+    for blk in data.as_chunks::<BY>().0.iter().take(n / QK) {
         let d = f16::from_bits(u16::from_le_bytes([blk[0], blk[1]])).to_f32();
         let dmin = f16::from_bits(u16::from_le_bytes([blk[2], blk[3]])).to_f32();
         let sc = &blk[4..16];
@@ -820,7 +826,7 @@ fn deq_q6_k(data: &[u8], n: usize) -> Vec<f16> {
     const QK: usize = 256;
     const BY: usize = 210;
     let mut out = Vec::with_capacity(n);
-    for blk in data.chunks_exact(BY).take(n / QK) {
+    for blk in data.as_chunks::<BY>().0.iter().take(n / QK) {
         let ql = &blk[0..128];
         let qh = &blk[128..192];
         let sc = &blk[192..208]; // i8 scales

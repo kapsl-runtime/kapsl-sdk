@@ -21,6 +21,9 @@ readme = "README.md"
 license = "Apache-2.0"
 repository = "https://github.com/Narsil/esaxx-rs"
 
+[package.metadata.cargo-machete]
+ignored = ["cc"] # Used by build.rs when the `cpp` feature is enabled.
+
 [[example]]
 name = "esaxx"
 required-features = ["cpp"]

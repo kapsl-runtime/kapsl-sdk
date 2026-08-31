@@ -143,8 +143,10 @@ pub(crate) fn decode_u32_words(tensor: &TensorView<'_>, name: &str) -> Result<Ve
         );
     }
     Ok(data
-        .chunks_exact(4)
-        .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|bytes| u32::from_le_bytes(*bytes))
         .collect())
 }
 
@@ -154,23 +156,29 @@ pub(crate) fn decode_float_values(tensor: &TensorView<'_>, name: &str) -> Result
         Dtype::F16 => {
             ensure_element_width(data, 2, name)?;
             Ok(data
-                .chunks_exact(2)
-                .map(|bytes| f16::from_le_bytes([bytes[0], bytes[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|bytes| f16::from_le_bytes(*bytes))
                 .collect())
         }
         Dtype::BF16 => {
             ensure_element_width(data, 2, name)?;
             Ok(data
-                .chunks_exact(2)
-                .map(|bytes| bf16::from_le_bytes([bytes[0], bytes[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|bytes| bf16::from_le_bytes(*bytes))
                 .map(|value| f16::from_f32(value.to_f32()))
                 .collect())
         }
         Dtype::F32 => {
             ensure_element_width(data, 4, name)?;
             Ok(data
-                .chunks_exact(4)
-                .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|bytes| f32::from_le_bytes(*bytes))
                 .map(f16::from_f32)
                 .collect())
         }

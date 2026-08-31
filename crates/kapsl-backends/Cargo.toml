@@ -2,6 +2,7 @@
 name = "kapsl-backends"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Pluggable inference backends (ONNX, llama.cpp) for the Kapsl engine"
@@ -16,7 +17,6 @@ kapsl-llm = { version = "0.3.0", path = "../kapsl-llm", features = ["gguf"] }
 cudarc = { version = "0.12", features = ["cublas"], optional = true }
 half = "2.0"
 rand = { version = "0.8", features = ["small_rng"] }
-thiserror = "1.0"
 log = "0.4"
 lru = "0.18.2"
 tokio = { version = "1", features = ["sync", "rt", "macros"] }

@@ -2,6 +2,7 @@
 name = "kapsl-monitor"
 version.workspace = true
 edition = "2024"
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Prometheus metrics and monitoring for the Kapsl inference engine"

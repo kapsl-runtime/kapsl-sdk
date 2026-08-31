@@ -2,6 +2,7 @@
 name = "kapsl-pyo3"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Python bindings for the Kapsl inference engine"
@@ -15,4 +16,4 @@ crate-type = ["cdylib"]
 pyo3 = { version = "0.29", features = ["extension-module", "abi3-py39"] }
 kapsl-communication = { path = "../kapsl-communication", default-features = false, features = ["hybrid"] }
 kapsl-engine-api = { path = "../kapsl-engine-api" }
-tokio = { version = "1", features = ["net", "rt", "sync"] }
+tokio = { version = "1", features = ["net", "rt-multi-thread", "sync"] }

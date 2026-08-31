@@ -2,6 +2,7 @@
 name = "kapsl-kernels"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Compute kernels for matrix operations and attention in Kapsl"

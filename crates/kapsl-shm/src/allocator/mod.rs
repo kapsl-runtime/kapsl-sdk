@@ -3,6 +3,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+mod shared;
+
+pub use shared::{SharedShmAllocator, SharedShmLease};
+
 const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(30);
 const DEFAULT_CLASS_SLOT_SIZES: [usize; 5] = [
     256 * 1024,       // 256 KiB
@@ -605,5 +609,5 @@ impl PerModelShmAllocator {
 }
 
 #[cfg(test)]
-#[path = "allocator_tests.rs"]
-mod allocator_tests;
+#[path = "tests.rs"]
+mod tests;

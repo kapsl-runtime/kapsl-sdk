@@ -2,12 +2,16 @@
 name = "kapsl-loader"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Safetensors weight loader and model config parser for the Kapsl native inference path"
 
+[package.metadata.cargo-machete]
+ignored = ["kapsl-hal"] # Public `cuda` feature forwarding; no direct Rust imports.
+
 [dependencies]
-kapsl-hal = { version = "0.3.0", path = "../kapsl-hal" }
+kapsl-hal = { version = "0.3.0", path = "../kapsl-hal", optional = true }
 half = "2.0"
 safetensors = "0.4"
 memmap2 = "0.9.11"
@@ -18,4 +22,4 @@ log = "0.4"
 
 [features]
 default = []
-cuda = ["kapsl-hal/cuda"]
+cuda = ["dep:kapsl-hal", "kapsl-hal/cuda"]

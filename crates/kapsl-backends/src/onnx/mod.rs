@@ -956,8 +956,8 @@ fn parse_ne_f32(bytes: &[u8], num_elements: usize) -> Cow<'_, [f32]> {
         return Cow::Borrowed(values);
     }
     let mut values = Vec::with_capacity(num_elements);
-    for chunk in bytes.chunks_exact(4) {
-        values.push(f32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    for chunk in bytes.as_chunks::<4>().0 {
+        values.push(f32::from_ne_bytes(*chunk));
     }
     Cow::Owned(values)
 }
@@ -967,10 +967,8 @@ fn parse_ne_f64(bytes: &[u8], num_elements: usize) -> Cow<'_, [f64]> {
         return Cow::Borrowed(values);
     }
     let mut values = Vec::with_capacity(num_elements);
-    for chunk in bytes.chunks_exact(8) {
-        values.push(f64::from_ne_bytes([
-            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
-        ]));
+    for chunk in bytes.as_chunks::<8>().0 {
+        values.push(f64::from_ne_bytes(*chunk));
     }
     Cow::Owned(values)
 }
@@ -982,8 +980,8 @@ fn parse_ne_f16(bytes: &[u8], num_elements: usize) -> Vec<f16> {
         return out;
     }
     let mut values = Vec::with_capacity(num_elements);
-    for chunk in bytes.chunks_exact(2) {
-        values.push(f16::from_bits(u16::from_ne_bytes([chunk[0], chunk[1]])));
+    for chunk in bytes.as_chunks::<2>().0 {
+        values.push(f16::from_bits(u16::from_ne_bytes(*chunk)));
     }
     values
 }
@@ -993,8 +991,8 @@ fn parse_ne_i32(bytes: &[u8], num_elements: usize) -> Cow<'_, [i32]> {
         return Cow::Borrowed(values);
     }
     let mut values = Vec::with_capacity(num_elements);
-    for chunk in bytes.chunks_exact(4) {
-        values.push(i32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    for chunk in bytes.as_chunks::<4>().0 {
+        values.push(i32::from_ne_bytes(*chunk));
     }
     Cow::Owned(values)
 }
@@ -1004,10 +1002,8 @@ fn parse_ne_i64(bytes: &[u8], num_elements: usize) -> Cow<'_, [i64]> {
         return Cow::Borrowed(values);
     }
     let mut values = Vec::with_capacity(num_elements);
-    for chunk in bytes.chunks_exact(8) {
-        values.push(i64::from_ne_bytes([
-            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
-        ]));
+    for chunk in bytes.as_chunks::<8>().0 {
+        values.push(i64::from_ne_bytes(*chunk));
     }
     Cow::Owned(values)
 }

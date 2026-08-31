@@ -1,9 +1,9 @@
 //! Platform-native IPC server and inference request dispatch.
 
 use crate::protocol::{
-    HybridRequest, HybridResponse, OP_HYBRID_INFER, OP_INFER, OP_INFER_STREAM, OP_OPENAI_WIRE,
-    OP_OPENAI_WIRE_STREAM, STATUS_ERR, STATUS_OK, STATUS_OPENAI_WIRE_CHUNK,
-    STATUS_OPENAI_WIRE_HEAD, STATUS_STREAM_CHUNK, STATUS_STREAM_END,
+    HybridRequest, HybridResponse, HYBRID_SHM_PROTOCOL_VERSION, OP_HYBRID_INFER, OP_INFER,
+    OP_INFER_STREAM, OP_OPENAI_WIRE, OP_OPENAI_WIRE_STREAM, STATUS_ERR, STATUS_OK,
+    STATUS_OPENAI_WIRE_CHUNK, STATUS_OPENAI_WIRE_HEAD, STATUS_STREAM_CHUNK, STATUS_STREAM_END,
 };
 use async_trait::async_trait;
 #[cfg(feature = "hybrid")]
@@ -29,6 +29,8 @@ use tokio::net::windows::named_pipe::ServerOptions;
 use tokio::net::{UnixListener, UnixStream};
 
 #[cfg(feature = "hybrid")]
+use kapsl_shm::allocator::{SharedShmAllocator, SharedShmLease};
+#[cfg(feature = "hybrid")]
 use kapsl_shm::memory::{ShmManager, TensorHeader};
 
 pub type SchedulerLookup =
@@ -41,6 +43,8 @@ pub struct HybridTensorLocation {
     pub offset: u64,
     /// Total encoded size of the tensor header and payload in bytes.
     pub size: u64,
+    /// Process-shared lease token protecting this region.
+    pub lease: u64,
 }
 
 /// Shared-memory operations required by the IPC hybrid opcode.
@@ -53,30 +57,56 @@ pub trait HybridMemory: Send + Sync {
     /// Decode a tensor from a caller-declared shared-memory region.
     fn read_tensor(&self, offset: u64, encoded_size: u64) -> Result<BinaryTensorPacket, String>;
 
+    /// Decode a tensor protected by a process-shared lease.
+    ///
+    /// The default preserves source compatibility for injected test or custom
+    /// adapters that own allocation safety outside `kapsl-shm`.
+    fn read_leased_tensor(
+        &self,
+        location: HybridTensorLocation,
+    ) -> Result<BinaryTensorPacket, String> {
+        self.read_tensor(location.offset, location.size)
+    }
+
     /// Encode an inference result and return the region advertised to the client.
     fn write_tensor(&self, tensor: &BinaryTensorPacket) -> Result<HybridTensorLocation, String>;
+
+    /// Release an encoded tensor when its control-plane response could not be
+    /// delivered. Adapters without lease ownership may keep the default no-op.
+    fn release_tensor(&self, _location: HybridTensorLocation) -> bool {
+        false
+    }
 }
 
 #[cfg(feature = "hybrid")]
-impl HybridMemory for ShmManager {
-    fn read_tensor(&self, offset: u64, encoded_size: u64) -> Result<BinaryTensorPacket, String> {
-        let offset = usize::try_from(offset)
-            .map_err(|_| "Hybrid tensor offset exceeds platform limits".to_string())?;
-        let encoded_size = usize::try_from(encoded_size)
-            .map_err(|_| "Hybrid tensor size exceeds platform limits".to_string())?;
+struct ShmHybridMemory {
+    shm: Arc<ShmManager>,
+    allocator: SharedShmAllocator,
+}
+
+#[cfg(feature = "hybrid")]
+impl ShmHybridMemory {
+    fn new(shm: Arc<ShmManager>) -> Self {
+        let allocator =
+            SharedShmAllocator::connect(shm.clone(), std::time::Duration::from_secs(30));
+        Self { shm, allocator }
+    }
+
+    fn decode_tensor(
+        &self,
+        lease: SharedShmLease,
+        encoded_size: usize,
+    ) -> Result<BinaryTensorPacket, String> {
+        let offset = lease.offset();
         let header_size = std::mem::size_of::<TensorHeader>();
         if encoded_size < header_size {
             return Err(format!(
                 "Hybrid tensor region is too small: {encoded_size} bytes"
             ));
         }
-        let header_end = offset
-            .checked_add(header_size)
-            .filter(|end| *end <= self.size())
-            .ok_or_else(|| "Hybrid tensor header exceeds SHM bounds".to_string())?;
-
-        let header =
-            unsafe { std::ptr::read_unaligned(self.as_ptr().add(offset) as *const TensorHeader) };
+        let header = unsafe {
+            std::ptr::read_unaligned(self.shm.as_ptr().add(offset).cast::<TensorHeader>())
+        };
         let rank = usize::try_from(header.ndim)
             .map_err(|_| "Hybrid tensor rank exceeds platform limits".to_string())?;
         if rank > header.shape.len() {
@@ -91,18 +121,12 @@ impl HybridMemory for ShmManager {
         let total_size = header_size
             .checked_add(data_size)
             .ok_or_else(|| "Hybrid tensor encoded size overflow".to_string())?;
-        if total_size > encoded_size {
+        if total_size > encoded_size || total_size > lease.capacity() {
             return Err(format!(
-                "Hybrid tensor payload exceeds declared region: required={total_size}, declared={encoded_size}"
+                "Hybrid tensor payload exceeds its lease: required={total_size}, declared={encoded_size}, capacity={}",
+                lease.capacity()
             ));
         }
-        let data_end = offset
-            .checked_add(total_size)
-            .filter(|end| *end <= self.size())
-            .ok_or_else(|| "Hybrid tensor payload exceeds SHM bounds".to_string())?;
-        debug_assert_eq!(header_end, offset + header_size);
-        debug_assert!(data_end >= header_end);
-
         let dtype = match header.dtype {
             0 => TensorDtype::Float32,
             1 => TensorDtype::Float64,
@@ -111,23 +135,41 @@ impl HybridMemory for ShmManager {
             value => return Err(format!("Unsupported hybrid tensor dtype code {value}")),
         };
         let data = unsafe {
-            std::slice::from_raw_parts(self.as_ptr().add(header_end), data_size).to_vec()
+            std::slice::from_raw_parts(self.shm.as_ptr().add(offset + header_size), data_size)
+                .to_vec()
         };
-
         Ok(BinaryTensorPacket {
             shape: header.shape[..rank].to_vec(),
             dtype,
             data,
         })
     }
+}
+
+#[cfg(feature = "hybrid")]
+impl HybridMemory for ShmHybridMemory {
+    fn read_tensor(&self, _offset: u64, _encoded_size: u64) -> Result<BinaryTensorPacket, String> {
+        Err("Hybrid SHM tensors require a process-shared lease".to_string())
+    }
+
+    fn read_leased_tensor(
+        &self,
+        location: HybridTensorLocation,
+    ) -> Result<BinaryTensorPacket, String> {
+        let offset = usize::try_from(location.offset)
+            .map_err(|_| "Hybrid tensor offset exceeds platform limits".to_string())?;
+        let encoded_size = usize::try_from(location.size)
+            .map_err(|_| "Hybrid tensor size exceeds platform limits".to_string())?;
+        let lease = self
+            .allocator
+            .acquire(offset, encoded_size, location.lease)
+            .ok_or_else(|| "Hybrid request carries an invalid or expired SHM lease".to_string())?;
+        let result = self.decode_tensor(lease, encoded_size);
+        let _ = self.allocator.release(lease);
+        result
+    }
 
     fn write_tensor(&self, tensor: &BinaryTensorPacket) -> Result<HybridTensorLocation, String> {
-        const OUTPUT_REGION_OFFSET: usize = 512 * 1024 * 1024;
-        const OUTPUT_SLOT_SIZE: usize = 1_000_000;
-        const OUTPUT_SLOT_COUNT: usize = 400;
-        static OUTPUT_SLOT_COUNTER: std::sync::atomic::AtomicUsize =
-            std::sync::atomic::AtomicUsize::new(0);
-
         if tensor.shape.len() > 8 {
             return Err(format!(
                 "Hybrid tensor rank {} exceeds maximum 8",
@@ -138,27 +180,6 @@ impl HybridMemory for ShmManager {
         let total_size = header_size
             .checked_add(tensor.data.len())
             .ok_or_else(|| "Hybrid output tensor size overflow".to_string())?;
-        if total_size > OUTPUT_SLOT_SIZE {
-            return Err(format!(
-                "Hybrid output requires {total_size} bytes but slot capacity is {OUTPUT_SLOT_SIZE}"
-            ));
-        }
-
-        let slot = OUTPUT_SLOT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            % OUTPUT_SLOT_COUNT;
-        let offset = OUTPUT_REGION_OFFSET
-            .checked_add(slot * OUTPUT_SLOT_SIZE)
-            .ok_or_else(|| "Hybrid output offset overflow".to_string())?;
-        offset
-            .checked_add(total_size)
-            .filter(|end| *end <= self.size())
-            .ok_or_else(|| {
-                format!(
-                    "Hybrid output exceeds SHM bounds: offset={offset}, size={total_size}, shm_size={}",
-                    self.size()
-                )
-            })?;
-
         let dtype = match tensor.dtype {
             TensorDtype::Float32 => 0,
             TensorDtype::Float64 => 1,
@@ -166,6 +187,12 @@ impl HybridMemory for ShmManager {
             TensorDtype::Int64 => 3,
             other => return Err(format!("Unsupported hybrid output dtype {other}")),
         };
+        let lease = self.allocator.try_allocate(total_size).ok_or_else(|| {
+            format!(
+                "Hybrid SHM pool exhausted: required={total_size}, largest_slot={}",
+                self.allocator.largest_slot_size()
+            )
+        })?;
         let mut shape = [0i64; 8];
         shape[..tensor.shape.len()].copy_from_slice(&tensor.shape);
         let header = TensorHeader {
@@ -177,18 +204,29 @@ impl HybridMemory for ShmManager {
         };
 
         unsafe {
-            std::ptr::write_unaligned(self.as_ptr().add(offset) as *mut TensorHeader, header);
+            std::ptr::write_unaligned(
+                self.shm.as_ptr().add(lease.offset()).cast::<TensorHeader>(),
+                header,
+            );
             std::ptr::copy_nonoverlapping(
                 tensor.data.as_ptr(),
-                self.as_ptr().add(offset + header_size),
+                self.shm.as_ptr().add(lease.offset() + header_size),
                 tensor.data.len(),
             );
         }
 
         Ok(HybridTensorLocation {
-            offset: offset as u64,
+            offset: lease.offset() as u64,
             size: total_size as u64,
+            lease: lease.token(),
         })
+    }
+
+    fn release_tensor(&self, location: HybridTensorLocation) -> bool {
+        let Ok(offset) = usize::try_from(location.offset) else {
+            return false;
+        };
+        self.allocator.release_wire(offset, location.lease)
     }
 }
 
@@ -366,7 +404,8 @@ impl IpcServer {
         scheduler_lookup: SchedulerLookup,
         shm_manager: Option<Arc<ShmManager>>,
     ) -> Self {
-        let hybrid_memory = shm_manager.map(|manager| manager as Arc<dyn HybridMemory>);
+        let hybrid_memory = shm_manager
+            .map(|manager| Arc::new(ShmHybridMemory::new(manager)) as Arc<dyn HybridMemory>);
         Self::new_with_lookup_and_hybrid_memory(socket_path, scheduler_lookup, hybrid_memory)
     }
 
@@ -772,19 +811,33 @@ where
             }
             OP_HYBRID_INFER => {
                 let hybrid_req: HybridRequest = frame.deserialize().map_err(codec_io)?;
+                if hybrid_req.protocol_version != HYBRID_SHM_PROTOCOL_VERSION {
+                    write_error_response(
+                        &mut connection,
+                        &format!(
+                            "Unsupported hybrid SHM protocol version {}; expected {}",
+                            hybrid_req.protocol_version, HYBRID_SHM_PROTOCOL_VERSION
+                        ),
+                    )
+                    .await?;
+                    continue;
+                }
                 let Some(hybrid_memory) = hybrid_memory.as_ref() else {
                     write_error_response(&mut connection, "Hybrid memory is not configured")
                         .await?;
                     continue;
                 };
-                let packet =
-                    match hybrid_memory.read_tensor(hybrid_req.shm_offset, hybrid_req.shm_size) {
-                        Ok(packet) => packet,
-                        Err(error) => {
-                            write_error_response(&mut connection, &error).await?;
-                            continue;
-                        }
-                    };
+                let packet = match hybrid_memory.read_leased_tensor(HybridTensorLocation {
+                    offset: hybrid_req.shm_offset,
+                    size: hybrid_req.shm_size,
+                    lease: hybrid_req.shm_lease,
+                }) {
+                    Ok(packet) => packet,
+                    Err(error) => {
+                        write_error_response(&mut connection, &error).await?;
+                        continue;
+                    }
+                };
                 let request = InferenceRequest {
                     input: packet,
                     additional_inputs: Vec::new(),
@@ -817,10 +870,16 @@ where
                                 },
                                 shm_offset: location.offset,
                                 shm_size: location.size,
+                                shm_lease: location.lease,
+                                protocol_version: HYBRID_SHM_PROTOCOL_VERSION,
                             };
-                            wire::write_response_value(&mut connection, STATUS_OK, &response)
-                                .await
-                                .map_err(codec_io)?;
+                            if let Err(error) =
+                                wire::write_response_value(&mut connection, STATUS_OK, &response)
+                                    .await
+                            {
+                                let _ = hybrid_memory.release_tensor(location);
+                                return Err(codec_io(error));
+                            }
                         }
                         Err(error) => {
                             write_error_response(&mut connection, &error).await?;
@@ -908,6 +967,7 @@ mod tests {
             Ok(HybridTensorLocation {
                 offset: 900,
                 size: 120,
+                lease: 91,
             })
         }
     }
@@ -1127,13 +1187,14 @@ mod tests {
     fn shm_hybrid_memory_reads_validated_tensor_regions() {
         let name = format!("/kapsl-ipc-hybrid-memory-{}", std::process::id());
         let manager = match ShmManager::create(&name, 1024 * 1024) {
-            Ok(manager) => manager,
+            Ok(manager) => Arc::new(manager),
             Err(error) => {
                 eprintln!("Skipping shared memory test (mapping creation failed: {error})");
                 return;
             }
         };
-        let offset = manager.tensor_pool_offset();
+        let allocator =
+            SharedShmAllocator::connect(manager.clone(), std::time::Duration::from_secs(30));
         let data = 3.0f32.to_ne_bytes();
         let header = TensorHeader {
             ndim: 2,
@@ -1143,26 +1204,51 @@ mod tests {
             data_size: data.len() as u64,
         };
         let header_size = std::mem::size_of::<TensorHeader>();
+        let encoded_size = header_size + data.len();
+        let lease = allocator
+            .try_allocate(encoded_size)
+            .expect("allocate input slot");
         unsafe {
-            std::ptr::write_unaligned(manager.as_ptr().add(offset) as *mut TensorHeader, header);
+            std::ptr::write_unaligned(
+                manager.as_ptr().add(lease.offset()).cast::<TensorHeader>(),
+                header,
+            );
             std::ptr::copy_nonoverlapping(
                 data.as_ptr(),
-                manager.as_ptr().add(offset + header_size),
+                manager.as_ptr().add(lease.offset() + header_size),
                 data.len(),
             );
         }
 
-        let packet = manager
-            .read_tensor(offset as u64, (header_size + data.len()) as u64)
+        let adapter = ShmHybridMemory::new(manager);
+        let packet = adapter
+            .read_leased_tensor(HybridTensorLocation {
+                offset: lease.offset() as u64,
+                size: encoded_size as u64,
+                lease: lease.token(),
+            })
             .expect("read hybrid tensor");
         assert_eq!(packet.shape, vec![1, 1]);
         assert_eq!(packet.dtype, TensorDtype::Float32);
         assert_eq!(packet.data, data);
 
-        let output_error = manager
-            .write_tensor(&packet)
-            .expect_err("small mappings cannot contain the compatibility output region");
-        assert!(output_error.contains("exceeds SHM bounds"));
+        let output = adapter.write_tensor(&packet).expect("write hybrid tensor");
+        assert!(adapter
+            .allocator
+            .validate(output.offset as usize, output.size as usize, output.lease)
+            .is_some());
+        assert!(adapter
+            .allocator
+            .release_wire(output.offset as usize, output.lease));
+
+        let before = adapter.allocator.snapshot().in_use_slots;
+        let unsupported = BinaryTensorPacket {
+            shape: vec![1],
+            dtype: TensorDtype::Uint8,
+            data: vec![1],
+        };
+        assert!(adapter.write_tensor(&unsupported).is_err());
+        assert_eq!(adapter.allocator.snapshot().in_use_slots, before);
     }
 
     #[tokio::test]
@@ -1288,6 +1374,8 @@ mod tests {
             metadata: kapsl_transport::RequestMetadata::new(44, 7, 1, false),
             shm_offset: 100,
             shm_size: 80,
+            shm_lease: 55,
+            protocol_version: HYBRID_SHM_PROTOCOL_VERSION,
         };
 
         wire::write_request_value(&mut client, 7, OP_HYBRID_INFER, &request)
@@ -1301,6 +1389,8 @@ mod tests {
         assert_eq!(response.metadata.request_id, 44);
         assert_eq!(response.shm_offset, 900);
         assert_eq!(response.shm_size, 120);
+        assert_eq!(response.shm_lease, 91);
+        assert_eq!(response.protocol_version, HYBRID_SHM_PROTOCOL_VERSION);
         assert_eq!(*memory.reads.lock().unwrap(), vec![(100, 80)]);
         {
             let writes = memory.writes.lock().unwrap();
@@ -1309,6 +1399,37 @@ mod tests {
             assert_eq!(writes[0].dtype, input.dtype);
             assert_eq!(writes[0].data, input.data);
         }
+        drop(client);
+        task.await
+            .expect("server task")
+            .expect("connection handler");
+    }
+
+    #[tokio::test]
+    async fn hybrid_opcode_rejects_stale_shared_memory_protocols() {
+        let scheduler: Arc<dyn ReplicaScheduler + Send + Sync> =
+            Arc::new(PriorityRecordingScheduler {
+                seen: Arc::new(Mutex::new(Vec::new())),
+            });
+        let (mut client, server) = duplex(4096);
+        let task = tokio::spawn(handle_connection(server, lookup_for(scheduler), None, None));
+        let request = HybridRequest {
+            metadata: kapsl_transport::RequestMetadata::new(45, 7, 1, false),
+            shm_offset: 100,
+            shm_size: 80,
+            shm_lease: 55,
+            protocol_version: HYBRID_SHM_PROTOCOL_VERSION - 1,
+        };
+
+        wire::write_request_value(&mut client, 7, OP_HYBRID_INFER, &request)
+            .await
+            .expect("write stale hybrid request");
+        let response = read_response(&mut client).await;
+        assert_eq!(response.header.status, STATUS_ERR);
+        assert!(response
+            .remote_error()
+            .to_string()
+            .contains("protocol version"));
         drop(client);
         task.await
             .expect("server task")

@@ -183,16 +183,20 @@ impl TensorData {
             DType::F16 => {
                 self.assert_dense_byte_len(2);
                 self.bytes
-                    .chunks_exact(2)
-                    .map(|bytes| f16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])))
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|bytes| f16::from_bits(u16::from_le_bytes(*bytes)))
                     .collect()
             }
             DType::BF16 => {
                 self.assert_dense_byte_len(2);
                 self.bytes
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|bytes| {
-                        let value = bf16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]]));
+                        let value = bf16::from_bits(u16::from_le_bytes(*bytes));
                         f16::from_f32(value.to_f32())
                     })
                     .collect()
@@ -200,10 +204,10 @@ impl TensorData {
             DType::F32 => {
                 self.assert_dense_byte_len(4);
                 self.bytes
-                    .chunks_exact(4)
-                    .map(|bytes| {
-                        f16::from_f32(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-                    })
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|bytes| f16::from_f32(f32::from_le_bytes(*bytes)))
                     .collect()
             }
             _ => panic!("Cannot convert {:?} tensor to f16", self.dtype),

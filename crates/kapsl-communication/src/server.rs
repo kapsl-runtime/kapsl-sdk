@@ -94,12 +94,8 @@ impl CommunicationServer {
         scheduler_lookup: SchedulerLookup,
     ) -> Result<Self, CommunicationError> {
         let shm = Arc::new(kapsl_shm::ShmManager::create(shm_name, shm_size)?);
-        let hybrid_memory: Arc<dyn kapsl_ipc::HybridMemory> = shm;
-        let server = kapsl_ipc::IpcServer::new_with_lookup_and_hybrid_memory(
-            socket_path,
-            scheduler_lookup,
-            Some(hybrid_memory),
-        );
+        let server =
+            kapsl_ipc::IpcServer::new_with_lookup(socket_path, scheduler_lookup, Some(shm));
         Ok(Self {
             inner: Arc::new(server),
             endpoint: format!("{socket_path} (shm: {shm_name})"),
