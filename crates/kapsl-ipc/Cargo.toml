@@ -2,6 +2,7 @@
 name = "kapsl-ipc"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Inter-process communication protocol for Kapsl engine clients"

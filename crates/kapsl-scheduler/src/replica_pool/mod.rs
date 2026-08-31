@@ -155,7 +155,7 @@ where
                 )
             })
             .collect::<Vec<_>>();
-        fallback_schedulers.sort_by(|left, right| left.0.cmp(&right.0));
+        fallback_schedulers.sort_by_key(|entry| entry.0);
 
         Ok(DispatchPlan {
             selected_replica_id: selected.replica_id,

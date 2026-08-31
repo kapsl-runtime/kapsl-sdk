@@ -26,9 +26,7 @@ jobs:
           submodules: recursive
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.92.0
+        uses: ./.github/actions/setup-rust
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
@@ -51,9 +49,7 @@ jobs:
           submodules: recursive
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.92.0
+        uses: ./.github/actions/setup-rust
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
@@ -77,9 +73,7 @@ jobs:
           python-version: "3.11"
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.92.0
+        uses: ./.github/actions/setup-rust
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
@@ -94,3 +88,26 @@ jobs:
         run: |
           pip install twine
           twine check dist/*
+
+  msrv:
+    name: Cargo check (MSRV)
+    runs-on: ubuntu-latest
+    env:
+      PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up workspace MSRV
+        uses: ./.github/actions/setup-rust
+        with:
+          msrv: true
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: msrv
+
+      - name: Check SDK workspace on its minimum Rust version
+        run: cargo check --workspace --locked

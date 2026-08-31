@@ -5259,10 +5259,8 @@ impl LLMEngine {
             self.device_kv_device_id,
             PoolAllocationClass::TransientWorkspace,
         );
-        let outputs = if self.decode_session.is_some() {
-            self.decode_session
-                .as_mut()
-                .unwrap()
+        let outputs = if let Some(decode_session) = self.decode_session.as_mut() {
+            decode_session
                 .run(inputs)
                 .map_err(|e| EngineError::backend(e.to_string()))?
         } else {

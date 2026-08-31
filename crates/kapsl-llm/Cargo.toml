@@ -2,6 +2,7 @@
 name = "kapsl-llm"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Large language model inference with GGUF and ONNX backend support for Kapsl"

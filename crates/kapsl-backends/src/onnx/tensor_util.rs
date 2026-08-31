@@ -13,8 +13,10 @@ pub(crate) fn dim_usize(d: i64) -> usize {
 
 /// Reinterpret little-endian bytes as f32 values, ignoring a trailing partial element.
 pub(crate) fn bytes_to_f32(data: &[u8]) -> Vec<f32> {
-    data.chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    data.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
         .collect()
 }
 

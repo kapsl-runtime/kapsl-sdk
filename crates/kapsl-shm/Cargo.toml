@@ -2,6 +2,7 @@
 name = "kapsl-shm"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Shared memory transport for high-throughput inter-process tensor transfer in Kapsl"

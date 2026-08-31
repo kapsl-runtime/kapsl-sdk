@@ -2,6 +2,7 @@
 name = "kapsl-backends"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Pluggable inference backends (ONNX, llama.cpp) for the Kapsl engine"

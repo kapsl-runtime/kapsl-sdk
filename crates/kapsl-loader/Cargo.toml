@@ -2,6 +2,7 @@
 name = "kapsl-loader"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Safetensors weight loader and model config parser for the Kapsl native inference path"

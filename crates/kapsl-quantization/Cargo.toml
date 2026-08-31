@@ -2,6 +2,7 @@
 name = "kapsl-quantization"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Model weight quantization formats and conversion utilities for Kapsl"

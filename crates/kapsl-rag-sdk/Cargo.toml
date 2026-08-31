@@ -2,6 +2,7 @@
 name = "kapsl-rag-sdk"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Lightweight connector protocol, manifests, and authoring traits for Kapsl"

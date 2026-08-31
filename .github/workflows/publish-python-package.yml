@@ -44,9 +44,7 @@ jobs:
           PY
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.92.0
+        uses: ./.github/actions/setup-rust
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
@@ -94,9 +92,7 @@ jobs:
           PY
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.92.0
+        uses: ./.github/actions/setup-rust
 
       - name: Build source distribution
         uses: PyO3/maturin-action@v1

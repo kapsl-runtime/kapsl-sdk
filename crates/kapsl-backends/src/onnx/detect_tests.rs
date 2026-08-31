@@ -26,10 +26,7 @@ fn raw_packet(rows: &[Vec<f32>]) -> BinaryTensorPacket {
 fn decode_rows(out: &BinaryTensorPacket) -> Vec<[f32; 6]> {
     assert_eq!(out.dtype, TensorDtype::Float32);
     assert_eq!(out.shape[1], 6);
-    bytes_to_f32(&out.data)
-        .chunks_exact(6)
-        .map(|c| [c[0], c[1], c[2], c[3], c[4], c[5]])
-        .collect()
+    bytes_to_f32(&out.data).as_chunks::<6>().0.to_vec()
 }
 
 #[test]

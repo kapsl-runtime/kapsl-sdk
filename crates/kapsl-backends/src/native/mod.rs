@@ -1850,8 +1850,10 @@ mod inner {
                 });
             }
             Ok(p.data
-                .chunks_exact(4)
-                .map(|b| i32::from_le_bytes(b.try_into().unwrap()) as u32)
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| i32::from_le_bytes(*b) as u32)
                 .collect())
         }
 
