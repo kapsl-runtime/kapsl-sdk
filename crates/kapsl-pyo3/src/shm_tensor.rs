@@ -1,4 +1,4 @@
-use kapsl_communication::shm::allocator::{ShmPoolAllocator, TieredShmAllocator};
+use kapsl_communication::shm::allocator::{SharedShmAllocator, SharedShmLease};
 use kapsl_communication::shm::memory::{ShmManager, TensorHeader};
 use kapsl_engine_api::{BinaryTensorPacket, TensorDtype};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -12,15 +12,6 @@ use std::time::Duration;
 const MAX_TENSOR_RANK: usize = 8;
 const MAX_ERROR_MESSAGE_BYTES: usize = 64 * 1024;
 const SLOT_LEASE_TTL: Duration = Duration::from_secs(30);
-
-pub(crate) fn next_request_id(counter: &mut u64) -> u64 {
-    let request_id = *counter;
-    *counter = counter.wrapping_add(1);
-    if *counter == 0 {
-        *counter = 1;
-    }
-    request_id
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ShmTensorError {
@@ -52,9 +43,11 @@ impl From<ShmTensorError> for PyErr {
 
 /// Owns a shared-memory allocation until the request has completed.
 pub(crate) struct StagedTensor {
-    allocator: Arc<TieredShmAllocator>,
+    allocator: Arc<SharedShmAllocator>,
+    lease: Option<SharedShmLease>,
     offset: usize,
     encoded_size: usize,
+    lease_token: u64,
 }
 
 impl StagedTensor {
@@ -65,24 +58,89 @@ impl StagedTensor {
     pub(crate) fn encoded_size(&self) -> usize {
         self.encoded_size
     }
+
+    pub(crate) fn lease_token(&self) -> u64 {
+        self.lease_token
+    }
+
+    /// Transfer responsibility for releasing the input slot to the server.
+    pub(crate) fn transfer_to_server(&mut self) {
+        self.lease = None;
+    }
 }
 
 impl Drop for StagedTensor {
     fn drop(&mut self) {
-        let _ = self.allocator.release(self.offset);
+        if let Some(lease) = self.lease.take() {
+            let _ = self.allocator.release(lease);
+        }
+    }
+}
+
+struct LeaseReleaseGuard<'a> {
+    allocator: &'a SharedShmAllocator,
+    lease: Option<SharedShmLease>,
+}
+
+/// Best-effort release for a lease copied from response metadata.
+///
+/// Tensor/error readers renew the exact generation and own their own guard.
+/// Keeping this outer guard ensures malformed offsets, sizes, or headers do not
+/// leave the original advertised lease live until its timeout.
+pub(crate) struct WireLeaseReleaseGuard<'a> {
+    allocator: &'a SharedShmAllocator,
+    offset: u64,
+    token: u64,
+}
+
+impl<'a> WireLeaseReleaseGuard<'a> {
+    pub(crate) fn new(allocator: &'a SharedShmAllocator, offset: u64, token: u64) -> Option<Self> {
+        (offset > 0 && token > 0).then_some(Self {
+            allocator,
+            offset,
+            token,
+        })
+    }
+}
+
+impl Drop for WireLeaseReleaseGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(offset) = usize::try_from(self.offset) {
+            let _ = self.allocator.release_wire(offset, self.token);
+        }
+    }
+}
+
+impl<'a> LeaseReleaseGuard<'a> {
+    fn new(allocator: &'a SharedShmAllocator, lease: SharedShmLease) -> Self {
+        Self {
+            allocator,
+            lease: Some(lease),
+        }
+    }
+
+    fn lease(&self) -> SharedShmLease {
+        self.lease.expect("lease guard is active")
+    }
+}
+
+impl Drop for LeaseReleaseGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(lease) = self.lease.take() {
+            let _ = self.allocator.release(lease);
+        }
     }
 }
 
 pub(crate) fn create_tensor_allocator(
-    shm: &ShmManager,
-) -> Result<Arc<TieredShmAllocator>, ShmTensorError> {
+    shm: &Arc<ShmManager>,
+) -> Result<Arc<SharedShmAllocator>, ShmTensorError> {
     let pool_offset = shm.tensor_pool_offset();
     let pool_size = shm.max_tensor_size();
     checked_region(shm.size(), pool_offset, pool_size, "tensor pool")?;
 
-    Ok(Arc::new(TieredShmAllocator::new_with_default_classes(
-        pool_offset,
-        pool_size,
+    Ok(Arc::new(SharedShmAllocator::connect(
+        shm.clone(),
         SLOT_LEASE_TTL,
     )))
 }
@@ -96,14 +154,14 @@ pub(crate) fn parse_shm_dtype(value: &str) -> Result<TensorDtype, ShmTensorError
 
 pub(crate) fn stage_tensor(
     shm: &ShmManager,
-    allocator: &Arc<TieredShmAllocator>,
+    allocator: &Arc<SharedShmAllocator>,
     shape: &[i64],
     dtype: TensorDtype,
     data: &[u8],
 ) -> Result<StagedTensor, ShmTensorError> {
     let header = build_header(shape, dtype, data.len())?;
     let encoded_size = tensor_size(data.len())?;
-    let offset = allocator.try_allocate(encoded_size).ok_or_else(|| {
+    let lease = allocator.try_allocate(encoded_size).ok_or_else(|| {
         ShmTensorError::PoolExhausted(format!(
             "SHM tensor pool exhausted (required={} bytes, largest_slot={} bytes, layout={})",
             encoded_size,
@@ -112,31 +170,42 @@ pub(crate) fn stage_tensor(
         ))
     })?;
 
-    if let Err(error) = write_tensor(shm, offset, &header, data) {
-        let _ = allocator.release(offset);
+    if let Err(error) = write_tensor(shm, lease.offset(), &header, data) {
+        let _ = allocator.release(lease);
         return Err(error);
     }
 
     Ok(StagedTensor {
         allocator: Arc::clone(allocator),
-        offset,
+        lease: Some(lease),
+        offset: lease.offset(),
         encoded_size,
+        lease_token: lease.token(),
     })
 }
 
 pub(crate) fn read_tensor(
     shm: &ShmManager,
+    allocator: &SharedShmAllocator,
     offset: usize,
     encoded_size: usize,
+    lease_token: u64,
 ) -> Result<BinaryTensorPacket, ShmTensorError> {
     let header_size = size_of::<TensorHeader>();
+    let lease = allocator
+        .acquire(offset, encoded_size, lease_token)
+        .ok_or_else(|| {
+            ShmTensorError::InvalidMemory(
+                "SHM response carries an invalid or expired tensor lease".to_string(),
+            )
+        })?;
+    let lease_guard = LeaseReleaseGuard::new(allocator, lease);
     if encoded_size < header_size {
         return Err(ShmTensorError::InvalidMemory(format!(
             "SHM tensor payload is too small: {} bytes (minimum {})",
             encoded_size, header_size
         )));
     }
-    checked_tensor_region(shm, offset, encoded_size)?;
 
     // SAFETY: the complete advertised region was checked above. `read_unaligned`
     // avoids assuming that a peer-supplied offset is naturally aligned.
@@ -146,10 +215,11 @@ pub(crate) fn read_tensor(
         ShmTensorError::InvalidMemory("SHM tensor rank cannot fit in usize".to_string())
     })?;
     if rank > MAX_TENSOR_RANK {
-        return Err(ShmTensorError::InvalidMemory(format!(
+        let error = ShmTensorError::InvalidMemory(format!(
             "SHM tensor rank {} exceeds the protocol maximum of {}",
             rank, MAX_TENSOR_RANK
-        )));
+        ));
+        return Err(error);
     }
 
     let data_size = usize::try_from(header.data_size).map_err(|_| {
@@ -162,7 +232,13 @@ pub(crate) fn read_tensor(
             required_size, encoded_size
         )));
     }
-    checked_tensor_region(shm, offset, required_size)?;
+    if required_size > lease_guard.lease().capacity() {
+        return Err(ShmTensorError::InvalidMemory(format!(
+            "SHM tensor requires {} bytes but lease capacity is {}",
+            required_size,
+            lease_guard.lease().capacity()
+        )));
+    }
     let dtype = decode_dtype(header.dtype)?;
 
     // SAFETY: `required_size` and the data start were checked against the
@@ -170,19 +246,29 @@ pub(crate) fn read_tensor(
     let data = unsafe {
         std::slice::from_raw_parts(shm.as_ptr().add(offset + header_size), data_size).to_vec()
     };
-    Ok(BinaryTensorPacket {
+    let packet = BinaryTensorPacket {
         shape: header.shape[..rank].to_vec(),
         dtype,
         data,
-    })
+    };
+    Ok(packet)
 }
 
 pub(crate) fn read_error_message(
     shm: &ShmManager,
+    allocator: &SharedShmAllocator,
     offset: usize,
+    lease_token: u64,
 ) -> Result<String, ShmTensorError> {
     let prefix_size = size_of::<u64>();
-    checked_tensor_region(shm, offset, prefix_size)?;
+    let lease = allocator
+        .acquire(offset, prefix_size, lease_token)
+        .ok_or_else(|| {
+            ShmTensorError::InvalidMemory(
+                "SHM error carries an invalid or expired tensor lease".to_string(),
+            )
+        })?;
+    let lease_guard = LeaseReleaseGuard::new(allocator, lease);
 
     // SAFETY: the prefix range was checked above and unaligned reads are used.
     let byte_len = unsafe { std::ptr::read_unaligned(shm.as_ptr().add(offset).cast::<u64>()) };
@@ -190,20 +276,26 @@ pub(crate) fn read_error_message(
         ShmTensorError::InvalidMemory("SHM error length cannot fit in usize".to_string())
     })?;
     if byte_len > MAX_ERROR_MESSAGE_BYTES {
-        return Err(ShmTensorError::InvalidMemory(format!(
+        let error = ShmTensorError::InvalidMemory(format!(
             "SHM error message exceeds the {} byte limit",
             MAX_ERROR_MESSAGE_BYTES
-        )));
+        ));
+        return Err(error);
     }
     let total_size = prefix_size.checked_add(byte_len).ok_or_else(|| {
         ShmTensorError::InvalidMemory("SHM error message size overflow".to_string())
     })?;
-    checked_tensor_region(shm, offset, total_size)?;
+    if total_size > lease_guard.lease().capacity() {
+        return Err(ShmTensorError::InvalidMemory(
+            "SHM error message exceeds its leased slot".to_string(),
+        ));
+    }
 
     // SAFETY: the complete error payload was checked against the mapped region.
     let bytes =
         unsafe { std::slice::from_raw_parts(shm.as_ptr().add(offset + prefix_size), byte_len) };
-    Ok(String::from_utf8_lossy(bytes).into_owned())
+    let message = String::from_utf8_lossy(bytes).into_owned();
+    Ok(message)
 }
 
 pub(crate) fn validate_region<T>(
@@ -370,14 +462,21 @@ mod tests {
     fn staged_tensor_round_trips_through_a_mapped_region() {
         // macOS limits POSIX shared-memory names to 31 bytes.
         let name = format!("/kp3_{}", std::process::id());
-        let shm = ShmManager::create(&name, 2 * 1024 * 1024).expect("create shared memory");
+        let shm =
+            Arc::new(ShmManager::create(&name, 2 * 1024 * 1024).expect("create shared memory"));
         let allocator = create_tensor_allocator(&shm).expect("create allocator");
         let data = [1_u8, 2, 3, 4, 5, 6, 7, 8];
         let staged = stage_tensor(&shm, &allocator, &[1, 2], TensorDtype::Int32, &data)
             .expect("stage tensor");
 
-        let decoded =
-            read_tensor(&shm, staged.offset(), staged.encoded_size()).expect("read staged tensor");
+        let decoded = read_tensor(
+            &shm,
+            &allocator,
+            staged.offset(),
+            staged.encoded_size(),
+            staged.lease_token(),
+        )
+        .expect("read staged tensor");
 
         assert_eq!(decoded.shape, vec![1, 2]);
         assert_eq!(decoded.dtype, TensorDtype::Int32);
@@ -389,14 +488,5 @@ mod tests {
         assert!(checked_region(128, 120, 8, "test").is_ok());
         assert!(checked_region(128, 120, 9, "test").is_err());
         assert!(checked_region(128, usize::MAX, 2, "test").is_err());
-    }
-
-    #[test]
-    fn request_ids_wrap_without_emitting_zero() {
-        let mut counter = u64::MAX;
-
-        assert_eq!(next_request_id(&mut counter), u64::MAX);
-        assert_eq!(next_request_id(&mut counter), 1);
-        assert_eq!(counter, 2);
     }
 }

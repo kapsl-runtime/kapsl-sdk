@@ -51,11 +51,13 @@ General-purpose client for runtime connections over TCP, Unix sockets, or Window
 
 ### `KapslShmClient`
 
-Shared-memory client for lower-overhead local inference workflows where request and response payloads are exchanged through shared memory.
+Shared-memory client for lower-overhead local inference workflows where request and response payloads are exchanged through shared memory. Concurrent calls use request-owned response mailboxes and process-shared tensor leases, so clients cannot consume or overwrite one another's in-flight payloads.
 
 ### `KapslHybridClient`
 
-Hybrid client that combines shared memory for tensor payloads with IPC signaling for coordination.
+Hybrid client that combines shared memory for tensor payloads with IPC signaling for coordination. A reusable control-connection pool allows concurrent calls on one client while tensor data remains in the shared-memory data plane.
+
+Both clients require the version 2 shared-memory protocol used by the matching runtime; upgrade and restart client and server together.
 
 ## Notes
 
