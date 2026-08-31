@@ -6,9 +6,10 @@ use crate::protocol::{
     STATUS_OPENAI_WIRE_HEAD, STATUS_STREAM_CHUNK, STATUS_STREAM_END,
 };
 use async_trait::async_trait;
+#[cfg(feature = "hybrid")]
+use kapsl_engine_api::TensorDtype;
 use kapsl_engine_api::{
     BinaryTensorPacket, CancellationToken, InferenceRequest, OpenAiWireFormat, OpenAiWireRequest,
-    TensorDtype,
 };
 use kapsl_scheduler::{Priority, ReplicaScheduler};
 use kapsl_transport::protocol::{
@@ -27,10 +28,169 @@ use tokio::net::windows::named_pipe::ServerOptions;
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 
+#[cfg(feature = "hybrid")]
 use kapsl_shm::memory::{ShmManager, TensorHeader};
 
 pub type SchedulerLookup =
     Arc<dyn Fn(u32) -> Option<Arc<dyn ReplicaScheduler + Send + Sync>> + Send + Sync>;
+
+/// Location of an encoded tensor in a hybrid transport's shared memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HybridTensorLocation {
+    /// Byte offset of the tensor header from the start of shared memory.
+    pub offset: u64,
+    /// Total encoded size of the tensor header and payload in bytes.
+    pub size: u64,
+}
+
+/// Shared-memory operations required by the IPC hybrid opcode.
+///
+/// Keeping this interface transport-neutral lets socket/TCP-only builds avoid
+/// linking a shared-memory implementation. The default `hybrid` feature still
+/// implements it for `kapsl_shm::memory::ShmManager` so existing constructors
+/// remain source compatible.
+pub trait HybridMemory: Send + Sync {
+    /// Decode a tensor from a caller-declared shared-memory region.
+    fn read_tensor(&self, offset: u64, encoded_size: u64) -> Result<BinaryTensorPacket, String>;
+
+    /// Encode an inference result and return the region advertised to the client.
+    fn write_tensor(&self, tensor: &BinaryTensorPacket) -> Result<HybridTensorLocation, String>;
+}
+
+#[cfg(feature = "hybrid")]
+impl HybridMemory for ShmManager {
+    fn read_tensor(&self, offset: u64, encoded_size: u64) -> Result<BinaryTensorPacket, String> {
+        let offset = usize::try_from(offset)
+            .map_err(|_| "Hybrid tensor offset exceeds platform limits".to_string())?;
+        let encoded_size = usize::try_from(encoded_size)
+            .map_err(|_| "Hybrid tensor size exceeds platform limits".to_string())?;
+        let header_size = std::mem::size_of::<TensorHeader>();
+        if encoded_size < header_size {
+            return Err(format!(
+                "Hybrid tensor region is too small: {encoded_size} bytes"
+            ));
+        }
+        let header_end = offset
+            .checked_add(header_size)
+            .filter(|end| *end <= self.size())
+            .ok_or_else(|| "Hybrid tensor header exceeds SHM bounds".to_string())?;
+
+        let header =
+            unsafe { std::ptr::read_unaligned(self.as_ptr().add(offset) as *const TensorHeader) };
+        let rank = usize::try_from(header.ndim)
+            .map_err(|_| "Hybrid tensor rank exceeds platform limits".to_string())?;
+        if rank > header.shape.len() {
+            return Err(format!(
+                "Hybrid tensor rank {} exceeds maximum {}",
+                rank,
+                header.shape.len()
+            ));
+        }
+        let data_size = usize::try_from(header.data_size)
+            .map_err(|_| "Hybrid tensor data size exceeds platform limits".to_string())?;
+        let total_size = header_size
+            .checked_add(data_size)
+            .ok_or_else(|| "Hybrid tensor encoded size overflow".to_string())?;
+        if total_size > encoded_size {
+            return Err(format!(
+                "Hybrid tensor payload exceeds declared region: required={total_size}, declared={encoded_size}"
+            ));
+        }
+        let data_end = offset
+            .checked_add(total_size)
+            .filter(|end| *end <= self.size())
+            .ok_or_else(|| "Hybrid tensor payload exceeds SHM bounds".to_string())?;
+        debug_assert_eq!(header_end, offset + header_size);
+        debug_assert!(data_end >= header_end);
+
+        let dtype = match header.dtype {
+            0 => TensorDtype::Float32,
+            1 => TensorDtype::Float64,
+            2 => TensorDtype::Int32,
+            3 => TensorDtype::Int64,
+            value => return Err(format!("Unsupported hybrid tensor dtype code {value}")),
+        };
+        let data = unsafe {
+            std::slice::from_raw_parts(self.as_ptr().add(header_end), data_size).to_vec()
+        };
+
+        Ok(BinaryTensorPacket {
+            shape: header.shape[..rank].to_vec(),
+            dtype,
+            data,
+        })
+    }
+
+    fn write_tensor(&self, tensor: &BinaryTensorPacket) -> Result<HybridTensorLocation, String> {
+        const OUTPUT_REGION_OFFSET: usize = 512 * 1024 * 1024;
+        const OUTPUT_SLOT_SIZE: usize = 1_000_000;
+        const OUTPUT_SLOT_COUNT: usize = 400;
+        static OUTPUT_SLOT_COUNTER: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+
+        if tensor.shape.len() > 8 {
+            return Err(format!(
+                "Hybrid tensor rank {} exceeds maximum 8",
+                tensor.shape.len()
+            ));
+        }
+        let header_size = std::mem::size_of::<TensorHeader>();
+        let total_size = header_size
+            .checked_add(tensor.data.len())
+            .ok_or_else(|| "Hybrid output tensor size overflow".to_string())?;
+        if total_size > OUTPUT_SLOT_SIZE {
+            return Err(format!(
+                "Hybrid output requires {total_size} bytes but slot capacity is {OUTPUT_SLOT_SIZE}"
+            ));
+        }
+
+        let slot = OUTPUT_SLOT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            % OUTPUT_SLOT_COUNT;
+        let offset = OUTPUT_REGION_OFFSET
+            .checked_add(slot * OUTPUT_SLOT_SIZE)
+            .ok_or_else(|| "Hybrid output offset overflow".to_string())?;
+        offset
+            .checked_add(total_size)
+            .filter(|end| *end <= self.size())
+            .ok_or_else(|| {
+                format!(
+                    "Hybrid output exceeds SHM bounds: offset={offset}, size={total_size}, shm_size={}",
+                    self.size()
+                )
+            })?;
+
+        let dtype = match tensor.dtype {
+            TensorDtype::Float32 => 0,
+            TensorDtype::Float64 => 1,
+            TensorDtype::Int32 => 2,
+            TensorDtype::Int64 => 3,
+            other => return Err(format!("Unsupported hybrid output dtype {other}")),
+        };
+        let mut shape = [0i64; 8];
+        shape[..tensor.shape.len()].copy_from_slice(&tensor.shape);
+        let header = TensorHeader {
+            ndim: tensor.shape.len() as u32,
+            dtype,
+            _padding: [0; 3],
+            shape,
+            data_size: tensor.data.len() as u64,
+        };
+
+        unsafe {
+            std::ptr::write_unaligned(self.as_ptr().add(offset) as *mut TensorHeader, header);
+            std::ptr::copy_nonoverlapping(
+                tensor.data.as_ptr(),
+                self.as_ptr().add(offset + header_size),
+                tensor.data.len(),
+            );
+        }
+
+        Ok(HybridTensorLocation {
+            offset: offset as u64,
+            size: total_size as u64,
+        })
+    }
+}
 
 // OpenAI ingress bodies are JSON/SSE control payloads, not arbitrary tensor
 // storage. Keep their pre-auth allocation ceiling substantially below the
@@ -151,11 +311,43 @@ fn inference_decode_message(error: CodecError) -> String {
 pub struct IpcServer {
     socket_path: String,
     scheduler_lookup: SchedulerLookup,
-    shm_manager: Option<Arc<ShmManager>>,
+    hybrid_memory: Option<Arc<dyn HybridMemory>>,
     auth_token: Option<Arc<str>>,
 }
 
 impl IpcServer {
+    /// Construct a socket/named-pipe server without hybrid shared memory.
+    pub fn new_socket(
+        socket_path: &str,
+        schedulers: HashMap<u32, Arc<dyn ReplicaScheduler + Send + Sync>>,
+    ) -> Self {
+        let schedulers = Arc::new(schedulers);
+        let scheduler_lookup: SchedulerLookup =
+            Arc::new(move |model_id| schedulers.get(&model_id).cloned());
+        Self::new_socket_with_lookup(socket_path, scheduler_lookup)
+    }
+
+    /// Construct a socket/named-pipe server from a dynamic scheduler lookup.
+    pub fn new_socket_with_lookup(socket_path: &str, scheduler_lookup: SchedulerLookup) -> Self {
+        Self::new_with_lookup_and_hybrid_memory(socket_path, scheduler_lookup, None)
+    }
+
+    /// Construct an IPC server with an optional transport-neutral hybrid-memory adapter.
+    pub fn new_with_lookup_and_hybrid_memory(
+        socket_path: &str,
+        scheduler_lookup: SchedulerLookup,
+        hybrid_memory: Option<Arc<dyn HybridMemory>>,
+    ) -> Self {
+        Self {
+            socket_path: socket_path.to_string(),
+            scheduler_lookup,
+            hybrid_memory,
+            auth_token: None,
+        }
+    }
+
+    /// Backward-compatible constructor for SHM-aware IPC consumers.
+    #[cfg(feature = "hybrid")]
     pub fn new(
         socket_path: &str,
         schedulers: HashMap<u32, Arc<dyn ReplicaScheduler + Send + Sync>>,
@@ -167,17 +359,15 @@ impl IpcServer {
         Self::new_with_lookup(socket_path, scheduler_lookup, shm_manager)
     }
 
+    /// Backward-compatible lookup constructor for SHM-aware IPC consumers.
+    #[cfg(feature = "hybrid")]
     pub fn new_with_lookup(
         socket_path: &str,
         scheduler_lookup: SchedulerLookup,
         shm_manager: Option<Arc<ShmManager>>,
     ) -> Self {
-        Self {
-            socket_path: socket_path.to_string(),
-            scheduler_lookup,
-            shm_manager,
-            auth_token: None,
-        }
+        let hybrid_memory = shm_manager.map(|manager| manager as Arc<dyn HybridMemory>);
+        Self::new_with_lookup_and_hybrid_memory(socket_path, scheduler_lookup, hybrid_memory)
     }
 
     async fn run_internal(&self) -> std::io::Result<()> {
@@ -210,12 +400,12 @@ impl IpcServer {
             loop {
                 let (stream, _) = listener.accept().await?;
                 let scheduler_lookup = scheduler_lookup.clone();
-                let shm_manager = self.shm_manager.clone();
+                let hybrid_memory = self.hybrid_memory.clone();
                 let auth_token = auth_token.clone();
 
                 tokio::spawn(async move {
                     if let Err(e) =
-                        handle_connection(stream, scheduler_lookup, shm_manager, auth_token).await
+                        handle_connection(stream, scheduler_lookup, hybrid_memory, auth_token).await
                     {
                         log::error!("Connection error: {}", e);
                     }
@@ -230,12 +420,12 @@ impl IpcServer {
 
                 server.connect().await?;
                 let scheduler_lookup = scheduler_lookup.clone();
-                let shm_manager = self.shm_manager.clone();
+                let hybrid_memory = self.hybrid_memory.clone();
                 let auth_token = auth_token.clone();
 
                 tokio::spawn(async move {
                     if let Err(e) =
-                        handle_connection(server, scheduler_lookup, shm_manager, auth_token).await
+                        handle_connection(server, scheduler_lookup, hybrid_memory, auth_token).await
                     {
                         log::error!("Connection error: {}", e);
                     }
@@ -266,7 +456,7 @@ impl TransportServer for IpcServer {
 pub(crate) async fn handle_connection<T>(
     connection: T,
     scheduler_lookup: SchedulerLookup,
-    shm_manager: Option<Arc<ShmManager>>,
+    hybrid_memory: Option<Arc<dyn HybridMemory>>,
     auth_token: Option<Arc<str>>,
 ) -> std::io::Result<()>
 where
@@ -275,7 +465,7 @@ where
     handle_connection_with_wire_policy(
         connection,
         scheduler_lookup,
-        shm_manager,
+        hybrid_memory,
         auth_token,
         OpenAiWireTransportPolicy::Local,
     )
@@ -285,7 +475,7 @@ where
 pub(crate) async fn handle_connection_with_wire_policy<T>(
     mut connection: T,
     scheduler_lookup: SchedulerLookup,
-    shm_manager: Option<Arc<ShmManager>>,
+    hybrid_memory: Option<Arc<dyn HybridMemory>>,
     auth_token: Option<Arc<str>>,
     wire_policy: OpenAiWireTransportPolicy,
 ) -> std::io::Result<()>
@@ -582,153 +772,63 @@ where
             }
             OP_HYBRID_INFER => {
                 let hybrid_req: HybridRequest = frame.deserialize().map_err(codec_io)?;
-
-                if let Some(shm_manager) = &shm_manager {
-                    let base_ptr = shm_manager.as_ptr();
-
-                    // Read TensorHeader from SHM
-                    let header_ptr = unsafe {
-                        base_ptr.add(hybrid_req.shm_offset as usize) as *const TensorHeader
+                let Some(hybrid_memory) = hybrid_memory.as_ref() else {
+                    write_error_response(&mut connection, "Hybrid memory is not configured")
+                        .await?;
+                    continue;
+                };
+                let packet =
+                    match hybrid_memory.read_tensor(hybrid_req.shm_offset, hybrid_req.shm_size) {
+                        Ok(packet) => packet,
+                        Err(error) => {
+                            write_error_response(&mut connection, &error).await?;
+                            continue;
+                        }
                     };
-                    let tensor_header = unsafe { &*header_ptr };
-
-                    // Read tensor data
-                    let data_ptr = unsafe {
-                        base_ptr.add(
-                            hybrid_req.shm_offset as usize + std::mem::size_of::<TensorHeader>(),
+                let request = InferenceRequest {
+                    input: packet,
+                    additional_inputs: Vec::new(),
+                    session_id: None,
+                    metadata: None,
+                    cancellation: None,
+                };
+                let result = if let Some(scheduler) = scheduler_lookup(hybrid_req.metadata.model_id)
+                {
+                    scheduler
+                        .infer(
+                            &request,
+                            Priority::Throughput,
+                            hybrid_req.metadata.force_cpu,
                         )
-                    };
-                    let data_slice = unsafe {
-                        std::slice::from_raw_parts(data_ptr, tensor_header.data_size as usize)
-                    };
+                        .await
+                } else {
+                    Err(kapsl_engine_api::EngineError::ModelNotLoaded)
+                };
 
-                    // Build InferenceRequest
-                    let shape = tensor_header.shape[0..tensor_header.ndim as usize].to_vec();
-                    let dtype = match tensor_header.dtype {
-                        0 => TensorDtype::Float32,
-                        1 => TensorDtype::Float64,
-                        2 => TensorDtype::Int32,
-                        3 => TensorDtype::Int64,
-                        _ => TensorDtype::Float32,
-                    };
-
-                    let packet = BinaryTensorPacket {
-                        shape,
-                        dtype,
-                        data: data_slice.to_vec(),
-                    };
-
-                    let request = InferenceRequest {
-                        input: packet,
-                        additional_inputs: Vec::new(),
-                        session_id: None,
-                        metadata: None,
-                        cancellation: None,
-                    };
-
-                    // Perform inference
-                    let result =
-                        if let Some(scheduler) = scheduler_lookup(hybrid_req.metadata.model_id) {
-                            scheduler
-                                .infer(
-                                    &request,
-                                    Priority::Throughput,
-                                    hybrid_req.metadata.force_cpu,
-                                )
-                                .await
-                        } else {
-                            Err(kapsl_engine_api::EngineError::ModelNotLoaded)
-                        };
-
-                    match result {
-                        Ok(output) => {
-                            // Serialize output to BinaryTensorPacket
-                            let packet = BinaryTensorPacket {
-                                shape: output.shape,
-                                dtype: output.dtype,
-                                data: output.data,
-                            };
-
-                            // Calculate required size
-                            let output_size =
-                                std::mem::size_of::<TensorHeader>() + packet.data.len();
-
-                            // Allocate output slot with bounds checking
-                            // Use smaller slots (1MB) and more of them (400 slots from 512MB to 912MB)
-                            static SERVER_SLOT_COUNTER: std::sync::atomic::AtomicUsize =
-                                std::sync::atomic::AtomicUsize::new(0);
-                            let slot = SERVER_SLOT_COUNTER
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            let output_offset = 512 * 1024 * 1024 + (slot % 400) * 1_000_000; // 1MB slots, 400 slots
-
-                            // Bounds check
-                            let shm_size = shm_manager.size();
-                            if output_offset + output_size > shm_size {
-                                let error_msg = format!("Output would exceed SHM bounds: offset={}, size={}, shm_size={}",
-                                    output_offset, output_size, shm_size);
-                                write_error_response(&mut connection, &error_msg).await?;
-                                continue;
-                            }
-
-                            // Write result to SHM
-                            // Re-acquire base_ptr to avoid holding !Send raw pointer across await
-                            let base_ptr = shm_manager.as_ptr();
-                            unsafe {
-                                // Write header
-                                let out_header = TensorHeader {
-                                    ndim: packet.shape.len() as u32,
-                                    dtype: match packet.dtype {
-                                        TensorDtype::Float32 => 0,
-                                        TensorDtype::Float64 => 1,
-                                        TensorDtype::Int32 => 2,
-                                        TensorDtype::Int64 => 3,
-                                        _ => 0,
-                                    },
-                                    _padding: [0; 3],
-                                    shape: {
-                                        let mut arr = [0i64; 8];
-                                        for (i, &v) in packet.shape.iter().enumerate() {
-                                            arr[i] = v;
-                                        }
-                                        arr
-                                    },
-                                    data_size: packet.data.len() as u64,
-                                };
-
-                                let hdr_ptr = base_ptr.add(output_offset) as *mut TensorHeader;
-                                std::ptr::write(hdr_ptr, out_header);
-
-                                let data_ptr = base_ptr
-                                    .add(output_offset + std::mem::size_of::<TensorHeader>());
-                                std::ptr::copy_nonoverlapping(
-                                    packet.data.as_ptr(),
-                                    data_ptr,
-                                    packet.data.len(),
-                                );
-                            }
-
-                            let resp = HybridResponse {
+                match result {
+                    Ok(output) => match hybrid_memory.write_tensor(&output) {
+                        Ok(location) => {
+                            let response = HybridResponse {
                                 metadata: ResponseMetadata {
                                     request_id: hybrid_req.metadata.request_id,
                                     status: STATUS_OK as u8,
                                     _padding: [0; 7],
                                     latency_ns: 0,
                                 },
-                                shm_offset: output_offset as u64,
-                                shm_size: (std::mem::size_of::<TensorHeader>() + packet.data.len())
-                                    as u64,
+                                shm_offset: location.offset,
+                                shm_size: location.size,
                             };
-
-                            wire::write_response_value(&mut connection, STATUS_OK, &resp)
+                            wire::write_response_value(&mut connection, STATUS_OK, &response)
                                 .await
                                 .map_err(codec_io)?;
                         }
-                        Err(e) => {
-                            write_error_response(&mut connection, &e.to_string()).await?;
+                        Err(error) => {
+                            write_error_response(&mut connection, &error).await?;
                         }
+                    },
+                    Err(error) => {
+                        write_error_response(&mut connection, &error.to_string()).await?;
                     }
-                } else {
-                    write_error_response(&mut connection, "SHM Manager not configured").await?;
                 }
             }
             _ => {
@@ -782,6 +882,34 @@ mod tests {
 
     struct IdleWireStreamScheduler {
         cancellation: Arc<Mutex<Option<CancellationToken>>>,
+    }
+
+    struct RecordingHybridMemory {
+        input: BinaryTensorPacket,
+        reads: Mutex<Vec<(u64, u64)>>,
+        writes: Mutex<Vec<BinaryTensorPacket>>,
+    }
+
+    impl HybridMemory for RecordingHybridMemory {
+        fn read_tensor(
+            &self,
+            offset: u64,
+            encoded_size: u64,
+        ) -> Result<BinaryTensorPacket, String> {
+            self.reads.lock().unwrap().push((offset, encoded_size));
+            Ok(self.input.clone())
+        }
+
+        fn write_tensor(
+            &self,
+            tensor: &BinaryTensorPacket,
+        ) -> Result<HybridTensorLocation, String> {
+            self.writes.lock().unwrap().push(tensor.clone());
+            Ok(HybridTensorLocation {
+                offset: 900,
+                size: 120,
+            })
+        }
     }
 
     #[async_trait::async_trait]
@@ -994,6 +1122,49 @@ mod tests {
         Arc::new(move |model_id| (model_id == 7).then(|| scheduler.clone()))
     }
 
+    #[cfg(feature = "hybrid")]
+    #[test]
+    fn shm_hybrid_memory_reads_validated_tensor_regions() {
+        let name = format!("/kapsl-ipc-hybrid-memory-{}", std::process::id());
+        let manager = match ShmManager::create(&name, 1024 * 1024) {
+            Ok(manager) => manager,
+            Err(error) => {
+                eprintln!("Skipping shared memory test (mapping creation failed: {error})");
+                return;
+            }
+        };
+        let offset = manager.tensor_pool_offset();
+        let data = 3.0f32.to_ne_bytes();
+        let header = TensorHeader {
+            ndim: 2,
+            dtype: 0,
+            _padding: [0; 3],
+            shape: [1, 1, 0, 0, 0, 0, 0, 0],
+            data_size: data.len() as u64,
+        };
+        let header_size = std::mem::size_of::<TensorHeader>();
+        unsafe {
+            std::ptr::write_unaligned(manager.as_ptr().add(offset) as *mut TensorHeader, header);
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                manager.as_ptr().add(offset + header_size),
+                data.len(),
+            );
+        }
+
+        let packet = manager
+            .read_tensor(offset as u64, (header_size + data.len()) as u64)
+            .expect("read hybrid tensor");
+        assert_eq!(packet.shape, vec![1, 1]);
+        assert_eq!(packet.dtype, TensorDtype::Float32);
+        assert_eq!(packet.data, data);
+
+        let output_error = manager
+            .write_tensor(&packet)
+            .expect_err("small mappings cannot contain the compatibility output region");
+        assert!(output_error.contains("exceeds SHM bounds"));
+    }
+
     #[tokio::test]
     async fn plaintext_remote_policy_rejects_wire_before_payload_read_or_dispatch() {
         for (operation, payload_size, expected_kind) in [
@@ -1087,6 +1258,61 @@ mod tests {
             *seen.lock().unwrap(),
             vec![Priority::Throughput, Priority::Throughput]
         );
+    }
+
+    #[tokio::test]
+    async fn hybrid_opcode_uses_injected_memory_adapter() {
+        let input = BinaryTensorPacket {
+            shape: vec![1],
+            dtype: TensorDtype::Float32,
+            data: 2.0f32.to_ne_bytes().to_vec(),
+        };
+        let memory = Arc::new(RecordingHybridMemory {
+            input: input.clone(),
+            reads: Mutex::new(Vec::new()),
+            writes: Mutex::new(Vec::new()),
+        });
+        let scheduler: Arc<dyn ReplicaScheduler + Send + Sync> =
+            Arc::new(PriorityRecordingScheduler {
+                seen: Arc::new(Mutex::new(Vec::new())),
+            });
+        let (mut client, server) = duplex(4096);
+        let hybrid_memory: Arc<dyn HybridMemory> = memory.clone();
+        let task = tokio::spawn(handle_connection(
+            server,
+            lookup_for(scheduler),
+            Some(hybrid_memory),
+            None,
+        ));
+        let request = HybridRequest {
+            metadata: kapsl_transport::RequestMetadata::new(44, 7, 1, false),
+            shm_offset: 100,
+            shm_size: 80,
+        };
+
+        wire::write_request_value(&mut client, 7, OP_HYBRID_INFER, &request)
+            .await
+            .expect("write hybrid request");
+        let response = read_response(&mut client).await;
+        assert_eq!(response.header.status, STATUS_OK);
+        let response = response
+            .deserialize::<HybridResponse>()
+            .expect("decode hybrid response");
+        assert_eq!(response.metadata.request_id, 44);
+        assert_eq!(response.shm_offset, 900);
+        assert_eq!(response.shm_size, 120);
+        assert_eq!(*memory.reads.lock().unwrap(), vec![(100, 80)]);
+        {
+            let writes = memory.writes.lock().unwrap();
+            assert_eq!(writes.len(), 1);
+            assert_eq!(writes[0].shape, input.shape);
+            assert_eq!(writes[0].dtype, input.dtype);
+            assert_eq!(writes[0].data, input.data);
+        }
+        drop(client);
+        task.await
+            .expect("server task")
+            .expect("connection handler");
     }
 
     #[tokio::test]

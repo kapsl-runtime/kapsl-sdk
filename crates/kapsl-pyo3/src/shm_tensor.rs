@@ -1,6 +1,6 @@
+use kapsl_communication::shm::allocator::{ShmPoolAllocator, TieredShmAllocator};
+use kapsl_communication::shm::memory::{ShmManager, TensorHeader};
 use kapsl_engine_api::{BinaryTensorPacket, TensorDtype};
-use kapsl_shm::allocator::{ShmPoolAllocator, TieredShmAllocator};
-use kapsl_shm::memory::{ShmManager, TensorHeader};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::PyErr;
 use std::fmt;

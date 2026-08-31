@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/kapsl-backends",
+    "crates/kapsl-communication",
     "crates/kapsl-core",
     "crates/kapsl-engine-api",
     "crates/kapsl-hal",
@@ -25,6 +26,7 @@ exclude = [
 ]
 default-members = [
     "crates/kapsl-backends",
+    "crates/kapsl-communication",
     "crates/kapsl-core",
     "crates/kapsl-engine-api",
     "crates/kapsl-hal",

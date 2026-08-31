@@ -1,7 +1,7 @@
-use kapsl_shm::allocator::TieredShmAllocator;
-use kapsl_shm::memory::ShmManager;
-use kapsl_shm::ring_buffer::LockFreeRingBuffer;
-use kapsl_transport::{RequestMetadata, ResponseMetadata};
+use kapsl_communication::shm::allocator::TieredShmAllocator;
+use kapsl_communication::shm::memory::ShmManager;
+use kapsl_communication::shm::ring_buffer::LockFreeRingBuffer;
+use kapsl_communication::{RequestMetadata, ResponseMetadata};
 use pyo3::prelude::*;
 use std::sync::Arc;
 use std::time::Duration;

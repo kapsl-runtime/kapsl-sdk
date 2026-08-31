@@ -13,8 +13,6 @@ crate-type = ["cdylib"]
 
 [dependencies]
 pyo3 = { version = "0.29", features = ["extension-module", "abi3-py39"] }
-kapsl-ipc = { path = "../kapsl-ipc" }
+kapsl-communication = { path = "../kapsl-communication", default-features = false, features = ["hybrid"] }
 kapsl-engine-api = { path = "../kapsl-engine-api" }
-kapsl-shm = { path = "../kapsl-shm" }
-kapsl-transport = { path = "../kapsl-transport" }
 tokio = { version = "1", features = ["net", "rt", "sync"] }
