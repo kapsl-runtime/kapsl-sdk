@@ -64,8 +64,8 @@ separate CUDA IPC/VMM design and is not part of the extraction migration.
 The published `kapsl-llm` crate exposes `onnx` as the portable CPU generation
 contract. Integration packs must disable default features and select exactly
 one reviewed profile: `onnx`, `onnx-cuda`, `onnx-tensorrt`, `onnx-coreml`,
-`onnx-openvino`, or `onnx-rocm`. `onnx-cuda-pool` includes `onnx-cuda` and the
-Kapsl allocator hooks.
+`onnx-directml`, `onnx-openvino`, or `onnx-rocm`. `onnx-cuda-pool` includes
+`onnx-cuda` and the Kapsl allocator hooks.
 
 The crate's default feature set retains the historical all-provider behavior
 for embedded callers during migration. It is not a pack profile. An external
