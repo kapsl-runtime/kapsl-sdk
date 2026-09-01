@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/kapsl-backend-abi",
     "crates/kapsl-backends",
     "crates/kapsl-communication",
     "crates/kapsl-core",
@@ -25,6 +26,7 @@ exclude = [
     "patches/llama-cpp-sys-2",
 ]
 default-members = [
+    "crates/kapsl-backend-abi",
     "crates/kapsl-backends",
     "crates/kapsl-communication",
     "crates/kapsl-core",
