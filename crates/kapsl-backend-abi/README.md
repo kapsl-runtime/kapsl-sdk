@@ -13,6 +13,11 @@ The backend-neutral `KapslBackendApiV1` contract covers:
 - structured memory, metrics, model, batching, and optional KV reports;
 - runtime-owned device allocations supplied through host callbacks.
 
+Every table must advertise memory reporting and at least one execution target.
+TensorRT tables also advertise CUDA, and governed-device-allocation tables may
+only be used by CUDA-capable packs. Hosts reject contradictory tables before
+adapter initialization.
+
 The existing llama.cpp v1 declarations are preserved and re-exported for source
 and binary-layout compatibility while native packs migrate to the neutral API.
 

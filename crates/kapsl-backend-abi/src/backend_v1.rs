@@ -21,6 +21,8 @@ pub const KAPSL_BACKEND_CAP_MEMORY_REPORTING: u64 = 1 << 6;
 pub const KAPSL_BACKEND_CAP_GOVERNED_DEVICE_ALLOCATOR: u64 = 1 << 7;
 pub const KAPSL_BACKEND_CAP_KV_PARTICIPANT: u64 = 1 << 8;
 pub const KAPSL_BACKEND_CAP_CONCURRENT_INFERENCE: u64 = 1 << 9;
+pub const KAPSL_BACKEND_CAP_EXECUTION_MASK: u64 =
+    KAPSL_BACKEND_CAP_CPU | KAPSL_BACKEND_CAP_CUDA | KAPSL_BACKEND_CAP_TENSORRT;
 
 pub const KAPSL_MEMORY_HOST: u32 = 1;
 pub const KAPSL_MEMORY_HOST_PINNED: u32 = 2;
@@ -454,8 +456,14 @@ impl KapslBackendApiV1 {
     /// callable surface. A host should reject inconsistent tables before
     /// invoking `initialize`.
     pub fn capabilities_are_consistent(&self) -> bool {
-        (self.capabilities & KAPSL_BACKEND_CAP_BATCHING == 0
-            || (self.infer_batch.is_some() && self.release_batch_result.is_some()))
+        self.capabilities & KAPSL_BACKEND_CAP_EXECUTION_MASK != 0
+            && self.capabilities & KAPSL_BACKEND_CAP_MEMORY_REPORTING != 0
+            && (self.capabilities & KAPSL_BACKEND_CAP_TENSORRT == 0
+                || self.capabilities & KAPSL_BACKEND_CAP_CUDA != 0)
+            && (self.capabilities & KAPSL_BACKEND_CAP_GOVERNED_DEVICE_ALLOCATOR == 0
+                || self.capabilities & KAPSL_BACKEND_CAP_CUDA != 0)
+            && (self.capabilities & KAPSL_BACKEND_CAP_BATCHING == 0
+                || (self.infer_batch.is_some() && self.release_batch_result.is_some()))
             && (self.capabilities & KAPSL_BACKEND_CAP_STREAMING == 0 || self.infer_stream.is_some())
             && (self.capabilities & KAPSL_BACKEND_CAP_CANCELLATION == 0 || self.cancel.is_some())
             && (self.capabilities & KAPSL_BACKEND_CAP_KV_PARTICIPANT == 0
@@ -610,6 +618,30 @@ mod tests {
         assert!(!api.capabilities_are_consistent());
 
         api.capabilities &= !KAPSL_BACKEND_CAP_CANCELLATION;
+        assert!(api.capabilities_are_consistent());
+    }
+
+    #[test]
+    fn contradictory_execution_capabilities_are_rejected() {
+        let mut api = complete_api();
+        api.capabilities &= !KAPSL_BACKEND_CAP_EXECUTION_MASK;
+        assert!(!api.capabilities_are_consistent());
+
+        api.capabilities = KAPSL_BACKEND_CAP_CPU;
+        assert!(!api.capabilities_are_consistent());
+
+        api.capabilities = KAPSL_BACKEND_CAP_TENSORRT | KAPSL_BACKEND_CAP_MEMORY_REPORTING;
+        assert!(!api.capabilities_are_consistent());
+
+        api.capabilities = KAPSL_BACKEND_CAP_CPU
+            | KAPSL_BACKEND_CAP_MEMORY_REPORTING
+            | KAPSL_BACKEND_CAP_GOVERNED_DEVICE_ALLOCATOR;
+        assert!(!api.capabilities_are_consistent());
+
+        api.capabilities = KAPSL_BACKEND_CAP_CUDA
+            | KAPSL_BACKEND_CAP_TENSORRT
+            | KAPSL_BACKEND_CAP_MEMORY_REPORTING
+            | KAPSL_BACKEND_CAP_GOVERNED_DEVICE_ALLOCATOR;
         assert!(api.capabilities_are_consistent());
     }
 
