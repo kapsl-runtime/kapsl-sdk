@@ -59,6 +59,26 @@ instances, tensors, sessions, and allocator registrations are gone.
 An optional out-of-process ORT worker is a later isolation mode. It would need a
 separate CUDA IPC/VMM design and is not part of the extraction migration.
 
+## Published LLM provider features
+
+The published `kapsl-llm` crate exposes `onnx` as the portable CPU generation
+contract. Integration packs must disable default features and select exactly
+one reviewed profile: `onnx`, `onnx-cuda`, `onnx-tensorrt`, `onnx-coreml`,
+`onnx-directml`, `onnx-openvino`, or `onnx-rocm`. `onnx-cuda-pool` includes
+`onnx-cuda` and the Kapsl allocator hooks.
+
+The crate's default feature set retains the target-neutral historical provider
+set for embedded callers during migration. DirectML is an explicit Windows-only
+feature because enabling it in a cross-platform default makes Linux binaries
+fail to link. The default is not a pack profile. An external adapter must never
+inherit it and then claim a CPU-only artifact.
+
+Stable `kapsl-llm` releases use `.github/workflows/publish-llm.yml`. Publication
+requires an exact `kapsl-llm-vX.Y.Z` tag whose commit is already on `main`, a
+stable package version with no prerelease suffix, and the `crates-io-llm`
+trusted-publisher environment. Branch, beta, and mismatched-tag publication fail
+before crates.io authentication.
+
 ## Migration sequence
 
 1. Capture the embedded ORT functional, memory, and performance baseline.

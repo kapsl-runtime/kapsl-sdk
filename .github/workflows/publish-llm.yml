@@ -1,0 +1,169 @@
+name: Publish kapsl-llm
+
+on:
+  push:
+    tags:
+      - "kapsl-llm-v*"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish to crates.io (requires selecting the matching stable tag)
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-llm-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    name: Test and package kapsl-llm
+    runs-on: ubuntu-latest
+    outputs:
+      publish: ${{ steps.release.outputs.publish }}
+      version: ${{ steps.release.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate stable release ref and package version
+        id: release
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REQUESTED_PUBLISH: ${{ inputs.publish || false }}
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          import subprocess
+          import tomllib
+          from pathlib import Path
+
+          manifest = Path("crates/kapsl-llm/Cargo.toml")
+          with manifest.open("rb") as handle:
+              version = tomllib.load(handle)["package"]["version"]
+
+          stable = re.fullmatch(
+              r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)",
+              version,
+          )
+          if not stable:
+              raise SystemExit(
+                  f"crates.io publication requires a stable X.Y.Z version, got {version!r}"
+              )
+
+          expected_tag = f"kapsl-llm-v{version}"
+          event_name = os.environ["EVENT_NAME"]
+          ref_name = os.environ["REF_NAME"]
+          ref_type = os.environ["REF_TYPE"]
+          requested_publish = os.environ["REQUESTED_PUBLISH"].lower() == "true"
+          should_publish = event_name == "push" or requested_publish
+
+          if ref_type == "tag" and ref_name != expected_tag:
+              raise SystemExit(
+                  f"release tag {ref_name!r} does not match package version; "
+                  f"expected {expected_tag!r}"
+              )
+          if should_publish and (ref_type != "tag" or ref_name != expected_tag):
+              raise SystemExit(
+                  "crates.io publication requires running from the exact matching "
+                  f"tag {expected_tag!r}"
+              )
+
+          if should_publish:
+              ancestor = subprocess.run(
+                  [
+                      "git",
+                      "merge-base",
+                      "--is-ancestor",
+                      "HEAD",
+                      "refs/remotes/origin/main",
+                  ],
+                  check=False,
+              )
+              if ancestor.returncode != 0:
+                  raise SystemExit(
+                      "the tagged commit must already be merged into main before publication"
+                  )
+
+          output = Path(os.environ["GITHUB_OUTPUT"])
+          with output.open("a", encoding="utf-8") as handle:
+              handle.write(f"version={version}\n")
+              handle.write(f"publish={'true' if should_publish else 'false'}\n")
+          PY
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust # zizmor: ignore[self-repository] actionlint does not support `$/` yet.
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          cache-bin: true
+          lookup-only: true
+          shared-key: llm-release
+
+      - name: Check ORT provider feature isolation
+        run: bash scripts/test-llm-ort-feature-contract.sh
+
+      - name: Test portable ONNX generation profile
+        run: cargo test -p kapsl-llm --no-default-features --features onnx --lib --locked
+
+      - name: Test default compatibility profile
+        run: cargo test -p kapsl-llm --lib --locked
+
+      - name: Verify crates.io package
+        run: cargo publish -p kapsl-llm --locked --dry-run
+
+      - name: Build package artifact
+        run: cargo package -p kapsl-llm --locked
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kapsl-llm-${{ steps.release.outputs.version }}
+          path: target/package/kapsl-llm-${{ steps.release.outputs.version }}.crate
+          if-no-files-found: error
+          retention-days: 14
+
+  publish-crates-io:
+    name: Publish kapsl-llm to crates.io
+    if: needs.package.outputs.publish == 'true'
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    environment:
+      name: crates-io-llm
+      url: https://crates.io/crates/kapsl-llm
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust # zizmor: ignore[self-repository] actionlint does not support `$/` yet.
+
+      - name: Authenticate with crates.io
+        id: crates-io-auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+      - name: Publish exact tagged package
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
+        run: cargo publish -p kapsl-llm --locked
