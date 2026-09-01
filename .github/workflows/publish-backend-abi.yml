@@ -136,9 +136,9 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  publish-crates-io:
-    name: Publish backend ABI to crates.io
-    if: needs.package.outputs.publish == 'true'
+  bootstrap-publish-crates-io:
+    name: Bootstrap backend ABI on crates.io
+    if: needs.package.outputs.publish == 'true' && needs.package.outputs.version == '0.1.0'
     needs: package
     runs-on: ubuntu-latest
     environment:
@@ -156,4 +156,35 @@ jobs:
       - name: Publish exact tagged package
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        # crates.io requires a token for a crate's initial publication. This job
+        # is permanently constrained to 0.1.0; later releases use OIDC below.
+        run: cargo publish -p kapsl-backend-abi --locked # zizmor: ignore[use-trusted-publishing]
+
+  publish-crates-io:
+    name: Publish backend ABI to crates.io
+    if: needs.package.outputs.publish == 'true' && needs.package.outputs.version != '0.1.0'
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    environment:
+      name: crates-io-backend-abi
+      url: https://crates.io/crates/kapsl-backend-abi
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust # zizmor: ignore[self-repository] actionlint does not support `$/` yet.
+
+      - name: Authenticate with crates.io
+        id: crates-io-auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+      - name: Publish exact tagged package
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
         run: cargo publish -p kapsl-backend-abi --locked
