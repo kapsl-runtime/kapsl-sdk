@@ -1,5 +1,8 @@
 //! LLM inference engines, scheduling, KV-cache management, and prompt tooling.
 
+#[cfg(all(feature = "onnx-directml", not(target_os = "windows")))]
+compile_error!("the `onnx-directml` feature is supported only on Windows");
+
 #[path = "cache/block_manager.rs"]
 pub mod block_manager;
 #[cfg(feature = "onnx")]

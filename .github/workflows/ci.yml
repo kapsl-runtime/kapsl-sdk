@@ -111,6 +111,9 @@ jobs:
       - name: Cache Cargo
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
+      - name: Check LLM ORT provider feature isolation
+        run: bash scripts/test-llm-ort-feature-contract.sh
+
       - name: Check SDK workspace
         run: cargo check --workspace --all-targets --locked
 
