@@ -113,6 +113,7 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           cache-bin: true
+          lookup-only: true
           shared-key: backend-abi-release
 
       - name: Test Rust ABI contract
