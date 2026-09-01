@@ -40,6 +40,9 @@ jobs:
       - name: Check native backend C ABI header
         run: scripts/test-backend-abi-header.sh
 
+      - name: Check LLM ORT provider feature isolation
+        run: bash scripts/test-llm-ort-feature-contract.sh
+
       - name: Lint SDK workspace
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 

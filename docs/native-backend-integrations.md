@@ -59,6 +59,18 @@ instances, tensors, sessions, and allocator registrations are gone.
 An optional out-of-process ORT worker is a later isolation mode. It would need a
 separate CUDA IPC/VMM design and is not part of the extraction migration.
 
+## Published LLM provider features
+
+The published `kapsl-llm` crate exposes `onnx` as the portable CPU generation
+contract. Integration packs must disable default features and select exactly
+one reviewed profile: `onnx`, `onnx-cuda`, `onnx-tensorrt`, `onnx-coreml`,
+`onnx-openvino`, or `onnx-rocm`. `onnx-cuda-pool` includes `onnx-cuda` and the
+Kapsl allocator hooks.
+
+The crate's default feature set retains the historical all-provider behavior
+for embedded callers during migration. It is not a pack profile. An external
+adapter must never inherit that default and then claim a CPU-only artifact.
+
 ## Migration sequence
 
 1. Capture the embedded ORT functional, memory, and performance baseline.

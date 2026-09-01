@@ -1,6 +1,6 @@
 [package]
 name = "kapsl-llm"
-version.workspace = true
+version = "0.3.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -30,14 +30,23 @@ parking_lot = "0.12"
 cudarc = { version = "0.12", features = ["cuda-version-from-build-system"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
-ort = { version = "=2.0.0-rc.11", optional = true, features = ["ndarray", "half", "download-binaries", "directml", "cuda", "tensorrt", "coreml", "openvino"] }
+ort = { version = "=2.0.0-rc.11", default-features = false, optional = true, features = ["std", "ndarray", "half", "download-binaries", "tls-rustls", "directml"] }
 
 [target.'cfg(not(windows))'.dependencies]
-ort = { version = "=2.0.0-rc.11", optional = true, features = ["ndarray", "half", "download-binaries", "cuda", "tensorrt", "coreml", "openvino"] }
+ort = { version = "=2.0.0-rc.11", default-features = false, optional = true, features = ["std", "ndarray", "half", "download-binaries", "tls-rustls"] }
 
 [features]
-default = ["gguf", "onnx"]
+# Keep the historical all-provider default for embedded callers. Integration
+# packs disable defaults and select the exact provider feature they package.
+default = ["gguf", "onnx-all-providers"]
+# `onnx` alone is the portable CPU generation contract.
 onnx = ["dep:ort"]
+onnx-all-providers = ["onnx-cuda", "onnx-tensorrt", "onnx-coreml", "onnx-openvino"]
+onnx-cuda = ["onnx", "ort/cuda"]
+onnx-tensorrt = ["onnx-cuda", "ort/tensorrt"]
+onnx-coreml = ["onnx", "ort/coreml"]
+onnx-openvino = ["onnx", "ort/openvino"]
+onnx-rocm = ["onnx", "ort/rocm"]
 gguf = ["dep:llama-cpp-2", "dep:llama-cpp-sys-2", "dep:kapsl-loader"]
 # Opt-in CUDA acceleration for GGUF. Keep default CPU/Metal portable so Linux
 # machines without a CUDA toolkit can still build.
@@ -48,7 +57,7 @@ gguf-external-kv = ["gguf"]
 gguf-cuda-shared-kv = ["gguf-cuda", "kapsl-hal/cuda", "dep:cudarc"]
 # Attribute ORT CUDA allocations to model/replica/allocation-class scopes when
 # the runtime registers its environment allocator.
-onnx-cuda-pool = ["kapsl-hal/cuda"]
+onnx-cuda-pool = ["onnx-cuda", "kapsl-hal/cuda"]
 
 [target.'cfg(target_os = "macos")'.dependencies.llama-cpp-2]
 package = "kapsl-llama-cpp-2"
