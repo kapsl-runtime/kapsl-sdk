@@ -67,9 +67,11 @@ one reviewed profile: `onnx`, `onnx-cuda`, `onnx-tensorrt`, `onnx-coreml`,
 `onnx-directml`, `onnx-openvino`, or `onnx-rocm`. `onnx-cuda-pool` includes
 `onnx-cuda` and the Kapsl allocator hooks.
 
-The crate's default feature set retains the historical all-provider behavior
-for embedded callers during migration. It is not a pack profile. An external
-adapter must never inherit that default and then claim a CPU-only artifact.
+The crate's default feature set retains the target-neutral historical provider
+set for embedded callers during migration. DirectML is an explicit Windows-only
+feature because enabling it in a cross-platform default makes Linux binaries
+fail to link. The default is not a pack profile. An external adapter must never
+inherit it and then claim a CPU-only artifact.
 
 ## Migration sequence
 

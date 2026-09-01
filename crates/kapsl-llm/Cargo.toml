@@ -36,12 +36,13 @@ ort = { version = "=2.0.0-rc.11", default-features = false, optional = true, fea
 ort = { version = "=2.0.0-rc.11", default-features = false, optional = true, features = ["std", "ndarray", "half", "download-binaries", "tls-rustls"] }
 
 [features]
-# Keep the historical all-provider default for embedded callers. Integration
-# packs disable defaults and select the exact provider feature they package.
-default = ["gguf", "onnx-all-providers"]
+# Keep the target-neutral historical provider set for embedded callers.
+# DirectML is Windows-only and must be selected explicitly. Integration packs
+# disable defaults and select the exact provider feature they package.
+default = ["gguf", "onnx-default-providers"]
 # `onnx` alone is the portable CPU generation contract.
 onnx = ["dep:ort"]
-onnx-all-providers = ["onnx-cuda", "onnx-tensorrt", "onnx-coreml", "onnx-directml", "onnx-openvino"]
+onnx-default-providers = ["onnx-cuda", "onnx-tensorrt", "onnx-coreml", "onnx-openvino"]
 onnx-cuda = ["onnx", "ort/cuda"]
 onnx-tensorrt = ["onnx-cuda", "ort/tensorrt"]
 onnx-coreml = ["onnx", "ort/coreml"]
