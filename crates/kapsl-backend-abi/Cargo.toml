@@ -1,0 +1,18 @@
+[package]
+name = "kapsl-backend-abi"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Stable C ABI shared by Kapsl runtimes and native inference backend packs"
+readme = "README.md"
+keywords = ["inference", "plugin", "ffi", "abi"]
+categories = ["api-bindings"]
+publish = ["crates-io"]
+
+[lib]
+path = "src/lib.rs"
+
+[package.metadata.docs.rs]
+all-features = true

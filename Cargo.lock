@@ -1723,6 +1723,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "kapsl-backend-abi"
+version = "0.1.0"
+
+[[package]]
 name = "kapsl-backends"
 version = "0.3.0"
 dependencies = [
