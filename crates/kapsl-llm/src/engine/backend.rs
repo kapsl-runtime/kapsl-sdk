@@ -679,8 +679,11 @@ impl LLMBackend {
     ///
     /// This also enables the ORT environment allocator and records the stable
     /// model/replica identity supplied to every scope. The provider must fail
-    /// closed if it cannot establish the requested context. Inference through
-    /// a configured provider must use
+    /// closed if it cannot establish the requested context. CUDA/TensorRT
+    /// availability is validated from the loaded ORT runtime, legacy provider
+    /// pack discovery is bypassed because the caller owns that validation, and
+    /// ORT CPU execution-provider fallback is disabled for every resulting
+    /// session. Inference through a configured provider must use
     /// [`Self::infer_stream_with_allocation_request_id`]; an unstamped request
     /// is rejected before provider execution.
     pub fn with_device_allocation_scope_provider(
