@@ -12,6 +12,7 @@ extern "C" {
 #define KAPSL_BACKEND_ENTRYPOINT_MAGIC 0x4b424e44u
 #define KAPSL_BACKEND_ENTRYPOINT_SYMBOL "kapsl_backend_v1"
 #define KAPSL_BACKEND_WIRE_FORMAT_TENSORS_V1 1u
+#define KAPSL_BACKEND_DESCRIPTOR_SCHEMA_V1 1u
 
 #define KAPSL_STATUS_OK 0
 #define KAPSL_STATUS_INVALID_ARGUMENT 1
@@ -31,6 +32,7 @@ extern "C" {
 #define KAPSL_BACKEND_CAP_GOVERNED_DEVICE_ALLOCATOR (UINT64_C(1) << 7)
 #define KAPSL_BACKEND_CAP_KV_PARTICIPANT (UINT64_C(1) << 8)
 #define KAPSL_BACKEND_CAP_CONCURRENT_INFERENCE (UINT64_C(1) << 9)
+#define KAPSL_BACKEND_CAP_SCOPED_DEVICE_ALLOCATOR (UINT64_C(1) << 10)
 #define KAPSL_BACKEND_CAP_EXECUTION_MASK                                             \
     (KAPSL_BACKEND_CAP_CPU | KAPSL_BACKEND_CAP_CUDA | KAPSL_BACKEND_CAP_TENSORRT)
 
@@ -62,6 +64,12 @@ extern "C" {
 #define KAPSL_ALLOCATION_CLASS_KV 3u
 #define KAPSL_ALLOCATION_CLASS_REQUEST 4u
 #define KAPSL_ALLOCATION_CLASS_OTHER 5u
+
+#define KAPSL_SCOPED_DEVICE_ALLOCATOR_VERSION 1u
+#define KAPSL_ALLOCATION_SCOPE_MODEL 1u
+#define KAPSL_ALLOCATION_SCOPE_REPLICA 2u
+#define KAPSL_ALLOCATION_SCOPE_REQUEST 3u
+#define KAPSL_ALLOCATION_SCOPE_REQUEST_BATCH 4u
 
 #define KAPSL_LOG_ERROR 1u
 #define KAPSL_LOG_WARN 2u
@@ -123,6 +131,52 @@ typedef struct kapsl_backend_host_v1 {
     kapsl_device_free_fn free_device;
     kapsl_device_synchronize_fn synchronize_device;
 } kapsl_backend_host_v1;
+
+/*
+ * model_id/replica_id are the durable charge owner. request_ids identify the
+ * operation that triggered an allocation; only the matching free callback
+ * ends the allocation lifetime. request_ids is borrowed for the synchronous
+ * allocation callback only.
+ */
+typedef struct kapsl_device_allocation_scope_v1 {
+    uint32_t struct_size;
+    uint32_t scope_kind;
+    uint64_t scope_id;
+    uint32_t model_id;
+    uint32_t replica_id;
+    uint32_t request_count;
+    uint32_t reserved;
+    const uint64_t *request_ids;
+} kapsl_device_allocation_scope_v1;
+
+typedef struct kapsl_scoped_device_allocation_request_v1 {
+    uint32_t struct_size;
+    uint32_t device_id;
+    uint32_t memory_kind;
+    uint32_t allocation_class;
+    kapsl_device_allocation_scope_v1 scope;
+    uint32_t flags;
+    uint32_t reserved;
+    uint64_t bytes;
+    uint64_t alignment;
+} kapsl_scoped_device_allocation_request_v1;
+
+typedef int32_t (*kapsl_scoped_device_allocate_fn)(
+    void *user_data,
+    const kapsl_scoped_device_allocation_request_v1 *request,
+    kapsl_device_allocation_v1 *allocation_out);
+
+/*
+ * Backward-compatible extension whose base field remains at offset zero.
+ * Pass &extension.base through kapsl_backend_config_v1.host and set the base
+ * struct_size to sizeof(kapsl_backend_host_scoped_allocator_v1).
+ */
+typedef struct kapsl_backend_host_scoped_allocator_v1 {
+    kapsl_backend_host_v1 base;
+    uint32_t scoped_allocator_version;
+    uint32_t reserved;
+    kapsl_scoped_device_allocate_fn allocate_device_scoped;
+} kapsl_backend_host_scoped_allocator_v1;
 
 typedef struct kapsl_backend_config_v1 {
     uint32_t struct_size;
@@ -190,6 +244,11 @@ typedef struct kapsl_inference_batch_result_v1 {
     void *owner_context;
 } kapsl_inference_batch_result_v1;
 
+/*
+ * Descriptor schema v1 requires schema_version, backend, profiles, formats,
+ * tasks, backend_abi, wire_format, and execution_mode. The signed pack and
+ * callable capability table remain authoritative over JSON claims.
+ */
 typedef int32_t (*kapsl_backend_describe_fn)(
     kapsl_owned_buffer *descriptor_json_out,
     kapsl_owned_buffer *error_out);

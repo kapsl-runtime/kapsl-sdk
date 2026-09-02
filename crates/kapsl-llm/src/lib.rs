@@ -3,6 +3,9 @@
 #[cfg(all(feature = "onnx-directml", not(target_os = "windows")))]
 compile_error!("the `onnx-directml` feature is supported only on Windows");
 
+#[cfg(feature = "onnx")]
+#[path = "engine/allocation_scope.rs"]
+pub mod allocation_scope;
 #[path = "cache/block_manager.rs"]
 pub mod block_manager;
 #[cfg(feature = "onnx")]

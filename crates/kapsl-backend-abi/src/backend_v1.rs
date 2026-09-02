@@ -8,6 +8,7 @@ pub const KAPSL_BACKEND_ABI_VERSION: u32 = 1;
 pub const KAPSL_BACKEND_ENTRYPOINT_MAGIC: u32 = 0x4b42_4e44; // KBND
 pub const KAPSL_BACKEND_ENTRYPOINT_SYMBOL: &[u8] = b"kapsl_backend_v1\0";
 pub const KAPSL_BACKEND_WIRE_FORMAT_TENSORS_V1: u32 = 1;
+pub const KAPSL_BACKEND_DESCRIPTOR_SCHEMA_V1: u32 = 1;
 
 pub type KapslBackendEntrypointV1 = unsafe extern "C" fn() -> *const KapslBackendApiV1;
 
@@ -21,6 +22,7 @@ pub const KAPSL_BACKEND_CAP_MEMORY_REPORTING: u64 = 1 << 6;
 pub const KAPSL_BACKEND_CAP_GOVERNED_DEVICE_ALLOCATOR: u64 = 1 << 7;
 pub const KAPSL_BACKEND_CAP_KV_PARTICIPANT: u64 = 1 << 8;
 pub const KAPSL_BACKEND_CAP_CONCURRENT_INFERENCE: u64 = 1 << 9;
+pub const KAPSL_BACKEND_CAP_SCOPED_DEVICE_ALLOCATOR: u64 = 1 << 10;
 pub const KAPSL_BACKEND_CAP_EXECUTION_MASK: u64 =
     KAPSL_BACKEND_CAP_CPU | KAPSL_BACKEND_CAP_CUDA | KAPSL_BACKEND_CAP_TENSORRT;
 
@@ -303,6 +305,12 @@ impl Default for KapslInferenceBatchResultV1 {
     }
 }
 
+/// Return a UTF-8 JSON descriptor using
+/// [`KAPSL_BACKEND_DESCRIPTOR_SCHEMA_V1`]. Schema v1 requires
+/// `schema_version`, `backend`, `profiles`, `formats`, `tasks`, `backend_abi`,
+/// `wire_format`, and `execution_mode`. A signed pack and the callable
+/// capability table remain authoritative; hosts must reject contradictory
+/// descriptor claims rather than treating the JSON as an override.
 pub type KapslBackendDescribeFn = unsafe extern "C" fn(
     descriptor_json_out: *mut KapslOwnedBuffer,
     error_out: *mut KapslOwnedBuffer,
@@ -462,6 +470,8 @@ impl KapslBackendApiV1 {
                 || self.capabilities & KAPSL_BACKEND_CAP_CUDA != 0)
             && (self.capabilities & KAPSL_BACKEND_CAP_GOVERNED_DEVICE_ALLOCATOR == 0
                 || self.capabilities & KAPSL_BACKEND_CAP_CUDA != 0)
+            && (self.capabilities & KAPSL_BACKEND_CAP_SCOPED_DEVICE_ALLOCATOR == 0
+                || self.capabilities & KAPSL_BACKEND_CAP_GOVERNED_DEVICE_ALLOCATOR != 0)
             && (self.capabilities & KAPSL_BACKEND_CAP_BATCHING == 0
                 || (self.infer_batch.is_some() && self.release_batch_result.is_some()))
             && (self.capabilities & KAPSL_BACKEND_CAP_STREAMING == 0 || self.infer_stream.is_some())
@@ -643,6 +653,14 @@ mod tests {
             | KAPSL_BACKEND_CAP_MEMORY_REPORTING
             | KAPSL_BACKEND_CAP_GOVERNED_DEVICE_ALLOCATOR;
         assert!(api.capabilities_are_consistent());
+
+        api.capabilities = KAPSL_BACKEND_CAP_CUDA
+            | KAPSL_BACKEND_CAP_MEMORY_REPORTING
+            | KAPSL_BACKEND_CAP_SCOPED_DEVICE_ALLOCATOR;
+        assert!(!api.capabilities_are_consistent());
+
+        api.capabilities |= KAPSL_BACKEND_CAP_GOVERNED_DEVICE_ALLOCATOR;
+        assert!(api.capabilities_are_consistent());
     }
 
     #[test]
@@ -678,6 +696,11 @@ mod tests {
         let mut sorted = values;
         sorted.sort_unstable();
         assert!(sorted.windows(2).all(|pair| pair[0] != pair[1]));
+    }
+
+    #[test]
+    fn descriptor_schema_version_is_stable() {
+        assert_eq!(KAPSL_BACKEND_DESCRIPTOR_SCHEMA_V1, 1);
     }
 
     #[test]
