@@ -420,7 +420,7 @@ mod tests {
                         Item = Result<BinaryTensorPacket, kapsl_engine_api::EngineError>,
                     > + Send,
             >,
-        > = backend.infer_stream(&request);
+        > = backend.infer_stream_with_allocation_request_id(&request, 77);
 
         let handle = tokio::spawn(async move {
             let mut stream = stream;
@@ -436,6 +436,7 @@ mod tests {
         });
 
         let seq_group = rx.recv().await.expect("seq_group");
+        assert_eq!(seq_group.allocation_request_id, Some(77));
         *backend.request_tx.write().unwrap() = None;
         assert!(
             rx.is_closed(),

@@ -1,5 +1,8 @@
 //! Engine API adapter for the ONNX LLM runtime.
 
+use crate::allocation_scope::{
+    inference_request_id, with_inference_request_id, DeviceAllocationScopeProvider,
+};
 use crate::block_manager::SharedBlockAllocator;
 use crate::engine::LLMEngine;
 use crate::global_scheduler::GlobalKvScheduler;
@@ -18,9 +21,9 @@ use async_stream::stream;
 use async_trait::async_trait;
 use futures::stream::{self, Stream, StreamExt};
 use kapsl_engine_api::{
-    BatchingPolicy, BinaryTensorPacket, Engine, EngineError, EngineMetrics, ExternalDeviceMemory,
-    ExternalDeviceMemoryReport, InferenceRequest, MemoryAllocation, MemoryAllocationClass,
-    MemoryAllocationSource, MemoryDomain, MemoryReport, TensorDtype,
+    BatchingPolicy, BinaryTensorPacket, Engine, EngineError, EngineMetrics, EngineStream,
+    ExternalDeviceMemory, ExternalDeviceMemoryReport, InferenceRequest, MemoryAllocation,
+    MemoryAllocationClass, MemoryAllocationSource, MemoryDomain, MemoryReport, TensorDtype,
 };
 use serde_json::Value;
 use std::fs;
@@ -56,6 +59,10 @@ pub struct LLMBackend {
     use_env_allocators: bool,
     /// Runtime model/replica identity propagated into ORT allocator scopes.
     memory_owner: Option<(u32, u32)>,
+    /// Backend-neutral provider bridge for request-aware allocation scopes.
+    allocation_scope_provider: Option<Arc<dyn DeviceAllocationScopeProvider>>,
+    /// Monotonic scope identity retained across unload/reload cycles.
+    allocation_scope_ids: Arc<AtomicU64>,
     /// Optional shared block pool.  When set, the engine draws from this pool
     /// instead of a private allocator, enabling unified KV memory across models.
     shared_pool: Option<SharedBlockAllocator>,
@@ -607,6 +614,8 @@ impl LLMBackend {
             device_ids_override: None,
             use_env_allocators: false,
             memory_owner: None,
+            allocation_scope_provider: None,
+            allocation_scope_ids: Arc::new(AtomicU64::new(1)),
             shared_pool: None,
             kv_blocks_cap: None,
             kv_compression_bits: None,
@@ -663,6 +672,59 @@ impl LLMBackend {
     pub fn with_memory_owner(mut self, model_id: u32, replica_id: u32) -> Self {
         self.memory_owner = Some((model_id, replica_id));
         self
+    }
+
+    /// Route provider allocations through an adapter-owned, request-aware
+    /// scope implementation.
+    ///
+    /// This also enables the ORT environment allocator and records the stable
+    /// model/replica identity supplied to every scope. The provider must fail
+    /// closed if it cannot establish the requested context. Inference through
+    /// a configured provider must use
+    /// [`Self::infer_stream_with_allocation_request_id`]; an unstamped request
+    /// is rejected before provider execution.
+    pub fn with_device_allocation_scope_provider(
+        mut self,
+        model_id: u32,
+        replica_id: u32,
+        provider: Arc<dyn DeviceAllocationScopeProvider>,
+    ) -> Self {
+        self.use_env_allocators = true;
+        self.memory_owner = Some((model_id, replica_id));
+        self.allocation_scope_provider = Some(provider);
+        self
+    }
+
+    /// Start a streaming request with the exact external request identity used
+    /// for governed device-allocation ownership.
+    pub fn infer_stream_with_allocation_request_id(
+        &self,
+        request: &InferenceRequest,
+        allocation_request_id: u64,
+    ) -> EngineStream {
+        if allocation_request_id == 0 {
+            return Box::pin(stream::once(async {
+                Err(EngineError::invalid_input(
+                    "allocation request ID must be non-zero",
+                ))
+            }));
+        }
+        with_inference_request_id(allocation_request_id, || self.infer_stream(request))
+    }
+
+    /// Run a one-shot request with the exact external request identity used
+    /// for governed device-allocation ownership.
+    pub fn infer_with_allocation_request_id(
+        &self,
+        request: &InferenceRequest,
+        allocation_request_id: u64,
+    ) -> Result<BinaryTensorPacket, EngineError> {
+        if allocation_request_id == 0 {
+            return Err(EngineError::invalid_input(
+                "allocation request ID must be non-zero",
+            ));
+        }
+        with_inference_request_id(allocation_request_id, || self.infer(request))
     }
 
     /// Attach a live KV block cap updated by the runtime on engine join/leave.
@@ -1147,6 +1209,8 @@ impl Engine for LLMBackend {
         let device_ids_override = self.device_ids_override.clone();
         let use_env_allocators = self.use_env_allocators;
         let memory_owner = self.memory_owner;
+        let allocation_scope_provider = self.allocation_scope_provider.clone();
+        let allocation_scope_ids = self.allocation_scope_ids.clone();
         let engine_block_size = hints.block_size;
         let engine_num_gpu_blocks = hints.num_gpu_blocks;
         let shared_pool = self.shared_pool.clone();
@@ -1171,6 +1235,10 @@ impl Engine for LLMBackend {
             let mut engine = engine;
             if let Some((model_id, replica_id)) = memory_owner {
                 engine.set_memory_owner(model_id, replica_id);
+            }
+            if let Some(provider) = allocation_scope_provider {
+                engine.set_allocation_scope_provider(provider);
+                engine.set_allocation_scope_id_source(allocation_scope_ids);
             }
             // If a shared pool was attached, replace the private allocator.
             let mut engine = if let Some(pool) = shared_pool {
@@ -1403,6 +1471,7 @@ impl Engine for LLMBackend {
             cancellation.clone(),
             response_tx,
         );
+        seq_group.allocation_request_id = inference_request_id();
         seq_group.priority = Self::sequence_priority(request);
 
         // Hard admission gate: reserve against the global budget.  If the budget
