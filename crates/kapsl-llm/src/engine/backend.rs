@@ -1548,11 +1548,11 @@ impl Engine for LLMBackend {
                 drop(tx);
 
                 let mut saw_finish = false;
+                let mut cancellation_requested = false;
                 loop {
                     if let Some(token) = cancellation.as_ref() {
                         if token.is_cancelled() {
-                            yield Err(EngineError::cancelled("Request cancelled"));
-                            return;
+                            cancellation_requested = true;
                         }
                     }
 
@@ -1562,9 +1562,21 @@ impl Engine for LLMBackend {
 
                     if let Some(token) = cancellation.as_ref() {
                         if token.is_cancelled() {
-                            yield Err(EngineError::cancelled("Request cancelled"));
-                            return;
+                            cancellation_requested = true;
                         }
+                    }
+
+                    // Once a queued request is cancelled, keep draining its
+                    // responses until the engine sends a terminal output. This
+                    // acknowledges that scheduler/session state is settled
+                    // before the synchronous adapter call can return and a
+                    // caller can reuse the session.
+                    if cancellation_requested {
+                        if output.finish_reason.is_some() {
+                            saw_finish = true;
+                            break;
+                        }
+                        continue;
                     }
 
                     let output_text = output.text;
@@ -1590,13 +1602,18 @@ impl Engine for LLMBackend {
                     }
                 }
 
+                if !saw_finish
+                    && cancellation
+                        .as_ref()
+                        .is_some_and(|token| token.is_cancelled())
+                {
+                    cancellation_requested = true;
+                }
+                if cancellation_requested {
+                    yield Err(EngineError::cancelled("Request cancelled"));
+                    return;
+                }
                 if !saw_finish {
-                    if let Some(token) = cancellation.as_ref() {
-                        if token.is_cancelled() {
-                            yield Err(EngineError::cancelled("Request cancelled"));
-                            return;
-                        }
-                    }
                     yield Err(EngineError::backend("LLM response channel closed"));
                 }
             };
