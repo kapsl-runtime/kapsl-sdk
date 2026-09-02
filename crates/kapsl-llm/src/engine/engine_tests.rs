@@ -4,8 +4,10 @@ mod tests {
         build_kv_array_f16, build_kv_array_f32_from_f16, device_kv_sequence_len, empty_kv_shape,
         empty_kv_shape_with_seq_len, infer_kv_layout, normalize_metadata_safe_load_setting,
         parse_safe_load_env_setting, parse_safe_load_setting, resolve_prepend_bos_token_id,
-        tokenizer_add_bos_token, tokenizer_declared_bos_token_id, KvCacheMode, KvLayout, LLMEngine,
-        LLMMetrics, SafeLoadSetting, SamplingParams, SchedulerConfig, SequenceGroup,
+        tokenizer_add_bos_token, tokenizer_declared_bos_token_id,
+        validate_scoped_device_provider_with, KvCacheMode, KvLayout, LLMEngine, LLMMetrics,
+        SafeLoadSetting, SamplingParams, SchedulerConfig, SequenceGroup,
+        DISABLE_CPU_EP_FALLBACK_KEY,
     };
     use crate::allocation_scope::{
         DeviceAllocationClass, DeviceAllocationScope, DeviceAllocationScopeGuard,
@@ -38,6 +40,37 @@ mod tests {
             self.scopes.lock().unwrap().push(scope.clone());
             Ok(Box::new(()))
         }
+    }
+
+    #[test]
+    fn scoped_device_provider_validation_disables_every_cpu_fallback_path() {
+        assert_eq!(
+            DISABLE_CPU_EP_FALLBACK_KEY,
+            "session.disable_cpu_ep_fallback"
+        );
+        assert!(
+            validate_scoped_device_provider_with(Some("cuda"), |provider| { provider == "cuda" })
+                .is_ok()
+        );
+        assert!(
+            validate_scoped_device_provider_with(Some("TensorRT"), |provider| {
+                matches!(provider, "tensorrt" | "cuda")
+            })
+            .is_ok()
+        );
+
+        let missing = validate_scoped_device_provider_with(None, |_| true).unwrap_err();
+        assert!(missing.contains("explicit CUDA or TensorRT"));
+        let cpu = validate_scoped_device_provider_with(Some("cpu"), |_| true).unwrap_err();
+        assert!(cpu.contains("does not support provider `cpu`"));
+        let unavailable =
+            validate_scoped_device_provider_with(Some("cuda"), |_| false).unwrap_err();
+        assert!(unavailable.contains("CPU fallback is disabled"));
+        let missing_cuda = validate_scoped_device_provider_with(Some("tensorrt"), |provider| {
+            provider == "tensorrt"
+        })
+        .unwrap_err();
+        assert!(missing_cuda.contains("provider `cuda`"));
     }
 
     #[test]

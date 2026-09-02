@@ -61,6 +61,7 @@ const DEFAULT_NUM_LAYERS: usize = 32;
 const DEFAULT_NUM_HEADS: usize = 32;
 const DEFAULT_HEAD_DIM: usize = 128;
 const MAX_SEQ_LEN: usize = 4096;
+const DISABLE_CPU_EP_FALLBACK_KEY: &str = "session.disable_cpu_ep_fallback";
 
 // === Failure isolation ===
 /// Trip the circuit breaker after this many consecutive `execute_step` failures.
@@ -388,6 +389,55 @@ fn llm_provider_available(provider: &str) -> bool {
         "cpu" => true,
         _ => false,
     }
+}
+
+fn ort_execution_provider_available(provider: &str) -> bool {
+    match provider {
+        "cuda" => CUDAExecutionProvider::default()
+            .is_available()
+            .unwrap_or(false),
+        "tensorrt" => TensorRTExecutionProvider::default()
+            .is_available()
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+fn validate_scoped_device_provider_with(
+    provider: Option<&str>,
+    provider_available: impl Fn(&str) -> bool,
+) -> Result<(), String> {
+    let provider = provider
+        .map(str::trim)
+        .filter(|provider| !provider.is_empty())
+        .ok_or_else(|| {
+            "scoped device allocation requires an explicit CUDA or TensorRT provider".to_string()
+        })?;
+    let normalized = provider.to_ascii_lowercase();
+    let required = match normalized.as_str() {
+        "cuda" => &["cuda"][..],
+        "tensorrt" => &["tensorrt", "cuda"][..],
+        _ => {
+            return Err(format!(
+                "scoped device allocation does not support provider `{provider}`; expected CUDA or TensorRT"
+            ))
+        }
+    };
+    if let Some(unavailable) = required
+        .iter()
+        .copied()
+        .find(|required| !provider_available(required))
+    {
+        return Err(format!(
+            "scoped device provider `{provider}` requires available ORT provider `{unavailable}`; CPU fallback is disabled"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_scoped_device_provider(provider: Option<&str>) -> Result<(), EngineError> {
+    validate_scoped_device_provider_with(provider, ort_execution_provider_available)
+        .map_err(EngineError::backend)
 }
 
 #[cfg(target_os = "windows")]
@@ -2028,8 +2078,12 @@ impl LLMEngine {
                 preferred_provider = Some(fastest);
             }
         }
+        let scoped_device_provider = self.allocation_scope_provider.is_some();
+        if scoped_device_provider {
+            validate_scoped_device_provider(preferred_provider.as_deref())?;
+        }
         if let Some(provider) = preferred_provider.as_ref() {
-            if !llm_provider_available(provider) {
+            if !scoped_device_provider && !llm_provider_available(provider) {
                 log::warn!(
                     "Requested LLM provider `{}` is unavailable, falling back to CPU",
                     provider
@@ -2204,6 +2258,15 @@ impl LLMEngine {
                         .with_config_entry("session.use_env_allocators", "1")
                         .map_err(|e| EngineError::backend(e.to_string()))?;
                 }
+                if scoped_device_provider {
+                    builder = builder
+                        .with_config_entry(DISABLE_CPU_EP_FALLBACK_KEY, "1")
+                        .map_err(|e| {
+                            EngineError::backend(format!(
+                                "disable ORT CPU execution-provider fallback: {e}"
+                            ))
+                        })?;
+                }
                 match p_lower.as_str() {
                     "coreml" | "metal" => {
                         if CoreMLExecutionProvider::default()
@@ -2269,6 +2332,11 @@ impl LLMEngine {
                                 })?;
                             log::info!("LLM using CUDA on device {}", device_id);
                         } else {
+                            if scoped_device_provider {
+                                return Err(EngineError::backend(
+                                    "CUDA became unavailable after scoped provider validation; CPU fallback is disabled",
+                                ));
+                            }
                             log::warn!("CUDA requested but not available, falling back to CPU");
                         }
                     }
@@ -2277,11 +2345,15 @@ impl LLMEngine {
                             .is_available()
                             .unwrap_or(false)
                         {
+                            let mut tensorrt = TensorRTExecutionProvider::default()
+                                .with_device_id(device_id)
+                                .build();
+                            if scoped_device_provider {
+                                tensorrt = tensorrt.error_on_failure();
+                            }
                             builder = builder
                                 .with_execution_providers([
-                                    TensorRTExecutionProvider::default()
-                                        .with_device_id(device_id)
-                                        .build(),
+                                    tensorrt,
                                     CUDAExecutionProvider::default()
                                         .with_device_id(device_id)
                                         .build()
@@ -2298,6 +2370,11 @@ impl LLMEngine {
                                 device_id
                             );
                         } else {
+                            if scoped_device_provider {
+                                return Err(EngineError::backend(
+                                    "TensorRT became unavailable after scoped provider validation; CPU fallback is disabled",
+                                ));
+                            }
                             log::warn!("TensorRT requested but not available, falling back to CPU");
                         }
                     }
@@ -2395,7 +2472,7 @@ impl LLMEngine {
             SafeLoadSetting::Auto => false,
         };
 
-        let allow_cpu_fallback = self.provider_override.is_none();
+        let allow_cpu_fallback = self.provider_override.is_none() && !scoped_device_provider;
         let try_build_session_with_provider = |path: &Path,
                                                provider: Option<&str>,
                                                device_id: i32|
