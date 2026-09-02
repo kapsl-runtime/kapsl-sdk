@@ -8,8 +8,8 @@ mod tests {
     use crate::sequence::{FinishReason, SequenceGroupOutput};
     use futures::StreamExt;
     use kapsl_engine_api::{
-        BinaryTensorPacket, Engine, InferenceRequest, MemoryAllocationClass, MemoryDomain,
-        RequestMetadata, TensorDtype,
+        BinaryTensorPacket, CancellationToken, Engine, EngineError, InferenceRequest,
+        MemoryAllocationClass, MemoryDomain, RequestMetadata, TensorDtype,
     };
     use serde_json::json;
     use std::fs;
@@ -477,6 +477,73 @@ mod tests {
 
         let chunks = handle.await.expect("join stream task");
         assert_eq!(chunks, vec!["Hel".to_string(), "lo".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn infer_stream_waits_for_engine_cancellation_acknowledgement() {
+        let backend = LLMBackend::new();
+        let (tx, mut rx) = mpsc::channel(1);
+        *backend.request_tx.write().unwrap() = Some(tx);
+        let cancellation = CancellationToken::new();
+        let request = InferenceRequest {
+            input: BinaryTensorPacket {
+                shape: vec![1, 2],
+                dtype: TensorDtype::Utf8,
+                data: b"Hi".to_vec(),
+            },
+            additional_inputs: Vec::new(),
+            session_id: Some("session".to_string()),
+            metadata: None,
+            cancellation: Some(cancellation.clone()),
+        };
+        let mut stream = backend.infer_stream(&request);
+        let (first_chunk_tx, first_chunk_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        let stream_task = tokio::spawn(async move {
+            let first = stream.next().await.expect("first stream item");
+            first_chunk_tx.send(first).expect("send first chunk");
+            resume_rx.await.expect("resume cancelled stream");
+            stream.next().await
+        });
+
+        let seq_group = rx.recv().await.expect("sequence group");
+        seq_group
+            .response_tx
+            .send(SequenceGroupOutput {
+                request_id: seq_group.request_id.clone(),
+                text: "token".to_string(),
+                finish_reason: None,
+            })
+            .await
+            .expect("send first output");
+        let first = first_chunk_rx
+            .await
+            .expect("receive first chunk")
+            .expect("first output");
+        assert_eq!(first.data, b"token");
+
+        cancellation.cancel();
+        resume_tx.send(()).expect("resume stream task");
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        assert!(
+            !stream_task.is_finished(),
+            "the stream returned before the engine acknowledged cancellation"
+        );
+        seq_group
+            .response_tx
+            .send(SequenceGroupOutput {
+                request_id: seq_group.request_id.clone(),
+                text: String::new(),
+                finish_reason: Some(FinishReason::Cancelled),
+            })
+            .await
+            .expect("send cancellation acknowledgement");
+
+        let terminal = stream_task
+            .await
+            .expect("join stream task")
+            .expect("cancellation result");
+        assert!(matches!(terminal, Err(EngineError::Cancelled { .. })));
     }
 
     #[test]
