@@ -8,6 +8,10 @@ This file is adapted from the original implementation and preserves the engine's
 behavior while making the KV geometry configurable at model-load time.
 */
 
+use crate::allocation_scope::{
+    DeviceAllocationClass, DeviceAllocationScope, DeviceAllocationScopeGuard,
+    DeviceAllocationScopeKind, DeviceAllocationScopeProvider,
+};
 use crate::block_manager::{BlockManager, SharedBlockAllocator};
 use crate::kv_cache::{KvCache, KvCacheConfig, KvCacheError, KvCacheMode, KvEvictionPolicy};
 use crate::llm_metrics::LLMMetrics;
@@ -1219,6 +1223,8 @@ pub struct LLMEngine {
     device_ids_override: Option<Vec<i32>>,
     use_env_allocators: bool,
     memory_owner: Option<(u32, u32)>,
+    allocation_scope_provider: Option<Arc<dyn DeviceAllocationScopeProvider>>,
+    allocation_scope_ids: Arc<AtomicU64>,
     pipeline_stages: Option<Vec<PipelineStage>>,
 
     // KV cache (recreated when model geometry detected)
@@ -1327,24 +1333,125 @@ impl Drop for LLMEngine {
 }
 
 impl LLMEngine {
-    #[cfg(feature = "onnx-cuda-pool")]
-    fn enter_pool_scope(
+    fn enter_allocation_scope(
         &self,
         device_id: i32,
-        class: PoolAllocationClass,
-    ) -> Option<PoolOwnerScope> {
-        if !self.use_env_allocators || device_id < 0 {
-            return None;
+        allocation_class: DeviceAllocationClass,
+        request_ids: &[u64],
+    ) -> Result<Option<Box<dyn DeviceAllocationScopeGuard>>, EngineError> {
+        if device_id < 0 {
+            return Ok(None);
         }
-        let owner = self.memory_owner.map_or_else(
-            || PoolOwner::unattributed(PoolBackend::Onnx, class),
-            |(model_id, replica_id)| PoolOwner::onnx(model_id, replica_id, class),
-        );
-        Some(PoolOwnerScope::enter(owner))
+        if !self.use_env_allocators {
+            return if self.allocation_scope_provider.is_some() {
+                Err(EngineError::backend(
+                    "device allocation scope provider requires ORT environment allocators",
+                ))
+            } else {
+                Ok(None)
+            };
+        }
+
+        if let Some(provider) = self.allocation_scope_provider.as_ref() {
+            let (model_id, replica_id) = self.memory_owner.ok_or_else(|| {
+                EngineError::backend(
+                    "device allocation scope provider requires a model/replica owner",
+                )
+            })?;
+            let scope_id = self
+                .allocation_scope_ids
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    current.checked_add(1)
+                })
+                .map_err(|_| EngineError::backend("device allocation scope IDs exhausted"))?;
+            let kind = match request_ids.len() {
+                0 if allocation_class == DeviceAllocationClass::PersistentWeights => {
+                    DeviceAllocationScopeKind::Model
+                }
+                0 => DeviceAllocationScopeKind::Replica,
+                1 => DeviceAllocationScopeKind::Request,
+                _ => DeviceAllocationScopeKind::RequestBatch,
+            };
+            let scope = DeviceAllocationScope {
+                kind,
+                scope_id,
+                device_id: device_id as u32,
+                model_id,
+                replica_id,
+                allocation_class,
+                request_ids: request_ids.to_vec(),
+            };
+            debug_assert!(scope.is_well_formed());
+            return provider.enter(&scope).map(Some).map_err(|error| {
+                EngineError::backend(format!(
+                    "establish governed device allocation scope: {error}"
+                ))
+            });
+        }
+
+        #[cfg(feature = "onnx-cuda-pool")]
+        {
+            let class = match allocation_class {
+                DeviceAllocationClass::PersistentWeights => PoolAllocationClass::PersistentWeights,
+                DeviceAllocationClass::KvCache => PoolAllocationClass::KvCache,
+                DeviceAllocationClass::TransientWorkspace => {
+                    PoolAllocationClass::TransientWorkspace
+                }
+                DeviceAllocationClass::BlockTable => PoolAllocationClass::BlockTable,
+                DeviceAllocationClass::RequestTransient => PoolAllocationClass::RequestTransient,
+                DeviceAllocationClass::Other => PoolAllocationClass::ExternallyOwned,
+            };
+            let owner = self.memory_owner.map_or_else(
+                || PoolOwner::unattributed(PoolBackend::Onnx, class),
+                |(model_id, replica_id)| PoolOwner::onnx(model_id, replica_id, class),
+            );
+            return Ok(Some(Box::new(PoolOwnerScope::enter(owner))));
+        }
+
+        #[cfg(not(feature = "onnx-cuda-pool"))]
+        {
+            Err(EngineError::backend(
+                "ORT environment allocators require a device allocation scope provider",
+            ))
+        }
     }
 
     pub fn set_memory_owner(&mut self, model_id: u32, replica_id: u32) {
         self.memory_owner = Some((model_id, replica_id));
+    }
+
+    pub(crate) fn set_allocation_scope_provider(
+        &mut self,
+        provider: Arc<dyn DeviceAllocationScopeProvider>,
+    ) {
+        self.allocation_scope_provider = Some(provider);
+    }
+
+    pub(crate) fn set_allocation_scope_id_source(&mut self, scope_ids: Arc<AtomicU64>) {
+        self.allocation_scope_ids = scope_ids;
+    }
+
+    fn allocation_request_ids(
+        &self,
+        groups: &[Arc<Mutex<SequenceGroup>>],
+    ) -> Result<Vec<u64>, EngineError> {
+        let mut request_ids = Vec::with_capacity(groups.len());
+        for group in groups {
+            match group.lock().unwrap().allocation_request_id {
+                Some(request_id) => {
+                    if !request_ids.contains(&request_id) {
+                        request_ids.push(request_id);
+                    }
+                }
+                None if self.allocation_scope_provider.is_some() => {
+                    return Err(EngineError::backend(
+                        "request-aware device allocation scope is missing an external request ID",
+                    ));
+                }
+                None => {}
+            }
+        }
+        Ok(request_ids)
     }
 
     fn get_empty_kv_value(
@@ -1450,6 +1557,8 @@ impl LLMEngine {
             device_ids_override,
             use_env_allocators,
             memory_owner: None,
+            allocation_scope_provider: None,
+            allocation_scope_ids: Arc::new(AtomicU64::new(1)),
             pipeline_stages: None,
             kv_cache,
             kv_cache_config: KvCacheConfig::default(),
@@ -2291,9 +2400,11 @@ impl LLMEngine {
                                                provider: Option<&str>,
                                                device_id: i32|
          -> Result<Session, EngineError> {
-            #[cfg(feature = "onnx-cuda-pool")]
-            let _pool_scope =
-                self.enter_pool_scope(device_id, PoolAllocationClass::PersistentWeights);
+            let _allocation_scope = self.enter_allocation_scope(
+                device_id,
+                DeviceAllocationClass::PersistentWeights,
+                &[],
+            )?;
             let mut builder = make_builder(provider, device_id)?;
             if safe_load {
                 builder = apply_safe_load(builder)?;
@@ -4157,9 +4268,13 @@ impl LLMEngine {
         )
         .map_err(|error| EngineError::backend(error.to_string()))?;
 
-        #[cfg(feature = "onnx-cuda-pool")]
-        let _pool_scope =
-            self.enter_pool_scope(self.device_kv_device_id, PoolAllocationClass::KvCache);
+        let allocation_request_ids =
+            self.allocation_request_ids(std::slice::from_ref(group_arc))?;
+        let _allocation_scope = self.enter_allocation_scope(
+            self.device_kv_device_id,
+            DeviceAllocationClass::KvCache,
+            &allocation_request_ids,
+        )?;
         let session = if use_decode_session {
             self.decode_session
                 .as_mut()
@@ -4558,11 +4673,12 @@ impl LLMEngine {
             }
         }
 
-        #[cfg(feature = "onnx-cuda-pool")]
-        let _pool_scope = self.enter_pool_scope(
+        let allocation_request_ids = self.allocation_request_ids(groups)?;
+        let _allocation_scope = self.enter_allocation_scope(
             self.device_kv_device_id,
-            PoolAllocationClass::TransientWorkspace,
-        );
+            DeviceAllocationClass::TransientWorkspace,
+            &allocation_request_ids,
+        )?;
         let outputs = self
             .session
             .as_mut()
@@ -5254,11 +5370,12 @@ impl LLMEngine {
             .map(|started| started.elapsed().as_secs_f64() * 1000.0)
             .unwrap_or(0.0);
         let ort_started = profile_decode.then(Instant::now);
-        #[cfg(feature = "onnx-cuda-pool")]
-        let _pool_scope = self.enter_pool_scope(
+        let allocation_request_ids = self.allocation_request_ids(groups)?;
+        let _allocation_scope = self.enter_allocation_scope(
             self.device_kv_device_id,
-            PoolAllocationClass::TransientWorkspace,
-        );
+            DeviceAllocationClass::TransientWorkspace,
+            &allocation_request_ids,
+        )?;
         let outputs = if let Some(decode_session) = self.decode_session.as_mut() {
             decode_session
                 .run(inputs)
@@ -6163,11 +6280,13 @@ impl LLMEngine {
                 }
 
                 // Run inference.
-                #[cfg(feature = "onnx-cuda-pool")]
-                let _pool_scope = self.enter_pool_scope(
+                let allocation_request_ids =
+                    self.allocation_request_ids(std::slice::from_ref(group_arc))?;
+                let _allocation_scope = self.enter_allocation_scope(
                     self.device_kv_device_id,
-                    PoolAllocationClass::TransientWorkspace,
-                );
+                    DeviceAllocationClass::TransientWorkspace,
+                    &allocation_request_ids,
+                )?;
                 let outputs = if use_dedicated_decode_session {
                     self.decode_session
                         .as_mut()
@@ -6470,11 +6589,12 @@ impl LLMEngine {
         &mut self,
         groups: &[Arc<Mutex<SequenceGroup>>],
     ) -> Result<(), EngineError> {
-        #[cfg(feature = "onnx-cuda-pool")]
-        let _pool_scope = self.enter_pool_scope(
+        let allocation_request_ids = self.allocation_request_ids(groups)?;
+        let _allocation_scope = self.enter_allocation_scope(
             self.device_kv_device_id,
-            PoolAllocationClass::TransientWorkspace,
-        );
+            DeviceAllocationClass::TransientWorkspace,
+            &allocation_request_ids,
+        )?;
         let stages = match self.pipeline_stages.as_mut() {
             Some(stages) => stages,
             None => return Err(EngineError::ModelNotLoaded),

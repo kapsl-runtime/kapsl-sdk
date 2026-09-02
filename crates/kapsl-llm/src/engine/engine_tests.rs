@@ -5,13 +5,18 @@ mod tests {
         empty_kv_shape_with_seq_len, infer_kv_layout, normalize_metadata_safe_load_setting,
         parse_safe_load_env_setting, parse_safe_load_setting, resolve_prepend_bos_token_id,
         tokenizer_add_bos_token, tokenizer_declared_bos_token_id, KvCacheMode, KvLayout, LLMEngine,
-        LLMMetrics, SafeLoadSetting, SamplingParams, SchedulerConfig,
+        LLMMetrics, SafeLoadSetting, SamplingParams, SchedulerConfig, SequenceGroup,
+    };
+    use crate::allocation_scope::{
+        DeviceAllocationClass, DeviceAllocationScope, DeviceAllocationScopeGuard,
+        DeviceAllocationScopeKind, DeviceAllocationScopeProvider,
     };
     use half::f16;
     use ort::tensor::TensorElementType;
     use serde_json::json;
     use std::collections::HashMap;
     use std::fs;
+    use std::sync::atomic::AtomicU64;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokenizers::decoders::byte_fallback::ByteFallback;
@@ -19,6 +24,21 @@ mod tests {
     use tokenizers::models::bpe::BPE;
     use tokenizers::Tokenizer;
     use tokio::sync::mpsc;
+
+    #[derive(Default)]
+    struct RecordingAllocationScopeProvider {
+        scopes: Mutex<Vec<DeviceAllocationScope>>,
+    }
+
+    impl DeviceAllocationScopeProvider for RecordingAllocationScopeProvider {
+        fn enter(
+            &self,
+            scope: &DeviceAllocationScope,
+        ) -> Result<Box<dyn DeviceAllocationScopeGuard>, String> {
+            self.scopes.lock().unwrap().push(scope.clone());
+            Ok(Box::new(()))
+        }
+    }
 
     #[test]
     fn parse_safe_load_setting_handles_bool_and_strings() {
@@ -313,6 +333,111 @@ mod tests {
         Arc::make_mut(&mut engine.model_output_names).insert("present.0.value".to_string());
         Arc::make_mut(&mut engine.model_input_shapes).remove("past_key_values.0.value");
         assert!(!engine.device_kv_contract_supported());
+    }
+
+    #[test]
+    fn external_allocation_scopes_preserve_owner_request_sets_and_unique_ids() {
+        let (_request_tx, request_rx) = mpsc::channel(1);
+        let mut engine = LLMEngine::new(
+            SchedulerConfig {
+                max_num_batched_tokens: 16,
+                max_num_seqs: 2,
+                max_paddings: 0,
+            },
+            16,
+            1,
+            request_rx,
+            Arc::new(Mutex::new(LLMMetrics::default())),
+            Some("cuda".to_string()),
+            Some(0),
+            None,
+            true,
+        );
+        let provider = Arc::new(RecordingAllocationScopeProvider::default());
+        let scope_ids = Arc::new(AtomicU64::new(1));
+        engine.set_memory_owner(7, 3);
+        engine.set_allocation_scope_provider(provider.clone());
+        engine.set_allocation_scope_id_source(scope_ids.clone());
+
+        engine.use_env_allocators = false;
+        assert!(engine
+            .enter_allocation_scope(0, DeviceAllocationClass::PersistentWeights, &[])
+            .is_err());
+        engine.use_env_allocators = true;
+
+        let (response_tx, _response_rx) = mpsc::channel(1);
+        let unscoped_group = Arc::new(Mutex::new(SequenceGroup::new(
+            "request".to_string(),
+            None,
+            "prompt".to_string(),
+            Vec::new(),
+            sampling_params(0.0),
+            None,
+            response_tx,
+        )));
+        assert!(engine.allocation_request_ids(&[unscoped_group]).is_err());
+
+        drop(
+            engine
+                .enter_allocation_scope(0, DeviceAllocationClass::PersistentWeights, &[])
+                .unwrap(),
+        );
+        drop(
+            engine
+                .enter_allocation_scope(0, DeviceAllocationClass::TransientWorkspace, &[41])
+                .unwrap(),
+        );
+        drop(
+            engine
+                .enter_allocation_scope(0, DeviceAllocationClass::TransientWorkspace, &[41, 42])
+                .unwrap(),
+        );
+
+        let (_request_tx, request_rx) = mpsc::channel(1);
+        let mut reloaded_engine = LLMEngine::new(
+            SchedulerConfig {
+                max_num_batched_tokens: 16,
+                max_num_seqs: 1,
+                max_paddings: 0,
+            },
+            16,
+            1,
+            request_rx,
+            Arc::new(Mutex::new(LLMMetrics::default())),
+            Some("cuda".to_string()),
+            Some(0),
+            None,
+            true,
+        );
+        reloaded_engine.set_memory_owner(7, 3);
+        reloaded_engine.set_allocation_scope_provider(provider.clone());
+        reloaded_engine.set_allocation_scope_id_source(scope_ids);
+        drop(
+            reloaded_engine
+                .enter_allocation_scope(0, DeviceAllocationClass::TransientWorkspace, &[43])
+                .unwrap(),
+        );
+
+        let scopes = provider.scopes.lock().unwrap();
+        assert_eq!(scopes.len(), 4);
+        assert_eq!(scopes[0].kind, DeviceAllocationScopeKind::Model);
+        assert_eq!(scopes[1].kind, DeviceAllocationScopeKind::Request);
+        assert_eq!(scopes[2].kind, DeviceAllocationScopeKind::RequestBatch);
+        assert_eq!(scopes[2].request_ids, vec![41, 42]);
+        assert!(scopes.iter().all(|scope| {
+            scope.model_id == 7
+                && scope.replica_id == 3
+                && scope.device_id == 0
+                && scope.is_well_formed()
+        }));
+        assert_eq!(scopes[3].kind, DeviceAllocationScopeKind::Request);
+        assert_eq!(
+            scopes
+                .iter()
+                .map(|scope| scope.scope_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
     }
 
     #[test]

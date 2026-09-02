@@ -154,6 +154,9 @@ impl Sequence {
 
 pub struct SequenceGroup {
     pub request_id: String,
+    /// Exact external request identity used only for governed device-memory
+    /// attribution. `None` preserves the legacy direct-SDK behavior.
+    pub allocation_request_id: Option<u64>,
     pub session_id: Option<String>,
     pub sequences: HashMap<u64, Arc<std::sync::Mutex<Sequence>>>,
     pub arrival_time: std::time::Instant,
@@ -194,6 +197,7 @@ impl SequenceGroup {
 
         Self {
             request_id,
+            allocation_request_id: None,
             session_id,
             sequences,
             arrival_time: std::time::Instant::now(),
