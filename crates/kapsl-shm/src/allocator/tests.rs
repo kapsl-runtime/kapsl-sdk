@@ -92,7 +92,9 @@ fn test_release_rejects_invalid_offsets() {
 
 #[test]
 fn test_snapshot_reports_in_use_and_oldest_lease() {
-    let allocator = SimpleShmAllocator::new_with_ttl(100, 64, 2, Duration::from_millis(100));
+    // Keep both leases active even when a loaded runner delays this thread.
+    // Lease expiration is covered by test_expired_lease_is_reused.
+    let allocator = SimpleShmAllocator::new_with_ttl(100, 64, 2, Duration::from_secs(30));
     let a = allocator.try_allocate(16).expect("slot a");
     thread::sleep(Duration::from_millis(10));
     let _b = allocator.try_allocate(16).expect("slot b");
