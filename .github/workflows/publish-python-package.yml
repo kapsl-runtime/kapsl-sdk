@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   python-tests:
-    uses: ./.github/workflows/python-sdk-tests.yml
+    uses: ./.github/workflows/python-sdk-tests.yml # zizmor: ignore[self-repository] actionlint does not support `$/` yet.
 
   build-wheels:
     name: Build wheel (${{ matrix.os }})
