@@ -13,8 +13,10 @@ ipc = ["dep:kapsl-ipc", "dep:kapsl-scheduler"]
 shm = ["dep:kapsl-shm", "dep:kapsl-scheduler", "dep:prometheus"]
 hybrid = ["ipc", "shm", "kapsl-ipc/hybrid"]
 streaming = ["kapsl-transport/streaming", "kapsl-ipc?/streaming"]
+grpc = ["dep:kapsl-grpc"]
 
 [dependencies]
+kapsl-grpc = { version = "0.3.0", path = "../kapsl-grpc", optional = true }
 kapsl-transport = { version = "0.3.0", path = "../kapsl-transport" }
 kapsl-ipc = { version = "0.3.0", path = "../kapsl-ipc", optional = true, default-features = false }
 kapsl-shm = { version = "0.3.0", path = "../kapsl-shm", optional = true }

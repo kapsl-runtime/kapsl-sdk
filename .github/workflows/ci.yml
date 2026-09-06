@@ -43,6 +43,9 @@ jobs:
       - name: Lint SDK workspace
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      - name: Check optional gRPC facade
+        run: cargo check -p kapsl-communication --no-default-features --features grpc --locked
+
       - name: Install unused-dependency checker
         # The published tool lockfile currently pins vulnerable transitive crates.
         run: cargo install cargo-machete --version 0.9.2
@@ -140,6 +143,15 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace --all-targets --locked
+
+      - name: Test Python and Triton gRPC clients
+        if: runner.os == 'Linux'
+        run: |
+          python3 -m venv .venv-grpc-interop
+          .venv-grpc-interop/bin/python -m pip install grpcio-tools==1.81.1 'tritonclient[grpc]==2.72.0'
+          cargo build -p kapsl-grpc --example echo_server --locked
+          .venv-grpc-interop/bin/python scripts/test-grpc-clients.py --server target/debug/examples/echo_server --client generated
+          .venv-grpc-interop/bin/python scripts/test-grpc-clients.py --server target/debug/examples/echo_server --client triton
 
   sdist-check:
     name: SDist metadata check
