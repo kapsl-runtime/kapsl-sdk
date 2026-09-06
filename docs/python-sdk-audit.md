@@ -3,8 +3,11 @@
 Checked on 2026-09-07 against SDK main `6b511d6`, the gRPC release commit
 `6742576`, and engine integration commit `e3223df`.
 
-The Python SDK is behind both the current SDK source and the new gRPC API.
-Updating its version alone will not provide compatibility across all transports.
+This records the audit before the Python 0.2.0 update. At that point the Python
+SDK was behind both SDK source and the new gRPC API. The subsequent
+[0.2.0 implementation](python-sdk-0.2.md) removes legacy decoding, packages the
+gRPC clients, and coordinates the native transport 0.4.0 / SHM version 3 update.
+The comparisons below describe the audited versions, not the updated source.
 
 ## Published package and source
 
@@ -83,20 +86,19 @@ Python source by itself would not synchronize SHM/hybrid clients and servers.
 SHM/hybrid interoperability was assessed from source layouts, not exercised
 with a live shared-memory model in this audit.
 
-## Recommended follow-up
+## Resolution in Python 0.2.0
 
-1. Fix and regression-test native metadata compatibility using requests from
-   the released Python wheel. Preserve credentials and policy fields through
-   supported legacy decoders; avoid silently discarding metadata.
-2. Release the matching transport/SHM changes and update the engine together
-   with new Python wheels. Test native, SHM, and hybrid client/server pairs.
-3. Package the generated gRPC clients behind an optional Python dependency,
-   with token/TLS configuration, deadlines, cancellation, and streaming helpers.
-4. Add Python request options for the supported scheduler and generation
-   controls, then publish a new Python version with wheel-level compatibility
-   checks against supported engine releases.
+1. Remove the fallback decoder. A captured 0.1.23 request is now rejected
+   explicitly; current requests preserve authentication and policy metadata.
+2. Remove the old SHM queue/notification and unleased hybrid paths. Version 3
+   uses response mailboxes and process-shared tensor leases exclusively.
+3. Package generated gRPC clients behind the `grpc` extra, with token/TLS
+   configuration, full-request deadlines, cancellation, and typed streaming.
+4. Expose supported scheduler/generation options and add installed-wheel tests
+   against current TCP, socket/pipe, SHM, hybrid, and gRPC server code. Python
+   release automation now requires those tests before publication.
 
-This audit did not modify or publish the Python package. The separate
+The original audit did not modify or publish the Python package. The separate
 [`kapsl-grpc 0.3.0` release](https://crates.io/crates/kapsl-grpc/0.3.0) was
 published and the engine now resolves it from crates.io. The packaged crate's
 18 tests and the engine's 452 tests passed after that dependency change.

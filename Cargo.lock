@@ -1914,16 +1914,20 @@ dependencies = [
 
 [[package]]
 name = "kapsl-communication"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
+ "futures",
+ "kapsl-engine-api",
  "kapsl-grpc",
  "kapsl-ipc",
  "kapsl-scheduler",
  "kapsl-shm",
  "kapsl-transport",
  "prometheus",
+ "serde_json",
  "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]
@@ -1999,7 +2003,7 @@ dependencies = [
 
 [[package]]
 name = "kapsl-ipc"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -2184,13 +2188,12 @@ dependencies = [
 
 [[package]]
 name = "kapsl-shm"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "kapsl-engine-api",
  "kapsl-scheduler",
  "kapsl-transport",
- "libc",
  "log",
  "prometheus",
  "shared_memory",
@@ -2199,7 +2202,7 @@ dependencies = [
 
 [[package]]
 name = "kapsl-transport"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "bincode",

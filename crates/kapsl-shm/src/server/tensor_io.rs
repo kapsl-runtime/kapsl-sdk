@@ -1,6 +1,5 @@
 use super::*;
 use crate::allocator::{SharedShmAllocator, SharedShmLease};
-use crate::mailbox::ResponseMailboxRegistry;
 
 const ERROR_LEN_PREFIX_BYTES: usize = std::mem::size_of::<u64>();
 
@@ -75,30 +74,6 @@ pub(super) fn error_response(
         error_offset: payload.map_or(0, |lease| lease.offset() as u64),
         payload_lease: payload.map_or(0, |lease| lease.token()),
     }
-}
-
-/// Publish to exactly one request mailbox and then emit the local wakeup hint.
-pub(super) fn publish_response_and_notify(
-    shm: &ShmManager,
-    mailboxes: &ResponseMailboxRegistry,
-    mailbox_index: u32,
-    request_id: u64,
-    response: ShmResponse,
-) -> bool {
-    if !mailboxes.publish(mailbox_index, request_id, response) {
-        return false;
-    }
-
-    let write_fd = shm.notify_write_fd();
-    if write_fd >= 0 {
-        let byte = 1_u8;
-        // SAFETY: this is a best-effort write to the creator's non-blocking
-        // notification pipe. Mailbox polling remains authoritative.
-        unsafe {
-            libc::write(write_fd, (&byte as *const u8).cast::<libc::c_void>(), 1);
-        }
-    }
-    true
 }
 
 fn decode_tensor(

@@ -1,6 +1,6 @@
 # Client Types
 
-`kapsl-sdk` provides three client classes, each optimised for a different deployment topology.
+`kapsl-sdk` provides native, gRPC, shared-memory, and hybrid clients.
 
 ## KapslClient
 
@@ -28,7 +28,9 @@ client = KapslClient("pipe://kapsl")
 
 ### Connection pool
 
-`KapslClient` maintains a pool of reusable connections (default size: 8). Requests borrow a connection, use it, and return it. On a broken connection the client transparently retries once on a fresh connection.
+`KapslClient` maintains a pool of reusable connections (default size: 8).
+Requests borrow a connection, use it, and return it. Broken connections are
+discarded and the error is returned without replaying the request.
 
 ```python
 # Custom pool size — set to 0 to disable pooling
@@ -42,6 +44,13 @@ client = KapslClient(max_pool_size=16)
 - Multi-threaded applications (each thread borrows a separate connection)
 
 ---
+
+## KapslGrpcClient / AsyncKapslGrpcClient
+
+Install `kapsl-sdk[grpc]` for discovery, inference, and typed server streaming
+over gRPC. Both clients include token, TLS, timeout, and cancellation support.
+The asynchronous client uses `grpc.aio`. See the
+[Python gRPC guide](python-sdk-0.2.md).
 
 ## KapslShmClient
 
@@ -99,6 +108,7 @@ result = client.infer(
 | Scenario | Recommended client |
 |----------|--------------------|
 | Remote runtime over network | `KapslClient` (TCP) |
+| Typed services and asynchronous network integrations | `KapslGrpcClient` / `AsyncKapslGrpcClient` |
 | Local runtime, general use | `KapslClient` (socket) |
 | Local runtime, large tensors | `KapslShmClient` |
 | Local runtime, maximum speed | `KapslHybridClient` |

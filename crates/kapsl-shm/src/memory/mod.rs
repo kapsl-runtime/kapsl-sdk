@@ -2,12 +2,12 @@ use crate::allocator::SharedShmAllocator;
 use crate::mailbox::{
     mailbox_alignment, mailbox_bytes, ResponseMailboxRegistry, RESPONSE_MAILBOX_COUNT,
 };
-use crate::protocol::{ShmRequest, ShmResponse, SHM_QUEUE_CAPACITY};
+use crate::protocol::{ShmRequest, SHM_QUEUE_CAPACITY};
 use shared_memory::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const MAGIC_NUMBER: u32 = 0x41494D4F; // "AIMO"
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 const CONTROL_PAGE_BYTES: usize = 4 * 1024;
 const QUEUE_REGION_BYTES: usize = 64 * 1024;
 const LEASE_SEQUENCE_OFFSET: usize = 512;
@@ -28,11 +28,8 @@ pub struct ShmHeader {
     pub magic: u32,
     pub version: u32,
     pub request_queue_offset: u64,
-    pub response_queue_offset: u64,
     pub tensor_pool_offset: u64,
     pub max_tensor_size: u64,
-    pub notify_read_fd: i32,
-    pub notify_write_fd: i32,
     pub features: u64,
     pub response_mailbox_offset: u64,
     pub response_mailbox_count: u32,
@@ -56,7 +53,6 @@ pub struct TensorHeader {
 pub struct ShmManager {
     shmem: Shmem,
     size: usize,
-    owns_notification_pipe: bool,
 }
 
 // SAFETY: the mapping lifetime is owned by this value. Mutable shared control
@@ -80,16 +76,12 @@ impl ShmManager {
             }
         };
 
-        let (notify_read_fd, notify_write_fd) = create_notification_pipe();
         let header = ShmHeader {
             magic: MAGIC_NUMBER,
             version: VERSION,
             request_queue_offset: layout.request_queue_offset as u64,
-            response_queue_offset: layout.response_queue_offset as u64,
             tensor_pool_offset: layout.tensor_pool_offset as u64,
             max_tensor_size: layout.tensor_pool_bytes as u64,
-            notify_read_fd,
-            notify_write_fd,
             features: REQUIRED_FEATURES,
             response_mailbox_offset: layout.response_mailbox_offset as u64,
             response_mailbox_count: RESPONSE_MAILBOX_COUNT as u32,
@@ -117,11 +109,7 @@ impl ShmManager {
             );
         }
 
-        let manager = Self {
-            shmem,
-            size,
-            owns_notification_pipe: true,
-        };
+        let manager = Self { shmem, size };
         ResponseMailboxRegistry::initialize(&manager);
         SharedShmAllocator::initialize(&manager);
 
@@ -142,7 +130,6 @@ impl ShmManager {
         let manager = Self {
             size: shmem.len(),
             shmem,
-            owns_notification_pipe: false,
         };
         manager.validate_header()?;
 
@@ -169,11 +156,6 @@ impl ShmManager {
         self.header().request_queue_offset as usize
     }
 
-    /// Get the retained legacy response queue offset.
-    pub fn response_queue_offset(&self) -> usize {
-        self.header().response_queue_offset as usize
-    }
-
     /// Get the response mailbox array offset.
     pub fn response_mailbox_offset(&self) -> usize {
         self.header().response_mailbox_offset as usize
@@ -192,24 +174,6 @@ impl ShmManager {
     /// Get the total number of bytes available to shared tensor slots.
     pub fn max_tensor_size(&self) -> usize {
         self.header().max_tensor_size as usize
-    }
-
-    /// Get the creator-process notification pipe read descriptor.
-    pub fn notify_read_fd(&self) -> i32 {
-        if self.owns_notification_pipe {
-            self.header().notify_read_fd
-        } else {
-            -1
-        }
-    }
-
-    /// Get the creator-process notification pipe write descriptor.
-    pub fn notify_write_fd(&self) -> i32 {
-        if self.owns_notification_pipe {
-            self.header().notify_write_fd
-        } else {
-            -1
-        }
     }
 
     /// Allocate a region-wide request id unique across connected clients.
@@ -286,7 +250,6 @@ impl ShmManager {
         }
         let expected = RegionLayout::for_size(self.size)?;
         if header.request_queue_offset != expected.request_queue_offset as u64
-            || header.response_queue_offset != expected.response_queue_offset as u64
             || header.response_mailbox_offset != expected.response_mailbox_offset as u64
             || header.tensor_pool_offset != expected.tensor_pool_offset as u64
             || header.max_tensor_size != expected.tensor_pool_bytes as u64
@@ -304,12 +267,6 @@ impl ShmManager {
         )?;
         validate_region(
             self.size,
-            header.response_queue_offset as usize,
-            QUEUE_REGION_BYTES,
-            "response queue",
-        )?;
-        validate_region(
-            self.size,
             header.response_mailbox_offset as usize,
             mailbox_bytes(header.response_mailbox_count as usize),
             "response mailboxes",
@@ -323,25 +280,6 @@ impl ShmManager {
         validate_atomic_offset(self.size, header.lease_sequence_offset as usize)?;
         validate_atomic_offset(self.size, header.request_sequence_offset as usize)?;
         Ok(())
-    }
-}
-
-impl Drop for ShmManager {
-    fn drop(&mut self) {
-        if !self.owns_notification_pipe {
-            return;
-        }
-        let header = self.header();
-        // SAFETY: only the creating manager owns these process-local file
-        // descriptors, and Drop runs once for that manager.
-        unsafe {
-            if header.notify_read_fd >= 0 {
-                libc::close(header.notify_read_fd);
-            }
-            if header.notify_write_fd >= 0 {
-                libc::close(header.notify_write_fd);
-            }
-        }
     }
 }
 
@@ -385,7 +323,6 @@ impl std::error::Error for ShmError {}
 #[derive(Debug, Clone, Copy)]
 struct RegionLayout {
     request_queue_offset: usize,
-    response_queue_offset: usize,
     response_mailbox_offset: usize,
     tensor_pool_offset: usize,
     tensor_pool_bytes: usize,
@@ -394,15 +331,13 @@ struct RegionLayout {
 impl RegionLayout {
     fn for_size(size: usize) -> Result<Self, ShmError> {
         let request_queue_bytes = std::mem::size_of::<ShmRequest>() * SHM_QUEUE_CAPACITY;
-        let response_queue_bytes = std::mem::size_of::<ShmResponse>() * SHM_QUEUE_CAPACITY;
-        if request_queue_bytes > QUEUE_REGION_BYTES || response_queue_bytes > QUEUE_REGION_BYTES {
+        if request_queue_bytes > QUEUE_REGION_BYTES {
             return Err(ShmError::InvalidLayout(format!(
-                "queue types require {request_queue_bytes}/{response_queue_bytes} bytes but each control region reserves {QUEUE_REGION_BYTES}"
+                "request queue requires {request_queue_bytes} bytes but its control region reserves {QUEUE_REGION_BYTES}"
             )));
         }
         let request_queue_offset = CONTROL_PAGE_BYTES;
-        let response_queue_offset = request_queue_offset + QUEUE_REGION_BYTES;
-        let response_mailbox_offset = response_queue_offset + QUEUE_REGION_BYTES;
+        let response_mailbox_offset = request_queue_offset + QUEUE_REGION_BYTES;
         let tensor_pool_offset = align_up(
             response_mailbox_offset + mailbox_bytes(RESPONSE_MAILBOX_COUNT),
             CONTROL_PAGE_BYTES,
@@ -416,34 +351,10 @@ impl RegionLayout {
         }
         Ok(Self {
             request_queue_offset,
-            response_queue_offset,
             response_mailbox_offset,
             tensor_pool_offset,
             tensor_pool_bytes: size - tensor_pool_offset,
         })
-    }
-}
-
-fn create_notification_pipe() -> (i32, i32) {
-    // File descriptors are usable only in the creator process. Connected
-    // clients poll their own mailbox; this pipe remains a local wakeup hint.
-    unsafe {
-        let mut descriptors = [0_i32; 2];
-        #[cfg(unix)]
-        let result = libc::pipe(descriptors.as_mut_ptr());
-        #[cfg(windows)]
-        let result = libc::pipe(descriptors.as_mut_ptr(), 8192, libc::O_BINARY);
-
-        if result != 0 {
-            log::warn!("Failed to create SHM notification pipe; clients will poll");
-            return (-1, -1);
-        }
-        #[cfg(unix)]
-        {
-            libc::fcntl(descriptors[0], libc::F_SETFL, libc::O_NONBLOCK);
-            libc::fcntl(descriptors[1], libc::F_SETFL, libc::O_NONBLOCK);
-        }
-        (descriptors[0], descriptors[1])
     }
 }
 
@@ -512,8 +423,6 @@ mod tests {
         );
         assert_eq!(manager1.tensor_pool_offset(), manager2.tensor_pool_offset());
         assert_ne!(manager1.next_request_id(), manager2.next_request_id());
-        assert_eq!(manager2.notify_read_fd(), -1);
-        assert_eq!(manager2.notify_write_fd(), -1);
     }
 
     #[test]

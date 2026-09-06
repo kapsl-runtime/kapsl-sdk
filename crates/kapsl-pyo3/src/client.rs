@@ -1,15 +1,21 @@
-use kapsl_communication::transport::protocol::{
-    blocking, CodecError, StreamResponse, DEFAULT_MAX_FRAME_PAYLOAD_BYTES, OP_INFER_STREAM,
+use kapsl_communication::transport::protocol::{asynchronous, CodecError, OP_INFER_STREAM};
+use kapsl_engine_api::{
+    BinaryTensorPacket, CancellationToken, InferenceRequest, NamedTensor, TensorDtype,
 };
-use kapsl_engine_api::{BinaryTensorPacket, InferenceRequest, NamedTensor, TensorDtype};
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 use std::collections::{HashMap, VecDeque};
-use std::io::{Read, Write};
-use std::net::TcpStream;
-#[cfg(unix)]
-use std::os::unix::net::UnixStream;
 use std::str::FromStr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+#[cfg(unix)]
+use tokio::net::UnixStream;
+use tokio::{
+    net::TcpStream,
+    runtime::{Builder, Runtime},
+};
+
+use crate::native_stream::{deadline, with_deadline, ClientConnection, StreamIterator};
+use crate::request_options::parse_options;
 
 const DEFAULT_MAX_POOL_SIZE: usize = 8;
 #[cfg(unix)]
@@ -19,9 +25,6 @@ const DEFAULT_SOCKET_ENDPOINT: &str = r"\\.\pipe\kapsl";
 const DEFAULT_TCP_HOST: &str = "127.0.0.1";
 const DEFAULT_TCP_PORT: u16 = 9096;
 
-trait ReadWriteConnection: Read + Write + Send + Sync {}
-impl<T: Read + Write + Send + Sync> ReadWriteConnection for T {}
-type ClientConnection = Box<dyn ReadWriteConnection>;
 type RawTensorInput = (Vec<i64>, String, Vec<u8>);
 type AdditionalInputMap = HashMap<String, RawTensorInput>;
 
@@ -40,12 +43,14 @@ enum ConnectionTarget {
 }
 
 #[derive(Debug)]
-enum ClientError {
+pub(crate) enum ClientError {
     Io(std::io::Error),
     InvalidEndpoint(String),
     InvalidDtype(String),
     Serialization(String),
     Server(String),
+    Timeout,
+    Closed,
 }
 
 impl From<std::io::Error> for ClientError {
@@ -75,6 +80,12 @@ impl From<ClientError> for PyErr {
             }
             ClientError::Serialization(msg) | ClientError::Server(msg) => {
                 PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(msg)
+            }
+            ClientError::Timeout => {
+                pyo3::exceptions::PyTimeoutError::new_err("Inference deadline exceeded")
+            }
+            ClientError::Closed => {
+                pyo3::exceptions::PyRuntimeError::new_err("The client is closed")
             }
         }
     }
@@ -335,35 +346,34 @@ pub(crate) struct KapslClient {
     max_pool_size: usize,
     connection_pool: Mutex<VecDeque<ClientConnection>>,
     api_token: Option<String>,
+    runtime: Arc<Runtime>,
+    closed: CancellationToken,
 }
 
 impl KapslClient {
-    fn connect_stream(&self) -> Result<ClientConnection, ClientError> {
+    async fn connect_stream(&self) -> Result<ClientConnection, ClientError> {
         match &self.target {
             #[cfg(unix)]
-            ConnectionTarget::UnixSocket(path) => Ok(Box::new(UnixStream::connect(path)?)),
+            ConnectionTarget::UnixSocket(path) => Ok(Box::new(UnixStream::connect(path).await?)),
             #[cfg(windows)]
-            ConnectionTarget::NamedPipe(path) => {
-                use std::fs::OpenOptions;
-                Ok(Box::new(
-                    OpenOptions::new().read(true).write(true).open(path)?,
-                ))
-            }
+            ConnectionTarget::NamedPipe(path) => Ok(Box::new(
+                kapsl_communication::transport::named_pipe::connect(path).await?,
+            )),
             ConnectionTarget::Tcp(addr) => {
-                let stream = TcpStream::connect(addr)?;
+                let stream = TcpStream::connect(addr).await?;
                 let _ = stream.set_nodelay(true);
                 Ok(Box::new(stream))
             }
         }
     }
 
-    fn checkout_connection(&self) -> Result<ClientConnection, ClientError> {
+    async fn checkout_connection(&self) -> Result<ClientConnection, ClientError> {
         if let Ok(mut pool) = self.connection_pool.lock() {
             if let Some(stream) = pool.pop_front() {
                 return Ok(stream);
             }
         }
-        self.connect_stream()
+        self.connect_stream().await
     }
 
     fn return_connection(&self, stream: ClientConnection) {
@@ -371,7 +381,7 @@ impl KapslClient {
             return;
         }
         if let Ok(mut pool) = self.connection_pool.lock() {
-            if pool.len() < self.max_pool_size {
+            if !self.closed.is_cancelled() && pool.len() < self.max_pool_size {
                 pool.push_back(stream);
             }
         }
@@ -397,28 +407,21 @@ impl KapslClient {
         data: Vec<u8>,
         additional_inputs: Option<AdditionalInputMap>,
         session_id: Option<String>,
-    ) -> Result<InferenceRequest, ClientError> {
+        options: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<InferenceRequest> {
         let dtype = TensorDtype::from_str(&dtype)
-            .map_err(|error| ClientError::InvalidDtype(error.to_string()))?;
+            .map_err(|error| PyErr::from(ClientError::InvalidDtype(error.to_string())))?;
         let additional_inputs =
-            Self::parse_additional_inputs(additional_inputs.unwrap_or_default())?;
+            Self::parse_additional_inputs(additional_inputs.unwrap_or_default())
+                .map_err(PyErr::from)?;
 
         Ok(InferenceRequest {
             input: BinaryTensorPacket { shape, dtype, data },
             additional_inputs,
             session_id,
-            metadata: self.request_metadata(),
+            metadata: parse_options(options, self.api_token.as_deref())?,
             cancellation: None,
         })
-    }
-
-    fn infer_impl(
-        &self,
-        stream: &mut dyn ReadWriteConnection,
-        model_id: u32,
-        request: &InferenceRequest,
-    ) -> Result<BinaryTensorPacket, ClientError> {
-        blocking::infer_request_over_stream(stream, model_id, request).map_err(ClientError::from)
     }
 
     fn run_infer(
@@ -426,37 +429,23 @@ impl KapslClient {
         model_id: u32,
         request: &InferenceRequest,
     ) -> Result<BinaryTensorPacket, ClientError> {
-        let mut stream = self.checkout_connection()?;
-        match self.infer_impl(&mut stream, model_id, request) {
-            Ok(output) => {
-                self.return_connection(stream);
-                Ok(output)
-            }
-            Err(ClientError::Io(_)) => {
-                let mut fresh = self.connect_stream()?;
-                match self.infer_impl(&mut fresh, model_id, request) {
-                    Ok(output) => {
-                        self.return_connection(fresh);
-                        Ok(output)
+        let deadline = deadline(request.metadata.as_ref().and_then(|m| m.timeout_ms))?;
+        self.runtime.block_on(async {
+            tokio::select! {
+                biased;
+                _ = self.closed.cancelled() => Err(ClientError::Closed),
+                result = with_deadline(deadline, async {
+                    let mut stream = self.checkout_connection().await?;
+                    let result = asynchronous::infer_request_over_stream(
+                        stream.as_mut(), model_id, request,
+                    ).await.map_err(ClientError::from);
+                    if result.is_ok() || matches!(result, Err(ClientError::Server(_))) {
+                        self.return_connection(stream);
                     }
-                    Err(error) => Err(error),
-                }
+                    result
+                }) => result,
             }
-            Err(error @ ClientError::Server(_)) => {
-                self.return_connection(stream);
-                Err(error)
-            }
-            Err(error) => Err(error),
-        }
-    }
-
-    fn request_metadata(&self) -> Option<kapsl_engine_api::RequestMetadata> {
-        self.api_token
-            .as_ref()
-            .map(|token| kapsl_engine_api::RequestMetadata {
-                auth_token: Some(token.clone()),
-                ..kapsl_engine_api::RequestMetadata::default()
-            })
+        })
     }
 }
 
@@ -501,6 +490,13 @@ impl KapslClient {
             max_pool_size,
             connection_pool: Mutex::new(VecDeque::new()),
             api_token,
+            runtime: Arc::new(
+                Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()?,
+            ),
+            closed: CancellationToken::new(),
         })
     }
 
@@ -512,7 +508,7 @@ impl KapslClient {
         self.target.endpoint_display()
     }
 
-    #[pyo3(signature = (model_id, shape, dtype, data, additional_inputs = None, session_id = None))]
+    #[pyo3(signature = (model_id, shape, dtype, data, additional_inputs = None, session_id = None, *, options = None))]
     fn infer(
         &self,
         py: Python<'_>,
@@ -522,10 +518,10 @@ impl KapslClient {
         data: Vec<u8>,
         additional_inputs: Option<AdditionalInputMap>,
         session_id: Option<String>,
+        options: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Vec<u8>> {
-        let request = self
-            .build_request(shape, dtype, data, additional_inputs, session_id)
-            .map_err(PyErr::from)?;
+        let request =
+            self.build_request(shape, dtype, data, additional_inputs, session_id, options)?;
         py.detach(|| self.run_infer(model_id, &request))
             .map_err(PyErr::from)
             .map(|packet| packet.data)
@@ -534,7 +530,7 @@ impl KapslClient {
     /// Like `infer` but returns `(data, shape, dtype)` so the caller knows
     /// how to interpret the output bytes without hardcoding dimensions.
     /// Essential for models whose output shape varies (diffusion, video, TTS).
-    #[pyo3(signature = (model_id, shape, dtype, data, additional_inputs = None, session_id = None))]
+    #[pyo3(signature = (model_id, shape, dtype, data, additional_inputs = None, session_id = None, *, options = None))]
     fn infer_tensor(
         &self,
         py: Python<'_>,
@@ -544,16 +540,16 @@ impl KapslClient {
         data: Vec<u8>,
         additional_inputs: Option<AdditionalInputMap>,
         session_id: Option<String>,
+        options: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<(Vec<u8>, Vec<i64>, String)> {
-        let request = self
-            .build_request(shape, dtype, data, additional_inputs, session_id)
-            .map_err(PyErr::from)?;
+        let request =
+            self.build_request(shape, dtype, data, additional_inputs, session_id, options)?;
         py.detach(|| self.run_infer(model_id, &request))
             .map_err(PyErr::from)
             .map(|packet| (packet.data, packet.shape, packet.dtype.as_str().to_string()))
     }
 
-    #[pyo3(signature = (model_id, shape, dtype, data, additional_inputs = None, session_id = None))]
+    #[pyo3(signature = (model_id, shape, dtype, data, additional_inputs = None, session_id = None, *, options = None))]
     fn infer_stream(
         &self,
         py: Python<'_>,
@@ -563,45 +559,52 @@ impl KapslClient {
         data: Vec<u8>,
         additional_inputs: Option<AdditionalInputMap>,
         session_id: Option<String>,
+        options: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<StreamIterator> {
-        let request = self
-            .build_request(shape, dtype, data, additional_inputs, session_id)
-            .map_err(PyErr::from)?;
+        let request =
+            self.build_request(shape, dtype, data, additional_inputs, session_id, options)?;
+        let deadline =
+            deadline(request.metadata.as_ref().and_then(|m| m.timeout_ms)).map_err(PyErr::from)?;
         let stream = py
             .detach(|| {
-                let mut stream = self.connect_stream()?;
-                blocking::write_request_value(stream.as_mut(), model_id, OP_INFER_STREAM, &request)
-                    .map_err(ClientError::from)?;
-                Ok::<_, ClientError>(stream)
+                self.runtime.block_on(async {
+                    tokio::select! {
+                        biased;
+                        _ = self.closed.cancelled() => Err(ClientError::Closed),
+                        result = with_deadline(deadline, async {
+                            let mut stream = self.connect_stream().await?;
+                            asynchronous::write_request_value(
+                                stream.as_mut(), model_id, OP_INFER_STREAM, &request,
+                            ).await.map_err(ClientError::from)?;
+                            Ok(stream)
+                        }) => result,
+                    }
+                })
             })
             .map_err(PyErr::from)?;
 
-        Ok(StreamIterator { stream })
+        Ok(StreamIterator::new(
+            self.runtime.clone(),
+            stream,
+            deadline,
+            self.closed.clone(),
+        ))
+    }
+
+    fn close(&self) {
+        self.closed.cancel();
+        self.connection_pool.lock().unwrap().clear();
+    }
+
+    #[getter]
+    fn closed(&self) -> bool {
+        self.closed.is_cancelled()
     }
 }
 
-#[pyclass]
-struct StreamIterator {
-    stream: ClientConnection,
-}
-
-#[pymethods]
-impl StreamIterator {
-    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
-    }
-
-    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<Vec<u8>>> {
-        let response = py
-            .detach(|| {
-                blocking::read_stream_packet(self.stream.as_mut(), DEFAULT_MAX_FRAME_PAYLOAD_BYTES)
-            })
-            .map_err(ClientError::from)
-            .map_err(PyErr::from)?;
-        match response {
-            StreamResponse::Chunk(packet) => Ok(Some(packet.data)),
-            StreamResponse::End => Ok(None),
-        }
+impl Drop for KapslClient {
+    fn drop(&mut self) {
+        self.closed.cancel();
     }
 }
 
@@ -610,7 +613,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn codec_io_errors_stay_retryable() {
+    fn codec_io_errors_remain_connection_errors() {
         let error = ClientError::from(CodecError::Io(std::io::Error::new(
             std::io::ErrorKind::BrokenPipe,
             "stale pooled connection",

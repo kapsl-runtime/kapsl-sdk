@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub mod connection_pool;
+#[cfg(windows)]
+pub mod named_pipe;
 pub mod protocol;
 pub mod tcp;
 
@@ -122,16 +124,13 @@ pub trait TransportClient: Send + Sync {
         input: BinaryTensorPacket,
     ) -> Result<BinaryTensorPacket, TransportError>;
 
-    /// Send a complete inference request. Socket clients override this to
-    /// preserve auth, session, priority, named-input, and generation metadata.
-    /// The default keeps third-party tensor-only transports source compatible.
+    /// Send the complete current request, preserving authentication, session,
+    /// priority, named-input, and generation metadata.
     async fn infer_request(
         &self,
         model_id: u32,
         request: &InferenceRequest,
-    ) -> Result<BinaryTensorPacket, TransportError> {
-        self.infer(model_id, request.input.clone()).await
-    }
+    ) -> Result<BinaryTensorPacket, TransportError>;
 
     /// Send streaming inference request
     #[cfg(feature = "streaming")]

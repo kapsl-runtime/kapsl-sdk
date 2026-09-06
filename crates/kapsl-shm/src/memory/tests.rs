@@ -15,7 +15,7 @@ fn test_offsets_within_bounds() {
     };
 
     let request_offset = manager.request_queue_offset();
-    let response_offset = manager.response_queue_offset();
+    let response_offset = manager.response_mailbox_offset();
     let tensor_offset = manager.tensor_pool_offset();
     let max_tensor_size = manager.max_tensor_size();
 

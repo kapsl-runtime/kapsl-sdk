@@ -1,2 +1,7 @@
 /target/
 /patches/llama-cpp-sys-2/llama.cpp/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv*/
+/dist/

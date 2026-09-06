@@ -75,19 +75,6 @@ impl SimpleShmAllocator {
         self.num_slots
     }
 
-    /// Best-effort legacy API.
-    ///
-    /// Prefer `try_allocate(required_size)` so callers can handle pool
-    /// exhaustion without overwriting in-flight slots.
-    pub fn allocate(&self) -> usize {
-        if let Some(offset) = self.try_allocate(self.slot_size) {
-            return offset;
-        }
-        // Fallback for legacy callers: preserve previous round-robin behavior.
-        let slot = self.counter.fetch_add(1, Ordering::Relaxed) % self.num_slots;
-        self.base_offset + slot * self.slot_size
-    }
-
     /// Try to lease a slot that can hold `required_size` bytes.
     pub fn try_allocate(&self, required_size: usize) -> Option<usize> {
         if required_size == 0 || required_size > self.slot_size {

@@ -1,50 +1,26 @@
-# Python SDK Transport Roadmap
+# Python SDK transport status
 
-This document describes a forward-compatible path for remote transports in `kapsl_runtime`.
+Python 0.2.0 uses the current native transport 0.4.0 and SHM version 3.
+See the [migration guide](python-sdk-0.2.md) for the supported client/server pair.
+Old request formats are rejected; no legacy decoder or protocol negotiation is
+retained.
 
-## Current State
+| Capability | Implementation |
+| --- | --- |
+| Native TCP / Unix socket / Windows pipe | `KapslClient` |
+| Full-request deadlines and cancellation | Native and gRPC clients |
+| Token authentication | Native TCP token metadata; shared API authorization for gRPC |
+| Typed server streaming and discovery | `KapslGrpcClient`, `AsyncKapslGrpcClient` |
+| TLS and mutual TLS | Python gRPC channels to a TLS-terminating proxy |
+| Concurrent local tensor transfer | SHM mailboxes and process-shared allocation leases |
 
-- Python `KapslClient` supports:
-  - local socket/pipe transport
-  - raw TCP transport (`tcp://host:port`)
-- Wire protocol is the existing binary IPC frame.
-- TCP transport is not encrypted and has no transport-layer authentication.
+The protobuf API and reusable Rust gRPC server live in the SDK's `kapsl-grpc`
+crate. The engine supplies model discovery, authorization, scheduling, and
+memory governance adapters. Python exposes gRPC as separate client classes
+because its discovery, generated messages, and channel lifecycle differ from
+the native framed protocol.
 
-## Goals
-
-- Keep one Python API surface while supporting local and remote runtimes.
-- Add secure remote transport for production deployments.
-- Maintain backward compatibility for existing socket users.
-
-## Phase 1: Hardened TCP
-
-- Add client-side connection/read timeouts in Python bindings.
-- Add optional auth token in transport metadata (or dedicated auth frame).
-- Add runtime flag to reject unauthenticated TCP requests by default when bound non-loopback.
-- Add integration tests for cross-machine TCP transport.
-
-## Phase 2: TLS for Binary Protocol
-
-- Add `tls://host:port` endpoint support in Python and Rust clients.
-- TLS modes:
-  - server verification with CA bundle
-  - optional mTLS with client cert/key
-- Suggested Python API extension:
-  - `KapslClient(protocol="tcp", host=..., port=..., tls=True, ca_cert=..., client_cert=..., client_key=...)`
-- Keep framing protocol unchanged so only transport layer changes.
-
-## Phase 3: gRPC Transport (Optional)
-
-- Define a stable gRPC service:
-  - `Infer`
-  - `InferStream`
-  - health/readiness methods
-- Map existing request/response schema to protobuf messages.
-- Add a gRPC-backed `TransportClient` implementation in Rust runtime.
-- Add Python adapter so `KapslClient(..., protocol="grpc")` routes to grpc transport internally.
-
-## Compatibility Policy
-
-- `KapslClient("/tmp/kapsl.sock")` and `KapslClient("tcp://...")` remain valid.
-- New security and protocol options are additive keyword arguments.
-- Existing inference methods (`infer`, `infer_stream`) remain unchanged.
+WebSocket and bidirectional generation controls remain outside this release.
+The engine's gRPC listener currently requires a proxy for TLS termination.
+Native TCP TLS, governance management helpers, and multiple-output tensor
+inference can be considered separately when integrations need them.

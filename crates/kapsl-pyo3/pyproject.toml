@@ -4,8 +4,8 @@ build-backend = "maturin"
 
 [project]
 name = "kapsl-sdk"
-version = "0.1.16"
-description = "Python client SDK for kapsl-runtime with IPC, shared-memory, and hybrid inference transports"
+version = "0.2.0"
+description = "Python SDK for Kapsl inference, native transports, and optional gRPC streaming"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "Proprietary" }
@@ -23,9 +23,13 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
+
+[project.optional-dependencies]
+grpc = ["grpcio>=1.71.2,<2", "protobuf>=5.29,<7"]
 
 [project.urls]
 Homepage = "https://kapsl.ai"
@@ -34,6 +38,6 @@ Issues = "https://github.com/kapsl-runtime/kapsl-sdk/issues"
 
 [tool.maturin]
 module-name = "kapsl_sdk.kapsl_sdk"
-python-packages = ["kapsl_sdk"]
+python-source = "."
 features = ["pyo3/extension-module"]
-include = ["kapsl_sdk/*.bin"]
+include = ["kapsl_sdk/*.bin", "kapsl_sdk/py.typed"]

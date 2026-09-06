@@ -1,6 +1,6 @@
 [package]
 name = "kapsl-ipc"
-version.workspace = true
+version = "0.4.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -17,8 +17,8 @@ streaming = ["kapsl-transport/streaming"]
 [dependencies]
 kapsl-engine-api = { version = "0.3.0", path = "../kapsl-engine-api" }
 kapsl-scheduler = { version = "0.3.0", path = "../kapsl-scheduler" }
-kapsl-transport = { version = "0.3.0", path = "../kapsl-transport" }
-kapsl-shm = { version = "0.3.0", path = "../kapsl-shm", optional = true }
+kapsl-transport = { version = "0.4.0", path = "../kapsl-transport" }
+kapsl-shm = { version = "0.4.0", path = "../kapsl-shm", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"

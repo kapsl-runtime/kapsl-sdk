@@ -5,9 +5,10 @@
 //! IPC server, Rust clients, and language bindings share one implementation.
 
 use crate::TransportError;
+use bincode::Options;
 use kapsl_engine_api::{
-    BinaryTensorPacket, InferenceRequest, NamedTensor, OpenAiWireFormat, OpenAiWireRequest,
-    OpenAiWireResponse, OpenAiWireResponseHead,
+    BinaryTensorPacket, InferenceRequest, OpenAiWireFormat, OpenAiWireRequest, OpenAiWireResponse,
+    OpenAiWireResponseHead,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::io;
@@ -34,6 +35,8 @@ pub const OP_OPENAI_WIRE_STREAM: u32 = 6;
 /// operation payloads. This preamble is checked before bincode deserializes the
 /// engine-facing request.
 pub const OPENAI_WIRE_TRANSPORT_VERSION: u16 = 1;
+/// Current tensor inference envelope. Unversioned payloads are not supported.
+pub const NATIVE_INFERENCE_PROTOCOL_VERSION: u16 = 1;
 
 pub const STATUS_OK: u32 = 0;
 pub const STATUS_ERR: u32 = 1;
@@ -44,6 +47,8 @@ pub const STATUS_OPENAI_WIRE_CHUNK: u32 = 5;
 
 const REQUEST_HEADER_BYTES: usize = 12;
 const RESPONSE_HEADER_BYTES: usize = 8;
+const NATIVE_INFERENCE_MAGIC: [u8; 4] = *b"KIRQ";
+const NATIVE_INFERENCE_PREAMBLE_BYTES: usize = 6;
 const OPENAI_WIRE_PREAMBLE_MAGIC: [u8; 4] = *b"KOWR";
 const OPENAI_WIRE_PREAMBLE_BYTES: usize =
     OPENAI_WIRE_PREAMBLE_MAGIC.len() + std::mem::size_of::<u16>();
@@ -264,43 +269,53 @@ impl From<CodecError> for TransportError {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct LegacyInferenceRequestV1 {
-    input: BinaryTensorPacket,
-    #[serde(default)]
-    additional_inputs: Vec<NamedTensor>,
-    #[serde(default)]
-    session_id: Option<String>,
-}
-
 pub fn serialize_value<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, CodecError> {
     bincode::serialize(value).map_err(|error| CodecError::Serialize(error.to_string()))
 }
 
 pub fn deserialize_value<T: DeserializeOwned>(payload: &[u8]) -> Result<T, CodecError> {
-    bincode::deserialize(payload).map_err(|error| CodecError::Deserialize(error.to_string()))
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_limit(DEFAULT_MAX_FRAME_PAYLOAD_BYTES as u64)
+        .reject_trailing_bytes()
+        .deserialize(payload)
+        .map_err(|error| CodecError::Deserialize(error.to_string()))
 }
 
 pub fn encode_inference_request(request: &InferenceRequest) -> Result<Vec<u8>, CodecError> {
-    serialize_value(request)
+    serialize_request_value(OP_INFER, request)
 }
 
-/// Decode the current request layout, with the server's pre-metadata layout as
-/// a compatibility fallback. This keeps every ingress on the same policy.
+/// Decode exactly the current request layout. Truncated metadata, older
+/// layouts, and trailing data are rejected without dropping policy fields.
 pub fn decode_inference_request(payload: &[u8]) -> Result<InferenceRequest, CodecError> {
-    match bincode::deserialize::<InferenceRequest>(payload) {
-        Ok(request) => Ok(request),
-        Err(primary_error) => match bincode::deserialize::<LegacyInferenceRequestV1>(payload) {
-            Ok(legacy) => Ok(InferenceRequest {
-                input: legacy.input,
-                additional_inputs: legacy.additional_inputs,
-                session_id: legacy.session_id,
-                metadata: None,
-                cancellation: None,
-            }),
-            Err(_) => Err(CodecError::Deserialize(primary_error.to_string())),
-        },
+    if payload.len() < NATIVE_INFERENCE_PREAMBLE_BYTES || payload[..4] != NATIVE_INFERENCE_MAGIC {
+        return Err(CodecError::Deserialize(
+            "native inference requires the versioned KIRQ envelope; upgrade client and server together".into(),
+        ));
     }
+    let version = u16::from_le_bytes([payload[4], payload[5]]);
+    if version != NATIVE_INFERENCE_PROTOCOL_VERSION {
+        return Err(CodecError::Deserialize(format!(
+            "unsupported native inference version {version}; expected {NATIVE_INFERENCE_PROTOCOL_VERSION}",
+        )));
+    }
+    deserialize_value(&payload[NATIVE_INFERENCE_PREAMBLE_BYTES..])
+}
+
+fn serialize_request_value<T: Serialize + ?Sized>(
+    op_code: u32,
+    value: &T,
+) -> Result<Vec<u8>, CodecError> {
+    let body = serialize_value(value)?;
+    if !matches!(op_code, OP_INFER | OP_INFER_STREAM) {
+        return Ok(body);
+    }
+    let mut payload = Vec::with_capacity(NATIVE_INFERENCE_PREAMBLE_BYTES + body.len());
+    payload.extend_from_slice(&NATIVE_INFERENCE_MAGIC);
+    payload.extend_from_slice(&NATIVE_INFERENCE_PROTOCOL_VERSION.to_le_bytes());
+    payload.extend_from_slice(&body);
+    Ok(payload)
 }
 
 fn checked_payload_len(size: usize, max: usize) -> Result<u32, CodecError> {
@@ -363,7 +378,12 @@ pub mod blocking {
         W: Write + ?Sized,
         T: Serialize + ?Sized,
     {
-        write_request_bytes(writer, model_id, op_code, &serialize_value(value)?)
+        write_request_bytes(
+            writer,
+            model_id,
+            op_code,
+            &serialize_request_value(op_code, value)?,
+        )
     }
 
     pub fn write_request_bytes<W: Write + ?Sized>(
@@ -611,7 +631,13 @@ pub mod asynchronous {
         W: AsyncWrite + Unpin + ?Sized,
         T: Serialize + ?Sized,
     {
-        write_request_bytes(writer, model_id, op_code, &serialize_value(value)?).await
+        write_request_bytes(
+            writer,
+            model_id,
+            op_code,
+            &serialize_request_value(op_code, value)?,
+        )
+        .await
     }
 
     pub async fn write_request_bytes<W: AsyncWrite + Unpin + ?Sized>(
@@ -893,8 +919,7 @@ pub mod asynchronous {
     }
 }
 
-/// Backward-compatible `TransportClient` helper. Its behavior is corrected to
-/// speak the same request-header protocol as `IpcServer` and `TcpServer`.
+/// Send a tensor-only request using the current native request protocol.
 pub async fn infer_over_stream<S>(
     conn: &mut S,
     model_id: u32,
@@ -1052,18 +1077,53 @@ mod tests {
     }
 
     #[test]
-    fn legacy_request_layout_decodes_in_one_shared_place() {
-        let legacy = LegacyInferenceRequestV1 {
-            input: packet(),
-            additional_inputs: Vec::new(),
-            session_id: Some("legacy-session".to_string()),
-        };
-        let payload = serialize_value(&legacy).unwrap();
+    fn old_request_prefix_is_rejected_instead_of_losing_metadata() {
+        let payload = serialize_value(&(
+            packet(),
+            Vec::<kapsl_engine_api::NamedTensor>::new(),
+            Some("old-session"),
+        ))
+        .unwrap();
+        assert!(decode_inference_request(&payload).is_err());
+    }
 
-        let decoded = decode_inference_request(&payload).unwrap();
-        assert_eq!(decoded.input.data, packet().data);
-        assert_eq!(decoded.session_id.as_deref(), Some("legacy-session"));
-        assert!(decoded.metadata.is_none());
+    #[test]
+    fn current_request_requires_complete_metadata_and_no_trailing_data() {
+        let request =
+            InferenceRequest::new(packet()).with_metadata(kapsl_engine_api::RequestMetadata {
+                auth_token: Some("test-token".into()),
+                priority: Some(1),
+                min_new_tokens: Some(3),
+                ..Default::default()
+            });
+        let mut payload = encode_inference_request(&request).unwrap();
+        let metadata = decode_inference_request(&payload)
+            .unwrap()
+            .metadata
+            .unwrap();
+        assert_eq!(metadata.auth_token.as_deref(), Some("test-token"));
+        assert_eq!(metadata.priority, Some(1));
+        assert_eq!(metadata.min_new_tokens, Some(3));
+        assert!(decode_inference_request(&payload[..payload.len() - 1]).is_err());
+        payload.push(0);
+        assert!(decode_inference_request(&payload).is_err());
+    }
+
+    #[test]
+    fn native_envelope_rejects_unversioned_current_layout_and_unknown_versions() {
+        let request = InferenceRequest::new(packet());
+        assert!(decode_inference_request(&serialize_value(&request).unwrap()).is_err());
+        let mut payload = encode_inference_request(&request).unwrap();
+        assert_eq!(&payload[..6], b"KIRQ\x01\x00");
+        assert_eq!(
+            decode_inference_request(&payload).unwrap().input.data,
+            request.input.data
+        );
+        payload[4..6].copy_from_slice(&(NATIVE_INFERENCE_PROTOCOL_VERSION + 1).to_le_bytes());
+        assert!(
+            matches!(decode_inference_request(&payload), Err(CodecError::Deserialize(message))
+            if message.contains("unsupported native inference version"))
+        );
     }
 
     #[test]

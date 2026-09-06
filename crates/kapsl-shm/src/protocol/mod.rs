@@ -4,7 +4,7 @@ use kapsl_transport::{RequestMetadata, ResponseMetadata};
 pub const SHM_QUEUE_CAPACITY: usize = 1024;
 
 /// Current fixed-layout shared-memory request/response protocol version.
-pub const SHM_PROTOCOL_VERSION: u16 = 2;
+pub const SHM_PROTOCOL_VERSION: u16 = 3;
 
 /// Request metadata exchanged through the shared-memory request queue.
 #[repr(C)]

@@ -1,6 +1,6 @@
 [package]
 name = "kapsl-communication"
-version.workspace = true
+version = "0.4.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -17,10 +17,21 @@ grpc = ["dep:kapsl-grpc"]
 
 [dependencies]
 kapsl-grpc = { version = "0.3.0", path = "../kapsl-grpc", optional = true }
-kapsl-transport = { version = "0.3.0", path = "../kapsl-transport" }
-kapsl-ipc = { version = "0.3.0", path = "../kapsl-ipc", optional = true, default-features = false }
-kapsl-shm = { version = "0.3.0", path = "../kapsl-shm", optional = true }
+kapsl-transport = { version = "0.4.0", path = "../kapsl-transport" }
+kapsl-ipc = { version = "0.4.0", path = "../kapsl-ipc", optional = true, default-features = false }
+kapsl-shm = { version = "0.4.0", path = "../kapsl-shm", optional = true }
 kapsl-scheduler = { version = "0.3.0", path = "../kapsl-scheduler", optional = true }
 prometheus = { version = "0.14", optional = true }
 async-trait = "0.1"
 thiserror = "1.0"
+
+[dev-dependencies]
+kapsl-engine-api = { version = "0.3.0", path = "../kapsl-engine-api" }
+kapsl-grpc = { version = "0.3.0", path = "../kapsl-grpc" }
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+serde_json = "1"
+
+[[example]]
+name = "python_test_server"
+required-features = ["hybrid"]

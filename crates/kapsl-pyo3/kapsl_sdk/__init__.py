@@ -1,8 +1,17 @@
-from .kapsl_sdk import KapslClient, KapslHybridClient, KapslShmClient
+from .kapsl_sdk import KapslHybridClient, KapslShmClient
+from .client import KapslClient
+from .grpc_client import KapslGrpcClient, AsyncKapslGrpcClient
+from ._types import Tensor
+from importlib.metadata import version as _package_version
 
 import pathlib
 
-__all__ = ["KapslClient", "KapslHybridClient", "KapslShmClient", "load_voice", "list_voices"]
+__version__ = _package_version("kapsl-sdk")
+
+__all__ = [
+    "KapslClient", "KapslGrpcClient", "AsyncKapslGrpcClient",
+    "KapslHybridClient", "KapslShmClient", "Tensor", "load_voice", "list_voices",
+]
 
 _VOICES_DIR = pathlib.Path(__file__).parent
 

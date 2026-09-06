@@ -50,32 +50,21 @@ pub struct HybridTensorLocation {
 /// Shared-memory operations required by the IPC hybrid opcode.
 ///
 /// Keeping this interface transport-neutral lets socket/TCP-only builds avoid
-/// linking a shared-memory implementation. The default `hybrid` feature still
-/// implements it for `kapsl_shm::memory::ShmManager` so existing constructors
-/// remain source compatible.
+/// linking a shared-memory implementation. Hybrid adapters must implement
+/// lease validation and release explicitly.
 pub trait HybridMemory: Send + Sync {
-    /// Decode a tensor from a caller-declared shared-memory region.
-    fn read_tensor(&self, offset: u64, encoded_size: u64) -> Result<BinaryTensorPacket, String>;
-
     /// Decode a tensor protected by a process-shared lease.
-    ///
-    /// The default preserves source compatibility for injected test or custom
-    /// adapters that own allocation safety outside `kapsl-shm`.
     fn read_leased_tensor(
         &self,
         location: HybridTensorLocation,
-    ) -> Result<BinaryTensorPacket, String> {
-        self.read_tensor(location.offset, location.size)
-    }
+    ) -> Result<BinaryTensorPacket, String>;
 
     /// Encode an inference result and return the region advertised to the client.
     fn write_tensor(&self, tensor: &BinaryTensorPacket) -> Result<HybridTensorLocation, String>;
 
     /// Release an encoded tensor when its control-plane response could not be
-    /// delivered. Adapters without lease ownership may keep the default no-op.
-    fn release_tensor(&self, _location: HybridTensorLocation) -> bool {
-        false
-    }
+    /// delivered.
+    fn release_tensor(&self, location: HybridTensorLocation) -> bool;
 }
 
 #[cfg(feature = "hybrid")]
@@ -148,10 +137,6 @@ impl ShmHybridMemory {
 
 #[cfg(feature = "hybrid")]
 impl HybridMemory for ShmHybridMemory {
-    fn read_tensor(&self, _offset: u64, _encoded_size: u64) -> Result<BinaryTensorPacket, String> {
-        Err("Hybrid SHM tensors require a process-shared lease".to_string())
-    }
-
     fn read_leased_tensor(
         &self,
         location: HybridTensorLocation,
@@ -232,7 +217,7 @@ impl HybridMemory for ShmHybridMemory {
 
 // OpenAI ingress bodies are JSON/SSE control payloads, not arbitrary tensor
 // storage. Keep their pre-auth allocation ceiling substantially below the
-// legacy tensor-frame maximum so an unauthenticated peer cannot force a 1 GiB
+// tensor-frame maximum so an unauthenticated peer cannot force a 1 GiB
 // allocation before the transport envelope's credential is checked.
 const OPENAI_WIRE_OPERATION_LIMITS: &[(u32, usize)] = &[
     (OP_OPENAI_WIRE, MAX_OPENAI_WIRE_REQUEST_PAYLOAD_BYTES),
@@ -317,6 +302,100 @@ fn request_priority(request: &InferenceRequest, default: Priority) -> Priority {
     )
 }
 
+async fn handle_tensor_request<T>(
+    connection: &mut T,
+    scheduler: &(dyn ReplicaScheduler + Send + Sync),
+    mut request: InferenceRequest,
+    streaming: bool,
+) -> std::io::Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    use futures::StreamExt;
+    let priority = request_priority(
+        &request,
+        if streaming {
+            Priority::LatencyCritical
+        } else {
+            Priority::Throughput
+        },
+    );
+    let force_cpu = request
+        .metadata
+        .as_ref()
+        .and_then(|m| m.force_cpu)
+        .unwrap_or(false);
+    let timeout_ms = request.metadata.as_ref().and_then(|m| m.timeout_ms);
+    let deadline = match timeout_ms {
+        Some(0) => {
+            write_error_response(connection, "timeout_ms must be positive").await?;
+            return Ok(());
+        }
+        Some(ms) => {
+            match tokio::time::Instant::now().checked_add(std::time::Duration::from_millis(ms)) {
+                Some(at) => Some(at),
+                None => {
+                    write_error_response(connection, "timeout_ms is too large").await?;
+                    return Ok(());
+                }
+            }
+        }
+        None => None,
+    };
+    let cancellation = CancellationToken::new();
+    request.cancellation = Some(cancellation.clone());
+    let _cancel_on_drop = WireCancellationGuard(cancellation);
+    let (mut reader, mut writer) = tokio::io::split(connection);
+    let operation = async {
+        if streaming {
+            match scheduler.infer_stream(request, priority, force_cpu).await {
+                Ok(mut stream) => {
+                    while let Some(result) = stream.next().await {
+                        match result {
+                            Ok(packet) => wire::write_response_value(
+                                &mut writer,
+                                STATUS_STREAM_CHUNK,
+                                &packet,
+                            )
+                            .await
+                            .map_err(codec_io)?,
+                            Err(error) => {
+                                write_error_response(&mut writer, &error.to_string()).await?;
+                                return Ok(());
+                            }
+                        }
+                    }
+                    wire::write_response_bytes(&mut writer, STATUS_STREAM_END, &[])
+                        .await
+                        .map_err(codec_io)?;
+                }
+                Err(error) => write_error_response(&mut writer, &error.to_string()).await?,
+            }
+        } else {
+            match scheduler.infer(&request, priority, force_cpu).await {
+                Ok(packet) => wire::write_response_value(&mut writer, STATUS_OK, &packet)
+                    .await
+                    .map_err(codec_io)?,
+                Err(error) => write_error_response(&mut writer, &error.to_string()).await?,
+            }
+        }
+        Ok(())
+    };
+    tokio::select! {
+        biased;
+        _ = async {
+            match deadline {
+                Some(at) => tokio::time::sleep_until(at).await,
+                None => std::future::pending().await,
+            }
+        } => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut, "Inference deadline exceeded",
+        )),
+        result = operation => result,
+        result = wait_for_peer_disconnect(&mut reader) => result,
+    }
+}
+
 fn openai_wire_priority(request: &OpenAiWireRequest, default: Priority) -> Priority {
     priority_value(
         request
@@ -384,7 +463,7 @@ impl IpcServer {
         }
     }
 
-    /// Backward-compatible constructor for SHM-aware IPC consumers.
+    /// Construct an IPC server with optional shared-memory tensor transfer.
     #[cfg(feature = "hybrid")]
     pub fn new(
         socket_path: &str,
@@ -397,7 +476,7 @@ impl IpcServer {
         Self::new_with_lookup(socket_path, scheduler_lookup, shm_manager)
     }
 
-    /// Backward-compatible lookup constructor for SHM-aware IPC consumers.
+    /// Construct an IPC server with live scheduler lookup and optional SHM.
     #[cfg(feature = "hybrid")]
     pub fn new_with_lookup(
         socket_path: &str,
@@ -715,99 +794,31 @@ where
                     }
                 }
             }
-            OP_INFER_STREAM => {
+            OP_INFER | OP_INFER_STREAM => {
                 let request = match decode_inference_request(&frame.payload) {
-                    Ok(req) => req,
+                    Ok(request) => request,
                     Err(error) => {
                         write_error_response(&mut connection, &inference_decode_message(error))
                             .await?;
                         continue;
                     }
                 };
-
-                if let Some(error_msg) = check_auth(&request, auth_token.as_deref()) {
-                    write_error_response(&mut connection, &error_msg).await?;
+                if let Some(message) = check_auth(&request, auth_token.as_deref()) {
+                    write_error_response(&mut connection, &message).await?;
                     continue;
                 }
-
-                let scheduler = match scheduler_lookup(model_id) {
-                    Some(s) => s,
-                    None => {
-                        write_error_response(
-                            &mut connection,
-                            &format!("Model {model_id} not found"),
-                        )
-                        .await?;
-                        continue;
-                    }
-                };
-
-                let priority = request_priority(&request, Priority::LatencyCritical);
-                let stream_result = scheduler.infer_stream(request, priority, false).await;
-
-                use futures::StreamExt;
-                match stream_result {
-                    Ok(mut inference_stream) => {
-                        while let Some(result) = inference_stream.next().await {
-                            match result {
-                                Ok(packet) => {
-                                    wire::write_response_value(
-                                        &mut connection,
-                                        STATUS_STREAM_CHUNK,
-                                        &packet,
-                                    )
-                                    .await
-                                    .map_err(codec_io)?;
-                                }
-                                Err(e) => {
-                                    write_error_response(&mut connection, &e.to_string()).await?;
-                                    break;
-                                }
-                            }
-                        }
-
-                        wire::write_response_bytes(&mut connection, STATUS_STREAM_END, &[])
-                            .await
-                            .map_err(codec_io)?;
-                    }
-                    Err(e) => {
-                        write_error_response(&mut connection, &e.to_string()).await?;
-                    }
-                }
-            }
-            OP_INFER => {
-                if let Some(scheduler) = scheduler_lookup(model_id) {
-                    let request = match decode_inference_request(&frame.payload) {
-                        Ok(req) => req,
-                        Err(error) => {
-                            write_error_response(&mut connection, &inference_decode_message(error))
-                                .await?;
-                            continue;
-                        }
-                    };
-
-                    if let Some(error_msg) = check_auth(&request, auth_token.as_deref()) {
-                        write_error_response(&mut connection, &error_msg).await?;
-                        continue;
-                    }
-
-                    let priority = request_priority(&request, Priority::Throughput);
-                    let result = scheduler.infer(&request, priority, false).await;
-
-                    match result {
-                        Ok(output) => {
-                            wire::write_response_value(&mut connection, STATUS_OK, &output)
-                                .await
-                                .map_err(codec_io)?;
-                        }
-                        Err(e) => {
-                            write_error_response(&mut connection, &e.to_string()).await?;
-                        }
-                    }
-                } else {
+                let Some(scheduler) = scheduler_lookup(model_id) else {
                     write_error_response(&mut connection, &format!("Model {model_id} not found"))
                         .await?;
-                }
+                    continue;
+                };
+                handle_tensor_request(
+                    &mut connection,
+                    scheduler.as_ref(),
+                    request,
+                    frame.header.op_code == OP_INFER_STREAM,
+                )
+                .await?;
             }
             OP_HYBRID_INFER => {
                 let hybrid_req: HybridRequest = frame.deserialize().map_err(codec_io)?;
@@ -950,12 +961,14 @@ mod tests {
     }
 
     impl HybridMemory for RecordingHybridMemory {
-        fn read_tensor(
+        fn read_leased_tensor(
             &self,
-            offset: u64,
-            encoded_size: u64,
+            location: HybridTensorLocation,
         ) -> Result<BinaryTensorPacket, String> {
-            self.reads.lock().unwrap().push((offset, encoded_size));
+            self.reads
+                .lock()
+                .unwrap()
+                .push((location.offset, location.size));
             Ok(self.input.clone())
         }
 
@@ -969,6 +982,10 @@ mod tests {
                 size: 120,
                 lease: 91,
             })
+        }
+
+        fn release_tensor(&self, _location: HybridTensorLocation) -> bool {
+            true
         }
     }
 

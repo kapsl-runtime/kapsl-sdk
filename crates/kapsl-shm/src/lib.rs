@@ -1,8 +1,7 @@
 //! Shared-memory transport primitives and server integration for Kapsl.
 //!
 //! The crate is organized by responsibility: memory mapping, tensor-pool
-//! allocation, ring-buffer queues, and server dispatch. Existing public module
-//! paths are retained for compatibility.
+//! allocation, request queues, response mailboxes, and server dispatch.
 //!
 //! # Concurrency
 //!
