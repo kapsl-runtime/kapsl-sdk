@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 description = "Open Inference Protocol clients and backend-neutral gRPC server for Kapsl"
+readme = "README.md"
 build = "build.rs"
 
 [package.metadata.cargo-machete]
