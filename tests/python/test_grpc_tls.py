@@ -34,9 +34,11 @@ extendedKeyUsage = serverAuth,clientAuth
         "-config", str(config), "-keyout", str(key_path), "-out", str(cert_path),
     ], check=True, capture_output=True)
     key, cert = key_path.read_bytes(), cert_path.read_bytes()
+    admitted = []
 
     class Health(inference_grpc.GRPCInferenceServiceServicer):
         def ServerLive(self, request, context):
+            admitted.append(True)
             assert dict(context.invocation_metadata())["authorization"] == "Bearer tls-test-token"
             return inference.ServerLiveResponse(live=True)
 
@@ -48,13 +50,13 @@ extendedKeyUsage = serverAuth,clientAuth
         ))
         server.start()
         try:
-            yield f"localhost:{port}", key, cert
+            yield f"localhost:{port}", key, cert, admitted
         finally:
             server.stop(0).wait()
 
 
 def test_tls_and_mutual_tls_credentials(tls_endpoint):
-    target, key, cert = tls_endpoint
+    target, key, cert, admitted = tls_endpoint
     options = dict(
         api_token="Bearer tls-test-token", tls=True, root_certificates=cert,
         private_key=key, certificate_chain=cert, timeout_ms=2000,
@@ -66,11 +68,19 @@ def test_tls_and_mutual_tls_credentials(tls_endpoint):
         async with AsyncKapslGrpcClient(target, **options) as client:
             assert await client.server_live()
     asyncio.run(check_async())
+    assert len(admitted) == 2
 
     with KapslGrpcClient(target, tls=True, root_certificates=cert, timeout_ms=1000) as client:
         with pytest.raises(grpc.RpcError) as error:
             client.server_live()
-        assert error.value.code() == grpc.StatusCode.UNAVAILABLE
+        # Windows may wait for the RPC deadline after a rejected TLS handshake.
+        assert error.value.code() in (
+            grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED,
+        )
+    assert len(admitted) == 2  # No certificate-less RPC reached the handler.
+    with KapslGrpcClient(target, **options) as client:
+        assert client.server_live()
+    assert len(admitted) == 3
 
 
 def test_invalid_tls_configuration_is_rejected():
