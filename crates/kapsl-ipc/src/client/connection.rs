@@ -9,7 +9,7 @@ use kapsl_transport::{TransportClient, TransportError};
 use tokio::net::UnixStream;
 
 #[cfg(windows)]
-use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
+use tokio::net::windows::named_pipe::NamedPipeClient;
 
 // Platform-specific connection type alias
 #[cfg(unix)]
@@ -42,7 +42,7 @@ impl ConnectionFactory for IpcConnectionFactory {
         return UnixStream::connect(&self.socket_path).await;
 
         #[cfg(windows)]
-        return ClientOptions::new().open(&self.socket_path);
+        return kapsl_transport::named_pipe::connect(&self.socket_path).await;
     }
 
     async fn is_valid(&self, _conn: &Self::Connection) -> bool {

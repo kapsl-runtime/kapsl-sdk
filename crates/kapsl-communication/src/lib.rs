@@ -9,6 +9,12 @@ pub mod transport {
     pub use kapsl_transport::*;
 }
 
+/// Open Inference Protocol clients and Kapsl server-streaming gRPC transport.
+#[cfg(feature = "grpc")]
+pub mod grpc {
+    pub use kapsl_grpc::*;
+}
+
 /// Local socket/named-pipe and authenticated TCP transports.
 #[cfg(feature = "ipc")]
 pub mod ipc {

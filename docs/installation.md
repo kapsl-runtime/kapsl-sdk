@@ -18,13 +18,9 @@ The package ships pre-compiled **abi3 wheels** for Linux (x86_64, aarch64), macO
 If you need to build from the monorepo:
 
 ```bash
-# Rust crates in the workspace
 cd kapsl-sdk
-cargo build --release
-
-# Python extension module (requires Rust 1.75+ and maturin)
+# Python extension module (requires Rust 1.92+ and an active virtualenv)
 pip install maturin
-cd kapsl-sdk/crates/kapsl-pyo3
 maturin develop --release
 ```
 
@@ -38,5 +34,9 @@ print(list_voices())  # lists bundled voice embeddings
 ```
 
 ## Runtime dependency
+
+For optional gRPC support, install `pip install 'kapsl-sdk[grpc]'`.
+Version 0.2.0 requires the coordinated native transport 0.4.0 engine update;
+see the [migration guide](python-sdk-0.2.md).
 
 `kapsl-sdk` is a client library — it does not bundle the inference engine. You need a running `kapsl-runtime` process on the same machine or reachable over TCP. See the [kapsl-runtime deployment guide](https://kapsl.ai/docs/engine/deployment) for setup instructions.

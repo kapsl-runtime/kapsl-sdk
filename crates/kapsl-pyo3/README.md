@@ -1,69 +1,67 @@
 # kapsl-sdk
 
-`kapsl-sdk` is the Python client package for [kapsl-runtime](https://kapsl.ai), the Kapsl inference runtime for local and embedded model execution.
-
-It provides Python bindings for the runtime's transport layer so Python applications can talk to a running `kapsl-runtime` process over:
-
-- TCP / IPC client connections with `KapslClient`
-- shared-memory transport with `KapslShmClient`
-- hybrid IPC + shared-memory transport with `KapslHybridClient`
-
-The package is intended for low-latency inference integrations where Python is orchestrating requests while the runtime performs the heavy model execution work.
-
-## Installation
+Python clients for Kapsl inference and orchestration. Supports CPython 3.9+
+through Rust abi3 bindings, with optional gRPC dependencies.
 
 ```bash
-pip install kapsl-sdk
+pip install kapsl-sdk         # native socket/TCP, SHM, hybrid
+pip install 'kapsl-sdk[grpc]' # adds gRPC and grpc.aio clients
 ```
 
-## What It Includes
-
-- Python bindings backed by the Rust runtime client implementation
-- support for CPython 3.9+
-- transport options for local development and high-throughput deployments
-- a small API surface aimed at direct integration into backend services and tools
-
-## Requirements
-
-- A running `kapsl-runtime` instance
-- The runtime endpoint details for your deployment
-- Shared-memory transport setup if you want to use `KapslShmClient` or `KapslHybridClient`
-
-## Usage
+## Native inference
 
 ```python
+import struct
 from kapsl_sdk import KapslClient
 
-client = KapslClient()
-result = client.infer(
-    model_id=0,
-    shape=[1, 4],
-    dtype="float32",
-    data=b"...",
-)
+with KapslClient(api_token="native-token") as client:
+    result = client.infer(
+        0, [2], "float32", struct.pack("<2f", 1.0, 2.0), timeout_ms=5000,
+    )
 ```
 
-## Client Types
+## Typed gRPC streaming
 
-### `KapslClient`
+```python
+from kapsl_sdk import KapslGrpcClient
 
-General-purpose client for runtime connections over TCP, Unix sockets, or Windows named pipes depending on platform and endpoint configuration.
+with KapslGrpcClient("127.0.0.1:9097", api_token="reader-token") as client:
+    print(client.list_models())
+    with client.infer_stream_tensors(
+        "my-model", [1], "string", b"Hello", timeout_ms=30_000,
+        max_new_tokens=128,
+    ) as stream:
+        for tensor in stream:
+            print(tensor.data.decode("utf-8"), end="", flush=True)
+```
 
-### `KapslShmClient`
+`AsyncKapslGrpcClient` supports awaited unary methods and async stream
+iteration. Native streams also support `async for`. Streams expose explicit
+cancellation and close operations; deadlines cover their complete lifetime.
+Generated protobuf modules are bundled, so consumers do not need protoc.
 
-Shared-memory client for lower-overhead local inference workflows where request and response payloads are exchanged through shared memory. Concurrent calls use request-owned response mailboxes and process-shared tensor leases, so clients cannot consume or overwrite one another's in-flight payloads.
+`KapslShmClient` and `KapslHybridClient` provide local unary tensor inference
+with `infer(shape, dtype, data, *, model_id=0)`. All clients return bytes;
+`infer_tensor` preserves shape/dtype and `infer_stream_tensors` yields `Tensor`
+objects on native/gRPC clients. SHM uses request-owned response mailboxes and
+shared allocation leases to isolate concurrent requests.
 
-### `KapslHybridClient`
+## Version 0.2.0 migration
 
-Hybrid client that combines shared memory for tensor payloads with IPC signaling for coordination. A reusable control-connection pool allows concurrent calls on one client while tensor data remains in the shared-memory data plane.
+Upgrade and restart the Python clients and engine together. This Python
+version uses `kapsl-transport`, `kapsl-ipc`, `kapsl-shm`, and
+`kapsl-communication` 0.4.0 with SHM protocol/region version 3, and
+`kapsl-grpc` 0.3.0. Old native encodings and SHM layouts are rejected. There is
+no fallback decoder, unleased memory access, or automatic inference replay.
 
-Both clients require the version 2 shared-memory protocol used by the matching runtime; upgrade and restart client and server together.
+Request options include timeouts, priority, force-CPU, request/model IDs, and
+supported generation controls. The engine remains responsible for scheduling,
+authorization, and memory governance. Native TCP uses its configured TCP
+token; gRPC uses public API reader tokens. TLS/mTLS gRPC connections require
+a TLS endpoint such as a terminating proxy.
 
-## Notes
-
-- `kapsl-sdk` is the package name on PyPI.
-- The Python import name is `kapsl_sdk`.
-- This package is an API client, not the runtime server itself.
+See the [migration and API guide](https://github.com/kapsl-runtime/kapsl-sdk/blob/main/docs/python-sdk-0.2.md).
+The package includes `list_voices()` and `load_voice()` for bundled embeddings.
 
 ## License
 

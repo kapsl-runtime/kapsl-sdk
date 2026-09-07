@@ -1,6 +1,6 @@
 [package]
 name = "kapsl-shm"
-version.workspace = true
+version = "0.4.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -8,12 +8,11 @@ repository.workspace = true
 description = "Shared memory transport for high-throughput inter-process tensor transfer in Kapsl"
 
 [dependencies]
-kapsl-transport = { version = "0.3.0", path = "../kapsl-transport" }
+kapsl-transport = { version = "0.4.0", path = "../kapsl-transport" }
 kapsl-engine-api = { version = "0.3.0", path = "../kapsl-engine-api" }
 kapsl-scheduler = { version = "0.3.0", path = "../kapsl-scheduler" }
 shared_memory = "0.12"
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 log = "0.4"
-libc = "0.2"
 prometheus = "0.14"

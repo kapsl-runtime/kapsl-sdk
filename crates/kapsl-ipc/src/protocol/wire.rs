@@ -10,7 +10,7 @@ use kapsl_transport::{RequestMetadata, ResponseMetadata};
 use serde::{Deserialize, Serialize};
 
 /// Version of the hybrid socket-control/shared-memory-data contract.
-pub const HYBRID_SHM_PROTOCOL_VERSION: u16 = 2;
+pub const HYBRID_SHM_PROTOCOL_VERSION: u16 = 3;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct HybridRequest {
@@ -18,9 +18,7 @@ pub struct HybridRequest {
     pub shm_offset: u64,
     pub shm_size: u64,
     /// Process-shared lease protecting the input tensor region.
-    #[serde(default)]
     pub shm_lease: u64,
-    #[serde(default)]
     pub protocol_version: u16,
 }
 
@@ -30,8 +28,6 @@ pub struct HybridResponse {
     pub shm_offset: u64,
     pub shm_size: u64,
     /// Process-shared lease protecting the output tensor region.
-    #[serde(default)]
     pub shm_lease: u64,
-    #[serde(default)]
     pub protocol_version: u16,
 }

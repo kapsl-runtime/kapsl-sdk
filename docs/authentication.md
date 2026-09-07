@@ -1,6 +1,10 @@
 # Authentication
 
-When `kapsl-runtime` is running with API authentication enabled, every request must include a valid token. `kapsl-sdk` handles this automatically once you configure the client.
+Configure the token for the selected listener. `KapslGrpcClient` and
+`AsyncKapslGrpcClient` use public API reader tokens through the engine's shared
+authorization adapter. Native TCP uses the separately configured
+`KAPSL_TCP_AUTH_TOKEN`. Local socket and shared-memory access follow their
+transport's local access policy.
 
 ## Setting the token
 
@@ -17,9 +21,11 @@ client = KapslClient(
 
 The token is attached to every `infer`, `infer_tensor`, and `infer_stream` call without any extra work on your part.
 
-## Token roles
+## Public API token roles (gRPC)
 
-`kapsl-runtime` has three roles. Use a token with at least **reader** role to call inference endpoints.
+Use a public API token with at least **reader** role for gRPC inference and
+discovery. The Python gRPC client sends it as `authorization: Bearer TOKEN`
+metadata on every RPC; the engine scopes session IDs to that credential.
 
 | Role | Inference | Model management | Admin |
 |------|-----------|-----------------|-------|
@@ -66,7 +72,9 @@ client = KapslClient(
 
 ## Error handling
 
-A missing or invalid token raises `RuntimeError` with the message `Unauthorized`:
+A missing or invalid native TCP token raises `RuntimeError` with the message
+`Unauthorized`. gRPC returns `grpc.StatusCode.UNAUTHENTICATED` through
+`grpc.RpcError` (or `grpc.aio.AioRpcError` for asynchronous calls).
 
 ```python
 try:

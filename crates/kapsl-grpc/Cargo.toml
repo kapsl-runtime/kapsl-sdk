@@ -1,0 +1,37 @@
+[package]
+name = "kapsl-grpc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Open Inference Protocol clients and backend-neutral gRPC server for Kapsl"
+readme = "README.md"
+build = "build.rs"
+
+[package.metadata.cargo-machete]
+# Build-script and OUT_DIR references are not detected by all machete versions.
+ignored = ["prost-build", "protoc-bin-vendored", "tonic-prost-build", "tonic-prost"]
+
+[dependencies]
+async-trait = "0.1"
+futures = "0.3"
+http = "1"
+kapsl-engine-api = { version = "0.3.0", path = "../kapsl-engine-api" }
+log = "0.4"
+prost = "0.14"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tonic = "0.14"
+tonic-prost = "0.14"
+tower = { version = "0.5", features = ["util"] }
+
+[build-dependencies]
+prost-build = "0.14"
+protoc-bin-vendored = "3"
+tonic-prost-build = "0.14"
+
+[dev-dependencies]
+http-body-util = "0.1"
+hyper-util = { version = "0.1", features = ["client-legacy", "http2", "tokio"] }

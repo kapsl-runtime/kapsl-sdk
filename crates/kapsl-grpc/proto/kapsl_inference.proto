@@ -1,0 +1,26 @@
+syntax = "proto3";
+package kapsl.v1;
+
+import "open_inference_grpc.proto";
+
+// Kapsl extensions to the unary Open Inference Protocol.
+service KapslInference {
+  rpc ListModels(ListModelsRequest) returns (ListModelsResponse);
+
+  // Each response contains one output packet. Successful completion uses OK
+  // trailers; failure uses a non-OK gRPC status. There is no sentinel packet.
+  // Cancelling the RPC cancels generation. grpc-timeout covers the whole stream.
+  rpc InferStream(inference.ModelInferRequest)
+      returns (stream inference.ModelInferResponse);
+}
+
+message ListModelsRequest {}
+message ListModelsResponse {
+  repeated Model models = 1;
+}
+message Model {
+  uint32 id = 1;
+  string name = 2;
+  string version = 3;
+  bool ready = 4;
+}

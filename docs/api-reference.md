@@ -17,6 +17,7 @@ KapslClient(
     pipe_name: str | None = None,
     max_pool_size: int = 8,
     api_token: str | None = None,
+    timeout_ms: int | None = None,
 )
 ```
 
@@ -39,8 +40,14 @@ KapslClient(
 | `pipe_name` | `\\.\pipe\kapsl` | Windows named pipe name |
 | `max_pool_size` | `8` | Connection pool capacity; `0` disables pooling |
 | `api_token` | `None` | Bearer token sent with every request |
+| `timeout_ms` | `None` | Default deadline for the complete request/stream |
 
 **Raises**: `ValueError` on invalid or conflicting endpoint options.
+
+All inference methods also accept keyword [request options](python-sdk-0.2.md#request-options),
+including deadlines, priority, CPU selection, and generation overrides.
+Use `with KapslClient(...) as client` or `client.close()` to cancel active
+operations and close pooled connections. `client.closed` reports its state.
 
 ---
 
@@ -70,7 +77,8 @@ Sends a synchronous inference request and returns the raw output bytes.
 
 **Returns**: `bytes` — raw output tensor data.
 
-**Raises**: `ConnectionError` on transport failure, `RuntimeError` on server-side error.
+**Raises**: `ConnectionError` on transport failure, `RuntimeError` on server-side
+error, `TimeoutError` when the complete request deadline expires.
 
 ---
 
@@ -108,9 +116,32 @@ client.infer_stream(
 
 Sends a streaming inference request. Returns an iterator that yields one `bytes` chunk per output token/frame as they arrive.
 
-Uses a dedicated connection (not pooled). The connection is held until the iterator is exhausted or garbage-collected.
+Uses a dedicated connection. The returned stream supports `close()`, `cancel()`,
+`closed`, `with`, `async with`, and `async for`. Use a context manager when
+stopping early. Cancellation interrupts a blocked read. A deadline covers the
+whole stream, including time when the caller is not reading.
 
 **Raises**: `RuntimeError` if the server returns an error mid-stream.
+
+### infer_stream_tensors()
+
+Accepts the same arguments as `infer_stream`, yielding immutable `Tensor`
+values with `data: bytes`, `shape: tuple[int, ...]`, and `dtype: str`.
+
+## KapslGrpcClient / AsyncKapslGrpcClient
+
+Install `kapsl-sdk[grpc]`. Both constructors accept `target`, `api_token`,
+`tls`, `root_certificates`, `private_key`, `certificate_chain`, `timeout_ms`,
+and `max_message_bytes`. PEM configuration uses bytes.
+
+Both clients expose the four inference methods above, plus `server_live`,
+`server_ready`, `server_metadata`, `model_ready`, `model_metadata`, and
+`list_models`. Model selection accepts a name or numeric ID; `input_name`
+selects the primary tensor name. gRPC does not support `stop_token_ids` in 0.3.
+
+The async client uses `async with`, awaited unary methods, and `async for`
+streams. Errors preserve gRPC status codes. See the
+[gRPC and migration guide](python-sdk-0.2.md) for complete examples.
 
 ---
 
@@ -194,3 +225,4 @@ Returns raw `float32` bytes. Reshape as `(-1, 1, 256)` to index by token length.
 | `int32` | `np.int32` | 4 |
 | `int64` | `np.int64` | 8 |
 | `uint8` | `np.uint8` | 1 |
+| `string` | UTF-8 bytes | Variable |

@@ -5,6 +5,7 @@ use kapsl_communication::shm::protocol::{ShmRequest, SHM_PROTOCOL_VERSION, SHM_Q
 use kapsl_communication::shm::ring_buffer::LockFreeRingBuffer;
 use kapsl_communication::RequestMetadata;
 use pyo3::prelude::*;
+use pyo3::types::PyBytes;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -58,7 +59,7 @@ impl KapslShmClient {
         dtype: String,
         data: Vec<u8>,
         model_id: u32,
-    ) -> PyResult<Vec<u8>> {
+    ) -> PyResult<Py<PyBytes>> {
         let request_id = self.shm.next_request_id();
         let dtype = parse_shm_dtype(&dtype).map_err(PyErr::from)?;
         let mut staged =
@@ -95,9 +96,7 @@ impl KapslShmClient {
         }
         staged.transfer_to_server();
 
-        // File-descriptor values are process-local and cannot be transferred by
-        // writing the integer into shared memory. Polling is therefore used on
-        // every platform, with the GIL released between checks.
+        // Poll the request's mailbox, releasing the GIL between checks.
         let start = std::time::Instant::now();
         loop {
             let response = self.response_mailboxes.try_take(mailbox);
@@ -148,7 +147,7 @@ impl KapslShmClient {
                     resp.payload_lease,
                 )
                 .map_err(PyErr::from)
-                .map(|packet| packet.data);
+                .map(|packet| PyBytes::new(py, &packet.data).unbind());
             }
 
             if start.elapsed() >= RESPONSE_TIMEOUT {

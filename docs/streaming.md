@@ -2,6 +2,26 @@
 
 `infer_stream` sends a request and receives output as an iterator of chunks. This is designed for LLMs that generate tokens one at a time, giving the caller each token as soon as it is produced rather than waiting for the full response.
 
+In Python 0.2.0, streams support explicit cancellation, full-stream deadlines,
+context managers, and async iteration. `infer_stream_tensors` preserves output
+shape/dtype in `Tensor` objects. The native and gRPC clients share these methods;
+see the [gRPC and async examples](python-sdk-0.2.md#stream-ownership-and-async-use).
+
+Use a context manager when stopping before EOF:
+
+```python
+with client.infer_stream(0, [1], "string", b"Hello", timeout_ms=30_000) as stream:
+    for chunk in stream:
+        if should_stop(chunk):
+            break
+        process(chunk)
+```
+
+`stream.cancel()` and `stream.close()` interrupt blocked reads. Client shutdown
+also cancels its streams. A deadline applies even while the caller is idle;
+native clients raise `TimeoutError`, and gRPC clients preserve the
+`DEADLINE_EXCEEDED` status. Stream errors are raised once and terminate iteration.
+
 ## Basic usage — text in, text out
 
 For LLMs that accept a raw text prompt and stream back text chunks (e.g. GGUF models):

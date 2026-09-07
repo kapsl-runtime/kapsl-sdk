@@ -1,5 +1,7 @@
 mod client;
 pub mod hybrid_client;
+mod native_stream;
+mod request_options;
 pub mod shm_client;
 mod shm_tensor;
 

@@ -9,10 +9,11 @@ use kapsl_communication::transport::protocol::{
 use kapsl_communication::RequestMetadata;
 use kapsl_engine_api::TensorDtype;
 use pyo3::prelude::*;
+use pyo3::types::PyBytes;
 use std::path::PathBuf;
 use std::sync::Arc;
 #[cfg(windows)]
-use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient, PipeMode};
+use tokio::net::windows::named_pipe::NamedPipeClient;
 #[cfg(unix)]
 use tokio::net::UnixStream;
 use tokio::runtime::{Builder, Runtime};
@@ -48,6 +49,7 @@ impl KapslHybridClient {
         let rt = Builder::new_multi_thread()
             .worker_threads(2)
             .enable_io()
+            .enable_time()
             .build()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
@@ -68,7 +70,7 @@ impl KapslHybridClient {
         dtype: String,
         data: Vec<u8>,
         model_id: u32,
-    ) -> PyResult<Vec<u8>> {
+    ) -> PyResult<Py<PyBytes>> {
         let request_id = self.shm.next_request_id();
         let dtype: TensorDtype = parse_shm_dtype(&dtype).map_err(PyErr::from)?;
         let mut staged =
@@ -99,19 +101,9 @@ impl KapslHybridClient {
                         #[cfg(unix)]
                         let stream = UnixStream::connect(socket_path).await?;
                         #[cfg(windows)]
-                        let stream = ClientOptions::new()
-                            .pipe_mode(PipeMode::Byte)
-                            .open(socket_path)
-                            .map_err(|e| {
-                                std::io::Error::new(
-                                    std::io::ErrorKind::ConnectionRefused,
-                                    format!(
-                                        "Failed to open named pipe '{}': {}",
-                                        socket_path.display(),
-                                        e
-                                    ),
-                                )
-                            })?;
+                        let stream =
+                            kapsl_communication::transport::named_pipe::connect(socket_path)
+                                .await?;
 
                         stream
                     };
@@ -170,6 +162,6 @@ impl KapslHybridClient {
             response.shm_lease,
         )
         .map_err(PyErr::from)
-        .map(|packet| packet.data)
+        .map(|packet| PyBytes::new(py, &packet.data).unbind())
     }
 }

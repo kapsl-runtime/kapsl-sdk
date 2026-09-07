@@ -184,24 +184,17 @@ impl ShmServer {
             configured_models,
         );
 
-        // Initialize request and response queues
+        // Responses use the per-request mailbox array initialized by ShmManager.
         let req_queue_offset = shm.request_queue_offset();
-        let resp_queue_offset = shm.response_queue_offset();
 
         log::info!("Request queue offset: {}", req_queue_offset);
-        log::info!("Response queue offset: {}", resp_queue_offset);
 
         let request_queue = unsafe {
             // Initialize the queues in shared memory (only once).
-            let request_queue = LockFreeRingBuffer::<ShmRequest>::new(
+            LockFreeRingBuffer::<ShmRequest>::new(
                 shm.as_ptr().add(req_queue_offset) as *mut ShmRequest,
                 SHM_QUEUE_CAPACITY,
-            );
-            let _ = LockFreeRingBuffer::<ShmResponse>::new(
-                shm.as_ptr().add(resp_queue_offset) as *mut ShmResponse,
-                SHM_QUEUE_CAPACITY,
-            );
-            request_queue
+            )
         };
 
         log::info!("Shared memory server running on '{}'", self.shm_name);
@@ -385,7 +378,6 @@ async fn handle_request(
     };
 
     if publish_or_release(
-        shm.as_ref(),
         tensor_allocator.as_ref(),
         &response_mailboxes,
         request.response_mailbox,
@@ -415,25 +407,17 @@ fn finish_request_with_error(
         started.elapsed().as_nanos() as u64,
         message,
     );
-    publish_or_release(
-        shm,
-        allocator,
-        mailboxes,
-        mailbox_index,
-        request_id,
-        response,
-    )
+    publish_or_release(allocator, mailboxes, mailbox_index, request_id, response)
 }
 
 fn publish_or_release(
-    shm: &ShmManager,
     allocator: &SharedShmAllocator,
     mailboxes: &ResponseMailboxRegistry,
     mailbox_index: u32,
     request_id: u64,
     response: ShmResponse,
 ) -> bool {
-    if publish_response_and_notify(shm, mailboxes, mailbox_index, request_id, response) {
+    if mailboxes.publish(mailbox_index, request_id, response) {
         return true;
     }
 
