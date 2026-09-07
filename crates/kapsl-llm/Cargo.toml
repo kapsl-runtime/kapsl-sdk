@@ -30,10 +30,10 @@ parking_lot = "0.12"
 cudarc = { version = "0.12", features = ["cuda-version-from-build-system"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
-ort = { version = "=2.0.0-rc.11", default-features = false, optional = true, features = ["std", "ndarray", "half", "download-binaries", "tls-rustls"] }
+ort = { version = "=2.0.0-rc.13", default-features = false, optional = true, features = ["std", "ndarray", "half", "download-binaries", "tls-rustls"] }
 
 [target.'cfg(not(windows))'.dependencies]
-ort = { version = "=2.0.0-rc.11", default-features = false, optional = true, features = ["std", "ndarray", "half", "download-binaries", "tls-rustls"] }
+ort = { version = "=2.0.0-rc.13", default-features = false, optional = true, features = ["std", "ndarray", "half", "download-binaries", "tls-rustls"] }
 
 [features]
 # Keep the target-neutral historical provider set for embedded callers.
