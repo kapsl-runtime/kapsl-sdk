@@ -133,6 +133,136 @@ mod tests {
     }
 
     #[test]
+    fn nested_model_keeps_complete_package_layout_after_loader_drop() {
+        let _guard = env_lock().lock().expect("acquire env lock");
+        clear_model_cache_env();
+        let manifest = default_manifest("graphs/decoder/model.onnx");
+        let files = [
+            ("graphs/decoder/model.onnx", b"model".as_slice()),
+            (
+                "graphs/decoder/data/weights.bin",
+                b"external weights".as_slice(),
+            ),
+            ("tokenizer.json", b"root tokenizer".as_slice()),
+            ("config.json", b"root config".as_slice()),
+            ("alternate/tokenizer.json", b"other tokenizer".as_slice()),
+        ];
+        let mut entries = vec![(
+            "metadata.json",
+            serde_json::to_vec(&manifest).expect("serialize manifest"),
+        )];
+        entries.extend(files.iter().map(|(path, bytes)| (*path, bytes.to_vec())));
+        let (_package_dir, package_path) = build_package(entries);
+        let loader = PackageLoader::load(&package_path).expect("load nested package");
+        let model_path = loader.get_model_path();
+        assert!(model_path.ends_with("graphs/decoder/model.onnx"));
+        let root = model_path
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_owned();
+        drop(loader);
+        std::fs::remove_file(&package_path).expect("remove original archive");
+        for (path, bytes) in files {
+            assert_eq!(std::fs::read(root.join(path)).expect(path), bytes);
+        }
+        let reloaded = PackageLoader::from_directory(&root).expect("reload persisted package");
+        assert_eq!(reloaded.get_model_path(), model_path);
+    }
+
+    #[test]
+    fn cache_admission_counts_assets_outside_the_model_directory() {
+        let _guard = env_lock().lock().expect("acquire env lock");
+        clear_model_cache_env();
+        let manifest = default_manifest("graphs/model.onnx");
+        let (_package_dir, package_path) = build_package(vec![
+            ("metadata.json", serde_json::to_vec(&manifest).unwrap()),
+            ("graphs/model.onnx", vec![1; 16]),
+            ("assets/vocabulary/data.bin", vec![2; 8192]),
+        ]);
+        std::env::set_var("KAPSL_MODEL_CACHE_MAX_BYTES", "4096");
+        let result = PackageLoader::load(&package_path);
+        clear_model_cache_env();
+        assert!(
+            matches!(result, Err(LoaderError::InsufficientDiskSpace { required_copy_bytes, .. }) if required_copy_bytes >= 8208)
+        );
+        assert!(
+            package_path.exists(),
+            "failed admission must retain the input archive"
+        );
+    }
+
+    #[test]
+    fn package_model_path_cannot_select_an_absolute_external_file() {
+        let _guard = env_lock().lock().expect("acquire env lock");
+        clear_model_cache_env();
+        let external = tempfile::tempdir().unwrap();
+        let model = external.path().join("outside.onnx");
+        std::fs::write(&model, b"outside package").unwrap();
+        let manifest = default_manifest(model.to_str().unwrap());
+        let (_package_dir, package_path) = build_package(vec![
+            ("metadata.json", serde_json::to_vec(&manifest).unwrap()),
+            ("inside.onnx", b"inside package".to_vec()),
+        ]);
+        assert!(PackageLoader::load(&package_path).is_err());
+        assert_eq!(std::fs::read(&model).unwrap(), b"outside package");
+    }
+
+    #[test]
+    fn package_model_path_cannot_escape_to_the_extraction_parent() {
+        let _guard = env_lock().lock().expect("acquire env lock");
+        clear_model_cache_env();
+        let manifest = default_manifest("../outside.onnx");
+        let (_package_dir, package_path) = build_package(vec![
+            ("metadata.json", serde_json::to_vec(&manifest).unwrap()),
+            ("inside.onnx", b"inside package".to_vec()),
+        ]);
+        let temporary_root = package_path.parent().unwrap().join(".kapsl-package-tmp");
+        std::fs::create_dir_all(&temporary_root).unwrap();
+        let outside = temporary_root.join("outside.onnx");
+        std::fs::write(&outside, b"outside package").unwrap();
+        assert!(PackageLoader::load(&package_path).is_err());
+        assert_eq!(std::fs::read(outside).unwrap(), b"outside package");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_assets_do_not_follow_symbolic_links() {
+        let _guard = env_lock().lock().expect("acquire env lock");
+        clear_model_cache_env();
+        let directory = tempfile::tempdir().unwrap();
+        let package = directory.path().join("linked.aimod");
+        let encoder = GzEncoder::new(File::create(&package).unwrap(), Compression::default());
+        let mut archive = Builder::new(encoder);
+        for (path, bytes) in [
+            (
+                "metadata.json",
+                serde_json::to_vec(&default_manifest("model.onnx")).unwrap(),
+            ),
+            ("model.onnx", b"model".to_vec()),
+            ("assets/vocab.txt", b"vocabulary".to_vec()),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            archive
+                .append_data(&mut header, path, bytes.as_slice())
+                .unwrap();
+        }
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_size(0);
+        archive
+            .append_link(&mut header, "tokenizer.json", "assets/vocab.txt")
+            .unwrap();
+        archive.into_inner().unwrap().finish().unwrap();
+        assert!(PackageLoader::load(&package).is_err());
+    }
+
+    #[test]
     fn raw_loader_classifies_only_supported_extensions() {
         for (name, framework) in [
             ("model.onnx", "onnx"),

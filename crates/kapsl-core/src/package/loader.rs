@@ -2,9 +2,8 @@
 
 use flate2::read::GzDecoder;
 use fs2::available_space;
-use std::collections::HashSet;
 use std::fs::{self, File};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use tar::Archive;
 use tempfile::TempDir;
 use thiserror::Error;
@@ -209,7 +208,8 @@ impl PackageLoader {
                 return Err(LoaderError::Json(e));
             }
         };
-        let model_path = extracted_path.join(&manifest.model_file);
+        let model_relative_path = package_model_relative_path(&manifest.model_file)?;
+        let model_path = extracted_path.join(&model_relative_path);
         if !model_path.exists() || !model_path.is_file() {
             return Err(LoaderError::ModelFileMissing {
                 package: package_path.to_path_buf(),
@@ -217,7 +217,7 @@ impl PackageLoader {
             });
         }
         let persisted_model_path =
-            persist_model_file(package_path, &manifest.model_file, &model_path)?;
+            persist_model_file(package_path, &model_relative_path, &extracted_path)?;
 
         // Only once the cache holds the model, and never before: the cached
         // copy is linked from the extracted temp directory rather than from the
@@ -423,21 +423,50 @@ struct CacheEntry {
 #[derive(Debug, Clone)]
 struct ModelAsset {
     source_path: PathBuf,
-    target_name: String,
+    relative_path: PathBuf,
     source_size: u64,
+}
+
+fn package_model_relative_path(model_file: &str) -> Result<PathBuf, LoaderError> {
+    let mut relative = PathBuf::new();
+    for component in Path::new(model_file).components() {
+        match component {
+            Component::Normal(name) => relative.push(name),
+            Component::CurDir => {}
+            _ => {
+                return Err(invalid_package_asset(
+                    "model_file must stay inside the package",
+                ))
+            }
+        }
+    }
+    if relative.as_os_str().is_empty() {
+        return Err(invalid_package_asset("model_file must name a package file"));
+    }
+    Ok(relative)
+}
+
+fn invalid_package_asset(message: &str) -> LoaderError {
+    LoaderError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        message,
+    ))
 }
 
 fn persist_model_file(
     package_path: &Path,
-    model_file: &str,
-    source_model_path: &Path,
+    model_file: &Path,
+    extracted_root: &Path,
 ) -> Result<PathBuf, LoaderError> {
     use sha2::{Digest, Sha256};
 
     let mut hasher = Sha256::new();
+    // Older caches flattened the model directory and omitted the package
+    // root. Keep that incomplete layout out of this cache namespace.
+    hasher.update(b"kapsl-package-layout-v1\0");
     hasher.update(package_path.to_string_lossy().as_bytes());
     hasher.update(b"\0");
-    hasher.update(model_file.as_bytes());
+    hasher.update(model_file.to_string_lossy().as_bytes());
     if let Ok(meta) = fs::metadata(package_path) {
         hasher.update(meta.len().to_le_bytes());
         if let Ok(modified) = meta.modified() {
@@ -449,22 +478,11 @@ fn persist_model_file(
     let hash_bytes = hasher.finalize();
     let package_hash = hex::encode(&hash_bytes[..8]);
 
-    let file_name = Path::new(model_file)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .unwrap_or("model.bin");
     let cache_root = resolve_model_cache_root(package_path);
     let cache_dir = cache_root.join(&package_hash);
     let cache_policy = CachePolicy::from_env();
-    persist_model_assets(
-        source_model_path,
-        &cache_root,
-        &cache_dir,
-        file_name,
-        cache_policy,
-    )?;
-    Ok(cache_dir.join(file_name))
+    persist_model_assets(extracted_root, &cache_root, &cache_dir, cache_policy)?;
+    Ok(cache_dir.join(model_file))
 }
 
 fn resolve_model_cache_root(package_path: &Path) -> PathBuf {
@@ -484,16 +502,15 @@ fn resolve_model_cache_root(package_path: &Path) -> PathBuf {
 }
 
 fn persist_model_assets(
-    source_model_path: &Path,
+    extracted_root: &Path,
     cache_root: &Path,
     cache_dir: &Path,
-    file_name: &str,
     cache_policy: CachePolicy,
-) -> Result<PathBuf, LoaderError> {
+) -> Result<(), LoaderError> {
     fs::create_dir_all(cache_root)?;
     fs::create_dir_all(cache_dir)?;
 
-    let assets = collect_model_assets(source_model_path, file_name)?;
+    let assets = collect_model_assets(extracted_root)?;
     let required_copy_bytes = estimate_required_copy_bytes(&assets, cache_dir)?;
 
     enforce_cache_policy(
@@ -508,57 +525,42 @@ fn persist_model_assets(
         link_or_copy_if_needed(
             &asset.source_path,
             asset.source_size,
-            &cache_dir.join(asset.target_name),
+            &cache_dir.join(asset.relative_path),
         )?;
     }
 
-    Ok(cache_dir.join(file_name))
+    Ok(())
 }
 
-fn collect_model_assets(
-    source_model_path: &Path,
-    model_target_name: &str,
-) -> Result<Vec<ModelAsset>, LoaderError> {
+/// Adapters may use assets beside the model, above it, or in nested paths.
+/// Preserve the package tree without knowing backend-specific filenames.
+fn collect_model_assets(extracted_root: &Path) -> Result<Vec<ModelAsset>, LoaderError> {
     let mut assets = Vec::new();
-    let mut seen_targets = HashSet::new();
-
-    let source_size = fs::metadata(source_model_path)?.len();
-    assets.push(ModelAsset {
-        source_path: source_model_path.to_path_buf(),
-        target_name: model_target_name.to_string(),
-        source_size,
-    });
-    seen_targets.insert(model_target_name.to_string());
-
-    let Some(source_dir) = source_model_path.parent() else {
-        return Ok(assets);
-    };
-    let main_model_name = source_model_path.file_name();
-
-    for entry in fs::read_dir(source_dir)? {
-        let entry = entry?;
-        let metadata = entry.metadata()?;
-        if !metadata.is_file() {
-            continue;
+    let mut directories = vec![extracted_root.to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            let path = entry.path();
+            if file_type.is_dir() {
+                directories.push(path);
+            } else if file_type.is_file() {
+                assets.push(ModelAsset {
+                    relative_path: path
+                        .strip_prefix(extracted_root)
+                        .expect("walked entry stays inside the extraction root")
+                        .to_path_buf(),
+                    source_path: path,
+                    source_size: entry.metadata()?.len(),
+                });
+            } else {
+                return Err(invalid_package_asset(
+                    "package assets must be regular files or directories; symbolic links are unsupported",
+                ));
+            }
         }
-        let path = entry.path();
-        if path.file_name() == main_model_name {
-            continue;
-        }
-        let target_name = path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        if target_name.is_empty() || !seen_targets.insert(target_name.clone()) {
-            continue;
-        }
-        assets.push(ModelAsset {
-            source_path: path,
-            target_name,
-            source_size: metadata.len(),
-        });
     }
-
+    assets.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
     Ok(assets)
 }
 
@@ -574,7 +576,7 @@ fn estimate_required_copy_bytes(
 ) -> Result<u64, LoaderError> {
     let mut required_bytes = 0u64;
     for asset in assets {
-        let target_path = cache_dir.join(&asset.target_name);
+        let target_path = cache_dir.join(&asset.relative_path);
         if should_copy_file(asset.source_size, &target_path)? {
             required_bytes = required_bytes.saturating_add(asset.source_size);
         }

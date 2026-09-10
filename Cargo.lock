@@ -1932,7 +1932,7 @@ dependencies = [
 
 [[package]]
 name = "kapsl-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "flate2",
  "fs2",
