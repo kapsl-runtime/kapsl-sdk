@@ -14,6 +14,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
+pub mod native;
+
 #[path = "contract/capabilities.rs"]
 mod capabilities;
 #[path = "contract/capacity.rs"]

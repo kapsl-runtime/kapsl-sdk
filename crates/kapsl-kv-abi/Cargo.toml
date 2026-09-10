@@ -1,11 +1,12 @@
 [package]
 name = "kapsl-kv-abi"
-version = "0.6.0"
+version = "0.6.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Versioned backend-neutral KV-cache contract for Kapsl runtimes and inference engines"
+readme = "README.md"
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }

@@ -11,10 +11,12 @@
 use std::ffi::c_void;
 
 mod backend_v1;
+mod host_extensions_v1;
 mod llama_cpp_v1;
 mod scoped_allocator_v1;
 
 pub use backend_v1::*;
+pub use host_extensions_v1::*;
 pub use llama_cpp_v1::*;
 pub use scoped_allocator_v1::*;
 

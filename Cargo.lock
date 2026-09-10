@@ -1882,7 +1882,7 @@ dependencies = [
 
 [[package]]
 name = "kapsl-backend-abi"
-version = "0.2.0"
+version = "0.2.1"
 
 [[package]]
 name = "kapsl-backends"
@@ -1895,7 +1895,7 @@ dependencies = [
  "half",
  "image",
  "kapsl-core",
- "kapsl-engine-api",
+ "kapsl-engine-api 0.3.0",
  "kapsl-hal",
  "kapsl-kernels",
  "kapsl-llama-cpp-2",
@@ -1918,7 +1918,7 @@ version = "0.4.0"
 dependencies = [
  "async-trait",
  "futures",
- "kapsl-engine-api",
+ "kapsl-engine-api 0.3.0",
  "kapsl-grpc",
  "kapsl-ipc",
  "kapsl-scheduler",
@@ -1937,7 +1937,7 @@ dependencies = [
  "flate2",
  "fs2",
  "hex",
- "kapsl-engine-api",
+ "kapsl-engine-api 0.3.0",
  "log",
  "parking_lot",
  "serde",
@@ -1957,11 +1957,25 @@ dependencies = [
  "base64 0.22.1",
  "bincode",
  "futures",
- "kapsl-kv-abi",
+ "kapsl-kv-abi 0.6.1",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
+]
+
+[[package]]
+name = "kapsl-engine-api"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "279a1f1abe9afc205c22bc0951df3ccd165cd3010ee4f0f360bad47f399f9931"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "futures",
+ "kapsl-kv-abi 0.6.0",
+ "serde",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -1973,7 +1987,7 @@ dependencies = [
  "http",
  "http-body-util",
  "hyper-util",
- "kapsl-engine-api",
+ "kapsl-engine-api 0.3.0",
  "log",
  "prost",
  "prost-build",
@@ -2007,7 +2021,7 @@ version = "0.4.0"
 dependencies = [
  "async-trait",
  "futures",
- "kapsl-engine-api",
+ "kapsl-engine-api 0.3.0",
  "kapsl-scheduler",
  "kapsl-shm",
  "kapsl-transport",
@@ -2030,6 +2044,16 @@ dependencies = [
 [[package]]
 name = "kapsl-kv-abi"
 version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "975e66b4912d45b0e8aaf6c9ea787c68966b0141174ffc435fe202ff7c406ffc"
+dependencies = [
+ "serde",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "kapsl-kv-abi"
+version = "0.6.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -2071,9 +2095,9 @@ dependencies = [
  "futures",
  "half",
  "kapsl-core",
- "kapsl-engine-api",
+ "kapsl-engine-api 0.3.0",
  "kapsl-hal",
- "kapsl-kv-abi",
+ "kapsl-kv-abi 0.6.1",
  "kapsl-llama-cpp-2",
  "kapsl-llama-cpp-sys-2",
  "kapsl-loader",
@@ -2105,12 +2129,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "kapsl-managed-abi"
+version = "0.1.0"
+dependencies = [
+ "kapsl-engine-api 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "kapsl-monitor"
 version = "0.3.0"
 dependencies = [
  "async-trait",
  "futures",
- "kapsl-engine-api",
+ "kapsl-engine-api 0.3.0",
  "prometheus",
  "tokio",
 ]
@@ -2120,7 +2153,7 @@ name = "kapsl-pyo3"
 version = "0.3.0"
 dependencies = [
  "kapsl-communication",
- "kapsl-engine-api",
+ "kapsl-engine-api 0.3.0",
  "pyo3",
  "tokio",
 ]
@@ -2177,7 +2210,7 @@ dependencies = [
  "cron",
  "futures",
  "kapsl-core",
- "kapsl-engine-api",
+ "kapsl-engine-api 0.3.0",
  "kapsl-hal",
  "log",
  "parking_lot",
@@ -2191,7 +2224,7 @@ name = "kapsl-shm"
 version = "0.4.0"
 dependencies = [
  "async-trait",
- "kapsl-engine-api",
+ "kapsl-engine-api 0.3.0",
  "kapsl-scheduler",
  "kapsl-transport",
  "log",
@@ -2207,7 +2240,7 @@ dependencies = [
  "async-trait",
  "bincode",
  "futures",
- "kapsl-engine-api",
+ "kapsl-engine-api 0.3.0",
  "serde",
  "thiserror 1.0.69",
  "tokio",

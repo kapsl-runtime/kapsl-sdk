@@ -27,6 +27,12 @@ static_assert(offsetof(kapsl_backend_host_scoped_allocator_v1, base) == 0u,
               "scoped host prefix moved");
 static_assert(sizeof(kapsl_backend_host_scoped_allocator_v1) == 64u,
               "scoped host extension layout changed");
+static_assert(offsetof(kapsl_backend_host_extensions_v1, base) == 0u,
+              "host extension prefix moved");
+static_assert(sizeof(kapsl_backend_host_extensions_v1) == 88u,
+              "host query extension layout changed");
+static_assert(offsetof(kapsl_backend_host_extensions_v1, query_extension) == 80u,
+              "host extension query callback moved");
 static_assert(sizeof(kapsl_backend_config_v1) == 80u, "config layout changed");
 static_assert(sizeof(kapsl_tensor_view_v1) == 56u, "tensor view layout changed");
 static_assert(sizeof(kapsl_named_tensor_view_v1) == 80u,

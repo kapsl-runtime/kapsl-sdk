@@ -24,3 +24,11 @@ cxx_compiler="${CXX:-c++}"
   -I "$repo_root/crates/kapsl-backend-abi/include" \
   -fsyntax-only \
   "$repo_root/crates/kapsl-backend-abi/tests/header_smoke.cpp"
+
+"$c_compiler" -std=c11 -Wall -Wextra -Werror -pedantic \
+  -I "$repo_root/crates/kapsl-kv-abi/include" -fsyntax-only \
+  "$repo_root/crates/kapsl-kv-abi/tests/native_header.c"
+
+"$cxx_compiler" -std=c++17 -Wall -Wextra -Werror -pedantic \
+  -I "$repo_root/crates/kapsl-kv-abi/include" -fsyntax-only \
+  "$repo_root/crates/kapsl-kv-abi/tests/native_header.cpp"
