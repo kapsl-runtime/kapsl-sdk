@@ -3,6 +3,22 @@
 GGUF and ONNX compute implementations for integration adapters. Engines that
 host signed backend packs should depend on the host contracts, not this crate.
 
+## ONNX session configuration
+
+`LLMBackend::with_onnx_session_configurator` installs an
+`OnnxSessionConfigurator` owned by the integration. Its context identifies the
+actual model or pipeline-stage path, provider and device for each load, reload
+and safe-load retry. The integration registers its execution providers and
+per-model options, such as TensorRT shape profiles, without process-wide
+environment settings. A configuration error aborts loading; it cannot trigger
+an SDK provider or CPU fallback.
+
+With a device allocation-scope provider, configuration executes inside the
+model's allocation scope. The SDK enforces environment allocator use and
+disables CPU execution-provider fallback after the configurator returns,
+including on retries. This hook uses Rust and ORT types within the integration;
+the engine continues to use the existing backend ABI.
+
 ## GGUF request ownership
 
 With the `gguf` feature, `GgufSequenceAdmission` binds an integration's engine
