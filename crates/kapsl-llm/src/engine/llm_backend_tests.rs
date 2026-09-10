@@ -480,6 +480,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn infer_stream_reports_terminal_failures_without_emitting_diagnostics_as_tokens() {
+        for finish_reason in [FinishReason::Error, FinishReason::Cancelled] {
+            for partial in [false, true] {
+                let backend = LLMBackend::new();
+                let (tx, mut rx) = mpsc::channel(1);
+                *backend.request_tx.write().unwrap() = Some(tx);
+                // The scheduler can cancel independently of a caller token.
+                let mut stream = backend.infer_stream(&priority_request(None));
+                let consumer = tokio::spawn(async move {
+                    let mut outputs = Vec::new();
+                    while let Some(output) = stream.next().await {
+                        outputs.push(output);
+                    }
+                    outputs
+                });
+                let group = rx.recv().await.expect("queued request");
+                if partial {
+                    group
+                        .response_tx
+                        .send(SequenceGroupOutput {
+                            request_id: group.request_id.clone(),
+                            text: "generated token".to_string(),
+                            finish_reason: None,
+                        })
+                        .await
+                        .expect("send generated token");
+                }
+                group
+                    .response_tx
+                    .send(SequenceGroupOutput {
+                        request_id: group.request_id.clone(),
+                        text: "provider diagnostic".to_string(),
+                        finish_reason: Some(finish_reason),
+                    })
+                    .await
+                    .expect("send terminal failure");
+                let mut outputs = consumer.await.expect("stream consumer");
+                assert_eq!(outputs.len(), if partial { 2 } else { 1 });
+                let error = outputs.pop().unwrap().expect_err("terminal failure");
+                match finish_reason {
+                    FinishReason::Error => {
+                        assert!(matches!(error, EngineError::Backend { .. }));
+                        assert!(error.to_string().contains("provider diagnostic"));
+                    }
+                    FinishReason::Cancelled => {
+                        assert!(matches!(error, EngineError::Cancelled { .. }));
+                    }
+                    _ => unreachable!(),
+                }
+                if partial {
+                    assert_eq!(outputs.pop().unwrap().unwrap().data, b"generated token");
+                }
+                assert!(group.response_tx.is_closed());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn infer_discards_partial_output_when_generation_fails() {
+        let backend = LLMBackend::new();
+        let (tx, mut rx) = mpsc::channel(1);
+        *backend.request_tx.write().unwrap() = Some(tx);
+        let consumer = tokio::task::spawn_blocking(move || backend.infer(&priority_request(None)));
+        let group = rx.recv().await.expect("queued request");
+        for (text, finish_reason) in [
+            ("partial output", None),
+            ("No engine is found.", Some(FinishReason::Error)),
+        ] {
+            group
+                .response_tx
+                .send(SequenceGroupOutput {
+                    request_id: group.request_id.clone(),
+                    text: text.to_string(),
+                    finish_reason,
+                })
+                .await
+                .expect("send output");
+        }
+        let error = consumer.await.unwrap().expect_err("inference must fail");
+        assert!(matches!(error, EngineError::Backend { .. }));
+        assert!(error.to_string().contains("No engine is found."));
+        assert!(!error.to_string().contains("partial output"));
+    }
+
+    #[tokio::test]
     async fn infer_stream_waits_for_engine_cancellation_acknowledgement() {
         let backend = LLMBackend::new();
         let (tx, mut rx) = mpsc::channel(1);

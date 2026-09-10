@@ -16,7 +16,7 @@ use crate::prompt_adapter::{
     chat_template_from_template_source, ChatPromptTemplate,
 };
 use crate::scheduler::SchedulerConfig;
-use crate::sequence::{SamplingParams, SequenceGroup};
+use crate::sequence::{FinishReason, SamplingParams, SequenceGroup};
 use async_stream::stream;
 use async_trait::async_trait;
 use futures::stream::{self, Stream, StreamExt};
@@ -1577,6 +1577,25 @@ impl Engine for LLMBackend {
                             break;
                         }
                         continue;
+                    }
+
+                    // Terminal diagnostics describe a failed operation. Keep
+                    // them in the error channel so native adapters cannot
+                    // expose provider failures as successful generated text.
+                    match output.finish_reason {
+                        Some(FinishReason::Error) => {
+                            yield Err(EngineError::backend(if output.text.is_empty() {
+                                "LLM generation failed".to_string()
+                            } else {
+                                output.text
+                            }));
+                            return;
+                        }
+                        Some(FinishReason::Cancelled) => {
+                            yield Err(EngineError::cancelled("Request cancelled"));
+                            return;
+                        }
+                        _ => {}
                     }
 
                     let output_text = output.text;
