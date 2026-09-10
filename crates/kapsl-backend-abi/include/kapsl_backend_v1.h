@@ -178,6 +178,23 @@ typedef struct kapsl_backend_host_scoped_allocator_v1 {
     kapsl_scoped_device_allocate_fn allocate_device_scoped;
 } kapsl_backend_host_scoped_allocator_v1;
 
+#define KAPSL_HOST_EXTENSION_QUERY_VERSION 1u
+
+/* Exact name/version lookup. Returned immutable tables remain live through
+ * adapter shutdown. Unsupported contracts return NULL; no implicit version
+ * substitution is allowed. Extension names identify contracts, not backends.
+ */
+typedef const void *(*kapsl_host_query_extension_fn)(
+    void *user_data, kapsl_slice name, uint32_t version);
+
+typedef struct kapsl_backend_host_extensions_v1 {
+    kapsl_backend_host_scoped_allocator_v1 base;
+    uint32_t extension_query_version;
+    uint32_t reserved;
+    void *extension_user_data;
+    kapsl_host_query_extension_fn query_extension;
+} kapsl_backend_host_extensions_v1;
+
 typedef struct kapsl_backend_config_v1 {
     uint32_t struct_size;
     uint32_t device_id;

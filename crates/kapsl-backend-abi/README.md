@@ -21,6 +21,23 @@ adapter initialization.
 The existing llama.cpp v1 declarations are preserved and re-exported for source
 and binary-layout compatibility while native packs migrate to the neutral API.
 
+## Optional host contracts
+
+`KapslBackendHostExtensionsV1` appends exact name/version discovery after the
+published host and scoped-allocator prefixes. The prefixes keep their layout,
+ABI version and behavior. Adapters check `struct_size` before reading the tail,
+then validate the queried table's own size, version and callbacks. Unsupported
+contracts return null; the host never substitutes another version. Tables and
+contexts remain borrowed through adapter shutdown.
+
+`kapsl-kv-abi` publishes the `kapsl-kv-native` extension for shared KV. This
+lookup mechanism contains no KV layout, backend name or backend launch policy.
+CPU hosts may expose extension discovery without device allocator callbacks;
+adapters independently require the capabilities they actually use.
+
+The separate `kapsl-managed-abi` crate defines lifecycle and inference for
+supervised processes. Neither protocol uses KV messages to launch backends.
+
 ## Ownership and lifetime
 
 - Request tensors are borrowed only for the duration of the synchronous ABI

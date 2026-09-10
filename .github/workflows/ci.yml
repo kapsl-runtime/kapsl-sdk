@@ -10,6 +10,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: sdk-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   quality:
     name: Formatting and Clippy
@@ -39,6 +43,9 @@ jobs:
 
       - name: Check native backend C ABI header
         run: scripts/test-backend-abi-header.sh
+
+      - name: Check host contract publication policy
+        run: python3 scripts/test_host_contract_release.py
 
       - name: Lint SDK workspace
         run: cargo clippy --workspace --all-targets --locked -- -D warnings

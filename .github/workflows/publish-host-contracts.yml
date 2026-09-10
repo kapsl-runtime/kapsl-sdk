@@ -1,0 +1,121 @@
+name: Publish backend host contracts
+
+on:
+  push:
+    tags:
+      - "kapsl-kv-abi-v*"
+      - "kapsl-managed-abi-v*"
+  workflow_dispatch:
+    inputs:
+      package:
+        description: Contract to test (a tag selects its own package)
+        type: choice
+        options: [kapsl-managed-abi, kapsl-kv-abi]
+        default: kapsl-managed-abi
+        required: true
+      publish:
+        description: Publish from the exact matching stable tag already merged into main
+        type: boolean
+        default: false
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-host-contract-${{ github.ref }}-${{ inputs.package || 'tag' }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    name: Test and package the selected contract
+    runs-on: ubuntu-latest
+    outputs:
+      package: ${{ steps.release.outputs.package }}
+      version: ${{ steps.release.outputs.version }}
+      publish: ${{ steps.release.outputs.publish }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate publication policy
+        id: release
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          PACKAGE_INPUT: ${{ inputs.package || 'kapsl-managed-abi' }}
+          REQUESTED_PUBLISH: ${{ inputs.publish || false }}
+        run: python3 scripts/validate_host_contract_release.py
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust # zizmor: ignore[self-repository] actionlint does not support `$/` yet.
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          lookup-only: true
+          shared-key: host-contracts-release
+      - name: Test contract and release policy
+        env:
+          SDK_PACKAGE: ${{ steps.release.outputs.package }}
+          SDK_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          python3 scripts/test_host_contract_release.py
+          bash scripts/test-backend-abi-header.sh
+          cargo test -p "$SDK_PACKAGE@$SDK_VERSION" --locked
+      - name: Verify the registry package
+        env:
+          SDK_PACKAGE: ${{ steps.release.outputs.package }}
+          SDK_VERSION: ${{ steps.release.outputs.version }}
+        run: cargo publish -p "$SDK_PACKAGE@$SDK_VERSION" --locked --dry-run
+      - name: Upload the verified crate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ steps.release.outputs.package }}-${{ steps.release.outputs.version }}
+          path: target/package/${{ steps.release.outputs.package }}-${{ steps.release.outputs.version }}.crate
+          if-no-files-found: error
+          retention-days: 14
+
+  bootstrap-managed:
+    name: Bootstrap the managed protocol crate
+    needs: package
+    if: needs.package.outputs.publish == 'true' && needs.package.outputs.package == 'kapsl-managed-abi' && needs.package.outputs.version == '0.1.0'
+    runs-on: ubuntu-latest
+    environment: crates-io-backend-abi
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust # zizmor: ignore[self-repository] actionlint does not support `$/` yet.
+      - name: Publish the initial managed protocol version
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        # crates.io requires a token for a crate's first publication. This job
+        # can publish only this one initial version; subsequent tags use OIDC.
+        run: cargo publish -p kapsl-managed-abi@0.1.0 --locked # zizmor: ignore[use-trusted-publishing]
+
+  publish:
+    name: Publish an established host contract
+    needs: package
+    if: needs.package.outputs.publish == 'true' && (needs.package.outputs.package != 'kapsl-managed-abi' || needs.package.outputs.version != '0.1.0')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    environment: crates-io-backend-abi
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust # zizmor: ignore[self-repository] actionlint does not support `$/` yet.
+      - name: Authenticate with crates.io
+        id: crates-io-auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+      - name: Publish the exact tagged package
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
+          SDK_PACKAGE: ${{ needs.package.outputs.package }}
+          SDK_VERSION: ${{ needs.package.outputs.version }}
+        run: cargo publish -p "$SDK_PACKAGE@$SDK_VERSION" --locked
