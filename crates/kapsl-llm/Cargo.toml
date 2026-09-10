@@ -1,11 +1,12 @@
 [package]
 name = "kapsl-llm"
-version = "0.3.4"
+version = "0.3.5"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Large language model inference with GGUF and ONNX backend support for Kapsl"
+readme = "README.md"
 
 [dependencies]
 kapsl-core = { version = "0.3.0", path = "../kapsl-core" }

@@ -1,6 +1,8 @@
 //! GGUF inference through llama.cpp with optional shared-KV integration.
 
 #[cfg(feature = "gguf")]
+use crate::gguf_sequence_admission::{GgufSequenceAdmission, RequestAdmission, RequestGuard};
+#[cfg(feature = "gguf")]
 use crate::prompt_adapter::{chat_template_from_model_identifiers, prompt_is_explicitly_formatted};
 use async_stream::stream;
 use async_trait::async_trait;
@@ -8,7 +10,7 @@ use async_trait::async_trait;
 use kapsl_engine_api::{
     BatchingPolicy, EngineModelInfo, ExternalDeviceMemory, ExternalDeviceMemoryReport,
     MemoryAllocation, MemoryAllocationClass, MemoryAllocationSource, MemoryDomain, MemoryReport,
-    RequestMemoryAdmission, RequestMemoryAdmissionGuard, TensorDtype,
+    RequestMemoryAdmission, TensorDtype,
 };
 use kapsl_engine_api::{
     BinaryTensorPacket, Engine, EngineError, EngineMetrics, EngineStream, InferenceRequest,
@@ -1531,7 +1533,7 @@ struct GgufRequest {
     /// Runtime authority hook. It remains unacquired while this request waits
     /// in the priority queue and is consumed only after a sequence ID is
     /// assigned.
-    memory_admission: Option<RequestMemoryAdmission>,
+    admission: RequestAdmission,
     response: GgufResponse,
 }
 
@@ -1563,7 +1565,7 @@ impl GgufResponse {
         }
     }
 
-    fn send_error(self, error: EngineError) {
+    fn send_error(&self, error: EngineError) {
         match self {
             Self::Final(tx) | Self::Stream(tx) => {
                 let _ = tx.send(Err(error));
@@ -1705,7 +1707,7 @@ struct PendingPrefill {
     max_tokens: i32,
     min_tokens: i32,
     session_id: Option<String>,
-    memory_guard: Option<RequestMemoryAdmissionGuard>,
+    memory_guard: Option<RequestGuard>,
     response: GgufResponse,
     copies: Vec<PendingPrefillCopy>,
 }
@@ -1716,7 +1718,7 @@ struct PendingPrefillCopy {
     max_tokens: i32,
     min_tokens: i32,
     session_id: Option<String>,
-    memory_guard: Option<RequestMemoryAdmissionGuard>,
+    memory_guard: Option<RequestGuard>,
     response: GgufResponse,
 }
 
@@ -1745,7 +1747,7 @@ struct ActiveSeq {
     absorbed: Vec<LlamaToken>,
     /// Held until `release_sequence_slot` has synchronously cleared this
     /// sequence's KV ownership.
-    _memory_guard: Option<RequestMemoryAdmissionGuard>,
+    _memory_guard: Option<RequestGuard>,
 }
 
 #[cfg(feature = "gguf")]
@@ -3651,10 +3653,31 @@ impl Default for GgufBackend {
 
 #[cfg(feature = "gguf")]
 impl GgufBackend {
+    /// Bind an integration's engine request identity to the scheduler slot.
+    /// The returned binding guard outlives KV use and is released before the
+    /// terminal response. The hook does not serialize independent requests.
+    pub fn infer_with_sequence_admission(
+        &self,
+        request: &InferenceRequest,
+        admission: GgufSequenceAdmission,
+    ) -> Result<BinaryTensorPacket, EngineError> {
+        self.infer_with_optional_memory_admission(request, None, Some(admission))
+    }
+
+    /// Streaming counterpart of [`Self::infer_with_sequence_admission`].
+    pub fn infer_stream_with_sequence_admission(
+        &self,
+        request: &InferenceRequest,
+        admission: GgufSequenceAdmission,
+    ) -> EngineStream {
+        self.infer_stream_with_optional_memory_admission(request, None, Some(admission))
+    }
+
     fn infer_with_optional_memory_admission(
         &self,
         request: &InferenceRequest,
         memory_admission: Option<RequestMemoryAdmission>,
+        sequence_admission: Option<GgufSequenceAdmission>,
     ) -> Result<BinaryTensorPacket, EngineError> {
         let inner = self.inner.as_ref().ok_or(EngineError::ModelNotLoaded)?;
         let prompt = gguf_prepare_prompt(&inner.weights.model, Self::extract_prompt(request)?)?;
@@ -3673,7 +3696,11 @@ impl GgufBackend {
                 min_tokens: Self::min_new_tokens(request),
                 priority: Self::priority(request),
                 session_id: request.session_id.clone(),
-                memory_admission,
+                admission: RequestAdmission {
+                    memory: memory_admission,
+                    sequence: sequence_admission,
+                    cancellation: request.cancellation.clone(),
+                },
                 response: GgufResponse::Final(resp_tx),
             })
             .map_err(|_| EngineError::backend("gguf scheduler disconnected"))?;
@@ -3695,6 +3722,7 @@ impl GgufBackend {
         &self,
         request: &InferenceRequest,
         memory_admission: Option<RequestMemoryAdmission>,
+        sequence_admission: Option<GgufSequenceAdmission>,
     ) -> EngineStream {
         let inner = match self.inner.as_ref() {
             Some(i) => i,
@@ -3732,7 +3760,11 @@ impl GgufBackend {
                 min_tokens: Self::min_new_tokens(request),
                 priority: Self::priority(request),
                 session_id: request.session_id.clone(),
-                memory_admission,
+                admission: RequestAdmission {
+                    memory: memory_admission,
+                    sequence: sequence_admission,
+                    cancellation: request.cancellation.clone(),
+                },
                 response: GgufResponse::Stream(resp_tx),
             })
             .is_err()
@@ -3832,13 +3864,25 @@ fn finish_or_activate_prefilled_sequence(
     suppress_eos_sampler: bool,
     session_id: Option<String>,
     absorbed: Vec<LlamaToken>,
-    memory_guard: Option<RequestMemoryAdmissionGuard>,
+    memory_guard: Option<RequestGuard>,
 ) {
+    if memory_guard
+        .as_ref()
+        .is_some_and(RequestGuard::is_cancelled)
+    {
+        release_sequence_slot(ctx, available_ids, seq_id);
+        drop(memory_guard);
+        response.send_error(EngineError::cancelled(
+            "GGUF request cancelled after prefill",
+        ));
+        return;
+    }
     let mut output = Vec::with_capacity((max_tokens.max(0) as usize).saturating_mul(4));
     let mut stop_filter = GgufStopFilter::new();
 
     if max_tokens <= 0 || (first_tok == eos_token && min_tokens <= 0) {
         release_sequence_slot(ctx, available_ids, seq_id);
+        drop(memory_guard);
         record_gguf_token_metrics(metrics, prompt_len.max(0) as usize, 0);
         response.finish(output);
         return;
@@ -3846,6 +3890,7 @@ fn finish_or_activate_prefilled_sequence(
 
     let Some(piece) = first_piece else {
         release_sequence_slot(ctx, available_ids, seq_id);
+        drop(memory_guard);
         response.send_error(EngineError::backend("missing first token piece"));
         return;
     };
@@ -3857,12 +3902,14 @@ fn finish_or_activate_prefilled_sequence(
         GgufEmitResult::Continue => {}
         GgufEmitResult::Stopped => {
             release_sequence_slot(ctx, available_ids, seq_id);
+            drop(memory_guard);
             record_gguf_token_metrics(metrics, prompt_len.max(0) as usize, 1);
             response.finish(output);
             return;
         }
         GgufEmitResult::Disconnected => {
             release_sequence_slot(ctx, available_ids, seq_id);
+            drop(memory_guard);
             return;
         }
     }
@@ -3870,9 +3917,11 @@ fn finish_or_activate_prefilled_sequence(
     if max_tokens <= 1 {
         if !stop_filter.flush(&response, &mut output) {
             release_sequence_slot(ctx, available_ids, seq_id);
+            drop(memory_guard);
             return;
         }
         release_sequence_slot(ctx, available_ids, seq_id);
+        drop(memory_guard);
         record_gguf_token_metrics(metrics, prompt_len.max(0) as usize, 1);
         response.finish(output);
     } else {
@@ -3933,12 +3982,64 @@ fn fail_pending_prefill(
     message: &'static str,
 ) {
     release_sequence_slot(ctx, available_ids, pref.seq_id);
+    drop(pref.memory_guard.take());
     pref.response.send_error(EngineError::backend(message));
 
     for copy in pref.copies.drain(..) {
         release_sequence_slot(ctx, available_ids, copy.seq_id);
+        drop(copy.memory_guard);
         copy.response.send_error(EngineError::backend(message));
     }
+}
+
+#[cfg(feature = "gguf")]
+fn prune_cancelled_prefill(
+    mut pref: PendingPrefill,
+    mut release: impl FnMut(i32),
+) -> Option<PendingPrefill> {
+    pref.copies.retain_mut(|copy| {
+        if copy
+            .memory_guard
+            .as_ref()
+            .is_some_and(RequestGuard::is_cancelled)
+        {
+            release(copy.seq_id);
+            drop(copy.memory_guard.take());
+            copy.response
+                .send_error(EngineError::cancelled("GGUF prefill copy cancelled"));
+            false
+        } else {
+            true
+        }
+    });
+    if !pref
+        .memory_guard
+        .as_ref()
+        .is_some_and(RequestGuard::is_cancelled)
+    {
+        return Some(pref);
+    }
+    release(pref.seq_id);
+    drop(pref.memory_guard.take());
+    pref.response
+        .send_error(EngineError::cancelled("GGUF prefill cancelled"));
+    if pref.copies.is_empty() {
+        return None;
+    }
+    // Followers have their own admission and cancellation. If their leader
+    // stops, restart the shared prompt under one surviving follower's slot.
+    let leader = pref.copies.remove(0);
+    Some(PendingPrefill {
+        seq_id: leader.seq_id,
+        tokens: pref.tokens,
+        next_token: 0,
+        max_tokens: leader.max_tokens,
+        min_tokens: leader.min_tokens,
+        session_id: leader.session_id,
+        memory_guard: leader.memory_guard,
+        response: leader.response,
+        copies: pref.copies,
+    })
 }
 
 #[cfg(feature = "gguf")]
@@ -4102,6 +4203,52 @@ fn run_scheduler(
         }
 
         // ── 2. Promote waiting → pending (assign seq_id) ─────────────────────
+        // Cancellation reaches queued requests even when every slot is busy.
+        waiting.retain(|req| {
+            if req.admission.is_cancelled() {
+                req.response
+                    .send_error(EngineError::cancelled("GGUF queued request cancelled"));
+                false
+            } else {
+                true
+            }
+        });
+        if pending.iter().any(|pref| {
+            pref.memory_guard
+                .as_ref()
+                .is_some_and(RequestGuard::is_cancelled)
+                || pref.copies.iter().any(|copy| {
+                    copy.memory_guard
+                        .as_ref()
+                        .is_some_and(RequestGuard::is_cancelled)
+                })
+        }) {
+            let mut live_prefills = VecDeque::with_capacity(pending.len());
+            for pref in pending.drain(..) {
+                if let Some(pref) = prune_cancelled_prefill(pref, |seq_id| {
+                    release_sequence_slot(&mut ctx, &mut available_ids, seq_id)
+                }) {
+                    live_prefills.push_back(pref);
+                }
+            }
+            pending = live_prefills;
+        }
+        let mut index = 0;
+        while index < active.len() {
+            if active[index]
+                ._memory_guard
+                .as_ref()
+                .is_some_and(RequestGuard::is_cancelled)
+            {
+                let mut seq = active.remove(index);
+                release_sequence_slot(&mut ctx, &mut available_ids, seq.seq_id);
+                drop(seq._memory_guard.take());
+                seq.response
+                    .send_error(EngineError::cancelled("GGUF active request cancelled"));
+            } else {
+                index += 1;
+            }
+        }
         // Priority-aware, not strict FIFO: pull the lowest-priority-value
         // (latency-critical first) waiting request, breaking ties toward the
         // earliest arrival so requests at the same level keep FIFO order.
@@ -4127,18 +4274,16 @@ fn run_scheduler(
                 available_ids.push(seq_id);
                 continue;
             }
-            let memory_guard = match req.memory_admission.as_ref() {
-                Some(admission) => match admission.acquire() {
-                    Ok(guard) => Some(guard),
-                    Err(error) => {
-                        req.response.send_error(error);
-                        available_ids.push(seq_id);
-                        continue;
-                    }
-                },
-                None => None,
+            let memory_guard = match req.admission.acquire(seq_id as u32) {
+                Ok(guard) => Some(guard),
+                Err(error) => {
+                    req.response.send_error(error);
+                    available_ids.push(seq_id);
+                    continue;
+                }
             };
             if !samplers.set_for_sequence(&mut ctx, seq_id, req.min_tokens > 0) {
+                drop(memory_guard);
                 req.response
                     .send_error(EngineError::backend("failed to install sampler"));
                 available_ids.push(seq_id);
@@ -4323,10 +4468,11 @@ fn run_scheduler(
         drop(decode_timing);
         if let Err(e) = decode_result {
             log::error!("[gguf] decode error: {e}");
-            for seq in active.drain(..) {
+            for mut seq in active.drain(..) {
+                release_sequence_slot(&mut ctx, &mut available_ids, seq.seq_id);
+                drop(seq._memory_guard.take());
                 seq.response
                     .send_error(EngineError::backend("decode failed"));
-                release_sequence_slot(&mut ctx, &mut available_ids, seq.seq_id);
             }
             for pref in partial_prefills.drain(..) {
                 fail_pending_prefill(&mut ctx, &mut available_ids, pref, "decode failed");
@@ -4370,7 +4516,16 @@ fn run_scheduler(
         }
 
         // ── 6. Sample each newly prefilled sequence and move it to active ──────
-        for (mut pref, last_pos) in completed_prefills.drain(..) {
+        for (pref, last_pos) in completed_prefills.drain(..) {
+            let Some(mut pref) = prune_cancelled_prefill(pref, |seq_id| {
+                release_sequence_slot(&mut ctx, &mut available_ids, seq_id)
+            }) else {
+                continue;
+            };
+            if pref.next_token == 0 {
+                pending.push_back(pref);
+                continue;
+            }
             // EOS is skipped during greedy sampling when min_tokens > 0, so first_tok is
             // guaranteed to be a real content token whenever min_tokens is nonzero.
             let first_tok = samplers.sample_token(&ctx, last_pos);
@@ -4387,9 +4542,11 @@ fn run_scheduler(
                     Ok(piece) => Some(piece),
                     Err(e) => {
                         release_sequence_slot(&mut ctx, &mut available_ids, pref.seq_id);
+                        drop(pref.memory_guard.take());
                         pref.response.send_error(e);
                         for copy in pref.copies.drain(..) {
                             release_sequence_slot(&mut ctx, &mut available_ids, copy.seq_id);
+                            drop(copy.memory_guard);
                             copy.response
                                 .send_error(EngineError::backend("token decode failed"));
                         }
@@ -4420,6 +4577,7 @@ fn run_scheduler(
                             copy.seq_id
                         );
                         release_sequence_slot(&mut ctx, &mut available_ids, copy.seq_id);
+                        drop(copy.memory_guard);
                         copy.response
                             .send_error(EngineError::backend("KV cache copy failed"));
                         continue;
@@ -4431,8 +4589,15 @@ fn run_scheduler(
             let suppress_eos_sampler = pref.min_tokens > 1;
             if !suppress_eos_sampler && !samplers.set_for_sequence(&mut ctx, pref.seq_id, false) {
                 release_sequence_slot(&mut ctx, &mut available_ids, pref.seq_id);
+                drop(pref.memory_guard.take());
                 pref.response
                     .send_error(EngineError::backend("failed to install sampler"));
+                for copy in ready_copies {
+                    release_sequence_slot(&mut ctx, &mut available_ids, copy.seq_id);
+                    drop(copy.memory_guard);
+                    copy.response
+                        .send_error(EngineError::backend("failed to install leader sampler"));
+                }
                 continue;
             }
 
@@ -4475,6 +4640,7 @@ fn run_scheduler(
                     && !samplers.set_for_sequence(&mut ctx, copy.seq_id, false)
                 {
                     release_sequence_slot(&mut ctx, &mut available_ids, copy.seq_id);
+                    drop(copy.memory_guard);
                     copy.response
                         .send_error(EngineError::backend("failed to install sampler"));
                     continue;
@@ -4508,6 +4674,17 @@ fn run_scheduler(
             .zip(decode_batch_positions.iter())
             .enumerate()
         {
+            if seq
+                ._memory_guard
+                .as_ref()
+                .is_some_and(RequestGuard::is_cancelled)
+            {
+                seq.error = Some(EngineError::cancelled(
+                    "GGUF request cancelled during decode",
+                ));
+                to_retire.push(i);
+                continue;
+            }
             if batch_pos < 0 {
                 continue; // this sequence was not in the batch this step
             }
@@ -4594,7 +4771,7 @@ fn run_scheduler(
         }
 
         for &i in to_retire.iter().rev() {
-            let done = active.remove(i);
+            let mut done = active.remove(i);
             // Save the retiring state as the session's resume point before the
             // slot release clears it. Error retirements are excluded — their
             // state may not match the absorbed-token record.
@@ -4606,6 +4783,7 @@ fn run_scheduler(
                 snapshot_ssm_session_state(&ctx, cache, sid, &done.absorbed, done.seq_id);
             }
             release_sequence_slot(&mut ctx, &mut available_ids, done.seq_id);
+            drop(done._memory_guard.take());
             if let Some(error) = done.error {
                 done.response.send_error(error);
             } else {
@@ -5280,7 +5458,7 @@ impl Engine for GgufBackend {
     }
 
     fn infer(&self, request: &InferenceRequest) -> Result<BinaryTensorPacket, EngineError> {
-        self.infer_with_optional_memory_admission(request, None)
+        self.infer_with_optional_memory_admission(request, None, None)
     }
 
     fn infer_with_memory_admission(
@@ -5288,11 +5466,11 @@ impl Engine for GgufBackend {
         request: &InferenceRequest,
         admission: RequestMemoryAdmission,
     ) -> Result<BinaryTensorPacket, EngineError> {
-        self.infer_with_optional_memory_admission(request, Some(admission))
+        self.infer_with_optional_memory_admission(request, Some(admission), None)
     }
 
     fn infer_stream(&self, request: &InferenceRequest) -> EngineStream {
-        self.infer_stream_with_optional_memory_admission(request, None)
+        self.infer_stream_with_optional_memory_admission(request, None, None)
     }
 
     fn infer_stream_with_memory_admission(
@@ -5300,7 +5478,7 @@ impl Engine for GgufBackend {
         request: &InferenceRequest,
         admission: RequestMemoryAdmission,
     ) -> EngineStream {
-        self.infer_stream_with_optional_memory_admission(request, Some(admission))
+        self.infer_stream_with_optional_memory_admission(request, Some(admission), None)
     }
 
     fn unload(&mut self) {
@@ -5525,6 +5703,10 @@ impl Engine for GgufBackend {
         ))
     }
 }
+
+#[cfg(all(test, feature = "gguf"))]
+#[path = "scheduler_lifecycle_tests.rs"]
+mod scheduler_lifecycle_tests;
 
 #[cfg(all(test, feature = "gguf"))]
 mod tests {

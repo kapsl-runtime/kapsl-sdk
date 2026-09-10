@@ -13,6 +13,11 @@ pub mod block_manager;
 pub mod engine;
 #[path = "gguf/backend.rs"]
 pub mod gguf_backend;
+#[cfg(any(feature = "gguf", test))]
+#[path = "gguf/sequence_admission.rs"]
+mod gguf_sequence_admission;
+#[cfg(any(feature = "gguf", test))]
+pub use gguf_sequence_admission::GgufSequenceAdmission;
 #[path = "scheduling/global_scheduler.rs"]
 pub mod global_scheduler;
 #[path = "cache/kv_cache.rs"]

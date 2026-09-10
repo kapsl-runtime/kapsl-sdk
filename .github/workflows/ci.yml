@@ -151,6 +151,9 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --all-targets --locked
 
+      - name: Test external KV ownership without a GPU
+        run: cargo test -p kapsl-llm --no-default-features --features gguf-external-kv --lib --locked
+
       - name: Test Python and Triton gRPC clients
         if: runner.os == 'Linux'
         run: |

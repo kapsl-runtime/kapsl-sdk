@@ -126,6 +126,9 @@ jobs:
       - name: Test default compatibility profile
         run: cargo test -p kapsl-llm --lib --locked
 
+      - name: Test external KV ownership on the host
+        run: cargo test -p kapsl-llm --no-default-features --features gguf-external-kv --lib --locked
+
       - name: Verify crates.io package
         run: cargo publish -p kapsl-llm --locked --dry-run
 
