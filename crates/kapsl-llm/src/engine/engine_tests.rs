@@ -1,10 +1,10 @@
 #[cfg(test)]
 mod tests {
     use super::super::{
-        build_kv_array_f16, build_kv_array_f32_from_f16, device_kv_sequence_len, empty_kv_shape,
-        empty_kv_shape_with_seq_len, infer_kv_layout, normalize_metadata_safe_load_setting,
-        parse_safe_load_env_setting, parse_safe_load_setting, resolve_prepend_bos_token_id,
-        tokenizer_add_bos_token, tokenizer_declared_bos_token_id,
+        build_kv_array_f16, build_kv_array_f32_from_f16, configure_adapter_session,
+        device_kv_sequence_len, empty_kv_shape, empty_kv_shape_with_seq_len, infer_kv_layout,
+        normalize_metadata_safe_load_setting, parse_safe_load_env_setting, parse_safe_load_setting,
+        resolve_prepend_bos_token_id, tokenizer_add_bos_token, tokenizer_declared_bos_token_id,
         validate_scoped_device_provider_with, KvCacheMode, KvLayout, LLMEngine, LLMMetrics,
         SafeLoadSetting, SamplingParams, SchedulerConfig, SequenceGroup,
         DISABLE_CPU_EP_FALLBACK_KEY,
@@ -13,8 +13,12 @@ mod tests {
         DeviceAllocationClass, DeviceAllocationScope, DeviceAllocationScopeGuard,
         DeviceAllocationScopeKind, DeviceAllocationScopeProvider,
     };
+    use crate::onnx_session::{OnnxSessionConfigurator, OnnxSessionContext};
     use half::f16;
+    use kapsl_engine_api::EngineError;
+    use ort::session::{builder::SessionBuilder, Session};
     use ort::tensor::TensorElementType;
+    use ort::AsPointer;
     use serde_json::json;
     use std::collections::HashMap;
     use std::fs;
@@ -26,6 +30,221 @@ mod tests {
     use tokenizers::models::bpe::BPE;
     use tokenizers::Tokenizer;
     use tokio::sync::mpsc;
+
+    fn retain_test_ort_environment() {
+        // ORT keeps only a weak reference globally. Keep its environment alive
+        // while these parallel tests create and drop short-lived builders.
+        static ENVIRONMENT: std::sync::OnceLock<Arc<ort::environment::Environment>> =
+            std::sync::OnceLock::new();
+        ENVIRONMENT.get_or_init(|| ort::environment::get_environment().unwrap());
+    }
+
+    struct RecordingSessionConfigurator {
+        identity: &'static str,
+        calls: Mutex<Vec<(std::path::PathBuf, String, i32)>>,
+        fail: bool,
+    }
+
+    impl OnnxSessionConfigurator for RecordingSessionConfigurator {
+        fn configure(
+            &self,
+            builder: SessionBuilder,
+            context: OnnxSessionContext<'_>,
+        ) -> Result<SessionBuilder, EngineError> {
+            self.calls.lock().unwrap().push((
+                context.model_path.to_path_buf(),
+                context.provider.to_string(),
+                context.device_id,
+            ));
+            if self.fail {
+                return Err(EngineError::backend("invalid model shape profile"));
+            }
+            builder
+                .with_config_entry("kapsl.test.configuration", self.identity)
+                .and_then(|builder| builder.with_config_entry("session.use_env_allocators", "0"))
+                .and_then(|builder| builder.with_config_entry(DISABLE_CPU_EP_FALLBACK_KEY, "0"))
+                .map_err(|error| EngineError::backend(error.to_string()))
+        }
+    }
+
+    fn session_config_entry(builder: &SessionBuilder, key: &str) -> String {
+        let key = std::ffi::CString::new(key).unwrap();
+        let mut value = [0u8; 256];
+        let mut size = value.len();
+        // SAFETY: the builder and key remain live and the output has `size`
+        // writable bytes. ORT returns a NUL-terminated value on success.
+        let status = unsafe {
+            (ort::api().GetSessionConfigEntry)(
+                builder.ptr(),
+                key.as_ptr(),
+                value.as_mut_ptr().cast(),
+                &mut size,
+            )
+        };
+        assert!(
+            status.0.is_null(),
+            "ORT must expose the applied session option"
+        );
+        std::str::from_utf8(&value[..size - 1]).unwrap().to_string()
+    }
+
+    #[test]
+    fn adapter_sessions_keep_model_options_isolated_and_enforce_governance_last() {
+        retain_test_ort_environment();
+        let first = RecordingSessionConfigurator {
+            identity: "first-model",
+            calls: Mutex::new(Vec::new()),
+            fail: false,
+        };
+        let second = RecordingSessionConfigurator {
+            identity: "second-model",
+            calls: Mutex::new(Vec::new()),
+            fail: false,
+        };
+        for (configurator, path, provider, device_id) in [
+            (&first, "first/prefill.onnx", "cuda", 2),
+            (&second, "second/model.onnx", "tensorrt", 3),
+            (&first, "first/decode.onnx", "cuda", 4),
+            (&first, "first/prefill.onnx", "cuda", 2),
+        ] {
+            let context = OnnxSessionContext {
+                model_path: std::path::Path::new(path),
+                provider,
+                device_id,
+            };
+            let builder = configure_adapter_session(
+                Session::builder().unwrap(),
+                context,
+                Some(configurator),
+                false,
+                true,
+            )
+            .unwrap();
+            assert_eq!(
+                session_config_entry(&builder, "kapsl.test.configuration"),
+                configurator.identity
+            );
+            assert_eq!(
+                session_config_entry(&builder, "session.use_env_allocators"),
+                "1"
+            );
+            assert_eq!(
+                session_config_entry(&builder, DISABLE_CPU_EP_FALLBACK_KEY),
+                "1"
+            );
+        }
+        let first_calls = first.calls.lock().unwrap();
+        assert_eq!(first_calls.len(), 3);
+        assert_eq!(
+            first_calls[0], first_calls[2],
+            "reload receives the same model context"
+        );
+        assert_eq!(first_calls[1].0, std::path::Path::new("first/decode.onnx"));
+        assert_eq!(first_calls[1].2, 4);
+        assert_eq!(second.calls.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn adapter_configuration_errors_abort_and_cpu_sessions_keep_their_own_options() {
+        retain_test_ort_environment();
+        let mut configurator = RecordingSessionConfigurator {
+            identity: "cpu-model",
+            calls: Mutex::new(Vec::new()),
+            fail: true,
+        };
+        let context = OnnxSessionContext {
+            model_path: std::path::Path::new("model.onnx"),
+            provider: "cpu",
+            device_id: 0,
+        };
+        let result = configure_adapter_session(
+            Session::builder().unwrap(),
+            context,
+            Some(&configurator),
+            false,
+            false,
+        );
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("invalid model shape profile"));
+        assert_eq!(configurator.calls.lock().unwrap().len(), 1);
+        configurator.fail = false;
+        let builder = configure_adapter_session(
+            Session::builder().unwrap(),
+            context,
+            Some(&configurator),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            session_config_entry(&builder, "session.use_env_allocators"),
+            "0"
+        );
+        assert_eq!(
+            session_config_entry(&builder, DISABLE_CPU_EP_FALLBACK_KEY),
+            "0"
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_load_and_reload_use_the_adapter_hook_without_default_retry() {
+        use crate::llm_backend::LLMBackend;
+        use kapsl_engine_api::Engine;
+
+        retain_test_ort_environment();
+        let directory = tempfile::tempdir().unwrap();
+        let model = directory.path().join("model.onnx");
+        // The hook must fail before ORT tries to parse these deliberately
+        // invalid model bytes. A default retry would produce a different error.
+        fs::write(&model, b"not an ONNX graph").unwrap();
+        Tokenizer::new(BPE::default())
+            .save(directory.path().join("tokenizer.json"), false)
+            .unwrap();
+        fs::write(
+            directory.path().join("metadata.json"),
+            json!({
+                "metadata": {"llm": {
+                    "max_sequence_length": 16,
+                    "scheduler": {"max_num_seqs": 1},
+                    "kv_cache": {"total_blocks": 1, "block_size": 1}
+                }}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("config.json"),
+            json!({
+                "num_hidden_layers": 1, "num_attention_heads": 1,
+                "hidden_size": 8, "max_position_embeddings": 16
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let configurator = Arc::new(RecordingSessionConfigurator {
+            identity: "load-model",
+            calls: Mutex::new(Vec::new()),
+            fail: true,
+        });
+        let mut backend = LLMBackend::with_device("cpu".into(), 3)
+            .with_onnx_session_configurator(configurator.clone());
+        for _ in 0..2 {
+            let error = backend.load(&model).await.unwrap_err();
+            assert!(
+                error.to_string().contains("invalid model shape profile"),
+                "{error}"
+            );
+            backend.unload();
+        }
+        let calls = configurator.calls.lock().unwrap();
+        assert_eq!(
+            calls.as_slice(),
+            &[(model.clone(), "cpu".into(), 3), (model, "cpu".into(), 3),]
+        );
+    }
 
     #[derive(Default)]
     struct RecordingAllocationScopeProvider {

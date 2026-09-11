@@ -11,6 +11,7 @@ use crate::global_scheduler::GlobalKvScheduler;
 type GlobalSchedulerMutex = parking_lot::Mutex<GlobalKvScheduler>;
 use crate::llm_metrics::LLMMetrics;
 use crate::model_paths::{find_model_asset, find_model_root};
+use crate::onnx_session::OnnxSessionConfigurator;
 use crate::prompt_adapter::{
     chat_template_from_explicit_name, chat_template_from_model_identifiers,
     chat_template_from_template_source, ChatPromptTemplate,
@@ -61,6 +62,7 @@ pub struct LLMBackend {
     memory_owner: Option<(u32, u32)>,
     /// Backend-neutral provider bridge for request-aware allocation scopes.
     allocation_scope_provider: Option<Arc<dyn DeviceAllocationScopeProvider>>,
+    onnx_session_configurator: Option<Arc<dyn OnnxSessionConfigurator>>,
     /// Monotonic scope identity retained across unload/reload cycles.
     allocation_scope_ids: Arc<AtomicU64>,
     /// Optional shared block pool.  When set, the engine draws from this pool
@@ -615,6 +617,7 @@ impl LLMBackend {
             use_env_allocators: false,
             memory_owner: None,
             allocation_scope_provider: None,
+            onnx_session_configurator: None,
             allocation_scope_ids: Arc::new(AtomicU64::new(1)),
             shared_pool: None,
             kv_blocks_cap: None,
@@ -665,6 +668,17 @@ impl LLMBackend {
     /// device pool.
     pub fn with_env_allocators(mut self, enabled: bool) -> Self {
         self.use_env_allocators = enabled;
+        self
+    }
+
+    /// Let an integration configure providers and per-model ONNX options.
+    /// Governed allocator and no-CPU-fallback requirements are applied after
+    /// the hook returns. See [`OnnxSessionConfigurator`] for the load contract.
+    pub fn with_onnx_session_configurator(
+        mut self,
+        configurator: Arc<dyn OnnxSessionConfigurator>,
+    ) -> Self {
+        self.onnx_session_configurator = Some(configurator);
         self
     }
 
@@ -1213,6 +1227,7 @@ impl Engine for LLMBackend {
         let use_env_allocators = self.use_env_allocators;
         let memory_owner = self.memory_owner;
         let allocation_scope_provider = self.allocation_scope_provider.clone();
+        let onnx_session_configurator = self.onnx_session_configurator.clone();
         let allocation_scope_ids = self.allocation_scope_ids.clone();
         let engine_block_size = hints.block_size;
         let engine_num_gpu_blocks = hints.num_gpu_blocks;
@@ -1236,6 +1251,7 @@ impl Engine for LLMBackend {
                 use_env_allocators,
             );
             let mut engine = engine;
+            engine.set_onnx_session_configurator(onnx_session_configurator);
             if let Some((model_id, replica_id)) = memory_owner {
                 engine.set_memory_owner(model_id, replica_id);
             }

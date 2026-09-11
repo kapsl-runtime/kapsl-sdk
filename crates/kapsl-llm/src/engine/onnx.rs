@@ -16,6 +16,7 @@ use crate::block_manager::{BlockManager, SharedBlockAllocator};
 use crate::kv_cache::{KvCache, KvCacheConfig, KvCacheError, KvCacheMode, KvEvictionPolicy};
 use crate::llm_metrics::LLMMetrics;
 use crate::model_paths::{find_model_asset, find_model_root};
+use crate::onnx_session::{OnnxSessionConfigurator, OnnxSessionContext};
 use crate::scheduler::{LLMScheduler, SchedulerConfig};
 use crate::sequence::{
     FinishReason, SamplingParams, Sequence, SequenceGroup, SequenceGroupOutput, SequenceStatus,
@@ -62,6 +63,37 @@ const DEFAULT_NUM_HEADS: usize = 32;
 const DEFAULT_HEAD_DIM: usize = 128;
 const MAX_SEQ_LEN: usize = 4096;
 const DISABLE_CPU_EP_FALLBACK_KEY: &str = "session.disable_cpu_ep_fallback";
+
+fn configure_adapter_session(
+    mut builder: SessionBuilder,
+    context: OnnxSessionContext<'_>,
+    configurator: Option<&dyn OnnxSessionConfigurator>,
+    use_env_allocators: bool,
+    scoped_device_provider: bool,
+) -> Result<SessionBuilder, EngineError> {
+    if let Some(configurator) = configurator {
+        builder = configurator.configure(builder, context)?;
+    }
+    // Apply the authority requirements last, even if the adapter supplied
+    // conflicting settings. A hook cannot opt a governed model out of them.
+    if (use_env_allocators
+        && matches!(
+            context.provider.to_ascii_lowercase().as_str(),
+            "cuda" | "tensorrt"
+        ))
+        || scoped_device_provider
+    {
+        builder = builder
+            .with_config_entry("session.use_env_allocators", "1")
+            .map_err(|error| EngineError::backend(error.to_string()))?;
+    }
+    if scoped_device_provider {
+        builder = builder
+            .with_config_entry(DISABLE_CPU_EP_FALLBACK_KEY, "1")
+            .map_err(|error| EngineError::backend(error.to_string()))?;
+    }
+    Ok(builder)
+}
 
 // === Failure isolation ===
 /// Trip the circuit breaker after this many consecutive `execute_step` failures.
@@ -1274,6 +1306,7 @@ pub struct LLMEngine {
     use_env_allocators: bool,
     memory_owner: Option<(u32, u32)>,
     allocation_scope_provider: Option<Arc<dyn DeviceAllocationScopeProvider>>,
+    onnx_session_configurator: Option<Arc<dyn OnnxSessionConfigurator>>,
     allocation_scope_ids: Arc<AtomicU64>,
     pipeline_stages: Option<Vec<PipelineStage>>,
 
@@ -1477,6 +1510,13 @@ impl LLMEngine {
         self.allocation_scope_provider = Some(provider);
     }
 
+    pub(crate) fn set_onnx_session_configurator(
+        &mut self,
+        configurator: Option<Arc<dyn OnnxSessionConfigurator>>,
+    ) {
+        self.onnx_session_configurator = configurator;
+    }
+
     pub(crate) fn set_allocation_scope_id_source(&mut self, scope_ids: Arc<AtomicU64>) {
         self.allocation_scope_ids = scope_ids;
     }
@@ -1608,6 +1648,7 @@ impl LLMEngine {
             use_env_allocators,
             memory_owner: None,
             allocation_scope_provider: None,
+            onnx_session_configurator: None,
             allocation_scope_ids: Arc::new(AtomicU64::new(1)),
             pipeline_stages: None,
             kv_cache,
@@ -2083,7 +2124,10 @@ impl LLMEngine {
             validate_scoped_device_provider(preferred_provider.as_deref())?;
         }
         if let Some(provider) = preferred_provider.as_ref() {
-            if !scoped_device_provider && !llm_provider_available(provider) {
+            if !scoped_device_provider
+                && self.onnx_session_configurator.is_none()
+                && !llm_provider_available(provider)
+            {
                 log::warn!(
                     "Requested LLM provider `{}` is unavailable, falling back to CPU",
                     provider
@@ -2245,28 +2289,15 @@ impl LLMEngine {
             .and_then(|tokenizer| tokenizer_declared_bos_token_id(model_path, tokenizer));
 
         // Build the ONNX session so we can inspect its declared inputs.
-        let make_builder = |provider: Option<&str>,
+        let make_builder = |path: &Path,
+                            provider: Option<&str>,
                             device_id: i32|
          -> Result<SessionBuilder, EngineError> {
             let mut builder =
                 Session::builder().map_err(|e| EngineError::backend(e.to_string()))?;
 
-            if let Some(provider) = provider {
+            if let Some(provider) = provider.filter(|_| self.onnx_session_configurator.is_none()) {
                 let p_lower = provider.to_lowercase();
-                if self.use_env_allocators && matches!(p_lower.as_str(), "cuda" | "tensorrt") {
-                    builder = builder
-                        .with_config_entry("session.use_env_allocators", "1")
-                        .map_err(|e| EngineError::backend(e.to_string()))?;
-                }
-                if scoped_device_provider {
-                    builder = builder
-                        .with_config_entry(DISABLE_CPU_EP_FALLBACK_KEY, "1")
-                        .map_err(|e| {
-                            EngineError::backend(format!(
-                                "disable ORT CPU execution-provider fallback: {e}"
-                            ))
-                        })?;
-                }
                 match p_lower.as_str() {
                     "coreml" | "metal" => {
                         if CoreMLExecutionProvider::default()
@@ -2424,6 +2455,17 @@ impl LLMEngine {
                 }
             }
 
+            builder = configure_adapter_session(
+                builder,
+                OnnxSessionContext {
+                    model_path: path,
+                    provider: provider.unwrap_or("cpu"),
+                    device_id,
+                },
+                self.onnx_session_configurator.as_deref(),
+                self.use_env_allocators,
+                scoped_device_provider,
+            )?;
             builder = builder
                 .with_optimization_level(optimization_level)
                 .map_err(|e| EngineError::backend(e.to_string()))?;
@@ -2472,7 +2514,9 @@ impl LLMEngine {
             SafeLoadSetting::Auto => false,
         };
 
-        let allow_cpu_fallback = self.provider_override.is_none() && !scoped_device_provider;
+        let allow_cpu_fallback = self.provider_override.is_none()
+            && !scoped_device_provider
+            && self.onnx_session_configurator.is_none();
         let try_build_session_with_provider = |path: &Path,
                                                provider: Option<&str>,
                                                device_id: i32|
@@ -2482,7 +2526,7 @@ impl LLMEngine {
                 DeviceAllocationClass::PersistentWeights,
                 &[],
             )?;
-            let mut builder = make_builder(provider, device_id)?;
+            let mut builder = make_builder(path, provider, device_id)?;
             if safe_load {
                 builder = apply_safe_load(builder)?;
                 log::info!(
@@ -2497,7 +2541,7 @@ impl LLMEngine {
                         log::warn!(
                             "LLM safe-load disabled by default, but session creation failed; retrying with safe-load settings."
                         );
-                        let mut builder = make_builder(provider, device_id)?;
+                        let mut builder = make_builder(path, provider, device_id)?;
                         builder = apply_safe_load(builder)?;
                         log::info!(
                             "LLM safe-load enabled: limiting ORT threads and disabling CPU mem arena."

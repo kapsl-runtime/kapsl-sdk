@@ -29,6 +29,9 @@ pub mod llm_backend;
 pub mod llm_metrics;
 #[path = "model/model_paths.rs"]
 pub mod model_paths;
+#[cfg(feature = "onnx")]
+#[path = "engine/session_configuration.rs"]
+pub mod onnx_session;
 #[path = "model/prompt_adapter.rs"]
 pub mod prompt_adapter;
 #[path = "cache/radix_tree.rs"]
