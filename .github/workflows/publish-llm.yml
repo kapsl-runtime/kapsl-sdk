@@ -121,7 +121,7 @@ jobs:
         run: bash scripts/test-llm-ort-feature-contract.sh
 
       - name: Test portable ONNX generation profile
-        run: cargo test -p kapsl-llm --no-default-features --features onnx --lib --locked
+        run: cargo test -p kapsl-llm --no-default-features --features onnx --lib --test device_kv_binding --locked
 
       - name: Test default compatibility profile
         run: cargo test -p kapsl-llm --lib --locked
