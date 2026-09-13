@@ -55,6 +55,9 @@ use futures::FutureExt;
 use tokenizers::Tokenizer;
 use tokio::sync::mpsc;
 
+#[path = "onnx_binding.rs"]
+mod binding_execution;
+
 // === DEFAULTS (used until model loads and detection happens) ===
 // These are conservative defaults; they will be overridden at load() time when
 // the model declares its input shapes.
@@ -4462,12 +4465,7 @@ impl LLMEngine {
             bound_layers.push(layer);
         }
 
-        let mut outputs = session
-            .run_binding(&binding)
-            .map_err(|error| EngineError::backend(error.to_string()))?;
-        binding
-            .synchronize_outputs()
-            .map_err(|error| EngineError::backend(error.to_string()))?;
+        let mut outputs = binding_execution::run_device_kv_binding(session, &binding)?;
 
         let mut new_cache = DeviceKvSequence::empty(self.num_layers);
         new_cache.length = total_len;
