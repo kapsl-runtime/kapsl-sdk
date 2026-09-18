@@ -109,7 +109,7 @@ path = "src/lib.rs"
 [dependencies]
 
 [build-dependencies.bindgen]
-version = "0.72.1"
+version = "0.73.2"
 
 [build-dependencies.cc]
 version = "1.2.61"
