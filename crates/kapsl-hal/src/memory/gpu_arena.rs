@@ -662,6 +662,44 @@ pub struct GpuDevicePool {
 }
 
 #[cfg(feature = "cuda")]
+fn allocate_initialized(
+    pool_id: u64,
+    policy: &mut PoolPolicy,
+    allocator: &mut AlignedRangeAllocator,
+    owner: PoolOwner,
+    bytes: usize,
+    alignment: usize,
+    initialize: impl FnOnce(&GpuAllocation) -> Result<(), ArenaError>,
+) -> Result<GpuAllocation, ArenaError> {
+    if bytes == 0 || alignment == 0 {
+        return Err(ArenaError::InvalidAllocationRequest);
+    }
+    let available = policy.available_for(owner, allocator.free_bytes());
+    if bytes > available {
+        return Err(ArenaError::QuotaExceeded {
+            owner,
+            requested: bytes,
+            available,
+        });
+    }
+    let allocation = allocator
+        .alloc(pool_id, owner, bytes, alignment)
+        .ok_or(ArenaError::Oom {
+            requested: bytes,
+            available: allocator.free_bytes(),
+        })?;
+    policy.account_alloc(owner, bytes);
+    if owner.class() == PoolAllocationClass::KvCache {
+        // Initialization may have submitted writes before reporting failure.
+        // Keep the range and charge on failure so another owner cannot reuse
+        // memory while those writes may still be pending. Pool destruction
+        // releases the backing allocation.
+        initialize(&allocation)?;
+    }
+    Ok(allocation)
+}
+
+#[cfg(feature = "cuda")]
 impl std::fmt::Debug for GpuDevicePool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GpuDevicePool")
@@ -699,48 +737,27 @@ impl GpuDevicePool {
         })
     }
 
+    /// Reserve an extent, completing KV initialization before publishing it.
+    /// If initialization fails, the extent remains charged and unavailable
+    /// until pool destruction: a failed fence cannot authorize its reuse.
     pub fn alloc(
         &self,
         owner: PoolOwner,
         bytes: usize,
         alignment: usize,
     ) -> Result<GpuAllocation, ArenaError> {
-        if bytes == 0 || alignment == 0 {
-            return Err(ArenaError::InvalidAllocationRequest);
-        }
         // Policy is always locked before allocator throughout this type.
         let mut policy = self.policy.lock().unwrap();
         let mut allocator = self.allocator.lock().unwrap();
-        let available = policy.available_for(owner, allocator.free_bytes());
-        if bytes > available {
-            return Err(ArenaError::QuotaExceeded {
-                owner,
-                requested: bytes,
-                available,
-            });
-        }
-        let allocation = allocator
-            .alloc(self.pool_id, owner, bytes, alignment)
-            .ok_or(ArenaError::Oom {
-                requested: bytes,
-                available: allocator.free_bytes(),
-            })?;
-        policy.account_alloc(owner, bytes);
-
-        // KV extents can move between sessions, models, and replicas while the
-        // process stays alive. Clear them synchronously before publishing the
-        // new ownership so stale cache contents can never be observed through
-        // a newly allocated block or an external raw pointer.
-        if owner.class() == PoolAllocationClass::KvCache {
-            if let Err(error) = self.zero_allocation_sync(&allocation) {
-                allocator
-                    .free(&allocation)
-                    .expect("fresh allocation must remain live during rollback");
-                policy.account_free(owner, bytes);
-                return Err(error);
-            }
-        }
-        Ok(allocation)
+        allocate_initialized(
+            self.pool_id,
+            &mut policy,
+            &mut allocator,
+            owner,
+            bytes,
+            alignment,
+            |allocation| self.zero_allocation_sync(allocation),
+        )
     }
 
     fn zero_allocation_sync(&self, allocation: &GpuAllocation) -> Result<(), ArenaError> {
@@ -749,9 +766,14 @@ impl GpuDevicePool {
             self.allocation_ptr(allocation) as usize as cudarc::driver::sys::CUdeviceptr;
         // SAFETY: `allocation` is still live in this pool, its full byte range
         // is exclusively owned by the allocating caller, and an all-zero bit
-        // pattern is valid for KV storage. The synchronous driver operation
-        // completes before the allocation is returned to its new owner.
-        unsafe { result::memset_d8_sync(device_ptr, 0, allocation.bytes())? };
+        // pattern is valid for KV storage. Even cuMemsetD8 (without Async in
+        // its name) can return before device memory is cleared. Submit to the
+        // retained pool stream and explicitly wait before exposing the pointer
+        // to a consumer that may execute on a different nonblocking stream.
+        unsafe {
+            result::memset_d8_async(device_ptr, 0, allocation.bytes(), *self.device.cu_stream())?
+        };
+        self.device.synchronize()?;
         Ok(())
     }
 
@@ -2283,3 +2305,7 @@ mod tests {
         assert_eq!(pool.capacity_bytes(), 8 * 256);
     }
 }
+
+#[cfg(all(test, feature = "cuda"))]
+#[path = "gpu_arena_initialization_tests.rs"]
+mod initialization_tests;
