@@ -370,6 +370,12 @@ impl PoolPolicy {
         self.quota_for_workload(owner.workload())
     }
 
+    /// Whether this owner's workload is admitted, across allocation classes.
+    /// Quotas and outstanding borrowed allocations do not imply admission.
+    pub fn is_admitted(&self, owner: PoolOwner) -> bool {
+        self.admitted.contains(&owner.workload())
+    }
+
     fn quota_for_workload(&self, workload: PoolWorkload) -> OwnerQuota {
         self.quotas.get(&workload).copied().unwrap_or(OwnerQuota {
             guaranteed_bytes: 0,
@@ -843,6 +849,16 @@ impl GpuDevicePool {
 
     pub fn owner_usage_bytes(&self, owner: PoolOwner) -> usize {
         self.policy.lock().unwrap().usage_bytes(owner)
+    }
+
+    /// Observe workload admission without constructing a pool-wide snapshot.
+    ///
+    /// This takes only the policy lock and does not reserve memory or acquire
+    /// an admission lease. Callers must keep their workload's admission alive
+    /// throughout allocation and use, just as when checking [`Self::snapshot`].
+    /// All allocation classes of the same backend/model/replica share admission.
+    pub fn is_owner_admitted(&self, owner: PoolOwner) -> bool {
+        self.policy.lock().unwrap().is_admitted(owner)
     }
 
     /// Aggregate bytes owned by all allocation classes for this model replica.
@@ -2309,3 +2325,7 @@ mod tests {
 #[cfg(all(test, feature = "cuda"))]
 #[path = "gpu_arena_initialization_tests.rs"]
 mod initialization_tests;
+
+#[cfg(all(test, feature = "cuda"))]
+#[path = "gpu_arena_admission_tests.rs"]
+mod admission_tests;
