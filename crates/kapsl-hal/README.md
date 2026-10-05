@@ -128,7 +128,7 @@ cuda,cudarc/cuda-12060 -- hardware_ --ignored --test-threads=1`. Full worker
 isolation, remote mapping and resize under queued inference still require the
 runtime's GPU conformance environment.
 
-This source change prepares the HAL release. Assign and publish the new crate
-version before migrating the engine's published dependency. The engine continues
+This source change prepares HAL 0.3.2. Publish the merged source under
+`kapsl-hal-v0.3.2` before migrating the engine's published dependency. The engine continues
 using its existing exported-backing implementation until that coordinated update.
 The common per-device allocation facade and region selection are later steps.
