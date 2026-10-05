@@ -99,7 +99,7 @@ pub enum GpuRegionError {
     },
 }
 
-#[cfg(all(feature = "cuda", any(target_os = "linux", test)))]
+#[cfg(feature = "cuda")]
 pub(crate) fn driver_error(
     operation: &'static str,
 ) -> impl FnOnce(cudarc::driver::DriverError) -> GpuRegionError {

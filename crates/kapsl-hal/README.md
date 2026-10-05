@@ -9,8 +9,11 @@ workload identities, worker registration and coordinated capacity changes.
 | `GpuIpcRegion` | Dedicated CUDA IPC export | Fixed | One isolated backing allocation |
 | `GpuVmmRegion` | Dedicated POSIX FD export | Explicit growth and tail release | Stable virtual reservation, multiple physical segments |
 
-The CUDA types require the `cuda` feature. IPC and VMM exports are available on
-Linux. `gpu_region` provides portable capability and observation types. Host
+The CUDA types require the `cuda` feature. The VMM API additionally requires Unix
+file descriptors; exported backing requires a supporting CUDA driver. The runtime
+enables its IPC/VMM transport on Linux. The bindings also compile on Unix hosts
+without a CUDA driver for consumer checks. `gpu_region` provides portable
+capability and observation types. Host
 unit tests compile the exported-region implementations with fake drivers so
 their lifetime and failure contracts can be tested without a GPU.
 
