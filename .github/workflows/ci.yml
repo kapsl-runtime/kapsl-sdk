@@ -64,6 +64,12 @@ jobs:
           --features cuda,cudarc/cuda-12060 gpu_arena::admission_tests
           -- --test-threads=1
 
+      - name: Test GPU physical region lifetimes on the host
+        run: >-
+          cargo test -p kapsl-hal --lib --locked
+          --features cuda,cudarc/cuda-12060
+          -- gpu_region gpu_ipc_region gpu_vmm_region --test-threads=1
+
       - name: Check optional gRPC facade
         run: cargo check -p kapsl-communication --no-default-features --features grpc --locked
 
