@@ -722,7 +722,7 @@ impl DeviceInfo {
             let cc = dev
                 .cuda_compute_capability()
                 .ok()
-                .map(|(maj, min)| format!("{maj}.{min}"));
+                .map(|cc| format!("{}.{}", cc.major, cc.minor));
 
             // UUID is a stable per-device identifier (e.g. "GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx")
             // that survives index reordering. For MIG compute instances NVML would return a
