@@ -5,10 +5,13 @@ repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # These are reviewed informational notices, documented in SECURITY.md. Deny
 # every other warning as well as all vulnerabilities.
+# RUSTSEC-2024-0449: unsafe-libyaml via serde_yaml is unmaintained with no fix,
+# tracked in kapsl-runtime/kapsl-sdk#172.
 cargo audit \
   --deny warnings \
   --ignore RUSTSEC-2025-0141 \
   --ignore RUSTSEC-2024-0436 \
+  --ignore RUSTSEC-2024-0449 \
   --file "$repository_root/Cargo.lock"
 
 for lockfile in \
