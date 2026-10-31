@@ -44,9 +44,9 @@
 //! # CPU store geometry
 //!
 //! Each `CpuBlockStore` is geometry-specific: it holds blocks of exactly
-//! `2 * num_kv_heads * block_size * head_dim` f16 elements. When a pool with
-//! a new geometry is registered, a matching `CpuBlockStore` is created
-//! automatically. This ensures sessions with different KV shapes (e.g. a
+//! `2 * num_kv_heads * block_size * head_dim` f16 elements. The first time a
+//! session of a given geometry is evicted, a matching `CpuBlockStore` is
+//! created; geometries that never evict never allocate one. This ensures sessions with different KV shapes (e.g. a
 //! 7B model with 8 heads vs a 70B model with 64 heads) can each be evicted
 //! independently without size mismatches.
 //!
@@ -170,7 +170,8 @@ mod inner {
         /// LRU sessions are offloaded to CPU to make room for new ones.
         ///
         /// `cpu_store_capacity` — number of block slots in each per-geometry
-        /// `CpuBlockStore` created when a new pool geometry is registered.
+        /// `CpuBlockStore`, allocated when a session of that geometry is first
+        /// evicted to CPU.
         pub fn new(evict_threshold: f32, cpu_store_capacity: usize) -> Self {
             Self {
                 device_pools: HashMap::new(),
@@ -185,18 +186,10 @@ mod inner {
         // ── Pool registration ─────────────────────────────────────────────────
 
         /// Register a `GpuBlockPool` for a device.  Multiple pools per device
-        /// are allowed (e.g. one per KV geometry).  A matching `CpuBlockStore`
-        /// is created automatically for the pool's geometry if none exists yet.
+        /// are allowed (e.g. one per KV geometry).  The geometry's
+        /// `CpuBlockStore` is not created here: it is allocated on the first
+        /// eviction, so registration costs no host memory.
         pub fn register_pool(&mut self, device_id: usize, pool: Arc<GpuBlockPool>) {
-            let geom = (pool.num_kv_heads(), pool.head_dim());
-            self.cpu_stores.entry(geom).or_insert_with(|| {
-                CpuBlockStore::new(
-                    self.cpu_store_capacity,
-                    pool.num_kv_heads(),
-                    pool.block_size(),
-                    pool.head_dim(),
-                )
-            });
             self.device_pools.entry(device_id).or_default().push(pool);
         }
 
@@ -387,11 +380,17 @@ mod inner {
                 }
             }
 
-            // Download only owned blocks to CPU.
-            let cpu_store = self
-                .cpu_stores
-                .get_mut(&kv_geom)
-                .ok_or(SchedulerError::NoCpuStore(kv_geom.0, kv_geom.1))?;
+            // Download only owned blocks to CPU, allocating the geometry's
+            // store on first use.
+            let capacity = self.cpu_store_capacity;
+            let cpu_store = self.cpu_stores.entry(kv_geom).or_insert_with(|| {
+                CpuBlockStore::new(
+                    capacity,
+                    pool.num_kv_heads(),
+                    pool.block_size(),
+                    pool.head_dim(),
+                )
+            });
 
             let mut cpu_slots = Vec::with_capacity(owned_blocks.len());
             for &blk in &owned_blocks {
@@ -700,15 +699,16 @@ mod inner {
         }
 
         #[test]
-        fn register_pool_creates_cpu_store_for_geometry() {
+        fn register_pool_does_not_allocate_cpu_store() {
             let mut s = sched();
             let pool = small_pool();
             s.register_pool(0, pool.clone());
             // After registration the device is visible.
             assert!(s.registered_devices().contains(&0));
-            // CPU store was created for this geometry.
             let free = s.device_free_blocks(0, pool.num_kv_heads(), pool.head_dim());
             assert_eq!(free, pool.total_blocks());
+            // No host memory is committed until a session is evicted.
+            assert!(s.cpu_stores.is_empty());
         }
 
         #[test]
@@ -861,6 +861,8 @@ mod inner {
             // Session is now on CPU.
             assert_eq!(s.sessions_on_cpu(), 1);
             assert_eq!(s.sessions_on_device(0), 0);
+            // The first eviction allocated the geometry's store.
+            assert_eq!(s.cpu_stores[&(kv_heads, head_dim)].capacity(), 64);
         }
 
         #[test]
