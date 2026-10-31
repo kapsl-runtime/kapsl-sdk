@@ -8,7 +8,7 @@ use kapsl_engine_api::{
     OpenAiWireRequest, OpenAiWireResponse, OpenAiWireResponseHead, OpenAiWireStreamResponse,
     TensorDtype,
 };
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use tokio::sync::oneshot;
 
@@ -392,10 +392,7 @@ fn build_scheduler_for_queue_tests(
     queue_size: usize,
     cpu_active: usize,
 ) -> Scheduler {
-    let cpu_pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(1)
-        .build()
-        .expect("Failed to create CPU thread pool");
+    let cpu_pool = CpuPool::new(1).expect("Failed to create CPU thread pool");
 
     let high_queue = crate::gpu_executor::WorkQueue::new(queue_size);
     let low_queue = crate::gpu_executor::WorkQueue::new(queue_size);
@@ -507,7 +504,7 @@ async fn zero_cpu_workers_retains_rayon_auto_selection() {
     let engine: EngineHandle = Arc::new(MockEngine::new(EngineMetrics::default()));
     let scheduler = Scheduler::new(vec![engine], 0, 1, 1, false, 1, 0, None);
 
-    assert!(scheduler.cpu_pool.current_num_threads() > 0);
+    assert!(scheduler.cpu_pool.threads() > 0);
 }
 
 #[test]
@@ -517,9 +514,9 @@ fn non_blocking_cpu_admission_reserves_capacity_atomically() {
 
     assert!(scheduler.try_reserve_cpu_slot());
     assert!(!scheduler.try_reserve_cpu_slot());
-    scheduler.cpu_active_count.fetch_sub(1, Ordering::Release);
+    scheduler.cpu_pool.release_reserved();
     assert!(scheduler.try_reserve_cpu_slot());
-    scheduler.cpu_active_count.fetch_sub(1, Ordering::Release);
+    scheduler.cpu_pool.release_reserved();
 }
 
 #[tokio::test]

@@ -17,6 +17,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 mod admission;
+mod cpu_pool;
+
+use cpu_pool::CpuPool;
 
 use admission::{
     ActiveCountGuard, PriorityAdmission, PriorityAdmissionPermit, StreamAdmissionGuard,
@@ -51,13 +54,15 @@ impl QueueOverflowPolicy {
 /// Main scheduler that coordinates CPU and GPU execution
 pub struct Scheduler {
     engines: Vec<EngineHandle>,
-    cpu_pool: rayon::ThreadPool,
+    // Capacity for `force_cpu` work is checked against this pool.
+    cpu_pool: CpuPool,
     // Vector of channels, one pair per worker
     gpu_high_priority_queues: Vec<WorkQueue>,
     gpu_low_priority_queues: Vec<WorkQueue>,
     // Maps each worker/queue index to the engine that owns that worker.
     worker_engine_indices: Vec<usize>,
-    // Track active CPU inferences
+    // Track this scheduler's active CPU inferences (reported as its CPU queue
+    // depth).
     cpu_active_count: Arc<std::sync::atomic::AtomicUsize>,
     // Track in-flight GPU work (requests already dequeued from the channels, but not finished).
     gpu_in_flight_count: Arc<AtomicUsize>,
@@ -120,11 +125,7 @@ impl Scheduler {
             "Scheduler requires at least one worker per device"
         );
 
-        // Create CPU thread pool
-        let cpu_pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(cpu_workers)
-            .build()
-            .expect("Failed to create CPU thread pool");
+        let cpu_pool = CpuPool::new(cpu_workers).expect("Failed to create CPU thread pool");
 
         let num_devices = engines.len();
         let total_workers = num_devices
@@ -219,23 +220,16 @@ impl Scheduler {
     }
 
     fn try_reserve_cpu_slot(&self) -> bool {
-        let capacity = self.cpu_pool.current_num_threads();
-        self.cpu_active_count
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-                (active < capacity).then_some(active + 1)
-            })
-            .is_ok()
+        self.cpu_pool.try_reserve()
     }
 
     fn dispatch_cpu(&self, request: Request, slot_reserved: bool) {
         let engine_idx = self.get_worker_index(&None) % self.engines.len();
         let engine = self.engines[engine_idx].clone();
-        if !slot_reserved {
-            self.cpu_active_count.fetch_add(1, Ordering::AcqRel);
-        }
+        self.cpu_active_count.fetch_add(1, Ordering::AcqRel);
         let cpu_active_count = self.cpu_active_count.clone();
 
-        self.cpu_pool.spawn(move || {
+        self.cpu_pool.spawn(slot_reserved, move || {
             let _active = ActiveCountGuard {
                 counter: cpu_active_count,
             };
