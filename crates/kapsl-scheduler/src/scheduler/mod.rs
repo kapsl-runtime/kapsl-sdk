@@ -9,7 +9,7 @@ use kapsl_engine_api::{
     OpenAiWireStreamResponse,
 };
 use parking_lot::RwLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 use tokio::sync::oneshot;
 
 use kapsl_hal::device_mesh::DeviceMesh;
@@ -250,20 +250,28 @@ impl Scheduler {
         self.engines[engine_index].clone()
     }
 
-    fn try_reserve_cpu_slot(&self) -> bool {
-        self.cpu_pool.try_reserve()
-    }
-
-    fn dispatch_cpu(&self, request: Request, slot_reserved: bool) {
+    /// Admits `request` to the CPU pool under `overflow_policy`, then runs it
+    /// there. It counts toward this scheduler's CPU queue depth while waiting.
+    async fn dispatch_cpu(
+        &self,
+        request: Request,
+        priority: Priority,
+        overflow_policy: QueueOverflowPolicy,
+    ) -> Result<(), EngineError> {
+        let depth = ActiveCountGuard::enter(self.cpu_active_count.clone());
+        let slot = self
+            .cpu_pool
+            .acquire(
+                priority,
+                overflow_policy,
+                request.input.cancellation.as_ref(),
+            )
+            .await?;
         let engine_idx = self.get_worker_index(&None) % self.engines.len();
         let engine = self.engines[engine_idx].clone();
-        self.cpu_active_count.fetch_add(1, Ordering::AcqRel);
-        let cpu_active_count = self.cpu_active_count.clone();
 
-        self.cpu_pool.spawn(slot_reserved, move || {
-            let _active = ActiveCountGuard {
-                counter: cpu_active_count,
-            };
+        self.cpu_pool.spawn(slot, move || {
+            let _depth = depth;
             let result = if request
                 .input
                 .cancellation
@@ -276,6 +284,7 @@ impl Scheduler {
             };
             let _ = request.response_tx.send(result);
         });
+        Ok(())
     }
 
     async fn acquire_gpu_stream_permit(
@@ -329,7 +338,8 @@ impl Scheduler {
         let request = Request { input, response_tx };
 
         if force_cpu {
-            self.dispatch_cpu(request, false);
+            self.dispatch_cpu(request, priority, self.queue_overflow_policy)
+                .await?;
 
             response_rx
                 .await
@@ -388,13 +398,14 @@ impl Scheduler {
             {
                 return Err(EngineError::cancelled("Request cancelled"));
             }
-            // Atomically reserve capacity so concurrent non-blocking callers
-            // cannot all observe the same free worker and overfill Rayon.
-            if !self.try_reserve_cpu_slot() {
-                return Err(EngineError::overloaded("CPU pool saturated".to_string()));
-            }
+            // Never wait: fail at once when every CPU thread is taken.
             let (response_tx, response_rx) = oneshot::channel();
-            self.dispatch_cpu(Request { input, response_tx }, true);
+            self.dispatch_cpu(
+                Request { input, response_tx },
+                priority,
+                QueueOverflowPolicy::DropNewest,
+            )
+            .await?;
             return response_rx
                 .await
                 .map_err(|_| EngineError::overloaded("Scheduler dropped request".to_string()))?;

@@ -507,16 +507,99 @@ async fn zero_cpu_workers_retains_rayon_auto_selection() {
     assert!(scheduler.cpu_pool.threads() > 0);
 }
 
-#[test]
-fn non_blocking_cpu_admission_reserves_capacity_atomically() {
+async fn hold_cpu_thread(scheduler: &Scheduler) -> PriorityAdmissionPermit {
+    scheduler
+        .cpu_pool
+        .acquire(Priority::Throughput, QueueOverflowPolicy::DropNewest, None)
+        .await
+        .expect("a free CPU thread")
+}
+
+#[tokio::test]
+async fn non_blocking_cpu_infer_fails_fast_when_every_thread_is_taken() {
     let engine: EngineHandle = Arc::new(MockEngine::new(EngineMetrics::default()));
     let scheduler = build_scheduler_for_queue_tests(vec![engine], 1, 0);
 
-    assert!(scheduler.try_reserve_cpu_slot());
-    assert!(!scheduler.try_reserve_cpu_slot());
-    scheduler.cpu_pool.release_reserved();
-    assert!(scheduler.try_reserve_cpu_slot());
-    scheduler.cpu_pool.release_reserved();
+    let held = hold_cpu_thread(&scheduler).await;
+    let error = scheduler
+        .try_infer(make_inference_request(None), Priority::Throughput, true)
+        .await
+        .unwrap_err();
+    assert!(error.is_overloaded(), "{error}");
+    assert_eq!(scheduler.get_queue_depth().0, 0);
+
+    drop(held);
+    scheduler
+        .try_infer(make_inference_request(None), Priority::Throughput, true)
+        .await
+        .expect("a released thread admits the next request");
+}
+
+#[tokio::test]
+async fn cpu_infer_applies_the_drop_newest_policy() {
+    let engine: EngineHandle = Arc::new(MockEngine::new(EngineMetrics::default()));
+    let scheduler = build_scheduler_for_queue_tests(vec![engine], 1, 0)
+        .with_queue_overflow_policy(QueueOverflowPolicy::DropNewest);
+
+    let _held = hold_cpu_thread(&scheduler).await;
+    let error = scheduler
+        .infer(
+            make_inference_request(None),
+            Priority::LatencyCritical,
+            true,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.is_overloaded(), "{error}");
+}
+
+#[tokio::test]
+async fn blocked_cpu_infer_waits_for_a_thread_and_counts_as_queued() {
+    let engine: EngineHandle = Arc::new(MockEngine::new(EngineMetrics::default()));
+    let scheduler = Arc::new(build_scheduler_for_queue_tests(vec![engine], 1, 0));
+
+    let held = hold_cpu_thread(&scheduler).await;
+    let waiting = tokio::spawn({
+        let scheduler = Arc::clone(&scheduler);
+        async move {
+            scheduler
+                .infer(make_inference_request(None), Priority::Throughput, true)
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!waiting.is_finished());
+    assert_eq!(scheduler.get_queue_depth().0, 1);
+
+    drop(held);
+    waiting
+        .await
+        .unwrap()
+        .expect("admitted once the thread frees");
+    assert_eq!(scheduler.get_queue_depth().0, 0);
+}
+
+#[tokio::test]
+async fn cancelled_cpu_waiter_leaves_without_leaking_capacity() {
+    let engine: EngineHandle = Arc::new(MockEngine::new(EngineMetrics::default()));
+    let scheduler = Arc::new(build_scheduler_for_queue_tests(vec![engine], 1, 0));
+    let cancellation = CancellationToken::new();
+
+    let held = hold_cpu_thread(&scheduler).await;
+    let waiting = tokio::spawn({
+        let scheduler = Arc::clone(&scheduler);
+        let mut request = make_inference_request(None);
+        request.cancellation = Some(cancellation.clone());
+        async move { scheduler.infer(request, Priority::Throughput, true).await }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    cancellation.cancel();
+    let error = waiting.await.unwrap().unwrap_err();
+    assert!(matches!(error, EngineError::Cancelled { .. }));
+    assert_eq!(scheduler.get_queue_depth().0, 0);
+    assert_eq!(scheduler.cpu_pool.active(), 1);
+    drop(held);
+    assert_eq!(scheduler.cpu_pool.active(), 0);
 }
 
 #[tokio::test]
@@ -529,13 +612,21 @@ async fn schedulers_sharing_a_cpu_pool_share_its_capacity() {
     let first = make(pool.clone());
     let second = make(pool.clone());
 
-    assert!(first.try_reserve_cpu_slot());
-    // The only thread is taken, whichever scheduler asks.
-    assert!(!second.try_reserve_cpu_slot());
+    let held = hold_cpu_thread(&first).await;
     assert_eq!(pool.active(), 1);
-    pool.release_reserved();
-    assert!(second.try_reserve_cpu_slot());
-    pool.release_reserved();
+    // The only thread is taken, whichever scheduler asks.
+    let error = second
+        .try_infer(make_inference_request(None), Priority::Throughput, true)
+        .await
+        .unwrap_err();
+    assert!(error.is_overloaded(), "{error}");
+
+    drop(held);
+    second
+        .try_infer(make_inference_request(None), Priority::Throughput, true)
+        .await
+        .expect("the shared thread is free again");
+    assert_eq!(pool.active(), 0);
 }
 
 #[tokio::test]

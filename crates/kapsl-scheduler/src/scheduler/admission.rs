@@ -20,6 +20,14 @@ pub(super) struct ActiveCountGuard {
     pub(super) counter: Arc<AtomicUsize>,
 }
 
+impl ActiveCountGuard {
+    /// Counts one unit of work in `counter` until the guard drops.
+    pub(super) fn enter(counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        Self { counter }
+    }
+}
+
 impl Drop for ActiveCountGuard {
     fn drop(&mut self) {
         self.counter.fetch_sub(1, Ordering::Release);
@@ -187,7 +195,6 @@ impl PriorityAdmission {
         (state.latency_waiters, state.throughput_waiters)
     }
 
-    #[cfg(test)]
     pub(super) fn available_permits(&self) -> usize {
         self.slots.available_permits()
     }
