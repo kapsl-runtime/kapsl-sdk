@@ -47,14 +47,17 @@ struct PriorityAdmissionState {
 /// avoid an unbounded handoff queue while ensuring a queued throughput request
 /// cannot take a newly released slot while any latency-critical request waits.
 pub(super) struct PriorityAdmission {
+    /// Names the bounded resource in overload errors, e.g. "GPU stream".
+    label: &'static str,
     slots: Arc<Semaphore>,
     state: Mutex<PriorityAdmissionState>,
     changed: Notify,
 }
 
 impl PriorityAdmission {
-    pub(super) fn new(capacity: usize) -> Arc<Self> {
+    pub(super) fn new(capacity: usize, label: &'static str) -> Arc<Self> {
         Arc::new(Self {
+            label,
             slots: Arc::new(Semaphore::new(capacity)),
             state: Mutex::new(PriorityAdmissionState::default()),
             changed: Notify::new(),
@@ -75,22 +78,19 @@ impl PriorityAdmission {
         match overflow_policy {
             QueueOverflowPolicy::Block => self.acquire_blocking(priority, cancellation).await,
             QueueOverflowPolicy::DropNewest => self.try_acquire().map_err(|error| match error {
-                TryAcquireError::Closed => {
-                    EngineError::overloaded("GPU stream slots closed".to_string())
-                }
+                TryAcquireError::Closed => self.closed_error(),
                 TryAcquireError::NoPermits => EngineError::overloaded(format!(
-                    "GPU stream slots full (policy={})",
+                    "{} slots full (policy={})",
+                    self.label,
                     overflow_policy.as_str()
                 )),
             }),
             QueueOverflowPolicy::DropOldest => self.try_acquire().map_err(|error| match error {
-                TryAcquireError::Closed => {
-                    EngineError::overloaded("GPU stream slots closed".to_string())
-                }
-                TryAcquireError::NoPermits => EngineError::overloaded(
-                    "GPU stream slots full (policy=drop_oldest; active streams cannot be evicted)"
-                        .to_string(),
-                ),
+                TryAcquireError::Closed => self.closed_error(),
+                TryAcquireError::NoPermits => EngineError::overloaded(format!(
+                    "{} slots full (policy=drop_oldest; admitted work cannot be evicted)",
+                    self.label
+                )),
             }),
         }
     }
@@ -129,9 +129,7 @@ impl PriorityAdmission {
                 }
                 Some(Err(TryAcquireError::Closed)) => {
                     waiter.finish();
-                    return Err(EngineError::overloaded(
-                        "GPU stream slots closed".to_string(),
-                    ));
+                    return Err(self.closed_error());
                 }
                 Some(Err(TryAcquireError::NoPermits)) | None => {
                     if let Some(cancellation) = cancellation {
@@ -150,6 +148,10 @@ impl PriorityAdmission {
                 }
             }
         }
+    }
+
+    fn closed_error(&self) -> EngineError {
+        EngineError::overloaded(format!("{} slots closed", self.label))
     }
 
     fn try_acquire(self: &Arc<Self>) -> Result<PriorityAdmissionPermit, TryAcquireError> {

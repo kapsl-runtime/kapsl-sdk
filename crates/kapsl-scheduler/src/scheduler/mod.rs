@@ -170,7 +170,7 @@ impl Scheduler {
         let stream_capacity = total_workers
             .checked_mul(queue_size.max(1))
             .expect("Scheduler stream admission capacity overflow");
-        let gpu_stream_admission = PriorityAdmission::new(stream_capacity);
+        let gpu_stream_admission = PriorityAdmission::new(stream_capacity, "GPU stream");
         let observer: SharedSchedulerObserver = Arc::new(RwLock::new(None));
 
         for (engine_index, engine) in engines.iter().enumerate() {

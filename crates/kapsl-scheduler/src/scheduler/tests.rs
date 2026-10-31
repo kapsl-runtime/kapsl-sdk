@@ -408,7 +408,7 @@ fn build_scheduler_for_queue_tests(
         cpu_active_count: Arc::new(AtomicUsize::new(cpu_active)),
         gpu_in_flight_count: Arc::new(AtomicUsize::new(0)),
         gpu_stream_in_flight_count: Arc::new(AtomicUsize::new(0)),
-        gpu_stream_admission: PriorityAdmission::new(queue_size.max(1)),
+        gpu_stream_admission: PriorityAdmission::new(queue_size.max(1), "GPU stream"),
         router: MeshRouter::new(None, 1),
         max_micro_batch: 1,
         queue_overflow_policy: QueueOverflowPolicy::Block,
