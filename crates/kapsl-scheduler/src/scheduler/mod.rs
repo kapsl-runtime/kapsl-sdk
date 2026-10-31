@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 mod admission;
 mod cpu_pool;
 
-use cpu_pool::CpuPool;
+pub use cpu_pool::CpuPool;
 
 use admission::{
     ActiveCountGuard, PriorityAdmission, PriorityAdmissionPermit, StreamAdmissionGuard,
@@ -54,7 +54,7 @@ impl QueueOverflowPolicy {
 /// Main scheduler that coordinates CPU and GPU execution
 pub struct Scheduler {
     engines: Vec<EngineHandle>,
-    // Capacity for `force_cpu` work is checked against this pool.
+    // May be shared with other schedulers; capacity is checked against it.
     cpu_pool: CpuPool,
     // Vector of channels, one pair per worker
     gpu_high_priority_queues: Vec<WorkQueue>,
@@ -62,7 +62,7 @@ pub struct Scheduler {
     // Maps each worker/queue index to the engine that owns that worker.
     worker_engine_indices: Vec<usize>,
     // Track this scheduler's active CPU inferences (reported as its CPU queue
-    // depth).
+    // depth, independent of other schedulers sharing `cpu_pool`).
     cpu_active_count: Arc<std::sync::atomic::AtomicUsize>,
     // Track in-flight GPU work (requests already dequeued from the channels, but not finished).
     gpu_in_flight_count: Arc<AtomicUsize>,
@@ -105,6 +105,9 @@ impl Scheduler {
     /// derived capacity overflows, the Rayon pool cannot be built, or this is
     /// called without an active Tokio runtime. A `cpu_workers` value of zero
     /// retains Rayon's automatic thread-count selection.
+    ///
+    /// The scheduler gets a private CPU pool; use [`Self::new_with_cpu_pool`]
+    /// to share one across schedulers.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         engines: Vec<EngineHandle>,
@@ -112,6 +115,36 @@ impl Scheduler {
         workers_per_device: usize,
         queue_size: usize,
         _enable_fallback: bool,
+        max_micro_batch: usize,
+        queue_delay_ms: u64,
+        device_mesh: Option<Arc<DeviceMesh>>,
+    ) -> Self {
+        let cpu_pool = CpuPool::new(cpu_workers).expect("Failed to create CPU thread pool");
+        Self::new_with_cpu_pool(
+            engines,
+            cpu_pool,
+            workers_per_device,
+            queue_size,
+            max_micro_batch,
+            queue_delay_ms,
+            device_mesh,
+        )
+    }
+
+    /// Like [`Self::new`], but runs `force_cpu` work on `cpu_pool`, which may
+    /// be shared with other schedulers so their combined CPU work is bounded
+    /// by its thread count.
+    ///
+    /// # Panics
+    ///
+    /// Panics when no engines are supplied, `workers_per_device` is zero, the
+    /// derived capacity overflows, or this is called without an active Tokio
+    /// runtime.
+    pub fn new_with_cpu_pool(
+        engines: Vec<EngineHandle>,
+        cpu_pool: CpuPool,
+        workers_per_device: usize,
+        queue_size: usize,
         max_micro_batch: usize,
         queue_delay_ms: u64,
         device_mesh: Option<Arc<DeviceMesh>>,
@@ -124,8 +157,6 @@ impl Scheduler {
             workers_per_device > 0,
             "Scheduler requires at least one worker per device"
         );
-
-        let cpu_pool = CpuPool::new(cpu_workers).expect("Failed to create CPU thread pool");
 
         let num_devices = engines.len();
         let total_workers = num_devices

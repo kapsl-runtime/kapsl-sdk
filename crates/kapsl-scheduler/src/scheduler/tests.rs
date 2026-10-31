@@ -8,7 +8,7 @@ use kapsl_engine_api::{
     OpenAiWireRequest, OpenAiWireResponse, OpenAiWireResponseHead, OpenAiWireStreamResponse,
     TensorDtype,
 };
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::oneshot;
 
@@ -517,6 +517,38 @@ fn non_blocking_cpu_admission_reserves_capacity_atomically() {
     scheduler.cpu_pool.release_reserved();
     assert!(scheduler.try_reserve_cpu_slot());
     scheduler.cpu_pool.release_reserved();
+}
+
+#[tokio::test]
+async fn schedulers_sharing_a_cpu_pool_share_its_capacity() {
+    let pool = CpuPool::new(1).unwrap();
+    let make = |pool: CpuPool| {
+        let engine: EngineHandle = Arc::new(MockEngine::new(EngineMetrics::default()));
+        Scheduler::new_with_cpu_pool(vec![engine], pool, 1, 1, 1, 0, None)
+    };
+    let first = make(pool.clone());
+    let second = make(pool.clone());
+
+    assert!(first.try_reserve_cpu_slot());
+    // The only thread is taken, whichever scheduler asks.
+    assert!(!second.try_reserve_cpu_slot());
+    assert_eq!(pool.active(), 1);
+    pool.release_reserved();
+    assert!(second.try_reserve_cpu_slot());
+    pool.release_reserved();
+}
+
+#[tokio::test]
+async fn shared_cpu_pool_keeps_per_scheduler_queue_depth() {
+    let pool = CpuPool::new(1).unwrap();
+    let engine: EngineHandle = Arc::new(MockEngine::new(EngineMetrics::default()));
+    let busy = Scheduler::new_with_cpu_pool(vec![engine], pool.clone(), 1, 1, 1, 0, None);
+    let engine: EngineHandle = Arc::new(MockEngine::new(EngineMetrics::default()));
+    let idle = Scheduler::new_with_cpu_pool(vec![engine], pool, 1, 1, 1, 0, None);
+
+    busy.cpu_active_count.fetch_add(1, Ordering::AcqRel);
+    assert_eq!(busy.get_queue_depth().0, 1);
+    assert_eq!(idle.get_queue_depth().0, 0);
 }
 
 #[tokio::test]

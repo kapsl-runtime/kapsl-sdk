@@ -3,7 +3,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// Rayon threads for `force_cpu` requests, plus a count of the jobs on them.
-pub(super) struct CpuPool {
+///
+/// Clones share both the threads and the count, so one pool handed to every
+/// [`Scheduler`](super::Scheduler) bounds CPU work across all of them instead
+/// of each replica starting threads of its own.
+#[derive(Clone)]
+pub struct CpuPool {
     pool: Arc<rayon::ThreadPool>,
     active: Arc<AtomicUsize>,
 }
@@ -11,7 +16,7 @@ pub(super) struct CpuPool {
 impl CpuPool {
     /// Builds a pool with `threads` workers. Zero keeps Rayon's automatic
     /// thread-count selection.
-    pub(super) fn new(threads: usize) -> Result<Self, rayon::ThreadPoolBuildError> {
+    pub fn new(threads: usize) -> Result<Self, rayon::ThreadPoolBuildError> {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
             .build()?;
@@ -21,8 +26,13 @@ impl CpuPool {
         })
     }
 
-    pub(super) fn threads(&self) -> usize {
+    pub fn threads(&self) -> usize {
         self.pool.current_num_threads()
+    }
+
+    /// Jobs running or queued on this pool, across every scheduler sharing it.
+    pub fn active(&self) -> usize {
+        self.active.load(Ordering::Relaxed)
     }
 
     /// Claims a slot only while a thread is free, atomically, so concurrent
