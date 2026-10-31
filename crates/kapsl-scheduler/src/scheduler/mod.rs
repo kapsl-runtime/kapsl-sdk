@@ -9,7 +9,7 @@ use kapsl_engine_api::{
     OpenAiWireStreamResponse,
 };
 use parking_lot::RwLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 use tokio::sync::oneshot;
 
 use kapsl_hal::device_mesh::DeviceMesh;
@@ -17,6 +17,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 mod admission;
+mod cpu_pool;
+
+pub use cpu_pool::CpuPool;
 
 use admission::{
     ActiveCountGuard, PriorityAdmission, PriorityAdmissionPermit, StreamAdmissionGuard,
@@ -51,13 +54,15 @@ impl QueueOverflowPolicy {
 /// Main scheduler that coordinates CPU and GPU execution
 pub struct Scheduler {
     engines: Vec<EngineHandle>,
-    cpu_pool: rayon::ThreadPool,
+    // May be shared with other schedulers; capacity is checked against it.
+    cpu_pool: CpuPool,
     // Vector of channels, one pair per worker
     gpu_high_priority_queues: Vec<WorkQueue>,
     gpu_low_priority_queues: Vec<WorkQueue>,
     // Maps each worker/queue index to the engine that owns that worker.
     worker_engine_indices: Vec<usize>,
-    // Track active CPU inferences
+    // Track this scheduler's active CPU inferences (reported as its CPU queue
+    // depth, independent of other schedulers sharing `cpu_pool`).
     cpu_active_count: Arc<std::sync::atomic::AtomicUsize>,
     // Track in-flight GPU work (requests already dequeued from the channels, but not finished).
     gpu_in_flight_count: Arc<AtomicUsize>,
@@ -100,6 +105,9 @@ impl Scheduler {
     /// derived capacity overflows, the Rayon pool cannot be built, or this is
     /// called without an active Tokio runtime. A `cpu_workers` value of zero
     /// retains Rayon's automatic thread-count selection.
+    ///
+    /// The scheduler gets a private CPU pool; use [`Self::new_with_cpu_pool`]
+    /// to share one across schedulers.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         engines: Vec<EngineHandle>,
@@ -107,6 +115,36 @@ impl Scheduler {
         workers_per_device: usize,
         queue_size: usize,
         _enable_fallback: bool,
+        max_micro_batch: usize,
+        queue_delay_ms: u64,
+        device_mesh: Option<Arc<DeviceMesh>>,
+    ) -> Self {
+        let cpu_pool = CpuPool::new(cpu_workers).expect("Failed to create CPU thread pool");
+        Self::new_with_cpu_pool(
+            engines,
+            cpu_pool,
+            workers_per_device,
+            queue_size,
+            max_micro_batch,
+            queue_delay_ms,
+            device_mesh,
+        )
+    }
+
+    /// Like [`Self::new`], but runs `force_cpu` work on `cpu_pool`, which may
+    /// be shared with other schedulers so their combined CPU work is bounded
+    /// by its thread count.
+    ///
+    /// # Panics
+    ///
+    /// Panics when no engines are supplied, `workers_per_device` is zero, the
+    /// derived capacity overflows, or this is called without an active Tokio
+    /// runtime.
+    pub fn new_with_cpu_pool(
+        engines: Vec<EngineHandle>,
+        cpu_pool: CpuPool,
+        workers_per_device: usize,
+        queue_size: usize,
         max_micro_batch: usize,
         queue_delay_ms: u64,
         device_mesh: Option<Arc<DeviceMesh>>,
@@ -120,12 +158,6 @@ impl Scheduler {
             "Scheduler requires at least one worker per device"
         );
 
-        // Create CPU thread pool
-        let cpu_pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(cpu_workers)
-            .build()
-            .expect("Failed to create CPU thread pool");
-
         let num_devices = engines.len();
         let total_workers = num_devices
             .checked_mul(workers_per_device)
@@ -138,7 +170,7 @@ impl Scheduler {
         let stream_capacity = total_workers
             .checked_mul(queue_size.max(1))
             .expect("Scheduler stream admission capacity overflow");
-        let gpu_stream_admission = PriorityAdmission::new(stream_capacity);
+        let gpu_stream_admission = PriorityAdmission::new(stream_capacity, "GPU stream");
         let observer: SharedSchedulerObserver = Arc::new(RwLock::new(None));
 
         for (engine_index, engine) in engines.iter().enumerate() {
@@ -218,27 +250,28 @@ impl Scheduler {
         self.engines[engine_index].clone()
     }
 
-    fn try_reserve_cpu_slot(&self) -> bool {
-        let capacity = self.cpu_pool.current_num_threads();
-        self.cpu_active_count
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-                (active < capacity).then_some(active + 1)
-            })
-            .is_ok()
-    }
-
-    fn dispatch_cpu(&self, request: Request, slot_reserved: bool) {
+    /// Admits `request` to the CPU pool under `overflow_policy`, then runs it
+    /// there. It counts toward this scheduler's CPU queue depth while waiting.
+    async fn dispatch_cpu(
+        &self,
+        request: Request,
+        priority: Priority,
+        overflow_policy: QueueOverflowPolicy,
+    ) -> Result<(), EngineError> {
+        let depth = ActiveCountGuard::enter(self.cpu_active_count.clone());
+        let slot = self
+            .cpu_pool
+            .acquire(
+                priority,
+                overflow_policy,
+                request.input.cancellation.as_ref(),
+            )
+            .await?;
         let engine_idx = self.get_worker_index(&None) % self.engines.len();
         let engine = self.engines[engine_idx].clone();
-        if !slot_reserved {
-            self.cpu_active_count.fetch_add(1, Ordering::AcqRel);
-        }
-        let cpu_active_count = self.cpu_active_count.clone();
 
-        self.cpu_pool.spawn(move || {
-            let _active = ActiveCountGuard {
-                counter: cpu_active_count,
-            };
+        self.cpu_pool.spawn(slot, move || {
+            let _depth = depth;
             let result = if request
                 .input
                 .cancellation
@@ -251,6 +284,7 @@ impl Scheduler {
             };
             let _ = request.response_tx.send(result);
         });
+        Ok(())
     }
 
     async fn acquire_gpu_stream_permit(
@@ -304,7 +338,8 @@ impl Scheduler {
         let request = Request { input, response_tx };
 
         if force_cpu {
-            self.dispatch_cpu(request, false);
+            self.dispatch_cpu(request, priority, self.queue_overflow_policy)
+                .await?;
 
             response_rx
                 .await
@@ -363,13 +398,14 @@ impl Scheduler {
             {
                 return Err(EngineError::cancelled("Request cancelled"));
             }
-            // Atomically reserve capacity so concurrent non-blocking callers
-            // cannot all observe the same free worker and overfill Rayon.
-            if !self.try_reserve_cpu_slot() {
-                return Err(EngineError::overloaded("CPU pool saturated".to_string()));
-            }
+            // Never wait: fail at once when every CPU thread is taken.
             let (response_tx, response_rx) = oneshot::channel();
-            self.dispatch_cpu(Request { input, response_tx }, true);
+            self.dispatch_cpu(
+                Request { input, response_tx },
+                priority,
+                QueueOverflowPolicy::DropNewest,
+            )
+            .await?;
             return response_rx
                 .await
                 .map_err(|_| EngineError::overloaded("Scheduler dropped request".to_string()))?;
@@ -547,7 +583,18 @@ impl crate::replica_pool::ReplicaScheduler for Scheduler {
 
         let queue_started = Instant::now();
         let (counter, permit) = if force_cpu {
-            (self.cpu_active_count.clone(), None)
+            (
+                self.cpu_active_count.clone(),
+                Some(
+                    self.cpu_pool
+                        .acquire(
+                            priority,
+                            self.queue_overflow_policy,
+                            request.cancellation.as_ref(),
+                        )
+                        .await?,
+                ),
+            )
         } else {
             (
                 self.gpu_stream_in_flight_count.clone(),
@@ -618,7 +665,18 @@ impl crate::replica_pool::ReplicaScheduler for Scheduler {
 
         let queue_started = Instant::now();
         let (counter, permit) = if force_cpu {
-            (self.cpu_active_count.clone(), None)
+            (
+                self.cpu_active_count.clone(),
+                Some(
+                    self.cpu_pool
+                        .acquire(
+                            priority,
+                            self.queue_overflow_policy,
+                            request.cancellation.as_ref(),
+                        )
+                        .await?,
+                ),
+            )
         } else {
             (
                 self.gpu_stream_in_flight_count.clone(),
@@ -691,7 +749,18 @@ impl crate::replica_pool::ReplicaScheduler for Scheduler {
         }
 
         let (counter, permit) = if force_cpu {
-            (self.cpu_active_count.clone(), None)
+            (
+                self.cpu_active_count.clone(),
+                Some(
+                    self.cpu_pool
+                        .acquire(
+                            priority,
+                            self.queue_overflow_policy,
+                            request.cancellation.as_ref(),
+                        )
+                        .await?,
+                ),
+            )
         } else {
             (
                 self.gpu_stream_in_flight_count.clone(),
