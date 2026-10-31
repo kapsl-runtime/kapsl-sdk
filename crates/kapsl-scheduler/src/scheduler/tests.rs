@@ -1465,6 +1465,42 @@ async fn test_scheduler_wire_token_cancelled_while_queued_never_dispatches() {
 }
 
 #[tokio::test]
+async fn cpu_stream_holds_a_cpu_thread_until_dropped() {
+    let engine: EngineHandle = Arc::new(PendingStreamEngine);
+    let scheduler = build_scheduler_for_queue_tests(vec![engine], 1, 0)
+        .with_queue_overflow_policy(QueueOverflowPolicy::DropNewest);
+
+    let stream = ReplicaScheduler::infer_stream(
+        &scheduler,
+        make_inference_request(None),
+        Priority::Throughput,
+        true,
+    )
+    .await
+    .expect("first CPU stream should be admitted");
+    assert_eq!(scheduler.get_queue_depth(), (1, 0));
+    assert_eq!(scheduler.cpu_pool.active(), 1);
+
+    let second = ReplicaScheduler::infer_stream(
+        &scheduler,
+        make_inference_request(None),
+        Priority::Throughput,
+        true,
+    )
+    .await;
+    assert!(matches!(second, Err(ref error) if error.is_overloaded()));
+    let unary = scheduler
+        .try_infer(make_inference_request(None), Priority::Throughput, true)
+        .await
+        .unwrap_err();
+    assert!(unary.is_overloaded(), "{unary}");
+
+    drop(stream);
+    assert_eq!(scheduler.get_queue_depth(), (0, 0));
+    assert_eq!(scheduler.cpu_pool.active(), 0);
+}
+
+#[tokio::test]
 async fn test_scheduler_stream_admission_tracks_depth_and_releases_on_drop() {
     let engine: EngineHandle = Arc::new(PendingStreamEngine);
     let scheduler = build_scheduler_for_queue_tests(vec![engine], 1, 0)

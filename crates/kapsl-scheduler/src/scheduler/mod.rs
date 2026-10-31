@@ -583,7 +583,18 @@ impl crate::replica_pool::ReplicaScheduler for Scheduler {
 
         let queue_started = Instant::now();
         let (counter, permit) = if force_cpu {
-            (self.cpu_active_count.clone(), None)
+            (
+                self.cpu_active_count.clone(),
+                Some(
+                    self.cpu_pool
+                        .acquire(
+                            priority,
+                            self.queue_overflow_policy,
+                            request.cancellation.as_ref(),
+                        )
+                        .await?,
+                ),
+            )
         } else {
             (
                 self.gpu_stream_in_flight_count.clone(),
@@ -654,7 +665,18 @@ impl crate::replica_pool::ReplicaScheduler for Scheduler {
 
         let queue_started = Instant::now();
         let (counter, permit) = if force_cpu {
-            (self.cpu_active_count.clone(), None)
+            (
+                self.cpu_active_count.clone(),
+                Some(
+                    self.cpu_pool
+                        .acquire(
+                            priority,
+                            self.queue_overflow_policy,
+                            request.cancellation.as_ref(),
+                        )
+                        .await?,
+                ),
+            )
         } else {
             (
                 self.gpu_stream_in_flight_count.clone(),
@@ -727,7 +749,18 @@ impl crate::replica_pool::ReplicaScheduler for Scheduler {
         }
 
         let (counter, permit) = if force_cpu {
-            (self.cpu_active_count.clone(), None)
+            (
+                self.cpu_active_count.clone(),
+                Some(
+                    self.cpu_pool
+                        .acquire(
+                            priority,
+                            self.queue_overflow_policy,
+                            request.cancellation.as_ref(),
+                        )
+                        .await?,
+                ),
+            )
         } else {
             (
                 self.gpu_stream_in_flight_count.clone(),
