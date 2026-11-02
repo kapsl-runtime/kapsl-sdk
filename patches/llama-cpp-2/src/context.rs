@@ -71,6 +71,44 @@ impl<'model> LlamaContext<'model> {
         unsafe { llama_cpp_sys_2::llama_n_ctx(self.context.as_ptr()) }
     }
 
+    /// Performs any pending compute-buffer reservation now rather than at the
+    /// next decode. Call once the sampler set is final so
+    /// [`Self::device_compute_memory`] reports the steady-state size.
+    pub fn reserve_compute_buffers(&mut self) {
+        unsafe { llama_cpp_sys_2::llama_context_sched_reserve(self.context.as_ptr()) }
+    }
+
+    /// Returns this context's compute (scheduler graph) buffer bytes by backend
+    /// device name, using the same device naming and order as
+    /// [`LlamaModel::device_memory`].
+    ///
+    /// This is allocated per context on top of the model weights and KV cache.
+    /// It is only final once the scheduler has been reserved, which happens
+    /// while the context is created.
+    #[must_use]
+    pub fn device_compute_memory(&self) -> Vec<(String, u64)> {
+        let model = self.model.model.as_ptr();
+        let count = unsafe { llama_cpp_sys_2::llama_model_device_memory_count(model) }.max(0);
+        (0..count)
+            .filter_map(|device_index| {
+                let name = unsafe { llama_cpp_sys_2::llama_model_device_name(model, device_index) };
+                if name.is_null() {
+                    return None;
+                }
+                let name = unsafe { std::ffi::CStr::from_ptr(name) }
+                    .to_string_lossy()
+                    .into_owned();
+                let bytes = unsafe {
+                    llama_cpp_sys_2::llama_context_device_compute_memory(
+                        self.context.as_ptr(),
+                        device_index,
+                    )
+                };
+                Some((name, bytes))
+            })
+            .collect()
+    }
+
     /// Get the backend-sampled token for the `i`th token in the current batch.
     #[must_use]
     pub fn sampled_token_ith(&self, i: i32) -> Option<LlamaToken> {
