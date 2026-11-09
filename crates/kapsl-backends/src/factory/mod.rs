@@ -102,7 +102,7 @@ fn manifest_metadata_bool(manifest: &Manifest, section: &str, key: &str, default
 }
 
 /// Wrap a freshly built ONNX engine in the task post-processor the manifest asks
-/// for (embedding pooling, classification softmax, or detection box-decode+NMS);
+/// for (embedding pooling, classification softmax, or transcription decoding);
 /// otherwise return it unchanged.
 fn maybe_wrap_onnx_postprocess(
     engine_kind: EngineKind,
@@ -125,21 +125,6 @@ fn maybe_wrap_onnx_postprocess(
                 apply_softmax,
             )))
         }
-        EngineKind::OnnxDetect => {
-            let spec = manifest
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("detect"))
-                .ok_or_else(|| {
-                    "detect task requires a `metadata.detect` block (num_classes at minimum)"
-                        .to_string()
-                })?;
-            let cfg: crate::onnx_detect::DetectConfig = serde_yaml::from_value(spec.clone())
-                .map_err(|e| format!("invalid metadata.detect: {e}"))?;
-            let backend = crate::onnx_detect::OnnxDetectBackend::new(inner, cfg)
-                .map_err(|e| format!("detector init failed: {e}"))?;
-            Ok(Box::new(backend))
-        }
         EngineKind::OnnxTranscribe => {
             // metadata.transcribe is optional (defaults to blank-0, collapse on).
             let cfg = match manifest.metadata.as_ref().and_then(|m| m.get("transcribe")) {
@@ -153,6 +138,45 @@ fn maybe_wrap_onnx_postprocess(
         }
         _ => Ok(inner),
     }
+}
+
+/// The `metadata.preprocess` block as a [`VisionConfig`], when it is a vision one.
+fn vision_preprocess_config(
+    manifest: &Manifest,
+) -> Result<Option<crate::preprocess::vision::VisionConfig>, String> {
+    let Some(spec) = manifest.metadata.as_ref().and_then(|m| m.get("preprocess")) else {
+        return Ok(None);
+    };
+    if spec.get("kind").and_then(|k| k.as_str()) != Some("vision") {
+        return Ok(None);
+    }
+    serde_yaml::from_value(spec.clone())
+        .map(Some)
+        .map_err(|e| format!("invalid metadata.preprocess (vision): {e}"))
+}
+
+/// Wrap `inner` in the detection post-processor. `inner` must already include
+/// any input preprocessor: the detector sits *outside* it so it sees the raw
+/// encoded image and can map boxes back to the original image's coordinates.
+fn wrap_onnx_detect(
+    manifest: &Manifest,
+    inner: Box<dyn Engine>,
+) -> Result<Box<dyn Engine>, String> {
+    let spec = manifest
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("detect"))
+        .ok_or_else(|| {
+            "detect task requires a `metadata.detect` block (num_classes at minimum)".to_string()
+        })?;
+    let cfg: crate::onnx_detect::DetectConfig = serde_yaml::from_value(spec.clone())
+        .map_err(|e| format!("invalid metadata.detect: {e}"))?;
+    let mut backend = crate::onnx_detect::OnnxDetectBackend::new(inner, cfg)
+        .map_err(|e| format!("detector init failed: {e}"))?;
+    if let Some(vision) = vision_preprocess_config(manifest)? {
+        backend = backend.with_image_input(vision);
+    }
+    Ok(Box::new(backend))
 }
 
 /// Wrap an ONNX engine in the input *pre*-processing stage its manifest asks for
@@ -208,6 +232,12 @@ fn finalize_onnx_pipeline(
     manifest: &Manifest,
     inner: Box<dyn Engine>,
 ) -> Result<Box<dyn Engine>, String> {
+    if engine_kind == EngineKind::OnnxDetect {
+        // Detection reverses the preprocessor's resize/pad, so it wraps the
+        // preprocessor (`onnx -> preprocess -> detect`) rather than the reverse.
+        let pre = maybe_wrap_onnx_preprocess(engine_kind, manifest, inner)?;
+        return wrap_onnx_detect(manifest, pre);
+    }
     let post = maybe_wrap_onnx_postprocess(engine_kind, manifest, inner)?;
     maybe_wrap_onnx_preprocess(engine_kind, manifest, post)
 }
