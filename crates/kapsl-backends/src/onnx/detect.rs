@@ -6,9 +6,18 @@
 //! its output into a compact list of surviving detections.
 //!
 //! Output layout is `[num_detections, 6]`, each row `[x1, y1, x2, y2, score,
-//! class_id]` in the model's input pixel space (i.e. relative to the tensor the
-//! model actually saw — pair this with the vision preprocessor's `width`/`height`
-//! and letterbox settings to map back to the original image).
+//! class_id]`. When the package declares a vision preprocessor the boxes are
+//! mapped back to the *original image's* pixel coordinates (undoing the resize,
+//! scale and letterbox pad the preprocessor applied) and clipped to the image;
+//! set `coordinates: model` to keep them in the model-input pixel space instead.
+//! Without a vision preprocessor (tensor-in) boxes are in model-input space and
+//! unclipped, since the image size is unknown.
+//!
+//! With `output_format: json` (which requires `labels`) the output is instead a
+//! UTF-8 JSON array (dtype `Utf8`, shape `[byte_len]`) of `{"box": [x1,y1,x2,y2],
+//! "score": f, "class_id": n, "label": "name"}` objects, since a numeric tensor
+//! cannot carry names. With the default `tensor`, `labels` (if given) is only
+//! validated and does not change the output.
 //!
 //! The decoder targets the common single-tensor YOLO family and is configured
 //! from the manifest's `metadata.detect` block, e.g.:
@@ -23,15 +32,22 @@
 //!     box_format: xywh        # center form (default); or `xyxy`
 //!     objectness: true        # YOLOv5 has an objectness channel; YOLOv8 does not
 //!     transposed: false       # YOLOv8 emits [1, 4+nc, anchors]; set true for it
+//!     coordinates: original   # or `model` (see above)
+//!     labels: [person, bicycle, ...]   # optional; length must equal num_classes
+//!     output_format: tensor   # default; or `json` (needs `labels`)
 //! ```
+//!
+//! Unknown keys are rejected at load time so a typo cannot silently change
+//! behavior.
 
+use crate::preprocess::vision::{encoded_image_dimensions, FitGeometry, VisionConfig};
 use crate::tensor_util::{bytes_to_f32, dim_usize, f32_packet};
 use async_trait::async_trait;
 use kapsl_engine_api::{
     BatchingPolicy, BinaryTensorPacket, Engine, EngineError, EngineMetrics, EngineModelInfo,
     EngineStream, InferenceRequest, TensorDtype,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// Encoding of the four box coordinates in the raw prediction.
@@ -43,6 +59,28 @@ pub enum BoxFormat {
     Xywh,
     /// `(x1, y1, x2, y2)` — corner coordinates.
     Xyxy,
+}
+
+/// Coordinate space of reported boxes when the package has a vision preprocessor.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Coordinates {
+    /// Pixels of the original image sent by the client (resize/pad undone).
+    #[default]
+    Original,
+    /// Pixels of the model input tensor (after resize and letterbox pad).
+    Model,
+}
+
+/// Wire format of the detection result.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OutputFormat {
+    /// `[N, 6]` float32 rows `[x1, y1, x2, y2, score, class_id]`.
+    #[default]
+    Tensor,
+    /// UTF-8 JSON array of objects that include the class label.
+    Json,
 }
 
 fn default_score_threshold() -> f32 {
@@ -60,6 +98,7 @@ fn default_objectness() -> bool {
 
 /// Parsed `metadata.detect` block.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DetectConfig {
     /// Number of object classes the model predicts. Required.
     pub num_classes: usize,
@@ -82,6 +121,16 @@ pub struct DetectConfig {
     /// Run NMS across all classes together instead of per class.
     #[serde(default)]
     pub class_agnostic: bool,
+    /// Class names indexed by class id. When set, its length must equal
+    /// `num_classes`. Used in the output only when `output_format` is `json`.
+    #[serde(default)]
+    pub labels: Option<Vec<String>>,
+    /// Box coordinate space when a vision preprocessor is configured.
+    #[serde(default)]
+    pub coordinates: Coordinates,
+    /// Result encoding: `tensor` (default) or `json`.
+    #[serde(default)]
+    pub output_format: OutputFormat,
 }
 
 impl DetectConfig {
@@ -94,6 +143,20 @@ impl DetectConfig {
     fn validate(&self) -> Result<(), EngineError> {
         if self.num_classes == 0 {
             return Err(EngineError::backend("detect: num_classes must be non-zero"));
+        }
+        if let Some(labels) = &self.labels {
+            if labels.len() != self.num_classes {
+                return Err(EngineError::backend(format!(
+                    "detect: labels has {} entries but num_classes is {}",
+                    labels.len(),
+                    self.num_classes
+                )));
+            }
+        }
+        if self.output_format == OutputFormat::Json && self.labels.is_none() {
+            return Err(EngineError::backend(
+                "detect: output_format `json` requires `labels` (the JSON carries class names)",
+            ));
         }
         Ok(())
     }
@@ -111,15 +174,52 @@ struct Candidate {
 }
 
 /// Wraps an inner ONNX engine and turns a raw prediction grid into detections.
+///
+/// When built [`with_image_input`](Self::with_image_input), `inner` must accept
+/// the client's raw encoded-image request (i.e. it includes the vision
+/// preprocessor), so the original image size can be read from the request and
+/// boxes mapped back to it.
 pub struct OnnxDetectBackend {
     inner: Box<dyn Engine>,
     cfg: DetectConfig,
+    image_input: Option<VisionConfig>,
 }
 
 impl OnnxDetectBackend {
     pub fn new(inner: Box<dyn Engine>, cfg: DetectConfig) -> Result<Self, EngineError> {
         cfg.validate()?;
-        Ok(Self { inner, cfg })
+        Ok(Self {
+            inner,
+            cfg,
+            image_input: None,
+        })
+    }
+
+    /// Declare that requests carry encoded images preprocessed with `vision`, so
+    /// boxes can be mapped to original-image coordinates and clipped.
+    pub fn with_image_input(mut self, vision: VisionConfig) -> Self {
+        self.image_input = Some(vision);
+        self
+    }
+
+    /// Turn one raw model output into the response packet for `request`.
+    fn finish(
+        &self,
+        request: &InferenceRequest,
+        output: &BinaryTensorPacket,
+    ) -> Result<BinaryTensorPacket, EngineError> {
+        let mut dets = decode_detections(output, &self.cfg)?;
+        if let Some(vision) = &self.image_input {
+            let (w, h) = encoded_image_dimensions(&request.input)?;
+            let geo = vision.geometry(w, h);
+            dets = match self.cfg.coordinates {
+                Coordinates::Original => place_boxes(dets, Some(&geo), w as f32, h as f32),
+                Coordinates::Model => {
+                    place_boxes(dets, None, vision.width as f32, vision.height as f32)
+                }
+            };
+        }
+        encode_detections(&dets, &self.cfg)
     }
 }
 
@@ -150,7 +250,7 @@ impl Engine for OnnxDetectBackend {
 
     fn infer(&self, request: &InferenceRequest) -> Result<BinaryTensorPacket, EngineError> {
         let output = self.inner.infer(request)?;
-        detect_from_output(&output, &self.cfg)
+        self.finish(request, &output)
     }
 
     fn infer_batch(
@@ -165,9 +265,10 @@ impl Engine for OnnxDetectBackend {
                 outputs.len()
             )));
         }
-        outputs
-            .into_iter()
-            .map(|output| detect_from_output(&output, &self.cfg))
+        requests
+            .iter()
+            .zip(&outputs)
+            .map(|(request, output)| self.finish(request, output))
             .collect()
     }
 
@@ -205,11 +306,85 @@ impl Engine for OnnxDetectBackend {
     }
 }
 
-/// Decode a raw YOLO-style prediction tensor into `[num_detections, 6]`.
+/// Decode a raw YOLO-style prediction tensor into the response packet, with
+/// boxes left in model-input space.
+#[cfg(test)]
 fn detect_from_output(
     output: &BinaryTensorPacket,
     cfg: &DetectConfig,
 ) -> Result<BinaryTensorPacket, EngineError> {
+    encode_detections(&decode_detections(output, cfg)?, cfg)
+}
+
+/// Move boxes into the reported coordinate space and clip them to `bound_w x
+/// bound_h`. With `geometry`, boxes are first mapped from model-input space back
+/// to the source image. Boxes left with no area after clipping (entirely in the
+/// letterbox padding or outside the image) are dropped.
+fn place_boxes(
+    dets: Vec<Candidate>,
+    geometry: Option<&FitGeometry>,
+    bound_w: f32,
+    bound_h: f32,
+) -> Vec<Candidate> {
+    dets.into_iter()
+        .filter_map(|mut d| {
+            if let Some(g) = geometry {
+                (d.x1, d.y1) = g.to_source(d.x1, d.y1);
+                (d.x2, d.y2) = g.to_source(d.x2, d.y2);
+            }
+            d.x1 = d.x1.clamp(0.0, bound_w);
+            d.x2 = d.x2.clamp(0.0, bound_w);
+            d.y1 = d.y1.clamp(0.0, bound_h);
+            d.y2 = d.y2.clamp(0.0, bound_h);
+            (d.x2 > d.x1 && d.y2 > d.y1).then_some(d)
+        })
+        .collect()
+}
+
+#[derive(Serialize)]
+struct DetectionJson<'a> {
+    #[serde(rename = "box")]
+    bbox: [f32; 4],
+    score: f32,
+    class_id: usize,
+    label: &'a str,
+}
+
+/// Encode detections as `[N, 6]` float32 rows (`tensor`) or as a labeled JSON
+/// array (`json`).
+fn encode_detections(
+    dets: &[Candidate],
+    cfg: &DetectConfig,
+) -> Result<BinaryTensorPacket, EngineError> {
+    if cfg.output_format == OutputFormat::Json {
+        // validate() guarantees labels are present and cover every class id.
+        let labels = cfg.labels.as_deref().unwrap_or_default();
+        let rows: Vec<DetectionJson<'_>> = dets
+            .iter()
+            .map(|d| DetectionJson {
+                bbox: [d.x1, d.y1, d.x2, d.y2],
+                score: d.score,
+                class_id: d.class,
+                label: &labels[d.class],
+            })
+            .collect();
+        let json = serde_json::to_vec(&rows)
+            .map_err(|e| EngineError::backend(format!("detect: encoding output failed: {e}")))?;
+        return BinaryTensorPacket::new(vec![json.len() as i64], TensorDtype::Utf8, json);
+    }
+    let mut out = Vec::with_capacity(dets.len() * 6);
+    for d in dets {
+        out.extend_from_slice(&[d.x1, d.y1, d.x2, d.y2, d.score, d.class as f32]);
+    }
+    Ok(f32_packet(vec![dets.len() as i64, 6], out))
+}
+
+/// Decode a raw YOLO-style prediction tensor into post-NMS detections in
+/// model-input space.
+fn decode_detections(
+    output: &BinaryTensorPacket,
+    cfg: &DetectConfig,
+) -> Result<Vec<Candidate>, EngineError> {
     if output.dtype != TensorDtype::Float32 {
         return Err(EngineError::backend(format!(
             "detector output dtype {:?} is not supported (expected float32)",
@@ -304,13 +479,9 @@ fn detect_from_output(
     }
 
     let kept = non_max_suppression(candidates, cfg.iou_threshold, cfg.class_agnostic);
-    let kept = &kept[..kept.len().min(cfg.max_detections)];
-
-    let mut out = Vec::with_capacity(kept.len() * 6);
-    for d in kept {
-        out.extend_from_slice(&[d.x1, d.y1, d.x2, d.y2, d.score, d.class as f32]);
-    }
-    Ok(f32_packet(vec![kept.len() as i64, 6], out))
+    let mut kept = kept;
+    kept.truncate(cfg.max_detections);
+    Ok(kept)
 }
 
 /// Greedy non-max suppression. Returns survivors sorted by descending score.

@@ -1932,7 +1932,7 @@ mod inner {
     impl GgufNativeBackend {
         pub fn new(device_id: i32) -> Result<Self, EngineError> {
             static NEXT_ALLOCATION_ID: AtomicUsize = AtomicUsize::new(1);
-            CudaDevice::new(device_id as usize)
+            CudaDevice::new(kapsl_llm::cuda_ordinal::to_cuda_ordinal(device_id as usize))
                 .map_err(|e| EngineError::backend(format!("CUDA device {device_id}: {e}")))?;
             let inner = Arc::new(Mutex::new(None));
             let batch_dec = Arc::new(BatchDecodeCoordinator::spawn(Arc::clone(&inner)));
@@ -2116,7 +2116,7 @@ mod inner {
                 let eos_token = llm_model.token_eos().0;
 
                 // ── Upload weights to GPU ────────────────────────────────────
-                let device = CudaDevice::new(device_id as usize)
+                let device = CudaDevice::new(kapsl_llm::cuda_ordinal::to_cuda_ordinal(device_id as usize))
                     .map_err(|e| EngineError::backend(format!("CUDA: {e}")))?;
                 let blas = Arc::new(CudaBlas::new(device.clone())
                     .map_err(|e| EngineError::backend(format!("cuBLAS: {e}")))?);

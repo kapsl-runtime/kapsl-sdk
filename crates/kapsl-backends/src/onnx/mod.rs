@@ -467,8 +467,9 @@ impl OnnxBackend {
         if !matches!(
             self.provider,
             ExecutionProvider::CUDA | ExecutionProvider::TensorRT
-        ) || !crate::ort_pool_allocator::is_registered(self.device_id)
-        {
+        ) || !crate::ort_pool_allocator::is_registered(
+            kapsl_llm::cuda_ordinal::to_cuda_ordinal_i32(self.device_id),
+        ) {
             return None;
         }
         let owner = self.memory_owner.map_or_else(
@@ -525,7 +526,9 @@ impl OnnxBackend {
         }
         #[cfg(feature = "onnx-cuda-pool")]
         {
-            !crate::ort_pool_allocator::is_registered(self.device_id)
+            !crate::ort_pool_allocator::is_registered(kapsl_llm::cuda_ordinal::to_cuda_ordinal_i32(
+                self.device_id,
+            ))
         }
         #[cfg(not(feature = "onnx-cuda-pool"))]
         {
@@ -734,8 +737,9 @@ impl OnnxBackend {
         if matches!(
             self.provider,
             ExecutionProvider::CUDA | ExecutionProvider::TensorRT
-        ) && crate::ort_pool_allocator::is_registered(self.device_id)
-        {
+        ) && crate::ort_pool_allocator::is_registered(
+            kapsl_llm::cuda_ordinal::to_cuda_ordinal_i32(self.device_id),
+        ) {
             builder = builder
                 .with_config_entry(crate::ort_pool_allocator::USE_ENV_ALLOCATORS_KEY, "1")
                 .map_err(|e| EngineError::ModelLoadError {
@@ -765,7 +769,9 @@ impl OnnxBackend {
                 builder
                     .with_execution_providers([
                         ort::execution_providers::CUDAExecutionProvider::default()
-                            .with_device_id(self.device_id)
+                            .with_device_id(kapsl_llm::cuda_ordinal::to_cuda_ordinal_i32(
+                                self.device_id,
+                            ))
                             .build(),
                     ])
                     .map_err(|e| EngineError::ModelLoadError {
@@ -786,11 +792,15 @@ impl OnnxBackend {
                 builder
                     .with_execution_providers([
                         ort::execution_providers::TensorRTExecutionProvider::default()
-                            .with_device_id(self.device_id)
+                            .with_device_id(kapsl_llm::cuda_ordinal::to_cuda_ordinal_i32(
+                                self.device_id,
+                            ))
                             .build(),
                         // Fallback to CUDA if TensorRT has issues with some nodes
                         ort::execution_providers::CUDAExecutionProvider::default()
-                            .with_device_id(self.device_id)
+                            .with_device_id(kapsl_llm::cuda_ordinal::to_cuda_ordinal_i32(
+                                self.device_id,
+                            ))
                             .build(),
                     ])
                     .map_err(|e| EngineError::ModelLoadError {

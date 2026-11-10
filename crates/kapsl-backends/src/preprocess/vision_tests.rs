@@ -1,6 +1,8 @@
 //! Unit tests for the vision preprocessing stage.
 
-use super::vision::{Layout, ResizeMode, VisionConfig, VisionPreprocessor};
+use super::vision::{
+    encoded_image_dimensions, ChannelOrder, Layout, ResizeMode, VisionConfig, VisionPreprocessor,
+};
 use super::Preprocessor;
 use image::{Rgb, RgbImage};
 use kapsl_engine_api::{BinaryTensorPacket, TensorDtype};
@@ -152,4 +154,126 @@ fn zero_std_config_rejected() {
         ..Default::default()
     };
     assert!(VisionPreprocessor::new(cfg).is_err());
+}
+
+#[test]
+fn bgr_channel_order_swaps_planes_and_keeps_mean_std_per_output_channel() {
+    for (layout, shape) in [
+        (Layout::Nchw, vec![1, 3, 2, 2]),
+        (Layout::Nhwc, vec![1, 2, 2, 3]),
+    ] {
+        let cfg = VisionConfig {
+            width: 2,
+            height: 2,
+            resize: ResizeMode::Stretch,
+            layout,
+            scale: 1.0,
+            // mean is indexed by output channel: out[0] is B, so it takes mean[0].
+            mean: [10.0, 0.0, 0.0],
+            channel_order: ChannelOrder::Bgr,
+            ..Default::default()
+        };
+        let pre = VisionPreprocessor::new(cfg).unwrap();
+        let out = pre
+            .apply(&uint8_packet(solid_png(2, 2, [200, 100, 50])))
+            .unwrap();
+        assert_eq!(out.shape, shape);
+
+        let values = output_f32(&out);
+        let expected = [50.0 - 10.0, 100.0, 200.0]; // B-mean, G, R
+        for (i, v) in values.iter().enumerate() {
+            let c = if layout == Layout::Nchw { i / 4 } else { i % 3 };
+            assert!(
+                (v - expected[c]).abs() < 1e-4,
+                "{layout:?} idx {i}: got {v}, want {}",
+                expected[c]
+            );
+        }
+    }
+}
+
+#[test]
+fn channel_order_defaults_to_rgb_and_parses_from_manifest_yaml() {
+    assert_eq!(VisionConfig::default().channel_order, ChannelOrder::Rgb);
+    let cfg: VisionConfig = serde_yaml::from_str("channel_order: bgr").unwrap();
+    assert_eq!(cfg.channel_order, ChannelOrder::Bgr);
+    let cfg: VisionConfig = serde_yaml::from_str("width: 8").unwrap();
+    assert_eq!(cfg.channel_order, ChannelOrder::Rgb);
+}
+
+#[test]
+fn letterbox_geometry_centers_and_inverts() {
+    let cfg = VisionConfig {
+        width: 100,
+        height: 100,
+        resize: ResizeMode::Letterbox,
+        ..Default::default()
+    };
+    let g = cfg.geometry(200, 100);
+    assert_eq!((g.fit_w, g.fit_h, g.pad_x, g.pad_y), (100, 50, 0, 25));
+    assert_eq!(g.scale(), (0.5, 0.5));
+    // Content corners map back to source corners.
+    assert_eq!(g.to_source(0.0, 25.0), (0.0, 0.0));
+    assert_eq!(g.to_source(100.0, 75.0), (200.0, 100.0));
+}
+
+#[test]
+fn letterbox_geometry_uses_the_rounded_resize_for_scale() {
+    // 300x101 -> ratio 1/3; fit 100x34 (33.67 rounds up), so y scale is 34/101,
+    // not the nominal 1/3.
+    let cfg = VisionConfig {
+        width: 100,
+        height: 100,
+        resize: ResizeMode::Letterbox,
+        ..Default::default()
+    };
+    let g = cfg.geometry(300, 101);
+    assert_eq!((g.fit_w, g.fit_h), (100, 34));
+    assert!((g.scale().1 - 34.0 / 101.0).abs() < 1e-6);
+    assert_eq!(g.pad_y, 33);
+}
+
+#[test]
+fn stretch_geometry_has_no_pad() {
+    let cfg = VisionConfig {
+        width: 64,
+        height: 32,
+        resize: ResizeMode::Stretch,
+        ..Default::default()
+    };
+    let g = cfg.geometry(128, 128);
+    assert_eq!((g.fit_w, g.fit_h, g.pad_x, g.pad_y), (64, 32, 0, 0));
+    assert_eq!(g.scale(), (0.5, 0.25));
+}
+
+#[test]
+fn geometry_matches_the_pixels_the_preprocessor_emits() {
+    // A white 8x4 image letterboxed into 8x8 with pad 0: content is rows 2..6.
+    let cfg = VisionConfig {
+        width: 8,
+        height: 8,
+        resize: ResizeMode::Letterbox,
+        layout: Layout::Nchw,
+        ..Default::default()
+    };
+    let g = cfg.geometry(8, 4);
+    let pre = VisionPreprocessor::new(cfg).unwrap();
+    let out = output_f32(
+        &pre.apply(&uint8_packet(solid_png(8, 4, [255, 255, 255])))
+            .unwrap(),
+    );
+    for y in 0..8u32 {
+        let inside = y >= g.pad_y && y < g.pad_y + g.fit_h;
+        assert_eq!(out[(y * 8) as usize] > 0.5, inside, "row {y}");
+    }
+}
+
+#[test]
+fn encoded_image_dimensions_reads_header_and_validates_input() {
+    let png = uint8_packet(solid_png(13, 7, [1, 2, 3]));
+    assert_eq!(encoded_image_dimensions(&png).unwrap(), (13, 7));
+    let not_image = uint8_packet(vec![1, 2, 3, 4]);
+    assert!(encoded_image_dimensions(&not_image).is_err());
+    let floats = BinaryTensorPacket::new(vec![1], TensorDtype::Float32, vec![0; 4]).unwrap();
+    assert!(encoded_image_dimensions(&floats).is_err());
 }
