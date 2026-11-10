@@ -5,6 +5,8 @@ pub mod factory;
 #[cfg(feature = "gguf-native")]
 #[path = "native/gguf.rs"]
 pub mod gguf_native;
+#[path = "onnx/memory_measure.rs"]
+mod memory_measure;
 #[cfg(feature = "native")]
 pub mod native;
 pub mod onnx;

@@ -1901,6 +1901,7 @@ dependencies = [
  "kapsl-llama-cpp-2",
  "kapsl-llm",
  "kapsl-loader",
+ "libc",
  "log",
  "lru",
  "ndarray",

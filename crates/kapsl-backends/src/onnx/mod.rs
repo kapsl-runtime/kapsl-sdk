@@ -1,4 +1,8 @@
 use crate::env_util::read_env_flag;
+use crate::memory_measure::{
+    creation_tracker, measured_report, process_resident_bytes, unattributed_domain, MemoryMeter,
+    MeterConfig, Placement, PoolUsage,
+};
 use async_trait::async_trait;
 use half::f16;
 use kapsl_engine_api::{
@@ -70,6 +74,8 @@ pub struct OnnxBackend {
     external_allocation_id: String,
     #[cfg_attr(not(feature = "onnx-cuda-pool"), allow(dead_code))]
     memory_owner: Option<(u32, u32)>,
+    /// Measured memory of every live session, behind `actual_memory`.
+    meter: Arc<MemoryMeter>,
 }
 
 #[derive(Default)]
@@ -86,6 +92,7 @@ struct SessionPool {
     waits_total: AtomicU64,
     wait_micros_total: AtomicU64,
     max_sessions: usize,
+    meter: Arc<MemoryMeter>,
 }
 
 struct PooledSession<'a> {
@@ -94,7 +101,7 @@ struct PooledSession<'a> {
 }
 
 impl SessionPool {
-    fn new(initial: Session, max_sessions: usize) -> Self {
+    fn new(initial: Session, max_sessions: usize, meter: Arc<MemoryMeter>) -> Self {
         Self {
             sessions: Mutex::new(vec![initial]),
             condvar: Condvar::new(),
@@ -102,6 +109,7 @@ impl SessionPool {
             waits_total: AtomicU64::new(0),
             wait_micros_total: AtomicU64::new(0),
             max_sessions: max_sessions.max(1),
+            meter,
         }
     }
 
@@ -216,11 +224,23 @@ struct SessionPoolStats {
     wait_seconds_total: f64,
 }
 
+impl Drop for SessionPool {
+    fn drop(&mut self) {
+        // Idle sessions are the only ones a dropping pool can still hold.
+        if let Ok(sessions) = self.sessions.get_mut() {
+            for session in sessions.iter() {
+                self.meter.forget(session);
+            }
+        }
+    }
+}
+
 impl PooledSession<'_> {
     fn discard(&mut self) {
-        let Some(_session) = self.session.take() else {
+        let Some(session) = self.session.take() else {
             return;
         };
+        self.pool.meter.forget(&session);
 
         self.pool.total_sessions.fetch_sub(1, Ordering::AcqRel);
         self.pool.condvar.notify_one();
@@ -262,6 +282,11 @@ impl Drop for PooledSession<'_> {
             }
         }
     }
+}
+
+/// Apple silicon CPUs, GPU and Neural Engine share one memory.
+fn apple_silicon_unified_memory() -> bool {
+    cfg!(all(target_os = "macos", target_arch = "aarch64"))
 }
 
 const ORT_MEMORY_PATTERN_ENV: &str = "KAPSL_ORT_MEMORY_PATTERN";
@@ -451,6 +476,20 @@ impl OnnxBackendBuilder {
                 NEXT_ONNX_EXTERNAL_ALLOCATION_ID.fetch_add(1, Ordering::Relaxed)
             ),
             memory_owner: self.memory_owner,
+            meter: Arc::new(MemoryMeter::new(MeterConfig {
+                device_arena: matches!(
+                    self.provider,
+                    ExecutionProvider::CUDA | ExecutionProvider::TensorRT
+                )
+                .then_some((
+                    ort::memory::AllocationDevice::CUDA,
+                    kapsl_llm::cuda_ordinal::to_cuda_ordinal_i32(self.device_id),
+                )),
+                use_creation_rss: matches!(
+                    self.provider,
+                    ExecutionProvider::CPU | ExecutionProvider::CoreML
+                ),
+            })),
         }
     }
 }
@@ -513,6 +552,63 @@ impl OnnxBackend {
             .build())
     }
 
+    /// Where this provider's model memory physically lives.
+    fn memory_placement(&self) -> Placement {
+        match self.provider {
+            ExecutionProvider::CPU => Placement::Host,
+            ExecutionProvider::CoreML if apple_silicon_unified_memory() => Placement::Host,
+            ExecutionProvider::CoreML => Placement::Unattributed,
+            ExecutionProvider::CUDA | ExecutionProvider::TensorRT => Placement::Cuda {
+                device_id: self.device_id as usize,
+                pooled: !self.uses_external_cuda_memory(),
+            },
+            provider => Placement::Provider {
+                name: format!("{provider:?}").to_ascii_lowercase(),
+                device_id: self.device_id as usize,
+            },
+        }
+    }
+
+    /// What the Kapsl GPU pool attributes to this replica, when ORT draws
+    /// device memory from it and the replica's owner is known.
+    fn pool_usage(&self) -> Option<PoolUsage> {
+        #[cfg(feature = "onnx-cuda-pool")]
+        {
+            let (model_id, replica_id) = self.memory_owner?;
+            let usage = |class| {
+                crate::ort_pool_allocator::owner_usage_bytes(
+                    kapsl_llm::cuda_ordinal::to_cuda_ordinal_i32(self.device_id),
+                    PoolOwner::onnx(model_id, replica_id, class),
+                )
+            };
+            Some(PoolUsage {
+                weights: usage(PoolAllocationClass::PersistentWeights)?,
+                workspace: usage(PoolAllocationClass::TransientWorkspace)?,
+            })
+        }
+        #[cfg(not(feature = "onnx-cuda-pool"))]
+        {
+            None
+        }
+    }
+
+    /// Refresh the statistics of sessions that are idle right now; busy ones
+    /// refresh themselves when their run finishes.
+    fn refresh_idle_sessions(&self) {
+        let Ok(session_guard) = self.session.try_read() else {
+            return;
+        };
+        let Some(pool) = session_guard.as_ref() else {
+            return;
+        };
+        let idle = pool.sessions.try_lock();
+        if let Ok(sessions) = idle {
+            for session in sessions.iter() {
+                self.meter.refresh(session, true);
+            }
+        }
+    }
+
     fn session_pool_size(&self) -> usize {
         self.peak_concurrency_hint.unwrap_or(1).max(1) as usize
     }
@@ -537,7 +633,11 @@ impl OnnxBackend {
     }
 
     fn create_session_pool(&self, session: Session) -> Arc<SessionPool> {
-        Arc::new(SessionPool::new(session, self.session_pool_size()))
+        Arc::new(SessionPool::new(
+            session,
+            self.session_pool_size(),
+            Arc::clone(&self.meter),
+        ))
     }
 
     fn prewarm_session_pool(
@@ -698,7 +798,26 @@ impl OnnxBackend {
         split_batched_output(&output, &row_counts)
     }
 
+    /// Create a session and record what it cost: the resident-size growth
+    /// around creation (when no other creation overlapped) and the arena
+    /// statistics right after load, before any run.
     fn create_session(
+        &self,
+        model_path: &Path,
+        opt_level: GraphOptimizationLevel,
+    ) -> Result<Session, EngineError> {
+        let window = creation_tracker().begin();
+        let rss_before = process_resident_bytes();
+        let session = self.create_session_unmeasured(model_path, opt_level);
+        let rss_after = process_resident_bytes();
+        let alone = window.finish();
+        let session = session?;
+        self.meter
+            .register_creation(&session, rss_before, rss_after, alone);
+        Ok(session)
+    }
+
+    fn create_session_unmeasured(
         &self,
         model_path: &Path,
         opt_level: GraphOptimizationLevel,
@@ -1497,8 +1616,29 @@ fn run_inference_with_pooled_session(
     shape_usize: Vec<usize>,
     main_input_tensor: SessionInputValue<'_>,
 ) -> Result<BinaryTensorPacket, EngineError> {
+    // The window also tells the meter whether anything else ran meanwhile, so
+    // a resident-size delta is only trusted when this run was alone.
+    let window = creation_tracker().begin();
+    let first_run_rss = session
+        .pool
+        .meter
+        .wants_first_run_rss(session)
+        .then(process_resident_bytes)
+        .flatten();
     let result =
         run_inference_with_session(session, request, metadata, shape_usize, main_input_tensor);
+    let alone = window.finish();
+    if first_run_rss.is_some() {
+        session.pool.meter.record_first_run(
+            session,
+            first_run_rss,
+            process_resident_bytes(),
+            alone,
+        );
+    }
+    if result.is_ok() {
+        session.pool.meter.refresh(session, false);
+    }
     if result.is_err() {
         log::warn!("Discarding ONNX session after inference failure");
         session.discard();
@@ -1625,6 +1765,24 @@ impl Engine for OnnxBackend {
                 },
             ),
             ExecutionProvider::CPU => return Ok(report),
+            ExecutionProvider::CoreML => {
+                // CoreML on Apple silicon runs in unified memory: count it
+                // where it lives. Elsewhere the placement is unknown.
+                let domain = if apple_silicon_unified_memory() {
+                    MemoryDomain::Host
+                } else {
+                    unattributed_domain()
+                };
+                report.allocations[0].domain = domain.clone();
+                report.push(MemoryAllocation {
+                    allocation_id: format!("{}:workspace", self.external_allocation_id),
+                    domain,
+                    class: MemoryAllocationClass::TransientWorkspace,
+                    source: MemoryAllocationSource::BackendManaged,
+                    bytes: (model_bytes / 4).max(64 * 1024 * 1024),
+                });
+                return Ok(report);
+            }
             provider => (
                 MemoryDomain::Provider {
                     provider: format!("{provider:?}").to_ascii_lowercase(),
@@ -1907,10 +2065,23 @@ impl Engine for OnnxBackend {
 
     fn actual_memory(&self) -> MemoryReport {
         let model_path = self.model_path.read().ok().and_then(|path| path.clone());
-        model_path
-            .as_deref()
-            .and_then(|path| self.planned_memory(path).ok())
-            .unwrap_or_default()
+        let Some(path) = model_path.as_deref() else {
+            return MemoryReport::default();
+        };
+        let Ok(plan) = self.planned_memory(path) else {
+            return MemoryReport::default();
+        };
+        let model_bytes = std::fs::metadata(path).map_or(0, |meta| meta.len() as usize);
+        self.refresh_idle_sessions();
+        measured_report(
+            &self.external_allocation_id,
+            &self.memory_placement(),
+            &self
+                .meter
+                .totals(model_bytes, (model_bytes / 4).max(64 * 1024 * 1024)),
+            self.pool_usage(),
+            &plan,
+        )
     }
 
     fn planned_request_memory(&self, request: &InferenceRequest) -> MemoryReport {
