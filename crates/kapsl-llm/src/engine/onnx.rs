@@ -2358,7 +2358,9 @@ impl LLMEngine {
                         {
                             builder = builder
                                 .with_execution_providers([CUDAExecutionProvider::default()
-                                    .with_device_id(device_id)
+                                    .with_device_id(crate::cuda_ordinal::to_cuda_ordinal_i32(
+                                        device_id,
+                                    ))
                                     .build()
                                     .error_on_failure()])
                                 .map_err(|e| {
@@ -2380,7 +2382,7 @@ impl LLMEngine {
                             .unwrap_or(false)
                         {
                             let mut tensorrt = TensorRTExecutionProvider::default()
-                                .with_device_id(device_id)
+                                .with_device_id(crate::cuda_ordinal::to_cuda_ordinal_i32(device_id))
                                 .build();
                             if scoped_device_provider {
                                 tensorrt = tensorrt.error_on_failure();
@@ -2389,7 +2391,9 @@ impl LLMEngine {
                                 .with_execution_providers([
                                     tensorrt,
                                     CUDAExecutionProvider::default()
-                                        .with_device_id(device_id)
+                                        .with_device_id(crate::cuda_ordinal::to_cuda_ordinal_i32(
+                                            device_id,
+                                        ))
                                         .build()
                                         .error_on_failure(),
                                 ])

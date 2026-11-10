@@ -16,6 +16,7 @@ kapsl-loader = { version = "0.3.0", path = "../kapsl-loader", optional = true }
 kapsl-llm = { version = "0.3.0", path = "../kapsl-llm", features = ["gguf"] }
 cudarc = { version = "0.12", features = ["cublas"], optional = true }
 half = "2.0"
+libc = "0.2"
 rand = { version = "0.8", features = ["small_rng"] }
 log = "0.4"
 lru = "0.18.2"
@@ -26,6 +27,7 @@ async-trait = "0.1.89"
 async-stream = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
+serde_json = "1"
 # Image decode/resize for the vision preprocessing stage. Kept minimal: only the
 # common encoded formats, no default codecs we don't serve.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }

@@ -272,3 +272,13 @@ pub fn unregister_pool_allocator(device_id: i32, pool: &Arc<GpuDevicePool>) -> R
 pub fn is_registered(device_id: i32) -> bool {
     registry().lock().unwrap().contains_key(&device_id)
 }
+
+/// Bytes the pool registered for `device_id` currently attributes to `owner`,
+/// `None` when no pool is registered for that device.
+pub fn owner_usage_bytes(device_id: i32, owner: PoolOwner) -> Option<usize> {
+    registry()
+        .lock()
+        .unwrap()
+        .get(&device_id)
+        .map(|registration| registration.pool.owner_usage_bytes(owner))
+}

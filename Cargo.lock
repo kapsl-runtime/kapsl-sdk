@@ -1901,6 +1901,7 @@ dependencies = [
  "kapsl-llama-cpp-2",
  "kapsl-llm",
  "kapsl-loader",
+ "libc",
  "log",
  "lru",
  "ndarray",
@@ -1908,6 +1909,7 @@ dependencies = [
  "rand 0.8.6",
  "rustfft",
  "serde",
+ "serde_json",
  "serde_yaml",
  "tokio",
 ]
