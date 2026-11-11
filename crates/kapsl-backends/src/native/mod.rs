@@ -1780,8 +1780,11 @@ mod inner {
     impl NativeBackend {
         pub fn new(device_id: i32) -> Result<Self, EngineError> {
             static NEXT_ALLOCATION_ID: AtomicU64 = AtomicU64::new(1);
-            CudaDevice::new(kapsl_llm::cuda_ordinal::to_cuda_ordinal(device_id as usize))
-                .map_err(|e| EngineError::backend(format!("CUDA device {device_id}: {e}")))?;
+            CudaDevice::new(
+                kapsl_llm::cuda_ordinal::to_cuda_ordinal(device_id as usize)
+                    .map_err(|e| EngineError::backend(e.to_string()))?,
+            )
+            .map_err(|e| EngineError::backend(format!("CUDA device {device_id}: {e}")))?;
             Ok(Self {
                 device_id,
                 external_allocation_id: format!(
@@ -1971,9 +1974,10 @@ mod inner {
             let device = if let Some((pool, _)) = self.device_pool.as_ref() {
                 Arc::clone(pool.device())
             } else {
-                CudaDevice::new(kapsl_llm::cuda_ordinal::to_cuda_ordinal(
-                    self.device_id as usize,
-                ))
+                CudaDevice::new(
+                    kapsl_llm::cuda_ordinal::to_cuda_ordinal(self.device_id as usize)
+                        .map_err(|e| EngineError::backend(e.to_string()))?,
+                )
                 .map_err(|e| EngineError::backend(format!("CUDA: {e}")))?
             };
             let blas = Arc::new(

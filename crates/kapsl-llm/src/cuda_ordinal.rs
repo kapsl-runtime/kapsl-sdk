@@ -45,25 +45,38 @@ pub struct CudaOrdinalMap {
     ordinals: Vec<Option<String>>,
 }
 
-/// Canonical PCI bus id (`dddddddd:bb:dd.f`, lowercase) or `None` if malformed.
+/// Canonical PCI bus id (`dddddddd:bb:dd.f`, lowercase hex) or `None` if malformed.
+///
+/// The single parser every PCI comparison uses (the engine's ordinal map and the
+/// GGUF device selection). It compares **values**, not spellings: NVML writes an
+/// 8-digit domain (`00000000:02:00.0`), the CUDA driver and ggml a 4-digit one
+/// (`0000:02:00.0`), hex digits may be upper or lower case, and a bare `bb:dd.f`
+/// means domain 0. Out-of-range fields (bus above 0xff, device above 0x1f,
+/// function above 7) are rejected rather than matched.
 pub fn normalize_pci(raw: &str) -> Option<String> {
     let trimmed = raw.trim_matches(|c: char| c == '\0' || c.is_whitespace());
-    if trimmed.is_empty() {
-        return None;
-    }
-    let lower = trimmed.to_ascii_lowercase();
-    let parts: Vec<&str> = lower.split(':').collect();
+    let parts: Vec<&str> = trimmed.split(':').collect();
     let (domain, bus, devfn) = match parts.as_slice() {
         [domain, bus, devfn] => (*domain, *bus, *devfn),
         [bus, devfn] => ("0", *bus, *devfn),
         _ => return None,
     };
     let (dev, func) = devfn.split_once('.')?;
-    let hex = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_hexdigit());
-    if ![domain, bus, dev, func].iter().all(|s| hex(s)) {
-        return None;
-    }
-    Some(format!("{domain:0>8}:{bus:0>2}:{dev:0>2}.{func}"))
+    let hex = |field: &str, max: u32| -> Option<u32> {
+        if field.is_empty() || !field.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        u32::from_str_radix(field, 16)
+            .ok()
+            .filter(|value| *value <= max)
+    };
+    let (domain, bus, dev, func) = (
+        hex(domain, u32::MAX)?,
+        hex(bus, 0xff)?,
+        hex(dev, 0x1f)?,
+        hex(func, 0x7)?,
+    );
+    Some(format!("{domain:08x}:{bus:02x}:{dev:02x}.{func:x}"))
 }
 
 impl CudaOrdinalMap {
@@ -162,6 +175,19 @@ impl CudaOrdinalMap {
         }
     }
 
+    /// CUDA ordinal of a visible engine device, or the reason there is none.
+    pub fn ordinal_or_error(&self, engine_id: usize) -> Result<usize, CudaOrdinalError> {
+        match self.status(engine_id) {
+            Some(CudaMatch::Visible { ordinal }) => Ok(*ordinal),
+            Some(CudaMatch::Hidden) => Err(CudaOrdinalError::Hidden { engine_id }),
+            Some(CudaMatch::Unmatched(reason)) => Err(CudaOrdinalError::Unmatched {
+                engine_id,
+                reason: reason.clone(),
+            }),
+            None => Err(CudaOrdinalError::Unknown { engine_id }),
+        }
+    }
+
     /// Engine id of a visible CUDA ordinal.
     pub fn engine_id_for(&self, ordinal: usize) -> Option<usize> {
         self.entries.iter().find_map(|(id, m, _)| match m {
@@ -226,34 +252,70 @@ pub fn installed() -> Option<Arc<CudaOrdinalMap>> {
     GLOBAL.read().ok().and_then(|slot| slot.clone())
 }
 
+/// Why an engine CUDA device id has no CUDA runtime ordinal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CudaOrdinalError {
+    /// The device exists but this process cannot see it (for example it is
+    /// excluded by `CUDA_VISIBLE_DEVICES`).
+    Hidden { engine_id: usize },
+    /// The device could not be matched to a CUDA ordinal.
+    Unmatched { engine_id: usize, reason: String },
+    /// The installed map has no such engine device.
+    Unknown { engine_id: usize },
+    /// The id is not a valid device id (negative or too large).
+    InvalidId { engine_id: i64 },
+}
+
+impl std::fmt::Display for CudaOrdinalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Hidden { engine_id } => write!(
+                f,
+                "engine CUDA device {engine_id} is not visible to this process \
+                 (CUDA_VISIBLE_DEVICES={:?}); it has no CUDA ordinal and is not managed",
+                std::env::var("CUDA_VISIBLE_DEVICES").ok()
+            ),
+            Self::Unmatched { engine_id, reason } => write!(
+                f,
+                "engine CUDA device {engine_id} could not be matched to a CUDA ordinal: {reason}"
+            ),
+            Self::Unknown { engine_id } => write!(
+                f,
+                "engine CUDA device {engine_id} is not in the CUDA device inventory of this process"
+            ),
+            Self::InvalidId { engine_id } => {
+                write!(f, "{engine_id} is not a valid CUDA device id")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CudaOrdinalError {}
+
 /// Convert an engine CUDA device id to the CUDA runtime ordinal to open or hand
 /// to a CUDA-based library (ORT's CUDA/TensorRT provider, cudarc).
 ///
-/// Identity when no map is installed (library users, tests) and for a device the
-/// map does not know. A hidden or unmatched device also returns the id, with an
-/// error log: the engine never selects such a device (it has no memory
-/// authority), so reaching this means a caller bypassed the engine.
-pub fn to_cuda_ordinal(engine_id: usize) -> usize {
+/// Identity when no map is installed (library users, tests). With a map
+/// installed, a device that is hidden, unmatched or unknown is an **error**:
+/// returning the raw id would open a different GPU than the one the engine
+/// accounts for, or an invalid ordinal. Callers must treat it as a load failure.
+pub fn to_cuda_ordinal(engine_id: usize) -> Result<usize, CudaOrdinalError> {
     match installed() {
-        None => engine_id,
-        Some(map) => match map.status(engine_id) {
-            Some(CudaMatch::Visible { ordinal }) => *ordinal,
-            Some(other) => {
-                log::error!(
-                    "engine CUDA device {engine_id} has no visible CUDA ordinal ({other:?}); using {engine_id} unchanged"
-                );
-                engine_id
-            }
-            None => engine_id,
-        },
+        None => Ok(engine_id),
+        Some(map) => map.ordinal_or_error(engine_id),
     }
 }
 
 /// [`to_cuda_ordinal`] for the `i32` device ids ONNX Runtime options take.
-pub fn to_cuda_ordinal_i32(engine_id: i32) -> i32 {
-    usize::try_from(engine_id)
-        .map(|id| i32::try_from(to_cuda_ordinal(id)).unwrap_or(engine_id))
-        .unwrap_or(engine_id)
+/// A negative id or an ordinal that does not fit `i32` is an error too.
+pub fn to_cuda_ordinal_i32(engine_id: i32) -> Result<i32, CudaOrdinalError> {
+    let id = usize::try_from(engine_id).map_err(|_| CudaOrdinalError::InvalidId {
+        engine_id: i64::from(engine_id),
+    })?;
+    let ordinal = to_cuda_ordinal(id)?;
+    i32::try_from(ordinal).map_err(|_| CudaOrdinalError::InvalidId {
+        engine_id: ordinal as i64,
+    })
 }
 
 #[cfg(test)]
