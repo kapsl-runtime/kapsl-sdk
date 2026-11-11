@@ -476,20 +476,27 @@ impl OnnxBackendBuilder {
                 NEXT_ONNX_EXTERNAL_ALLOCATION_ID.fetch_add(1, Ordering::Relaxed)
             ),
             memory_owner: self.memory_owner,
-            meter: Arc::new(MemoryMeter::new(MeterConfig {
-                device_arena: matches!(
-                    self.provider,
-                    ExecutionProvider::CUDA | ExecutionProvider::TensorRT
-                )
-                .then_some((
-                    ort::memory::AllocationDevice::CUDA,
-                    kapsl_llm::cuda_ordinal::to_cuda_ordinal_i32(self.device_id),
-                )),
-                use_creation_rss: matches!(
-                    self.provider,
-                    ExecutionProvider::CPU | ExecutionProvider::CoreML
+            meter: Arc::new(
+                MemoryMeter::new(MeterConfig {
+                    device_arena: matches!(
+                        self.provider,
+                        ExecutionProvider::CUDA | ExecutionProvider::TensorRT
+                    )
+                    .then_some((
+                        ort::memory::AllocationDevice::CUDA,
+                        kapsl_llm::cuda_ordinal::to_cuda_ordinal_i32(self.device_id),
+                    )),
+                    use_creation_rss: matches!(
+                        self.provider,
+                        ExecutionProvider::CPU | ExecutionProvider::CoreML
+                    ),
+                })
+                .with_label(
+                    self.memory_owner,
+                    &format!("{:?}", self.provider).to_ascii_lowercase(),
+                    self.device_id,
                 ),
-            })),
+            ),
         }
     }
 }
@@ -590,6 +597,17 @@ impl OnnxBackend {
         {
             None
         }
+    }
+
+    /// Debug-level `[onnx-mem]` lines (arena statistics per session, pool owner
+    /// usage) for `stage` = `load` or `warmup`. Free when the target is off.
+    fn log_memory_stage(&self, stage: &str) {
+        if !MemoryMeter::log_enabled() {
+            return;
+        }
+        self.refresh_idle_sessions();
+        self.meter.log_stage(stage);
+        self.meter.log_pool(stage, self.pool_usage());
     }
 
     /// Refresh the statistics of sessions that are idle right now; busy ones
@@ -1937,6 +1955,7 @@ impl Engine for OnnxBackend {
 
         // Reset warmup state
         self.warmed_up.store(false, Ordering::SeqCst);
+        self.log_memory_stage("load");
 
         Ok(())
     }
@@ -2057,8 +2076,10 @@ impl Engine for OnnxBackend {
             // so we leave it as is or update if we had a way.
         }
 
-        // Mark as warmed up
-        self.warmed_up.store(true, Ordering::SeqCst);
+        // Mark as warmed up; the first successful inference is the warm-up.
+        if !self.warmed_up.swap(true, Ordering::SeqCst) {
+            self.log_memory_stage("warmup");
+        }
 
         Ok(output_packet)
     }
