@@ -195,6 +195,55 @@ use kapsl_engine_api::{
 const REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 const ALWAYS_REFRESH_FIRST_RUNS: u32 = 4;
 
+/// `log` target of the stable memory lines below. Enable them with
+/// `RUST_LOG=info,kapsl_onnx_mem=debug`.
+pub(crate) const MEM_LOG_TARGET: &str = "kapsl_onnx_mem";
+
+/// Stable one-line format, parsed by `claude/gpu-verify/lib/gv.py` (`parse_onnx_mem`).
+/// `key=value` pairs separated by single spaces, in this order; a value that
+/// is not available is the literal `na`. Adding a key means bumping `v`.
+///
+/// ```text
+/// [onnx-mem] v=1 kind=arena stage=load model=0 replica=0 provider=cuda device=0 session=0 arena=cpu in_use=N total_allocated=N max_in_use=N num_allocs=N
+/// [onnx-mem] v=1 kind=pool  stage=warmup model=0 replica=0 provider=cuda device=0 weights=N workspace=N
+/// ```
+///
+/// `stage` is `load` (after `load()` returned, sessions prewarmed) or `warmup`
+/// (after the backend's first successful inference). `model`/`replica` are `-`
+/// when the backend has no memory owner. `arena` is `cpu` or `device`.
+pub(crate) fn format_arena_line(
+    label: &str,
+    stage: &str,
+    session: usize,
+    arena: &str,
+    stats: Option<&AllocatorStats>,
+) -> String {
+    let value = |pick: fn(&AllocatorStats) -> usize| {
+        stats.map_or_else(|| "na".to_string(), |s| pick(s).to_string())
+    };
+    format!(
+        "[onnx-mem] v=1 kind=arena stage={stage} {label} session={session} arena={arena} \
+         in_use={} total_allocated={} max_in_use={} num_allocs={}",
+        value(|s| s.in_use),
+        value(|s| s.total_allocated),
+        value(|s| s.max_in_use),
+        value(|s| s.num_allocs),
+    )
+}
+
+pub(crate) fn format_pool_line(label: &str, stage: &str, usage: Option<PoolUsage>) -> String {
+    let value = |pick: fn(&PoolUsage) -> usize| {
+        usage
+            .as_ref()
+            .map_or_else(|| "na".to_string(), |u| pick(u).to_string())
+    };
+    format!(
+        "[onnx-mem] v=1 kind=pool stage={stage} {label} weights={} workspace={}",
+        value(|u| u.weights),
+        value(|u| u.workspace),
+    )
+}
+
 /// What the meter reads for every session of one backend.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct MeterConfig {
@@ -256,6 +305,8 @@ pub(crate) fn creation_tracker() -> &'static CreationTracker {
 
 #[derive(Debug, Clone)]
 struct SessionRecord {
+    /// Creation order within this backend, the `session=` of the log lines.
+    ordinal: usize,
     /// Resident-size growth while this session was created; `None` when it
     /// was not measured, not attributable (overlapping creation) or negative.
     creation_rss_delta: Option<usize>,
@@ -307,6 +358,9 @@ pub(crate) struct MeterTotals {
 #[derive(Debug)]
 pub(crate) struct MemoryMeter {
     config: MeterConfig,
+    /// `model=.. replica=.. provider=.. device=..`, the common part of every log line.
+    label: String,
+    next_ordinal: AtomicUsize,
     records: Mutex<HashMap<usize, SessionRecord>>,
 }
 
@@ -318,7 +372,72 @@ impl MemoryMeter {
     pub(crate) fn new(config: MeterConfig) -> Self {
         Self {
             config,
+            label: "model=- replica=- provider=- device=-".to_string(),
+            next_ordinal: AtomicUsize::new(0),
             records: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Identify the backend in the log lines (see [`format_arena_line`]).
+    pub(crate) fn with_label(
+        mut self,
+        owner: Option<(u32, u32)>,
+        provider: &str,
+        device_id: i32,
+    ) -> Self {
+        let (model, replica) = owner.map_or_else(
+            || ("-".to_string(), "-".to_string()),
+            |(m, r)| (m.to_string(), r.to_string()),
+        );
+        self.label =
+            format!("model={model} replica={replica} provider={provider} device={device_id}");
+        self
+    }
+
+    pub(crate) fn log_enabled() -> bool {
+        log::log_enabled!(target: MEM_LOG_TARGET, log::Level::Debug)
+    }
+
+    /// Log every session's current arena statistics (debug level, one line per
+    /// session and arena). Call after refreshing the sessions.
+    pub(crate) fn log_stage(&self, stage: &str) {
+        if !Self::log_enabled() {
+            return;
+        }
+        let mut rows: Vec<(usize, Option<AllocatorStats>, Option<AllocatorStats>)> = self
+            .records
+            .lock()
+            .map(|records| {
+                records
+                    .values()
+                    .map(|r| (r.ordinal, r.cpu_now, r.device_now))
+                    .collect()
+            })
+            .unwrap_or_default();
+        rows.sort_by_key(|row| row.0);
+        for (ordinal, cpu, device) in rows {
+            log::debug!(
+                target: MEM_LOG_TARGET,
+                "{}",
+                format_arena_line(&self.label, stage, ordinal, "cpu", cpu.as_ref())
+            );
+            if self.config.device_arena.is_some() {
+                log::debug!(
+                    target: MEM_LOG_TARGET,
+                    "{}",
+                    format_arena_line(&self.label, stage, ordinal, "device", device.as_ref())
+                );
+            }
+        }
+    }
+
+    pub(crate) fn log_pool(&self, stage: &str, usage: Option<PoolUsage>) {
+        if Self::log_enabled() {
+            log::debug!(
+                target: MEM_LOG_TARGET,
+                "{}",
+                format_pool_line(&self.label, stage, usage)
+            );
         }
     }
 
@@ -349,6 +468,7 @@ impl MemoryMeter {
             None
         };
         let record = SessionRecord {
+            ordinal: self.next_ordinal.fetch_add(1, Ordering::Relaxed),
             creation_rss_delta,
             cpu_at_load: cpu,
             cpu_now: cpu,
@@ -700,6 +820,7 @@ mod tests {
         device: Option<(usize, usize)>,
     ) -> SessionRecord {
         SessionRecord {
+            ordinal: 0,
             creation_rss_delta: rss,
             cpu_at_load: cpu.map(|(load, _)| stats(load, 0)),
             cpu_now: cpu.map(|(_, now)| stats(now, 0)),
@@ -1299,5 +1420,53 @@ mod tests {
             let _ = session.run(ort::inputs![name.as_str() => &input]).unwrap();
             show(&format!("after-run-{i}"), &session);
         }
+    }
+
+    #[test]
+    fn arena_log_line_format_is_stable() {
+        let meter = MemoryMeter::new(MeterConfig {
+            device_arena: None,
+            use_creation_rss: true,
+        })
+        .with_label(Some((3, 1)), "cuda", 0);
+        let stats = AllocatorStats {
+            in_use: 10,
+            total_allocated: 20,
+            max_in_use: 15,
+            num_allocs: 4,
+            ..AllocatorStats::default()
+        };
+        assert_eq!(
+            format_arena_line(&meter.label, "load", 2, "cpu", Some(&stats)),
+            "[onnx-mem] v=1 kind=arena stage=load model=3 replica=1 provider=cuda device=0 \
+             session=2 arena=cpu in_use=10 total_allocated=20 max_in_use=15 num_allocs=4"
+        );
+        assert_eq!(
+            format_arena_line(&meter.label, "warmup", 0, "device", None),
+            "[onnx-mem] v=1 kind=arena stage=warmup model=3 replica=1 provider=cuda device=0 \
+             session=0 arena=device in_use=na total_allocated=na max_in_use=na num_allocs=na"
+        );
+    }
+
+    #[test]
+    fn pool_log_line_format_is_stable_and_unowned_backends_use_dashes() {
+        let meter = MemoryMeter::new(MeterConfig {
+            device_arena: None,
+            use_creation_rss: true,
+        })
+        .with_label(None, "cpu", 0);
+        assert_eq!(
+            format_pool_line(
+                &meter.label,
+                "warmup",
+                Some(PoolUsage {
+                    weights: 7,
+                    workspace: 9
+                })
+            ),
+            "[onnx-mem] v=1 kind=pool stage=warmup model=- replica=- provider=cpu device=0 \
+             weights=7 workspace=9"
+        );
+        assert!(format_pool_line(&meter.label, "load", None).ends_with("weights=na workspace=na"));
     }
 }
