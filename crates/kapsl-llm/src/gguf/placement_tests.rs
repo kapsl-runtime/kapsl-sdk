@@ -230,6 +230,22 @@ fn cuda_without_pci_ids_is_mapped_only_when_unambiguous() {
 }
 
 #[test]
+fn selecting_an_engine_device_the_engine_does_not_have_is_an_error() {
+    // One visible llama CUDA device, no PCI ids: only the engine's own device
+    // maps to it. Asking for device 1 must not silently load on CUDA0.
+    let one = [gpu("CUDA0", "CUDA", None)];
+    let engine = [engine_cuda(0, NVML_A)];
+    assert!(select_cuda_llama_device(&one, &[], 1).is_err());
+    assert_eq!(select_cuda_llama_device(&one, &[], 0), Ok(0));
+    let engine_no_pci = [EngineDeviceInfo {
+        pci_bus_id: None,
+        ..engine[0].clone()
+    }];
+    assert!(select_cuda_llama_device(&one, &engine_no_pci, 1).is_err());
+    assert_eq!(select_cuda_llama_device(&one, &engine_no_pci, 0), Ok(0));
+}
+
+#[test]
 fn cuda_device_missing_from_the_engine_list_is_unattributed() {
     let all = [cuda("CUDA0", PCI_B)];
     let engine = [engine_cuda(0, NVML_A)];
@@ -493,4 +509,45 @@ fn a_class_split_across_domains_gets_distinct_ids_with_one_base_id() {
     assert_eq!(allocation_id_for("kv", &rows, &rows[0]), "kv@host");
     // A class with a single domain always keeps its base id.
     assert_eq!(allocation_id_for("w", &rows, &rows[2]), "w");
+}
+
+#[test]
+fn selection_matches_nvml_and_cuda_spellings_in_any_case() {
+    // ggml/CUDA: 4-digit domain, upper case; NVML: 8-digit domain, lower case.
+    let all = [cuda("CUDA0", "0000:0A:00.0"), cuda("CUDA1", "0000:0B:00.0")];
+    let engine = [
+        engine_cuda(0, "00000000:0a:00.0"),
+        engine_cuda(1, "00000000:0b:00.0"),
+    ];
+    assert_eq!(select_cuda_llama_device(&all, &engine, 0), Ok(0));
+    assert_eq!(select_cuda_llama_device(&all, &engine, 1), Ok(1));
+    // Same inventory in the other order (fastest-first): PCI wins over position.
+    let swapped = [all[1].clone(), all[0].clone()];
+    assert_eq!(select_cuda_llama_device(&swapped, &engine, 0), Ok(1));
+}
+
+#[test]
+fn selection_with_a_real_pci_mismatch_still_fails() {
+    let all = [cuda("CUDA0", "0000:0a:00.0"), cuda("CUDA1", "0000:0b:00.0")];
+    let engine = [engine_cuda(0, "00000000:0c:00.0")];
+    let error = select_cuda_llama_device(&all, &engine, 0).unwrap_err();
+    assert!(error.contains("not visible to llama.cpp"), "{error}");
+}
+
+#[test]
+fn selection_without_a_registered_inventory_says_so() {
+    // The reported failure: two llama CUDA devices and an empty engine list.
+    let all = [cuda("CUDA0", "0000:02:00.0"), cuda("CUDA1", "0000:03:00.0")];
+    let error = select_cuda_llama_device(&all, &[], 0).unwrap_err();
+    assert!(error.contains("never registered"), "{error}");
+    // Registered, with a device that has no PCI id, is a different message.
+    let no_pci = [
+        EngineDeviceInfo {
+            pci_bus_id: None,
+            ..engine_cuda(0, NVML_A)
+        },
+        engine_cuda(1, NVML_B),
+    ];
+    let error = select_cuda_llama_device(&all, &no_pci, 0).unwrap_err();
+    assert!(error.contains("no usable PCI bus id"), "{error}");
 }

@@ -217,10 +217,10 @@ fn run_smoke_test_provider(
             {
                 return Err("CUDA execution provider is not available in ONNX Runtime".to_string());
             }
+            // Strict registration: a provider that cannot load must fail the smoke
+            // test, not leave a CPU session that passes it.
             builder
-                .with_execution_providers([CUDAExecutionProvider::default()
-                    .with_device_id(device_id)
-                    .build()])
+                .with_execution_providers(crate::onnx::cuda_execution_providers(false, device_id))
                 .map_err(|e| format!("failed to register CUDA execution provider: {e}"))?
         }
         OnnxAcceleratorProvider::TensorRt => {
@@ -233,14 +233,7 @@ fn run_smoke_test_provider(
                 );
             }
             builder
-                .with_execution_providers([
-                    TensorRTExecutionProvider::default()
-                        .with_device_id(device_id)
-                        .build(),
-                    CUDAExecutionProvider::default()
-                        .with_device_id(device_id)
-                        .build(),
-                ])
+                .with_execution_providers(crate::onnx::cuda_execution_providers(true, device_id))
                 .map_err(|e| format!("failed to register TensorRT execution provider: {e}"))?
         }
     };

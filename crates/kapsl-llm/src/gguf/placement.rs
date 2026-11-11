@@ -110,26 +110,10 @@ pub fn unattributed_domain() -> MemoryDomain {
     }
 }
 
-/// Canonical PCI bus id: lowercase `dddddddd:bb:dd.f`. Accepts the CUDA form
-/// (`0000:01:00.0`), the NVML form (`00000000:01:00.0`) and a bare `bb:dd.f`.
+/// Canonical PCI bus id; see [`crate::cuda_ordinal::normalize_pci`], the one
+/// implementation shared with the engine's CUDA ordinal map.
 pub fn normalize_pci_bus_id(raw: &str) -> Option<String> {
-    let trimmed = raw.trim_matches(|c: char| c == '\0' || c.is_whitespace());
-    if trimmed.is_empty() {
-        return None;
-    }
-    let lower = trimmed.to_ascii_lowercase();
-    let parts: Vec<&str> = lower.split(':').collect();
-    let (domain, bus, devfn) = match parts.as_slice() {
-        [domain, bus, devfn] => (*domain, *bus, *devfn),
-        [bus, devfn] => ("0", *bus, *devfn),
-        _ => return None,
-    };
-    let valid_hex = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_hexdigit());
-    let (dev, func) = devfn.split_once('.')?;
-    if ![domain, bus, dev, func].iter().all(|s| valid_hex(s)) {
-        return None;
-    }
-    Some(format!("{domain:0>8}:{bus:0>2}:{dev:0>2}.{func}"))
+    crate::cuda_ordinal::normalize_pci(raw)
 }
 
 /// Provider label for a non-CUDA discrete GPU backend.
@@ -292,12 +276,28 @@ pub fn select_cuda_llama_device(
             )),
         };
     }
-    if cuda.len() == 1 && (engine.iter().filter(|d| d.is_cuda()).count() <= 1) {
+    let engine_cuda = engine.iter().filter(|d| d.is_cuda()).count();
+    // Without a PCI id the choice is unambiguous only with one GPU on each side,
+    // and only for the device the engine actually has (an empty engine list is a
+    // library user with a single GPU, which is device 0).
+    let known_device = if engine_cuda == 0 {
+        engine_id == 0
+    } else {
+        engine.iter().any(|d| d.is_cuda() && d.id == engine_id)
+    };
+    if cuda.len() == 1 && engine_cuda <= 1 && known_device {
         return Ok(cuda[0]);
     }
+    let reason = if engine_cuda == 0 {
+        "the engine's device inventory was never registered with the GGUF backend \
+         (no engine CUDA devices are known)"
+    } else if !known_device {
+        "the engine has no CUDA device with that id"
+    } else {
+        "the engine reports no usable PCI bus id for that device"
+    };
     Err(format!(
-        "cannot identify engine CUDA device {engine_id} among {} llama.cpp CUDA devices: \
-         no PCI bus id for the engine device",
+        "cannot identify engine CUDA device {engine_id} among {} llama.cpp CUDA devices: {reason}",
         cuda.len()
     ))
 }

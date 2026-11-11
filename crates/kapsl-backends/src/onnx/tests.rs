@@ -586,4 +586,39 @@ mod tests {
         let with_top_k = plain.clone().with_metadata(meta);
         assert!(request_wants_top_k(&with_top_k));
     }
+
+    /// ORT silently builds a CPU session when the CUDA provider cannot register
+    /// (observed on a GPU host whose glibc was too old for the provider library):
+    /// the engine then charged a GPU the model never used. The registration must
+    /// be an error. A host where CUDA works cannot exercise the failure, so the
+    /// test is a no-op there.
+    #[test]
+    fn a_cuda_provider_that_fails_to_register_fails_the_session_build() {
+        use ort::execution_providers::{CUDAExecutionProvider, ExecutionProvider as _};
+        if CUDAExecutionProvider::default()
+            .is_available()
+            .unwrap_or(false)
+        {
+            eprintln!("skipped: CUDA is usable on this host");
+            return;
+        }
+        let silent = Session::builder().and_then(|builder| {
+            builder.with_execution_providers([CUDAExecutionProvider::default()
+                .with_device_id(0)
+                .build()])
+        });
+        assert!(
+            silent.is_ok(),
+            "control: without error_on_failure ORT falls back to the CPU quietly"
+        );
+        for tensorrt in [false, true] {
+            let strict = Session::builder().and_then(|builder| {
+                builder.with_execution_providers(cuda_execution_providers(tensorrt, 0))
+            });
+            assert!(
+                strict.is_err(),
+                "tensorrt={tensorrt}: the session must not be built on the CPU"
+            );
+        }
+    }
 }

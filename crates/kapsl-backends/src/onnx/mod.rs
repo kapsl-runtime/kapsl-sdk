@@ -289,6 +289,59 @@ fn apple_silicon_unified_memory() -> bool {
     cfg!(all(target_os = "macos", target_arch = "aarch64"))
 }
 
+/// The execution providers for a CUDA or TensorRT session on CUDA `ordinal`.
+///
+/// The CUDA provider is registered with `error_on_failure`: without it ONNX
+/// Runtime logs "may fall back to CPU" and builds a CPU session, which the engine
+/// would then charge to a GPU it never touches. A TensorRT request keeps CUDA as
+/// its documented fallback for graphs TensorRT rejects, so TensorRT alone may fail
+/// to register, but the session is never left with neither.
+pub(crate) fn cuda_execution_providers(
+    tensorrt: bool,
+    ordinal: i32,
+) -> Vec<ort::execution_providers::ExecutionProviderDispatch> {
+    use ort::execution_providers::{CUDAExecutionProvider, TensorRTExecutionProvider};
+    let mut providers = Vec::new();
+    if tensorrt {
+        providers.push(
+            TensorRTExecutionProvider::default()
+                .with_device_id(ordinal)
+                .build(),
+        );
+    }
+    providers.push(
+        CUDAExecutionProvider::default()
+            .with_device_id(ordinal)
+            .build()
+            .error_on_failure(),
+    );
+    providers
+}
+
+/// CUDA ordinal for an engine device id, as a load failure when the device has
+/// none (hidden from this process, unmatched): never another GPU's ordinal.
+fn cuda_ordinal_for_load(device_id: i32, model_path: &Path) -> Result<i32, EngineError> {
+    kapsl_llm::cuda_ordinal::to_cuda_ordinal_i32(device_id).map_err(|error| {
+        EngineError::ModelLoadError {
+            path: model_path.to_string_lossy().into_owned(),
+            source: Box::new(error),
+        }
+    })
+}
+
+/// CUDA ordinal for accounting queries made after (or independent of) a load.
+/// `None` means there is no such device for this process; the load itself fails
+/// in [`cuda_ordinal_for_load`], so a query never selects a device.
+fn mapped_cuda_ordinal(device_id: i32) -> Option<i32> {
+    match kapsl_llm::cuda_ordinal::to_cuda_ordinal_i32(device_id) {
+        Ok(ordinal) => Some(ordinal),
+        Err(error) => {
+            log::error!("{error}");
+            None
+        }
+    }
+}
+
 const ORT_MEMORY_PATTERN_ENV: &str = "KAPSL_ORT_MEMORY_PATTERN";
 const ORT_DISABLE_CPU_MEM_ARENA_ENV: &str = "KAPSL_ORT_DISABLE_CPU_MEM_ARENA";
 const ORT_SESSION_BUCKETS_ENV: &str = "KAPSL_ORT_SESSION_BUCKETS";
@@ -482,10 +535,9 @@ impl OnnxBackendBuilder {
                         self.provider,
                         ExecutionProvider::CUDA | ExecutionProvider::TensorRT
                     )
-                    .then_some((
-                        ort::memory::AllocationDevice::CUDA,
-                        kapsl_llm::cuda_ordinal::to_cuda_ordinal_i32(self.device_id),
-                    )),
+                    .then(|| mapped_cuda_ordinal(self.device_id))
+                    .flatten()
+                    .map(|ordinal| (ort::memory::AllocationDevice::CUDA, ordinal)),
                     use_creation_rss: matches!(
                         self.provider,
                         ExecutionProvider::CPU | ExecutionProvider::CoreML
@@ -513,9 +565,9 @@ impl OnnxBackend {
         if !matches!(
             self.provider,
             ExecutionProvider::CUDA | ExecutionProvider::TensorRT
-        ) || !crate::ort_pool_allocator::is_registered(
-            kapsl_llm::cuda_ordinal::to_cuda_ordinal_i32(self.device_id),
-        ) {
+        ) || !mapped_cuda_ordinal(self.device_id)
+            .is_some_and(crate::ort_pool_allocator::is_registered)
+        {
             return None;
         }
         let owner = self.memory_owner.map_or_else(
@@ -582,9 +634,10 @@ impl OnnxBackend {
         #[cfg(feature = "onnx-cuda-pool")]
         {
             let (model_id, replica_id) = self.memory_owner?;
+            let ordinal = mapped_cuda_ordinal(self.device_id)?;
             let usage = |class| {
                 crate::ort_pool_allocator::owner_usage_bytes(
-                    kapsl_llm::cuda_ordinal::to_cuda_ordinal_i32(self.device_id),
+                    ordinal,
                     PoolOwner::onnx(model_id, replica_id, class),
                 )
             };
@@ -640,9 +693,9 @@ impl OnnxBackend {
         }
         #[cfg(feature = "onnx-cuda-pool")]
         {
-            !crate::ort_pool_allocator::is_registered(kapsl_llm::cuda_ordinal::to_cuda_ordinal_i32(
-                self.device_id,
-            ))
+            // A device with no CUDA ordinal cannot be pooled: count it as external.
+            !mapped_cuda_ordinal(self.device_id)
+                .is_some_and(crate::ort_pool_allocator::is_registered)
         }
         #[cfg(not(feature = "onnx-cuda-pool"))]
         {
@@ -870,13 +923,19 @@ impl OnnxBackend {
         // When a shared Kapsl GPU pool is registered with ORT for this
         // device, opt into env allocators so this session's device memory is
         // carved out of the same pool as the GGUF KV cache.
-        #[cfg(feature = "onnx-cuda-pool")]
-        if matches!(
+        // An engine device this process cannot see has no CUDA ordinal: fail the
+        // load instead of opening another GPU or taking the unpooled path.
+        #[cfg_attr(not(feature = "onnx-cuda-pool"), allow(unused_variables))]
+        let cuda_ordinal = if matches!(
             self.provider,
             ExecutionProvider::CUDA | ExecutionProvider::TensorRT
-        ) && crate::ort_pool_allocator::is_registered(
-            kapsl_llm::cuda_ordinal::to_cuda_ordinal_i32(self.device_id),
         ) {
+            Some(cuda_ordinal_for_load(self.device_id, model_path)?)
+        } else {
+            None
+        };
+        #[cfg(feature = "onnx-cuda-pool")]
+        if cuda_ordinal.is_some_and(crate::ort_pool_allocator::is_registered) {
             builder = builder
                 .with_config_entry(crate::ort_pool_allocator::USE_ENV_ALLOCATORS_KEY, "1")
                 .map_err(|e| EngineError::ModelLoadError {
@@ -904,16 +963,16 @@ impl OnnxBackend {
                     });
                 }
                 builder
-                    .with_execution_providers([
-                        ort::execution_providers::CUDAExecutionProvider::default()
-                            .with_device_id(kapsl_llm::cuda_ordinal::to_cuda_ordinal_i32(
-                                self.device_id,
-                            ))
-                            .build(),
-                    ])
+                    .with_execution_providers(cuda_execution_providers(
+                        false,
+                        cuda_ordinal_for_load(self.device_id, model_path)?,
+                    ))
                     .map_err(|e| EngineError::ModelLoadError {
                         path: model_path.to_string_lossy().into_owned(),
-                        source: Box::new(std::io::Error::other(e.to_string())),
+                        source: Box::new(std::io::Error::other(format!(
+                            "the CUDA execution provider could not be registered, so ONNX Runtime \
+                             would run this model on the CPU: {e}"
+                        ))),
                     })?
             }
             ExecutionProvider::TensorRT => {
@@ -927,22 +986,16 @@ impl OnnxBackend {
                     });
                 }
                 builder
-                    .with_execution_providers([
-                        ort::execution_providers::TensorRTExecutionProvider::default()
-                            .with_device_id(kapsl_llm::cuda_ordinal::to_cuda_ordinal_i32(
-                                self.device_id,
-                            ))
-                            .build(),
-                        // Fallback to CUDA if TensorRT has issues with some nodes
-                        ort::execution_providers::CUDAExecutionProvider::default()
-                            .with_device_id(kapsl_llm::cuda_ordinal::to_cuda_ordinal_i32(
-                                self.device_id,
-                            ))
-                            .build(),
-                    ])
+                    .with_execution_providers(cuda_execution_providers(
+                        true,
+                        cuda_ordinal_for_load(self.device_id, model_path)?,
+                    ))
                     .map_err(|e| EngineError::ModelLoadError {
                         path: model_path.to_string_lossy().into_owned(),
-                        source: Box::new(std::io::Error::other(e.to_string())),
+                        source: Box::new(std::io::Error::other(format!(
+                            "neither the TensorRT nor the CUDA execution provider could be \
+                             registered, so ONNX Runtime would run this model on the CPU: {e}"
+                        ))),
                     })?
             }
             ExecutionProvider::DirectML => {

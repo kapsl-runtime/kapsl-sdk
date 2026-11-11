@@ -35,17 +35,34 @@ use ort::session::builder::GraphOptimizationLevel;
 ))]
 use std::sync::Arc;
 
-fn use_registered_env_allocator(device_id: i32) -> bool {
+/// Whether ORT should draw device memory from the registered Kapsl pool for
+/// `device_id`. `provider` is the execution provider when the caller knows it.
+///
+/// A CUDA/TensorRT provider on a device with no CUDA ordinal (hidden from this
+/// process, unmatched) is an error, not "no pool registered": the load must
+/// fail instead of continuing unpooled on a device the engine does not manage.
+/// With no known provider the answer is `false` for such a device; if the
+/// runtime then picks CUDA, the provider setup in the ONNX backend fails the
+/// load with the same error.
+fn use_registered_env_allocator(provider: Option<&str>, device_id: i32) -> Result<bool, String> {
     #[cfg(feature = "onnx-cuda-pool")]
     {
-        crate::ort_pool_allocator::is_registered(kapsl_llm::cuda_ordinal::to_cuda_ordinal_i32(
-            device_id,
-        ))
+        let is_cuda = provider.is_some_and(|provider| {
+            provider.eq_ignore_ascii_case("cuda") || provider.eq_ignore_ascii_case("tensorrt")
+        });
+        match kapsl_llm::cuda_ordinal::to_cuda_ordinal_i32(device_id) {
+            Ok(ordinal) => Ok(crate::ort_pool_allocator::is_registered(ordinal)),
+            Err(error) if is_cuda => Err(error.to_string()),
+            Err(error) => {
+                log::debug!("no pool allocator for device {device_id}: {error}");
+                Ok(false)
+            }
+        }
     }
     #[cfg(not(feature = "onnx-cuda-pool"))]
     {
-        let _ = device_id;
-        false
+        let _ = (provider, device_id);
+        Ok(false)
     }
 }
 
@@ -363,7 +380,11 @@ impl BackendFactory {
 
     /// Give the GGUF backends the engine's accelerator inventory so llama.cpp
     /// devices are matched to engine devices by PCI bus id, not by position.
-    fn register_gguf_engine_devices(device_info: &DeviceInfo) {
+    ///
+    /// The `create_gguf_*` constructors take no device list, so a host that calls
+    /// them directly (the engine does) must call this first; without it a host
+    /// with several CUDA devices cannot map an engine device to a llama.cpp one.
+    pub fn register_gguf_engine_devices(device_info: &DeviceInfo) {
         let devices = device_info
             .devices
             .iter()
@@ -443,8 +464,10 @@ impl BackendFactory {
                         "✓ Using LLMBackend with manifest provider override: {}",
                         provider
                     );
+                    let env_allocators =
+                        use_registered_env_allocator(Some(provider.as_str()), device_id)?;
                     let mut backend = LLMBackend::with_device(provider, device_id)
-                        .with_env_allocators(use_registered_env_allocator(device_id));
+                        .with_env_allocators(env_allocators);
                     if let Some((model_id, replica_id)) = memory_owner {
                         backend = backend.with_memory_owner(model_id, replica_id);
                     }
@@ -454,7 +477,7 @@ impl BackendFactory {
             log::info!("✓ Using LLMBackend with runtime fastest-provider selection");
             let device_id = requirements.device_id.unwrap_or(0);
             let mut backend = LLMBackend::with_device_id(device_id)
-                .with_env_allocators(use_registered_env_allocator(device_id));
+                .with_env_allocators(use_registered_env_allocator(None, device_id)?);
             if let Some((model_id, replica_id)) = memory_owner {
                 backend = backend.with_memory_owner(model_id, replica_id);
             }
@@ -623,8 +646,10 @@ impl BackendFactory {
                     "✓ Using LLMBackend with manifest provider override: {}",
                     provider
                 );
+                let env_allocators =
+                    use_registered_env_allocator(Some(provider), device_id as i32)?;
                 let mut backend = LLMBackend::with_device(provider.to_string(), device_id as i32)
-                    .with_env_allocators(use_registered_env_allocator(device_id as i32));
+                    .with_env_allocators(env_allocators);
                 if let Some((model_id, replica_id)) = memory_owner {
                     backend = backend.with_memory_owner(model_id, replica_id);
                 }
@@ -635,7 +660,7 @@ impl BackendFactory {
                 "✓ Using LLMBackend with device pinning and runtime provider auto-selection"
             );
             let mut backend = LLMBackend::with_device_id(device_id as i32)
-                .with_env_allocators(use_registered_env_allocator(device_id as i32));
+                .with_env_allocators(use_registered_env_allocator(None, device_id as i32)?);
             if let Some((model_id, replica_id)) = memory_owner {
                 backend = backend.with_memory_owner(model_id, replica_id);
             }

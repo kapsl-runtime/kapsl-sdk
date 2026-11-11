@@ -5457,9 +5457,10 @@ impl Engine for GgufBackend {
                             n_head_kv,
                             head_dim
                         );
-                                let device = CudaDevice::new(crate::cuda_ordinal::to_cuda_ordinal(
-                                    effective_device_id,
-                                ))
+                                let device = CudaDevice::new(
+                                    crate::cuda_ordinal::to_cuda_ordinal(effective_device_id)
+                                        .map_err(|e| EngineError::backend(e.to_string()))?,
+                                )
                                 .map_err(|e| EngineError::backend(format!("CUDA: {e}")))?;
                                 let pool = Arc::new(
                                     GpuBlockPool::new(
@@ -5478,9 +5479,10 @@ impl Engine for GgufBackend {
                                 handle
                             }
                         } else {
-                            let device = CudaDevice::new(crate::cuda_ordinal::to_cuda_ordinal(
-                                effective_device_id,
-                            ))
+                            let device = CudaDevice::new(
+                                crate::cuda_ordinal::to_cuda_ordinal(effective_device_id)
+                                    .map_err(|e| EngineError::backend(e.to_string()))?,
+                            )
                             .map_err(|e| EngineError::backend(format!("CUDA: {e}")))?;
                             let pool = Arc::new(
                                 GpuBlockPool::new(
