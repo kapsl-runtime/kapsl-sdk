@@ -159,6 +159,23 @@ fn n_ctx_per_seq() -> u32 {
         .unwrap_or(N_CTX_PER_SEQ_DEFAULT)
 }
 
+/// llama.cpp device values for engine CUDA device `engine_id` (see
+/// [`crate::gguf_placement::CudaLlamaDevicePlan`]).
+#[cfg(feature = "gguf-cuda")]
+fn gguf_cuda_device_plan(
+    engine_id: usize,
+) -> Result<crate::gguf_placement::CudaLlamaDevicePlan, EngineError> {
+    let ordinal = crate::cuda_ordinal::to_cuda_ordinal(engine_id)
+        .map_err(|error| EngineError::backend(error.to_string()))?;
+    crate::gguf_placement::plan_cuda_llama_devices(
+        &llama_device_list(),
+        &engine_devices(),
+        engine_id,
+        ordinal,
+    )
+    .map_err(|error| EngineError::backend(format!("select llama.cpp CUDA device: {error}")))
+}
+
 #[cfg(feature = "gguf")]
 fn gguf_model_params(device_id: usize) -> Result<LlamaModelParams, EngineError> {
     let mut params = LlamaModelParams::default();
@@ -171,15 +188,11 @@ fn gguf_model_params(device_id: usize) -> Result<LlamaModelParams, EngineError> 
     };
     #[cfg(feature = "gguf-cuda")]
     {
-        let devices = llama_device_list();
-        let selected =
-            crate::gguf_placement::select_cuda_llama_device(&devices, &engine_devices(), device_id)
-                .map_err(|error| {
-                    EngineError::backend(format!("select llama.cpp CUDA device: {error}"))
-                })?;
+        let plan = gguf_cuda_device_plan(device_id)?;
         params = params
-            .with_devices(&[selected])
-            .map_err(|error| EngineError::backend(format!("select llama.cpp device: {error}")))?;
+            .with_devices(&[plan.llama_device])
+            .map_err(|error| EngineError::backend(format!("select llama.cpp device: {error}")))?
+            .with_main_gpu(plan.main_gpu);
     }
     #[cfg(not(feature = "gguf-cuda"))]
     let _ = device_id;
@@ -831,12 +844,12 @@ struct GgufWeights {
 
 #[cfg(feature = "gguf")]
 static GGUF_WEIGHTS_CACHE: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, std::sync::Weak<GgufWeights>>>,
+    std::sync::Mutex<std::collections::HashMap<GgufWeightsKey, std::sync::Weak<GgufWeights>>>,
 > = std::sync::OnceLock::new();
 
 #[cfg(feature = "gguf")]
 fn gguf_weights_cache() -> &'static std::sync::Mutex<
-    std::collections::HashMap<std::path::PathBuf, std::sync::Weak<GgufWeights>>,
+    std::collections::HashMap<GgufWeightsKey, std::sync::Weak<GgufWeights>>,
 > {
     GGUF_WEIGHTS_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
@@ -846,9 +859,35 @@ fn gguf_model_key(model_path: &Path) -> std::path::PathBuf {
     std::fs::canonicalize(model_path).unwrap_or_else(|_| model_path.to_path_buf())
 }
 
+/// Identity of loaded weights: the model file and the engine device they live
+/// on. With `gguf-cuda` the weights are loaded onto exactly one GPU
+/// (`gguf_model_params`), so replicas on different devices must not share them:
+/// a replica whose KV pool is on device B would otherwise attach to a model
+/// resident on device A. Replicas on the same device still share one copy.
 #[cfg(feature = "gguf")]
-fn gguf_allocation_id(model_path: &Path) -> String {
-    format!("llama-gguf:{}", gguf_model_key(model_path).display())
+type GgufWeightsKey = (std::path::PathBuf, usize);
+
+#[cfg(feature = "gguf")]
+fn gguf_weights_key(model_path: &Path, device_id: usize) -> GgufWeightsKey {
+    #[cfg(not(feature = "gguf-cuda"))]
+    let device_id = {
+        let _ = device_id;
+        0
+    };
+    (gguf_model_key(model_path), device_id)
+}
+
+/// Id of a device's copy of the weights. It must match between planning and the
+/// post-load report, and differ per device so each device's ledger is charged
+/// for the copy that really lives there.
+#[cfg(feature = "gguf")]
+fn gguf_allocation_id(model_path: &Path, device_id: usize) -> String {
+    let (path, device_id) = gguf_weights_key(model_path, device_id);
+    if cfg!(feature = "gguf-cuda") {
+        format!("llama-gguf:{}@device{device_id}", path.display())
+    } else {
+        format!("llama-gguf:{}", path.display())
+    }
 }
 
 /// Distinguishes `GgufBackend` instances (replicas) of one model. Weights are
@@ -2173,6 +2212,27 @@ impl GgufExternalKvPool {
         guard: Box<dyn Send>,
         usage_bytes: Arc<dyn Fn() -> usize + Send + Sync>,
     ) -> Result<Self, String> {
+        // The descriptor names the engine device; llama.cpp needs the CUDA ordinal.
+        let ordinal = crate::cuda_ordinal::to_cuda_ordinal(geometry.device_id)
+            .map_err(|error| error.to_string())?;
+        // SAFETY: forwarded unchanged from this function's contract.
+        unsafe { Self::from_raw_on_ordinal(geometry, desc, guard, usage_bytes, ordinal) }
+    }
+
+    /// [`Self::from_raw`] with the CUDA ordinal of `geometry.device_id` already
+    /// resolved. `desc.device_id` is checked against the engine id in
+    /// `geometry`, then rewritten to `cuda_ordinal` for llama.cpp.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`Self::from_raw`].
+    unsafe fn from_raw_on_ordinal(
+        geometry: GgufExternalKvPoolGeometry,
+        mut desc: llama_kapsl_kv_pool_desc,
+        guard: Box<dyn Send>,
+        usage_bytes: Arc<dyn Fn() -> usize + Send + Sync>,
+        cuda_ordinal: usize,
+    ) -> Result<Self, String> {
         if desc.device_id as usize != geometry.device_id
             || desc.block_size as usize != geometry.block_size_tokens
             || desc.num_kv_heads as usize != geometry.num_kv_heads
@@ -2213,6 +2273,8 @@ impl GgufExternalKvPool {
         topology
             .validate()
             .map_err(|error| format!("external GGUF KV topology: {error}"))?;
+        desc.device_id = u32::try_from(cuda_ordinal)
+            .map_err(|_| format!("CUDA ordinal {cuda_ordinal} does not fit the descriptor"))?;
         Ok(Self {
             desc: Box::new(desc),
             topology,
@@ -2285,7 +2347,7 @@ impl GgufActiveKvPool {
             }
             let kv_heads = pool.state.handle.pool.num_kv_heads();
             let head_dim = pool.state.handle.pool.head_dim();
-            let device_id = pool.desc.device_id as usize;
+            let device_id = pool.state.device_id;
             let sched = gguf_global_kv_scheduler().lock().unwrap();
             log::debug!(
             "[gguf] idle: device {} pressure={:.2} free_blocks={} ({}h×{}d), cross-device registered=[{}]",
@@ -2439,6 +2501,7 @@ impl GgufSharedKvPool {
         handle: GpuPoolHandle,
         metrics: Arc<Mutex<EngineMetrics>>,
         device_id: usize,
+        cuda_ordinal: usize,
         n_layers: usize,
         ctx_per_seq: usize,
         max_concurrent: usize,
@@ -2497,7 +2560,9 @@ impl GgufSharedKvPool {
         let pool = &state.handle.pool;
         let desc = Box::new(llama_kapsl_kv_pool_desc {
             user_data: state_ptr.cast(),
-            device_id: device_id as u32,
+            // llama.cpp wraps the pool with ggml's CUDA backend, which numbers
+            // devices by CUDA ordinal; the engine id stays in `state.device_id`.
+            device_id: cuda_ordinal as u32,
             block_size: pool.block_size() as u32,
             // Physical block ids are relative to the whole device backing, so
             // GGML's buffer must cover the whole addressable span. Allocation
@@ -2563,7 +2628,7 @@ impl GgufSharedKvPool {
         let fp = inner.model_fingerprint;
         let pool = state.handle.pool.clone();
         let n_layers = state.n_layers;
-        let device_id = self.desc.device_id as usize;
+        let device_id = state.device_id;
         let mut c = match cache.lock() {
             Ok(c) => c,
             Err(_) => return,
@@ -5197,7 +5262,7 @@ impl Engine for GgufBackend {
         let kv_id = gguf_kv_allocation_id(model_path, self.instance_id);
         let mut allocations = allocations_from_placement(
             &placement,
-            &gguf_allocation_id(model_path),
+            &gguf_allocation_id(model_path, self.device_id),
             &kv_id,
             &gguf_scratch_allocation_id(model_path, self.instance_id),
         );
@@ -5230,7 +5295,7 @@ impl Engine for GgufBackend {
         // The device pool's legacy view: CUDA devices only, weights and scratch.
         let allocations = allocations_from_placement(
             &placement,
-            &gguf_allocation_id(model_path),
+            &gguf_allocation_id(model_path, self.device_id),
             &gguf_kv_allocation_id(model_path, self.instance_id),
             &gguf_scratch_allocation_id(model_path, self.instance_id),
         )
@@ -5249,11 +5314,12 @@ impl Engine for GgufBackend {
 
     async fn load(&mut self, model_path: &Path) -> Result<(), EngineError> {
         let model_path_key = gguf_model_key(model_path);
+        let weights_key = gguf_weights_key(model_path, self.device_id);
 
         let cached = gguf_weights_cache()
             .lock()
             .unwrap()
-            .get(&model_path_key)
+            .get(&weights_key)
             .and_then(|w| w.upgrade());
 
         let weights = if let Some(shared) = cached {
@@ -5282,12 +5348,12 @@ impl Engine for GgufBackend {
                 backend: backend_for_load,
                 model: Arc::new(model),
                 n_ctx_train,
-                allocation_id: gguf_allocation_id(&model_path_key),
+                allocation_id: gguf_allocation_id(&model_path_key, self.device_id),
             });
             gguf_weights_cache()
                 .lock()
                 .unwrap()
-                .insert(model_path_key, Arc::downgrade(&arc));
+                .insert(weights_key, Arc::downgrade(&arc));
             arc
         };
 
@@ -5541,6 +5607,8 @@ impl Engine for GgufBackend {
                             handle,
                             self.metrics.clone(),
                             effective_device_id,
+                            crate::cuda_ordinal::to_cuda_ordinal(effective_device_id)
+                                .map_err(|e| EngineError::backend(e.to_string()))?,
                             n_layers,
                             config.ctx_per_seq as usize,
                             config.max_concurrent,
@@ -6244,11 +6312,67 @@ mod tests {
         let geometry = external_test_geometry();
         let descriptor = external_test_descriptor(geometry);
         let pool = unsafe {
-            GgufExternalKvPool::from_raw(geometry, descriptor, Box::new(()), Arc::new(|| 4096))
+            GgufExternalKvPool::from_raw_on_ordinal(
+                geometry,
+                descriptor,
+                Box::new(()),
+                Arc::new(|| 4096),
+                geometry.device_id,
+            )
         }
         .expect("valid runtime-owned descriptor");
         assert_eq!((pool.usage_bytes)(), 4096);
         pool.topology.validate().expect("valid derived topology");
+    }
+
+    #[cfg(feature = "gguf-cuda")]
+    #[test]
+    fn weights_are_keyed_and_charged_per_device() {
+        use super::{gguf_allocation_id, gguf_weights_key};
+        let path = std::path::Path::new("/models/qwen.gguf");
+        // Replicas of one model on different GPUs must not share a loaded model
+        // (it lives on one GPU) nor an allocation id (each device is charged).
+        assert_ne!(gguf_weights_key(path, 0), gguf_weights_key(path, 1));
+        assert_ne!(gguf_allocation_id(path, 0), gguf_allocation_id(path, 1));
+        // Replicas on one device still share.
+        assert_eq!(gguf_weights_key(path, 1), gguf_weights_key(path, 1));
+        assert_eq!(gguf_allocation_id(path, 1), gguf_allocation_id(path, 1));
+        assert!(gguf_allocation_id(path, 1).starts_with("llama-gguf:"));
+    }
+
+    #[cfg(feature = "gguf-external-kv")]
+    #[test]
+    fn external_kv_descriptor_reaches_llama_cpp_with_the_cuda_ordinal() {
+        // Engine device 2 is CUDA ordinal 0 (CUDA_VISIBLE_DEVICES=2): the
+        // descriptor is validated against the engine id, then llama.cpp gets 0.
+        let geometry = external_test_geometry();
+        assert_eq!(geometry.device_id, 2);
+        let descriptor = external_test_descriptor(geometry);
+        assert_eq!(descriptor.device_id, 2);
+        let pool = unsafe {
+            GgufExternalKvPool::from_raw_on_ordinal(
+                geometry,
+                descriptor,
+                Box::new(()),
+                Arc::new(|| 0),
+                0,
+            )
+        }
+        .expect("valid runtime-owned descriptor");
+        assert_eq!(pool.desc.device_id, 0);
+        // A descriptor that names another engine device is still refused.
+        let mut other = external_test_descriptor(geometry);
+        other.device_id = 0;
+        assert!(unsafe {
+            GgufExternalKvPool::from_raw_on_ordinal(
+                geometry,
+                other,
+                Box::new(()),
+                Arc::new(|| 0),
+                0,
+            )
+        }
+        .is_err());
     }
 
     #[cfg(feature = "gguf-external-kv")]

@@ -551,3 +551,100 @@ fn selection_without_a_registered_inventory_says_so() {
     let error = select_cuda_llama_device(&all, &no_pci, 0).unwrap_err();
     assert!(error.contains("no usable PCI bus id"), "{error}");
 }
+
+// ---- device values handed to llama.cpp under CUDA_VISIBLE_DEVICES ----------
+
+use crate::cuda_ordinal::{CudaOrdinalMap, EngineCudaDevice};
+
+/// The engine inventory (NVML, both GPUs) and the llama.cpp device list, which
+/// only holds the CUDA devices this process can see, then the CPU.
+fn two_gpu_engine() -> (Vec<EngineDeviceInfo>, Vec<EngineCudaDevice>) {
+    (
+        vec![engine_cuda(0, NVML_A), engine_cuda(1, NVML_B)],
+        vec![
+            EngineCudaDevice {
+                id: 0,
+                pci_bus_id: Some(NVML_A.into()),
+            },
+            EngineCudaDevice {
+                id: 1,
+                pci_bus_id: Some(NVML_B.into()),
+            },
+        ],
+    )
+}
+
+fn plan_for(engine_id: usize, visible_pci: &[&str]) -> Result<CudaLlamaDevicePlan, String> {
+    let (engine, cuda_engine) = two_gpu_engine();
+    let mut llama: Vec<LlamaDeviceInfo> = visible_pci
+        .iter()
+        .enumerate()
+        .map(|(ordinal, pci)| cuda(&format!("CUDA{ordinal}"), pci))
+        .collect();
+    llama.push(cpu());
+    let pcis: Vec<Option<String>> = visible_pci.iter().map(|p| Some((*p).to_string())).collect();
+    let map = CudaOrdinalMap::build(&cuda_engine, &pcis);
+    let ordinal = map
+        .ordinal_or_error(engine_id)
+        .map_err(|error| error.to_string())?;
+    plan_cuda_llama_devices(&llama, &engine, engine_id, ordinal)
+}
+
+#[test]
+fn cvd1_engine_device_1_is_llama_cuda0_and_ordinal_0_everywhere() {
+    // CUDA_VISIBLE_DEVICES=1: the run-2 crash. ggml has one CUDA device (CUDA0),
+    // so anything still saying "1" (the KV pool's device id) has no buffer type.
+    let plan = plan_for(1, &[PCI_B]).unwrap();
+    assert_eq!(
+        plan,
+        CudaLlamaDevicePlan {
+            llama_device: 0,
+            main_gpu: 0,
+            cuda_ordinal: 0,
+        }
+    );
+    let hidden = plan_for(0, &[PCI_B]).unwrap_err();
+    assert!(hidden.contains("not visible"), "{hidden}");
+}
+
+#[test]
+fn cvd_1_0_swaps_the_two_devices_in_every_value() {
+    // CUDA_VISIBLE_DEVICES=1,0: CUDA0 is the second card, CUDA1 the first.
+    let on_engine_1 = plan_for(1, &[PCI_B, PCI_A]).unwrap();
+    assert_eq!(
+        on_engine_1,
+        CudaLlamaDevicePlan {
+            llama_device: 0,
+            main_gpu: 0,
+            cuda_ordinal: 0,
+        }
+    );
+    let on_engine_0 = plan_for(0, &[PCI_B, PCI_A]).unwrap();
+    assert_eq!(
+        on_engine_0,
+        CudaLlamaDevicePlan {
+            llama_device: 1,
+            main_gpu: 0,
+            cuda_ordinal: 1,
+        }
+    );
+}
+
+#[test]
+fn unmasked_devices_keep_their_own_numbers() {
+    let on_engine_1 = plan_for(1, &[PCI_A, PCI_B]).unwrap();
+    assert_eq!((on_engine_1.llama_device, on_engine_1.cuda_ordinal), (1, 1));
+    let on_engine_0 = plan_for(0, &[PCI_A, PCI_B]).unwrap();
+    assert_eq!((on_engine_0.llama_device, on_engine_0.cuda_ordinal), (0, 0));
+}
+
+#[test]
+fn a_disagreement_between_the_ordinal_map_and_the_llama_name_is_refused() {
+    let (engine, _) = two_gpu_engine();
+    let all = [cuda("CUDA0", PCI_B)];
+    let error = plan_cuda_llama_devices(&all, &engine, 1, 1).unwrap_err();
+    assert!(
+        error.contains("PCI-matched") && error.contains("CUDA0"),
+        "{error}"
+    );
+}

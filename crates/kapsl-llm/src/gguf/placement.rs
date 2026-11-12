@@ -302,6 +302,55 @@ pub fn select_cuda_llama_device(
     ))
 }
 
+/// Every value a CUDA GGUF load hands to llama.cpp to name a device.
+///
+/// They live in three different numbering spaces, and the engine id is none of
+/// them, so none may be filled from it directly:
+/// - `llama_device`: index into ggml's backend device list
+///   (`LlamaModelParams::with_devices`),
+/// - `main_gpu`: index into the device list given to `with_devices`,
+/// - `cuda_ordinal`: the CUDA runtime ordinal, which ggml's CUDA backend uses
+///   as its own device index (`llama_kapsl_kv_pool_desc.device_id` reaches
+///   `ggml_backend_cuda_buffer_from_device_ptr`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CudaLlamaDevicePlan {
+    pub llama_device: usize,
+    pub main_gpu: i32,
+    pub cuda_ordinal: usize,
+}
+
+/// Plan the llama.cpp device values for engine CUDA device `engine_id`.
+/// `cuda_ordinal` is the engine's own mapping of that device
+/// (`cuda_ordinal::to_cuda_ordinal`); the PCI-matched llama device must agree
+/// with it when ggml names its devices `CUDA<n>`, otherwise the two mappings
+/// disagree about which GPU this is and the load is refused.
+pub fn plan_cuda_llama_devices(
+    all: &[LlamaDeviceInfo],
+    engine: &[EngineDeviceInfo],
+    engine_id: usize,
+    cuda_ordinal: usize,
+) -> Result<CudaLlamaDevicePlan, String> {
+    let llama_device = select_cuda_llama_device(all, engine, engine_id)?;
+    let name = &all[llama_device].name;
+    if let Some(named) = name
+        .strip_prefix("CUDA")
+        .and_then(|n| n.parse::<usize>().ok())
+    {
+        if named != cuda_ordinal {
+            return Err(format!(
+                "engine CUDA device {engine_id} is CUDA ordinal {cuda_ordinal}, but its PCI-matched \
+                 llama.cpp device is named {name}"
+            ));
+        }
+    }
+    Ok(CudaLlamaDevicePlan {
+        llama_device,
+        // The model is loaded on exactly one device, listed first.
+        main_gpu: 0,
+        cuda_ordinal,
+    })
+}
+
 /// Measured bytes of one llama device.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DeviceBytes {
