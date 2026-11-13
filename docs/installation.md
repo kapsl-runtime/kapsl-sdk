@@ -2,7 +2,7 @@
 
 ## Requirements
 
-- Python 3.9 or later (CPython)
+- Python 3.10 or later (CPython)
 - A running `kapsl-runtime` instance
 
 ## Install from PyPI
@@ -11,7 +11,7 @@
 pip install kapsl-sdk
 ```
 
-The package ships pre-compiled **abi3 wheels** for Linux (x86_64, aarch64), macOS (x86_64, Apple Silicon), and Windows (x86_64). A single wheel covers Python 3.9 and later — including Python 3.14+ — with no recompilation needed.
+The package ships pre-compiled **abi3 wheels** for Linux (x86_64, aarch64), macOS (x86_64, Apple Silicon), and Windows (x86_64). A single wheel covers Python 3.10 and later — including Python 3.14+ — with no recompilation needed.
 
 ## Install from source
 

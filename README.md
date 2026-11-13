@@ -11,7 +11,7 @@ with synchronous and asynchronous streaming.
 pip install kapsl-sdk
 ```
 
-Pre-compiled abi3 wheels are available for Linux, macOS, and Windows on Python 3.9+.
+Pre-compiled abi3 wheels are available for Linux, macOS, and Windows on Python 3.10+.
 
 The 0.2.0 source requires the matching engine transport update. Older native
 request layouts and SHM protocols are rejected. See the
@@ -103,5 +103,5 @@ client = KapslClient(api_token="your-token")
 
 ## Requirements
 
-- Python 3.9+
+- Python 3.10+
 - A running `kapsl-runtime` instance ([install guide](https://downloads.kapsl.net/install.sh))
