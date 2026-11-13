@@ -43,7 +43,7 @@ jobs:
           python-version: ${{ matrix.python }}
       - name: Set up Rust
         uses: ./.github/actions/setup-rust # zizmor: ignore[self-repository]
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: python-sdk
       - name: Build and install the wheel without optional dependencies
