@@ -281,33 +281,46 @@ fn gguf_timing_record(calls: &AtomicU64, micros: &AtomicU64, start: Instant) {
     micros.fetch_add(gguf_timing_elapsed_us(start), Ordering::Relaxed);
 }
 
+/// Wrap `prompt` in the chat template family guessed from the model's GGUF
+/// identity (`general.name`, `general.architecture`), or return it unchanged
+/// when no family is recognised.
+#[cfg(feature = "gguf")]
+fn gguf_family_prompt(model: &LlamaModel, prompt: String) -> String {
+    let identifiers: Vec<String> = ["general.name", "general.architecture"]
+        .iter()
+        .filter_map(|key| model.meta_val_str(key).ok())
+        .collect();
+    match chat_template_from_model_identifiers(identifiers.iter().map(String::as_str)) {
+        Some(template) => template.render(&prompt),
+        None => prompt,
+    }
+}
+
 #[cfg(feature = "gguf")]
 fn gguf_prepare_prompt(model: &LlamaModel, prompt: String) -> Result<String, EngineError> {
     if prompt.trim().is_empty() || prompt_is_explicitly_formatted(&prompt) {
         return Ok(prompt);
     }
 
-    let template = match model.chat_template(None) {
-        Ok(template) => template,
-        Err(_) => {
-            let identifiers: Vec<String> = ["general.name", "general.architecture"]
-                .iter()
-                .filter_map(|key| model.meta_val_str(key).ok())
-                .collect();
-            if let Some(template) =
-                chat_template_from_model_identifiers(identifiers.iter().map(String::as_str))
-            {
-                return Ok(template.render(&prompt));
-            }
-            return Ok(prompt);
-        }
+    let Ok(template) = model.chat_template(None) else {
+        return Ok(gguf_family_prompt(model, prompt));
     };
     let message = LlamaChatMessage::new("user".to_string(), prompt.clone())
         .map_err(|e| EngineError::backend(format!("chat message build failed: {e}")))?;
 
-    model
-        .apply_chat_template(&template, &[message], true)
-        .map_err(|e| EngineError::backend(format!("chat template apply failed: {e}")))
+    // llama.cpp only renders the templates it recognises. A fine-tune that ships
+    // its own Jinja makes `apply_chat_template` fail with `ffi error -1`; that
+    // must not fail the request, so fall back to the family guess (or the raw
+    // prompt) exactly as for a GGUF with no embedded template.
+    match model.apply_chat_template(&template, &[message], true) {
+        Ok(rendered) => Ok(rendered),
+        Err(e) => {
+            log::warn!(
+                "[gguf] embedded chat template could not be applied ({e}); falling back to the model-family template"
+            );
+            Ok(gguf_family_prompt(model, prompt))
+        }
+    }
 }
 
 #[cfg(feature = "gguf")]
@@ -2012,6 +2025,47 @@ struct ActiveSeq {
     _memory_guard: Option<RequestGuard>,
 }
 
+/// Every token that ends a generation, not just the vocabulary's single EOS id.
+///
+/// GGUF conversions routinely disagree with the model about which id closes a
+/// turn: a chat-tuned model may emit `<|im_end|>` while `tokenizer.ggml.eos_token_id`
+/// names `<|endoftext|>`, or the reverse. llama.cpp already classifies the
+/// end-of-generation tokens (`llama_vocab_is_eog`: EOS, EOT, EOM and the known
+/// turn markers), so the decode loop retires a sequence on any of them. Matching
+/// only the EOS id let the other marker through as literal text, after which the
+/// model carried on writing into a fresh turn.
+#[cfg(feature = "gguf")]
+#[derive(Debug, Clone)]
+struct GgufEndTokens {
+    ids: Vec<LlamaToken>,
+}
+
+#[cfg(feature = "gguf")]
+impl GgufEndTokens {
+    fn from_model(model: &LlamaModel) -> Self {
+        let eos = model.token_eos();
+        let n_vocab = model.n_vocab();
+        let mut ids = vec![eos];
+        ids.extend(
+            (0..n_vocab)
+                .map(LlamaToken::new)
+                .filter(|token| *token != eos && model.is_eog_token(*token)),
+        );
+        Self { ids }
+    }
+
+    fn contains(&self, token: LlamaToken) -> bool {
+        self.ids.contains(&token)
+    }
+
+    fn logit_bias(&self, bias: f32) -> Vec<LlamaLogitBias> {
+        self.ids
+            .iter()
+            .map(|token| LlamaLogitBias::new(*token, bias))
+            .collect()
+    }
+}
+
 #[cfg(feature = "gguf")]
 struct GgufBackendSamplers {
     // One [logit_bias(eos), greedy] chain per slot, installed once and kept for the context
@@ -2020,15 +2074,15 @@ struct GgufBackendSamplers {
     chains: Vec<LlamaSampler>,
     installed_by_seq_id: Vec<bool>,
     mode_by_seq_id: Vec<bool>,
-    eos_token: LlamaToken,
+    end_tokens: GgufEndTokens,
     sample: LlamaSampler,
 }
 
 #[cfg(feature = "gguf")]
 impl GgufBackendSamplers {
-    fn new(model: &LlamaModel, max_concurrent: usize, eos_token: LlamaToken) -> Self {
+    fn new(model: &LlamaModel, max_concurrent: usize, end_tokens: GgufEndTokens) -> Self {
         let n_vocab = model.n_vocab();
-        let eos_bias = [LlamaLogitBias::new(eos_token, 0.0)];
+        let eos_bias = end_tokens.logit_bias(0.0);
         let chains = (0..max_concurrent)
             .map(|_| {
                 LlamaSampler::chain_simple([
@@ -2042,7 +2096,7 @@ impl GgufBackendSamplers {
             chains,
             installed_by_seq_id: vec![false; max_concurrent],
             mode_by_seq_id: vec![false; max_concurrent],
-            eos_token,
+            end_tokens,
             sample: LlamaSampler::greedy(),
         }
     }
@@ -2061,7 +2115,7 @@ impl GgufBackendSamplers {
         };
         if self.mode_by_seq_id[slot] != suppress_eos {
             let bias = if suppress_eos { f32::NEG_INFINITY } else { 0.0 };
-            if !chain.chain_logit_bias_set(0, &[LlamaLogitBias::new(self.eos_token, bias)]) {
+            if !chain.chain_logit_bias_set(0, &self.end_tokens.logit_bias(bias)) {
                 return false;
             }
             self.mode_by_seq_id[slot] = suppress_eos;
@@ -4216,9 +4270,9 @@ fn sequence_needs_kv_after_first(
     max_tokens: i32,
     min_tokens: i32,
     first_tok: LlamaToken,
-    eos_token: LlamaToken,
+    end_tokens: &GgufEndTokens,
 ) -> bool {
-    max_tokens > 1 && !(first_tok == eos_token && min_tokens <= 0)
+    max_tokens > 1 && !(end_tokens.contains(first_tok) && min_tokens <= 0)
 }
 
 #[cfg(feature = "gguf")]
@@ -4248,7 +4302,7 @@ fn finish_or_activate_prefilled_sequence(
     max_tokens: i32,
     min_tokens: i32,
     response: GgufResponse,
-    eos_token: LlamaToken,
+    end_tokens: &GgufEndTokens,
     first_tok: LlamaToken,
     first_piece: Option<&[u8]>,
     suppress_eos_sampler: bool,
@@ -4270,7 +4324,7 @@ fn finish_or_activate_prefilled_sequence(
     let mut output = Vec::with_capacity((max_tokens.max(0) as usize).saturating_mul(4));
     let mut stop_filter = GgufStopFilter::new();
 
-    if max_tokens <= 0 || (first_tok == eos_token && min_tokens <= 0) {
+    if max_tokens <= 0 || (end_tokens.contains(first_tok) && min_tokens <= 0) {
         release_sequence_slot(ctx, available_ids, seq_id);
         drop(memory_guard);
         record_gguf_token_metrics(metrics, prompt_len.max(0) as usize, 0);
@@ -4544,8 +4598,8 @@ fn run_scheduler(
         total_ctx.saturating_mul(config.kv_bytes_per_cell) / (1024 * 1024),
         config.kv_bytes_per_cell
     );
-    let eos_token = model.token_eos();
-    let mut samplers = GgufBackendSamplers::new(&model, config.max_concurrent, eos_token);
+    let end_tokens = GgufEndTokens::from_model(&model);
+    let mut samplers = GgufBackendSamplers::new(&model, config.max_concurrent, end_tokens.clone());
     // Pre-install a sampler for every seq slot up front so the installed-sampler
     // set (and thus the compute-graph topology) is stable from the first decode.
     // `set_sampler` flips `sched_need_reserve`, forcing a worst-case
@@ -4941,9 +4995,9 @@ fn run_scheduler(
             let prompt_len = pref.tokens.len() as i32;
 
             let emits_first_piece =
-                pref.max_tokens > 0 && !(first_tok == eos_token && pref.min_tokens <= 0);
+                pref.max_tokens > 0 && !(end_tokens.contains(first_tok) && pref.min_tokens <= 0);
             let copy_emits_first_piece = pref.copies.iter().any(|copy| {
-                copy.max_tokens > 0 && !(first_tok == eos_token && copy.min_tokens <= 0)
+                copy.max_tokens > 0 && !(end_tokens.contains(first_tok) && copy.min_tokens <= 0)
             });
 
             let first_piece = if emits_first_piece || copy_emits_first_piece {
@@ -4972,7 +5026,7 @@ fn run_scheduler(
                     copy.max_tokens,
                     copy.min_tokens,
                     first_tok,
-                    eos_token,
+                    &end_tokens,
                 ) {
                     if let Err(e) = ctx.copy_kv_cache_seq(
                         pref.seq_id,
@@ -5034,7 +5088,7 @@ fn run_scheduler(
                 pref.max_tokens,
                 pref.min_tokens,
                 pref.response,
-                eos_token,
+                &end_tokens,
                 first_tok,
                 first_piece.as_deref(),
                 suppress_eos_sampler,
@@ -5065,7 +5119,7 @@ fn run_scheduler(
                     copy.max_tokens,
                     copy.min_tokens,
                     copy.response,
-                    eos_token,
+                    &end_tokens,
                     first_tok,
                     first_piece.as_deref(),
                     copy_suppress_eos_sampler,
@@ -5109,7 +5163,7 @@ fn run_scheduler(
             let next_tok = samplers.sample_token(&ctx, batch_pos);
             seq.pos += 1;
 
-            let eos_and_ready = next_tok == eos_token && seq.n_generated >= seq.min_tokens;
+            let eos_and_ready = end_tokens.contains(next_tok) && seq.n_generated >= seq.min_tokens;
             let next_generated = seq.n_generated + 1;
             let max_reached = next_generated >= seq.max_tokens;
             // A chat stop-marker may only retire the sequence once the
@@ -6135,6 +6189,10 @@ impl Engine for GgufBackend {
 #[cfg(all(test, feature = "gguf"))]
 #[path = "scheduler_lifecycle_tests.rs"]
 mod scheduler_lifecycle_tests;
+
+#[cfg(all(test, feature = "gguf"))]
+#[path = "chat_stop_tests.rs"]
+mod chat_stop_tests;
 
 #[cfg(all(test, feature = "gguf"))]
 mod tests {
