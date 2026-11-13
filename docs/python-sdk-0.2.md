@@ -39,7 +39,7 @@ maturin develop --release
 pip install 'grpcio>=1.71.2,<2' 'protobuf>=5.29,<7'
 ```
 
-Released wheels use the CPython 3.9 stable ABI. gRPC is optional; a native-only
+Released wheels use the CPython 3.10 stable ABI. gRPC is optional; a native-only
 installation imports and works without grpcio or protobuf.
 
 ## Request options

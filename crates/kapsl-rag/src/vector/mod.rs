@@ -267,11 +267,13 @@ impl SqliteVectorStore {
             .lock()
             .map_err(|_| VectorStoreError::Db("vector store mutex poisoned".to_string()))?;
 
-        let count: usize = conn.query_row(
+        // rusqlite 0.42 no longer implements `FromSql` for `usize`; COUNT(*) is never negative.
+        let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM rag_chunks WHERE tenant_id = ?1 AND workspace_id = ?2",
             params![request.tenant_id, request.workspace_id],
             |row| row.get(0),
         )?;
+        let count = usize::try_from(count).unwrap_or(0);
         if count < self.ann_threshold {
             return Ok(None);
         }

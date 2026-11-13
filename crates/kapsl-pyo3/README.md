@@ -1,6 +1,6 @@
 # kapsl-sdk
 
-Python clients for Kapsl inference and orchestration. Supports CPython 3.9+
+Python clients for Kapsl inference and orchestration. Supports CPython 3.10+
 through Rust abi3 bindings, with optional gRPC dependencies.
 
 ```bash
