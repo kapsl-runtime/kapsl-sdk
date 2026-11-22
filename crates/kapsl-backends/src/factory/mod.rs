@@ -80,6 +80,30 @@ pub struct OnnxRuntimeTuning {
 
 /// Error for a declared-but-unimplemented engine cell (e.g. ONNX classification).
 /// The triple is valid; there is just no backend yet.
+/// Numeric comparison of dotted versions: `13.0 >= 9.0` (a string compare says
+/// otherwise). Missing trailing parts count as zero. Either side failing to
+/// parse is a failed requirement (fail closed).
+pub(crate) fn cuda_version_at_least(device_version: &str, min_version: &str) -> bool {
+    fn parse(version: &str) -> Option<Vec<u64>> {
+        version
+            .trim()
+            .split('.')
+            .map(|part| part.trim().parse::<u64>().ok())
+            .collect()
+    }
+    let (Some(device), Some(min)) = (parse(device_version), parse(min_version)) else {
+        return false;
+    };
+    for i in 0..device.len().max(min.len()) {
+        let d = device.get(i).copied().unwrap_or(0);
+        let m = min.get(i).copied().unwrap_or(0);
+        if d != m {
+            return d > m;
+        }
+    }
+    true
+}
+
 fn unimplemented_engine_error(kind: EngineKind) -> String {
     format!(
         "model kind `{}` is declared but not yet implemented by a backend",
@@ -1058,7 +1082,7 @@ impl BackendFactory {
                     if backend_key == "cuda" {
                         if let Some(min_ver) = &requirements.min_cuda_version {
                             if let Some(dev_ver) = &device.cuda_version {
-                                if dev_ver < min_ver {
+                                if !cuda_version_at_least(dev_ver, min_ver) {
                                     return false;
                                 }
                             } else {
@@ -1111,7 +1135,7 @@ impl BackendFactory {
                 if backend_key == "cuda" {
                     if let Some(min_ver) = &requirements.min_cuda_version {
                         if let Some(dev_ver) = &device.cuda_version {
-                            if dev_ver < min_ver {
+                            if !cuda_version_at_least(dev_ver, min_ver) {
                                 reasons.push(format!(
                                     "CUDA version too old: {} < required {}",
                                     dev_ver, min_ver
