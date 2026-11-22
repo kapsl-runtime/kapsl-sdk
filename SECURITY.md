@@ -23,6 +23,12 @@ Three informational RustSec notices are explicitly tracked:
   version. It is pulled in through `serde_yaml` 0.9.34. `kapsl-core` exposes
   `serde_yaml` types in its public API, so replacing it is a semver-breaking
   change. Tracked in kapsl-runtime/kapsl-sdk#172.
+- `RUSTSEC-2026-0543`: `chrono` is unmaintained and has no patched version. It
+  is pulled in through `cron` 0.12 in `kapsl-scheduler`; the advisory reports
+  no vulnerability. Replacing it means replacing the cron parser.
+- `RUSTSEC-2026-0542`: `humantime` is unmaintained. It is reachable only as a
+  development dependency (`env_logger` 0.10 in `kapsl-llm` tests) and is not
+  linked into release builds.
 
 The audit script ignores only these three reviewed notices so any new warning is
 still a CI failure.
