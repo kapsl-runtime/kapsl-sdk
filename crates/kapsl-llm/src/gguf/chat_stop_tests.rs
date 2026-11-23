@@ -44,9 +44,33 @@ fn request(prompt: &str, max_new_tokens: u32) -> InferenceRequest {
 }
 
 async fn reply(path: &Path, prompt: &str, max_new_tokens: u32) -> Result<String, EngineError> {
+    reply_with_min(path, prompt, max_new_tokens, None).await
+}
+
+async fn reply_with_min(
+    path: &Path,
+    prompt: &str,
+    max_new_tokens: u32,
+    min_new_tokens: Option<u32>,
+) -> Result<String, EngineError> {
+    reply_sampled(path, prompt, max_new_tokens, min_new_tokens, None).await
+}
+
+async fn reply_sampled(
+    path: &Path,
+    prompt: &str,
+    max_new_tokens: u32,
+    min_new_tokens: Option<u32>,
+    temperature: Option<f32>,
+) -> Result<String, EngineError> {
     let mut backend = GgufBackend::new();
     backend.load(path).await?;
-    let packet = backend.infer(&request(prompt, max_new_tokens));
+    let mut request = request(prompt, max_new_tokens);
+    if let Some(metadata) = request.metadata.as_mut() {
+        metadata.min_new_tokens = min_new_tokens;
+        metadata.temperature = temperature;
+    }
+    let packet = backend.infer(&request);
     // Release the weights before the process exits: ggml's Metal teardown aborts
     // when a model is still resident at exit.
     backend.unload();
@@ -136,4 +160,52 @@ async fn chat_stop_unrenderable_embedded_template_falls_back_to_the_family_templ
     .expect("an unrenderable template must not fail the request");
     assert!(text.contains("15"), "unexpected answer: {text:?}");
     assert!(!text.contains("<|"), "turn marker leaked: {text:?}");
+}
+
+/// Run 9, check l: a CUDA GGUF answered `What is 5 times 3?` with 16 bytes (`5 times 3 is 15.`) to a request
+/// with `min_new_tokens=20`. This is the same request on the CPU sampler, the half of the path the engine's
+/// native route reaches after the adapter. A token is at least one byte, so 20 tokens are at least 20 bytes.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs KAPSL_TEST_GGUF (real GGUF, CPU)"]
+async fn chat_stop_min_new_tokens_holds_against_the_end_token() {
+    let path = model_path("KAPSL_TEST_GGUF");
+    let control = reply_with_min(&path, "What is 5 times 3?", 64, None)
+        .await
+        .expect("control infer");
+    assert!(
+        !control.contains("<|"),
+        "turn marker leaked in the control: {control:?}"
+    );
+    let held = reply_with_min(&path, "What is 5 times 3?", 64, Some(20))
+        .await
+        .expect("infer with min_new_tokens");
+    eprintln!("control ({} bytes): {control:?}", control.len());
+    eprintln!("min_new_tokens=20 ({} bytes): {held:?}", held.len());
+    assert!(
+        held.len() >= 20,
+        "min_new_tokens=20 produced {} bytes: {held:?}",
+        held.len()
+    );
+    assert!(!held.contains("<|"), "turn marker leaked: {held:?}");
+}
+
+/// The request run 9 posted: `temperature: 0` (greedy) with `min_tokens=20`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs KAPSL_TEST_GGUF (real GGUF, CPU)"]
+async fn chat_stop_min_new_tokens_holds_when_sampling_greedily() {
+    let path = model_path("KAPSL_TEST_GGUF");
+    let control = reply_sampled(&path, "What is 5 times 3?", 64, None, Some(0.0))
+        .await
+        .expect("greedy control");
+    let held = reply_sampled(&path, "What is 5 times 3?", 64, Some(20), Some(0.0))
+        .await
+        .expect("greedy infer with min_new_tokens");
+    eprintln!("greedy control ({} bytes): {control:?}", control.len());
+    eprintln!("greedy min_new_tokens=20 ({} bytes): {held:?}", held.len());
+    assert!(
+        held.len() >= 20,
+        "greedy min_new_tokens=20 produced {} bytes: {held:?}",
+        held.len()
+    );
+    assert!(!held.contains("<|"), "turn marker leaked: {held:?}");
 }
