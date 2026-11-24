@@ -22,13 +22,13 @@ use cudarc::driver::{
     DeviceSlice, ValidAsZeroBits,
 };
 #[cfg(feature = "cuda")]
-use std::cell::{Cell, UnsafeCell};
+use std::cell::Cell;
 #[cfg(feature = "cuda")]
 use std::collections::{BTreeMap, HashMap, HashSet};
 #[cfg(feature = "cuda")]
 use std::ops::{Deref, DerefMut};
 #[cfg(feature = "cuda")]
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(feature = "cuda")]
 use std::sync::{Arc, Mutex};
 
@@ -370,6 +370,12 @@ impl PoolPolicy {
         self.quota_for_workload(owner.workload())
     }
 
+    /// Whether this owner's workload is admitted, across allocation classes.
+    /// Quotas and outstanding borrowed allocations do not imply admission.
+    pub fn is_admitted(&self, owner: PoolOwner) -> bool {
+        self.admitted.contains(&owner.workload())
+    }
+
     fn quota_for_workload(&self, workload: PoolWorkload) -> OwnerQuota {
         self.quotas.get(&workload).copied().unwrap_or(OwnerQuota {
             guaranteed_bytes: 0,
@@ -645,329 +651,55 @@ fn build_device_pool_snapshot(
     }
 }
 
-/// One stable backing allocation and byte-range allocator for a CUDA device.
 #[cfg(feature = "cuda")]
-static NEXT_DEVICE_POOL_ID: AtomicU64 = AtomicU64::new(1);
-
-#[cfg(feature = "cuda")]
-pub struct GpuDevicePool {
+fn allocate_initialized(
     pool_id: u64,
-    device: Arc<CudaDevice>,
-    // Kept optional so Drop can release the cudaMallocAsync allocation before
-    // trimming CUDA's default memory pool. CudaSlice::drop alone returns the
-    // range to that pool, but the driver is free to retain the physical pages.
-    storage: UnsafeCell<Option<CudaSlice<u8>>>,
-    allocator: Mutex<AlignedRangeAllocator>,
-    policy: Mutex<PoolPolicy>,
+    policy: &mut PoolPolicy,
+    allocator: &mut AlignedRangeAllocator,
+    owner: PoolOwner,
+    bytes: usize,
+    alignment: usize,
+    initialize: impl FnOnce(&GpuAllocation) -> Result<(), ArenaError>,
+) -> Result<GpuAllocation, ArenaError> {
+    if bytes == 0 || alignment == 0 {
+        return Err(ArenaError::InvalidAllocationRequest);
+    }
+    let available = policy.available_for(owner, allocator.free_bytes());
+    if bytes > available {
+        return Err(ArenaError::QuotaExceeded {
+            owner,
+            requested: bytes,
+            available,
+        });
+    }
+    let allocation = allocator
+        .alloc(pool_id, owner, bytes, alignment)
+        .ok_or(ArenaError::Oom {
+            requested: bytes,
+            available: allocator.free_bytes(),
+        })?;
+    policy.account_alloc(owner, bytes);
+    if owner.class() == PoolAllocationClass::KvCache {
+        // Initialization may have submitted writes before reporting failure.
+        // Keep the range and charge on failure so another owner cannot reuse
+        // memory while those writes may still be pending. Pool destruction
+        // releases the backing allocation.
+        initialize(&allocation)?;
+    }
+    Ok(allocation)
 }
 
 #[cfg(feature = "cuda")]
-impl std::fmt::Debug for GpuDevicePool {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GpuDevicePool")
-            .field("capacity_bytes", &self.capacity_bytes())
-            .field("free_bytes", &self.free_bytes())
-            .finish()
-    }
-}
-
-// SAFETY: the allocator assigns non-overlapping extents. Consumers may mutate
-// only extents they own, and the backing CudaSlice remains pinned for the pool
-// lifetime.
+#[path = "gpu_arena_region.rs"]
+pub mod arena_region;
 #[cfg(feature = "cuda")]
-unsafe impl Send for GpuDevicePool {}
+pub use arena_region::GpuArenaRegion;
+
+/// Compatibility name for the single-arena allocator. The future common
+/// device-pool facade will have a distinct API; existing base-pointer views
+/// continue to refer to this exact arena type.
 #[cfg(feature = "cuda")]
-unsafe impl Sync for GpuDevicePool {}
-
-#[cfg(feature = "cuda")]
-impl GpuDevicePool {
-    pub fn new(device: Arc<CudaDevice>, capacity_bytes: usize) -> Result<Self, ArenaError> {
-        if capacity_bytes == 0 {
-            return Err(ArenaError::InvalidAllocationRequest);
-        }
-        let storage = device.alloc_zeros::<u8>(capacity_bytes)?;
-        log::info!(
-            "GPU device pool allocated: {} MiB",
-            capacity_bytes / (1024 * 1024)
-        );
-        Ok(Self {
-            pool_id: NEXT_DEVICE_POOL_ID.fetch_add(1, Ordering::Relaxed),
-            device,
-            storage: UnsafeCell::new(Some(storage)),
-            allocator: Mutex::new(AlignedRangeAllocator::new(capacity_bytes)),
-            policy: Mutex::new(PoolPolicy::new(capacity_bytes)),
-        })
-    }
-
-    pub fn alloc(
-        &self,
-        owner: PoolOwner,
-        bytes: usize,
-        alignment: usize,
-    ) -> Result<GpuAllocation, ArenaError> {
-        if bytes == 0 || alignment == 0 {
-            return Err(ArenaError::InvalidAllocationRequest);
-        }
-        // Policy is always locked before allocator throughout this type.
-        let mut policy = self.policy.lock().unwrap();
-        let mut allocator = self.allocator.lock().unwrap();
-        let available = policy.available_for(owner, allocator.free_bytes());
-        if bytes > available {
-            return Err(ArenaError::QuotaExceeded {
-                owner,
-                requested: bytes,
-                available,
-            });
-        }
-        let allocation = allocator
-            .alloc(self.pool_id, owner, bytes, alignment)
-            .ok_or(ArenaError::Oom {
-                requested: bytes,
-                available: allocator.free_bytes(),
-            })?;
-        policy.account_alloc(owner, bytes);
-
-        // KV extents can move between sessions, models, and replicas while the
-        // process stays alive. Clear them synchronously before publishing the
-        // new ownership so stale cache contents can never be observed through
-        // a newly allocated block or an external raw pointer.
-        if owner.class() == PoolAllocationClass::KvCache {
-            if let Err(error) = self.zero_allocation_sync(&allocation) {
-                allocator
-                    .free(&allocation)
-                    .expect("fresh allocation must remain live during rollback");
-                policy.account_free(owner, bytes);
-                return Err(error);
-            }
-        }
-        Ok(allocation)
-    }
-
-    fn zero_allocation_sync(&self, allocation: &GpuAllocation) -> Result<(), ArenaError> {
-        self.device.bind_to_thread()?;
-        let device_ptr =
-            self.allocation_ptr(allocation) as usize as cudarc::driver::sys::CUdeviceptr;
-        // SAFETY: `allocation` is still live in this pool, its full byte range
-        // is exclusively owned by the allocating caller, and an all-zero bit
-        // pattern is valid for KV storage. The synchronous driver operation
-        // completes before the allocation is returned to its new owner.
-        unsafe { result::memset_d8_sync(device_ptr, 0, allocation.bytes())? };
-        Ok(())
-    }
-
-    pub fn free(&self, allocation: GpuAllocation) -> Result<(), ArenaError> {
-        let mut policy = self.policy.lock().unwrap();
-        let mut allocator = self.allocator.lock().unwrap();
-        allocator.free(&allocation)?;
-        policy.account_free(allocation.owner, allocation.bytes);
-        Ok(())
-    }
-
-    pub fn set_owner_quota(
-        &self,
-        owner: PoolOwner,
-        guaranteed_bytes: usize,
-        max_bytes: usize,
-    ) -> Result<(), ArenaError> {
-        let mut policy = self.policy.lock().unwrap();
-        let allocator = self.allocator.lock().unwrap();
-        let workload = owner.workload();
-        let previous = policy.quotas.get(&workload).copied();
-        policy.set_quota(owner, guaranteed_bytes, max_bytes)?;
-        if policy.unmet_reservations() > allocator.free_bytes() {
-            if let Some(previous) = previous {
-                policy.quotas.insert(workload, previous);
-            } else {
-                policy.quotas.remove(&workload);
-            }
-            return Err(ArenaError::QuotaExceeded {
-                owner,
-                requested: guaranteed_bytes,
-                available: allocator.free_bytes(),
-            });
-        }
-        Ok(())
-    }
-
-    pub fn set_owner_admitted(&self, owner: PoolOwner, admitted: bool) -> Result<(), ArenaError> {
-        let mut policy = self.policy.lock().unwrap();
-        let allocator = self.allocator.lock().unwrap();
-        let workload = owner.workload();
-        let usage = policy.workload_usage_bytes(workload);
-        if !admitted && usage != 0 {
-            return Err(ArenaError::OwnerInUse { owner, usage });
-        }
-        let was_admitted = policy.admitted.contains(&workload);
-        let previous_owner = policy.admission_owners.get(&workload).copied();
-        policy.set_admitted(owner, admitted);
-        if admitted && policy.unmet_reservations() > allocator.free_bytes() {
-            if was_admitted {
-                policy.admitted.insert(workload);
-                if let Some(previous_owner) = previous_owner {
-                    policy.admission_owners.insert(workload, previous_owner);
-                }
-            } else {
-                policy.admitted.remove(&workload);
-                policy.admission_owners.remove(&workload);
-            }
-            return Err(ArenaError::QuotaExceeded {
-                owner,
-                requested: policy.quota(owner).guaranteed_bytes,
-                available: allocator.free_bytes(),
-            });
-        }
-        Ok(())
-    }
-
-    pub fn owner_usage_bytes(&self, owner: PoolOwner) -> usize {
-        self.policy.lock().unwrap().usage_bytes(owner)
-    }
-
-    /// Aggregate bytes owned by all allocation classes for this model replica.
-    pub fn workload_usage_bytes(&self, owner: PoolOwner) -> usize {
-        self.policy
-            .lock()
-            .unwrap()
-            .workload_usage_bytes(owner.workload())
-    }
-
-    pub fn owner_quota(&self, owner: PoolOwner) -> OwnerQuota {
-        self.policy.lock().unwrap().quota(owner)
-    }
-
-    pub fn free_bytes(&self) -> usize {
-        self.allocator.lock().unwrap().free_bytes()
-    }
-
-    /// Capture pool geometry, allocation, fragmentation, and per-owner policy
-    /// state from one instant.
-    ///
-    /// Policy is locked before the allocator, matching all pool operations, so
-    /// owner usage and live ranges cannot come from different mutations.
-    pub fn snapshot(&self) -> GpuDevicePoolSnapshot {
-        let policy = self.policy.lock().unwrap();
-        let allocator = self.allocator.lock().unwrap();
-        build_device_pool_snapshot(&policy, &allocator)
-    }
-
-    /// Maximum number of `unit_bytes` allocations currently possible for an
-    /// owner, including quota/reservation checks and alignment fragmentation.
-    pub fn max_allocatable(&self, owner: PoolOwner, unit_bytes: usize, alignment: usize) -> usize {
-        if unit_bytes == 0 || alignment == 0 {
-            return 0;
-        }
-        let policy = self.policy.lock().unwrap();
-        let allocator = self.allocator.lock().unwrap();
-        let quota_count = policy.available_for(owner, allocator.free_bytes()) / unit_bytes;
-        quota_count.min(allocator.max_allocatable_units(unit_bytes, alignment))
-    }
-
-    pub fn base_ptr(&self) -> *mut std::ffi::c_void {
-        let storage = unsafe { &*self.storage.get() }
-            .as_ref()
-            .expect("live GPU device pool storage");
-        *storage.device_ptr() as *mut std::ffi::c_void
-    }
-
-    pub fn allocation_ptr(&self, allocation: &GpuAllocation) -> *mut std::ffi::c_void {
-        debug_assert_eq!(allocation.pool_id, self.pool_id);
-        (self.base_ptr() as usize + allocation.offset) as *mut std::ffi::c_void
-    }
-
-    pub fn capacity_bytes(&self) -> usize {
-        let storage = unsafe { &*self.storage.get() }
-            .as_ref()
-            .expect("live GPU device pool storage");
-        storage.len()
-    }
-
-    pub fn device(&self) -> &Arc<CudaDevice> {
-        &self.device
-    }
-
-    fn f16_storage(&self) -> CudaView<'_, half::f16> {
-        let storage = unsafe { &*self.storage.get() }
-            .as_ref()
-            .expect("live GPU device pool storage");
-        // CUDA allocations are sufficiently aligned for f16; a trailing odd
-        // byte, if any, is intentionally not exposed through the typed view.
-        unsafe { storage.transmute(storage.len() / std::mem::size_of::<half::f16>()) }
-            .expect("f16 view fits device pool")
-    }
-
-    /// # Safety
-    /// The caller must write only extents allocated to it. Multiple mutable
-    /// views may coexist because ownership is enforced by the range allocator.
-    unsafe fn f16_storage_mut(&self) -> CudaViewMut<'_, half::f16> {
-        let storage = unsafe { &mut *self.storage.get() }
-            .as_mut()
-            .expect("live GPU device pool storage");
-        let len = storage.len() / std::mem::size_of::<half::f16>();
-        unsafe { storage.transmute_mut(len) }.expect("f16 view fits device pool")
-    }
-}
-
-#[cfg(feature = "cuda")]
-impl Drop for GpuDevicePool {
-    fn drop(&mut self) {
-        let capacity = unsafe { &mut *self.storage.get() }
-            .take()
-            .map(|storage| {
-                let capacity = storage.len();
-                // On memory-pool-capable devices this enqueues cudaFreeAsync.
-                drop(storage);
-                capacity
-            })
-            .unwrap_or(0);
-
-        if capacity == 0 {
-            return;
-        }
-        if let Err(error) = self.device.synchronize() {
-            log::warn!(
-                "GPU device pool released {} bytes but could not synchronize before trimming CUDA's default memory pool: {}",
-                capacity,
-                error
-            );
-            return;
-        }
-
-        let memory_pools_supported = self
-            .device
-            .attribute(
-                cudarc::driver::sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED,
-            )
-            .map(|supported| supported > 0)
-            .unwrap_or(false);
-        if !memory_pools_supported {
-            log::info!(
-                "GPU device pool backing released: {} MiB",
-                capacity / (1024 * 1024)
-            );
-            return;
-        }
-
-        let trim_result = unsafe {
-            use cudarc::driver::sys;
-
-            let mut default_pool = std::ptr::null_mut();
-            sys::lib()
-                .cuDeviceGetDefaultMemPool(&mut default_pool, *self.device.cu_device())
-                .result()
-                .and_then(|()| sys::lib().cuMemPoolTrimTo(default_pool, 0).result())
-        };
-        match trim_result {
-            Ok(()) => log::info!(
-                "GPU device pool backing released and CUDA default memory pool trimmed: {} MiB",
-                capacity / (1024 * 1024)
-            ),
-            Err(error) => log::warn!(
-                "GPU device pool backing released, but CUDA default memory pool trim failed: {}",
-                error
-            ),
-        }
-    }
-}
+pub type GpuDevicePool = GpuArenaRegion;
 
 // ─── Pool-backed typed buffers ─────────────────────────────────────────────
 
@@ -2283,3 +2015,11 @@ mod tests {
         assert_eq!(pool.capacity_bytes(), 8 * 256);
     }
 }
+
+#[cfg(all(test, feature = "cuda"))]
+#[path = "gpu_arena_initialization_tests.rs"]
+mod initialization_tests;
+
+#[cfg(all(test, feature = "cuda"))]
+#[path = "gpu_arena_admission_tests.rs"]
+mod admission_tests;

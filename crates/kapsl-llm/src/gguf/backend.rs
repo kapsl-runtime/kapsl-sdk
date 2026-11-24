@@ -1,12 +1,16 @@
 //! GGUF inference through llama.cpp with optional shared-KV integration.
 
 #[cfg(feature = "gguf")]
+use crate::gguf_placement::{
+    allocation_id_for, engine_devices, place_bytes, plan_rows, DeviceBytes, EngineDeviceInfo,
+    LlamaDeviceInfo, LlamaDeviceKind, PlacementReport, PlanInput,
+};
+#[cfg(feature = "gguf")]
 use crate::gguf_sequence_admission::{GgufSequenceAdmission, RequestAdmission, RequestGuard};
 #[cfg(feature = "gguf")]
 use crate::prompt_adapter::{chat_template_from_model_identifiers, prompt_is_explicitly_formatted};
 use async_stream::stream;
 use async_trait::async_trait;
-#[cfg(feature = "gguf")]
 use kapsl_engine_api::{
     BatchingPolicy, EngineModelInfo, ExternalDeviceMemory, ExternalDeviceMemoryReport,
     MemoryAllocation, MemoryAllocationClass, MemoryAllocationSource, MemoryDomain, MemoryReport,
@@ -155,6 +159,23 @@ fn n_ctx_per_seq() -> u32 {
         .unwrap_or(N_CTX_PER_SEQ_DEFAULT)
 }
 
+/// llama.cpp device values for engine CUDA device `engine_id` (see
+/// [`crate::gguf_placement::CudaLlamaDevicePlan`]).
+#[cfg(feature = "gguf-cuda")]
+fn gguf_cuda_device_plan(
+    engine_id: usize,
+) -> Result<crate::gguf_placement::CudaLlamaDevicePlan, EngineError> {
+    let ordinal = crate::cuda_ordinal::to_cuda_ordinal(engine_id)
+        .map_err(|error| EngineError::backend(error.to_string()))?;
+    crate::gguf_placement::plan_cuda_llama_devices(
+        &llama_device_list(),
+        &engine_devices(),
+        engine_id,
+        ordinal,
+    )
+    .map_err(|error| EngineError::backend(format!("select llama.cpp CUDA device: {error}")))
+}
+
 #[cfg(feature = "gguf")]
 fn gguf_model_params(device_id: usize) -> Result<LlamaModelParams, EngineError> {
     let mut params = LlamaModelParams::default();
@@ -167,21 +188,11 @@ fn gguf_model_params(device_id: usize) -> Result<LlamaModelParams, EngineError> 
     };
     #[cfg(feature = "gguf-cuda")]
     {
-        let selected = llama_cpp_2::list_llama_ggml_backend_devices()
-            .into_iter()
-            .filter(|device| {
-                device.device_type == llama_cpp_2::LlamaBackendDeviceType::Gpu
-                    && device.backend.eq_ignore_ascii_case("cuda")
-            })
-            .nth(device_id)
-            .ok_or_else(|| {
-                EngineError::backend(format!(
-                    "llama.cpp CUDA device {device_id} is not available"
-                ))
-            })?;
+        let plan = gguf_cuda_device_plan(device_id)?;
         params = params
-            .with_devices(&[selected.index])
-            .map_err(|error| EngineError::backend(format!("select llama.cpp device: {error}")))?;
+            .with_devices(&[plan.llama_device])
+            .map_err(|error| EngineError::backend(format!("select llama.cpp device: {error}")))?
+            .with_main_gpu(plan.main_gpu);
     }
     #[cfg(not(feature = "gguf-cuda"))]
     let _ = device_id;
@@ -270,33 +281,46 @@ fn gguf_timing_record(calls: &AtomicU64, micros: &AtomicU64, start: Instant) {
     micros.fetch_add(gguf_timing_elapsed_us(start), Ordering::Relaxed);
 }
 
+/// Wrap `prompt` in the chat template family guessed from the model's GGUF
+/// identity (`general.name`, `general.architecture`), or return it unchanged
+/// when no family is recognised.
+#[cfg(feature = "gguf")]
+fn gguf_family_prompt(model: &LlamaModel, prompt: String) -> String {
+    let identifiers: Vec<String> = ["general.name", "general.architecture"]
+        .iter()
+        .filter_map(|key| model.meta_val_str(key).ok())
+        .collect();
+    match chat_template_from_model_identifiers(identifiers.iter().map(String::as_str)) {
+        Some(template) => template.render(&prompt),
+        None => prompt,
+    }
+}
+
 #[cfg(feature = "gguf")]
 fn gguf_prepare_prompt(model: &LlamaModel, prompt: String) -> Result<String, EngineError> {
     if prompt.trim().is_empty() || prompt_is_explicitly_formatted(&prompt) {
         return Ok(prompt);
     }
 
-    let template = match model.chat_template(None) {
-        Ok(template) => template,
-        Err(_) => {
-            let identifiers: Vec<String> = ["general.name", "general.architecture"]
-                .iter()
-                .filter_map(|key| model.meta_val_str(key).ok())
-                .collect();
-            if let Some(template) =
-                chat_template_from_model_identifiers(identifiers.iter().map(String::as_str))
-            {
-                return Ok(template.render(&prompt));
-            }
-            return Ok(prompt);
-        }
+    let Ok(template) = model.chat_template(None) else {
+        return Ok(gguf_family_prompt(model, prompt));
     };
     let message = LlamaChatMessage::new("user".to_string(), prompt.clone())
         .map_err(|e| EngineError::backend(format!("chat message build failed: {e}")))?;
 
-    model
-        .apply_chat_template(&template, &[message], true)
-        .map_err(|e| EngineError::backend(format!("chat template apply failed: {e}")))
+    // llama.cpp only renders the templates it recognises. A fine-tune that ships
+    // its own Jinja makes `apply_chat_template` fail with `ffi error -1`; that
+    // must not fail the request, so fall back to the family guess (or the raw
+    // prompt) exactly as for a GGUF with no embedded template.
+    match model.apply_chat_template(&template, &[message], true) {
+        Ok(rendered) => Ok(rendered),
+        Err(e) => {
+            log::warn!(
+                "[gguf] embedded chat template could not be applied ({e}); falling back to the model-family template"
+            );
+            Ok(gguf_family_prompt(model, prompt))
+        }
+    }
 }
 
 #[cfg(feature = "gguf")]
@@ -451,6 +475,95 @@ fn estimate_kv_bytes_per_cell(model: &LlamaModel) -> usize {
         * n_head_kv
         * (head_dim_k + head_dim_v)
         * std::mem::size_of::<u16>()
+}
+
+/// Shape inputs of llama.cpp's worst-case compute-buffer reservation.
+#[cfg(feature = "gguf")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ComputeBufferShape {
+    n_vocab: usize,
+    n_embd: usize,
+    n_ff: usize,
+    /// Tokens per micro-batch (`n_ubatch`); the reserve graph is built for this
+    /// many tokens, every one of which may be an output row.
+    n_ubatch: usize,
+    /// Total context cells (`n_ctx` = `n_seq_max` * context per sequence).
+    n_ctx: usize,
+}
+
+/// Estimates the per-context device compute buffer llama.cpp reserves, in bytes.
+///
+/// ```text
+/// bytes = (8*n_vocab*n_ubatch + 4*(n_embd + n_ff)*n_ubatch + 256*n_ctx) * 17/16
+/// ```
+///
+/// * `8 * n_vocab * n_ubatch`: with backend sampling every sequence slot is
+///   sampled on-device, so the reserve graph holds the f32 logits for all
+///   `n_ubatch` rows plus the sampler's working copy (2 x 4 bytes per logit).
+///   This is >98% of the buffer for the Qwen2.5 family (151,936-token vocab).
+/// * `4 * (n_embd + n_ff) * n_ubatch`: one f32 hidden and FFN activation row per
+///   token. An upper bound; measured activations are 13 KB/token (0.5B) and
+///   18 KB/token (3B) against 23 KB and 52 KB here.
+/// * `256 * n_ctx`: attention mask / position bookkeeping, fitted (~230 B/cell).
+/// * `17/16`: 6.25% headroom so the estimate stays an upper bound across
+///   backends. The measured buffer replaces the estimate after load.
+///
+/// Error against measurements (kapsl llama.cpp fork, Qwen2.5 Q4_K_M, buffer read
+/// from `LlamaContext::device_compute_memory` after the scheduler reserve; see
+/// `COMPUTE_BUFFER_MEASUREMENTS` in the tests and `docs/gguf-memory-accounting.md`):
+///
+/// * Metal, 0.5B and 3B, `n_ubatch` 136..1032, `n_ctx` 4096..65536: the raw
+///   formula is +1.0% to +5.3% above measured, the planned value (with margin)
+///   +7.3% to +11.9%. The 3B overshoot comes from the activation upper bound.
+/// * CUDA (RTX 3090, 0.5B, 616.26 MiB): the run's `KAPSL_GGUF_*` settings were
+///   not recorded; assuming defaults (`n_ubatch` 544, `n_ctx` 65536) the raw
+///   formula is +6.9% and the planned value +13.5%. CUDA is not yet measured
+///   for 3B; re-run `tests/gguf_memory_probe.rs` on a GPU box to confirm.
+#[cfg(feature = "gguf")]
+fn estimate_compute_buffer_bytes(shape: ComputeBufferShape) -> usize {
+    const MIN_BYTES: usize = 64 * 1024 * 1024;
+    let logits = 8usize
+        .saturating_mul(shape.n_vocab)
+        .saturating_mul(shape.n_ubatch);
+    let activations = 4usize
+        .saturating_mul(shape.n_embd.saturating_add(shape.n_ff))
+        .saturating_mul(shape.n_ubatch);
+    let context = 256usize.saturating_mul(shape.n_ctx);
+    let raw = logits.saturating_add(activations).saturating_add(context);
+    (raw.saturating_add(raw / 16)).max(MIN_BYTES)
+}
+
+/// Planned compute-buffer bytes for the context `run_scheduler` will create.
+/// Falls back to the legacy `max(file_size / 8, 256 MiB)` guess when the GGUF
+/// header cannot be read, so planning never fails on account of the estimate.
+#[cfg(feature = "gguf")]
+fn planned_gguf_scratch_bytes(model_path: &Path, file_bytes: usize) -> usize {
+    let legacy = (file_bytes / 8).max(256 * 1024 * 1024);
+    let config = match kapsl_loader::gguf_loader::GgufFile::open(model_path)
+        .and_then(|file| file.extract_config())
+    {
+        Ok(config) => config,
+        Err(error) => {
+            log::warn!(
+                "[gguf] cannot read GGUF config for compute-buffer planning ({error}); \
+                 using file-size heuristic"
+            );
+            return legacy;
+        }
+    };
+    let max_concurrent = max_concurrent().max(1);
+    let ctx_per_seq = n_ctx_per_seq()
+        .min(config.max_position_embeddings as u32)
+        .max(1) as usize;
+    // Mirrors `GgufServingConfig::{from_model, n_batch}`.
+    let prefill_chunk = gguf_prefill_chunk_size().min(ctx_per_seq).max(1);
+    estimate_compute_buffer_bytes(ComputeBufferShape {
+        n_vocab: config.vocab_size,
+        n_embd: config.hidden_size,
+        n_ff: config.intermediate_size,
+        n_ubatch: prefill_chunk.saturating_add(max_concurrent),
+        n_ctx: max_concurrent.saturating_mul(ctx_per_seq),
+    })
 }
 
 #[cfg(feature = "gguf")]
@@ -744,12 +857,12 @@ struct GgufWeights {
 
 #[cfg(feature = "gguf")]
 static GGUF_WEIGHTS_CACHE: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, std::sync::Weak<GgufWeights>>>,
+    std::sync::Mutex<std::collections::HashMap<GgufWeightsKey, std::sync::Weak<GgufWeights>>>,
 > = std::sync::OnceLock::new();
 
 #[cfg(feature = "gguf")]
 fn gguf_weights_cache() -> &'static std::sync::Mutex<
-    std::collections::HashMap<std::path::PathBuf, std::sync::Weak<GgufWeights>>,
+    std::collections::HashMap<GgufWeightsKey, std::sync::Weak<GgufWeights>>,
 > {
     GGUF_WEIGHTS_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
@@ -759,9 +872,163 @@ fn gguf_model_key(model_path: &Path) -> std::path::PathBuf {
     std::fs::canonicalize(model_path).unwrap_or_else(|_| model_path.to_path_buf())
 }
 
+/// Identity of loaded weights: the model file and the engine device they live
+/// on. With `gguf-cuda` the weights are loaded onto exactly one GPU
+/// (`gguf_model_params`), so replicas on different devices must not share them:
+/// a replica whose KV pool is on device B would otherwise attach to a model
+/// resident on device A. Replicas on the same device still share one copy.
 #[cfg(feature = "gguf")]
-fn gguf_allocation_id(model_path: &Path) -> String {
-    format!("llama-gguf:{}", gguf_model_key(model_path).display())
+type GgufWeightsKey = (std::path::PathBuf, usize);
+
+#[cfg(feature = "gguf")]
+fn gguf_weights_key(model_path: &Path, device_id: usize) -> GgufWeightsKey {
+    #[cfg(not(feature = "gguf-cuda"))]
+    let device_id = {
+        let _ = device_id;
+        0
+    };
+    (gguf_model_key(model_path), device_id)
+}
+
+/// Id of a device's copy of the weights. It must match between planning and the
+/// post-load report, and differ per device so each device's ledger is charged
+/// for the copy that really lives there.
+#[cfg(feature = "gguf")]
+fn gguf_allocation_id(model_path: &Path, device_id: usize) -> String {
+    let (path, device_id) = gguf_weights_key(model_path, device_id);
+    if cfg!(feature = "gguf-cuda") {
+        format!("llama-gguf:{}@device{device_id}", path.display())
+    } else {
+        format!("llama-gguf:{}", path.display())
+    }
+}
+
+/// Distinguishes `GgufBackend` instances (replicas) of one model. Weights are
+/// shared across replicas and charged once, but the compute buffer and the
+/// native KV cache belong to each replica's own context, so their allocation
+/// ids carry the instance and are charged per replica.
+#[cfg(feature = "gguf")]
+static GGUF_INSTANCE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+#[cfg(feature = "gguf")]
+fn gguf_scratch_allocation_id(model_path: &Path, instance_id: u64) -> String {
+    format!(
+        "gguf-scratch:{}#{instance_id}",
+        gguf_model_key(model_path).display()
+    )
+}
+
+/// Id of a replica's native (llama.cpp-owned) KV cache. It must contain "kv" so
+/// the engine classifies it as KV, and match between planning and the
+/// post-load report.
+#[cfg(feature = "gguf")]
+fn gguf_kv_allocation_id(model_path: &Path, instance_id: u64) -> String {
+    format!(
+        "gguf-kv:{}#{instance_id}",
+        gguf_model_key(model_path).display()
+    )
+}
+
+/// Per-device buffer bytes read from the llama.cpp context once its scheduler is
+/// reserved: `(device name, bytes)` per model device, plus the bytes that live
+/// outside every listed device (host-resident buffers).
+#[cfg(feature = "gguf")]
+#[derive(Debug, Clone, Default)]
+struct ContextMemory {
+    compute: Vec<(String, u64)>,
+    kv: Vec<(String, u64)>,
+    /// `(model, context, compute)` bytes not on any listed device.
+    host: (u64, u64, u64),
+}
+
+#[cfg(feature = "gguf")]
+type ComputeMemorySlot = Arc<Mutex<ContextMemory>>;
+
+/// llama.cpp's devices as placement sees them.
+#[cfg(feature = "gguf")]
+fn llama_device_list() -> Vec<LlamaDeviceInfo> {
+    llama_cpp_2::list_llama_ggml_backend_devices()
+        .into_iter()
+        .map(|device| LlamaDeviceInfo {
+            name: device.name,
+            backend: device.backend,
+            kind: match device.device_type {
+                llama_cpp_2::LlamaBackendDeviceType::Cpu => LlamaDeviceKind::Cpu,
+                llama_cpp_2::LlamaBackendDeviceType::Accelerator => LlamaDeviceKind::Accelerator,
+                llama_cpp_2::LlamaBackendDeviceType::Gpu => LlamaDeviceKind::Gpu,
+                llama_cpp_2::LlamaBackendDeviceType::IntegratedGpu => {
+                    LlamaDeviceKind::IntegratedGpu
+                }
+                _ => LlamaDeviceKind::Other,
+            },
+            pci_bus_id: device.pci_bus_id,
+            unified_memory: device.unified_memory,
+        })
+        .collect()
+}
+
+/// `KAPSL_GGUF_N_GPU_LAYERS` as a number, when set and valid.
+#[cfg(feature = "gguf")]
+fn configured_n_gpu_layers() -> Option<u32> {
+    std::env::var(GGUF_N_GPU_LAYERS_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+}
+
+/// The llama device expected to hold the offloaded layers of a model created for
+/// engine device `engine_device_id`; `None` when the model stays on the CPU.
+#[cfg(feature = "gguf")]
+fn primary_llama_device(
+    all: &[LlamaDeviceInfo],
+    engine: &[EngineDeviceInfo],
+    engine_device_id: usize,
+) -> Option<usize> {
+    if configured_n_gpu_layers() == Some(0) {
+        return None;
+    }
+    #[cfg(feature = "gguf-cuda")]
+    {
+        crate::gguf_placement::select_cuda_llama_device(all, engine, engine_device_id).ok()
+    }
+    #[cfg(not(feature = "gguf-cuda"))]
+    {
+        let _ = (engine, engine_device_id);
+        all.iter().position(|device| {
+            matches!(
+                device.kind,
+                LlamaDeviceKind::Gpu | LlamaDeviceKind::IntegratedGpu
+            )
+        })
+    }
+}
+
+/// Memory rows (`class`, `domain`, `bytes`, allocation id) for a placement
+/// report, one row per domain and class; ids follow `allocation_id_for`.
+#[cfg(feature = "gguf")]
+fn allocations_from_placement(
+    report: &PlacementReport,
+    weights_id: &str,
+    kv_id: &str,
+    scratch_id: &str,
+) -> Vec<MemoryAllocation> {
+    report
+        .rows
+        .iter()
+        .map(|row| {
+            let base = match row.class {
+                MemoryAllocationClass::PersistentWeights => weights_id,
+                MemoryAllocationClass::KvCache => kv_id,
+                _ => scratch_id,
+            };
+            MemoryAllocation {
+                allocation_id: allocation_id_for(base, &report.rows, row),
+                domain: row.domain.clone(),
+                class: row.class,
+                source: MemoryAllocationSource::BackendManaged,
+                bytes: row.bytes,
+            }
+        })
+        .collect()
 }
 
 // Global LlamaBackend singleton — llama.cpp allows only one backend per process.
@@ -1510,6 +1777,14 @@ fn global_gguf_backend() -> Result<Arc<LlamaBackend>, EngineError> {
     if let Some(b) = GGUF_BACKEND.get() {
         return Ok(Arc::clone(b));
     }
+    // Route llama.cpp/ggml logging (create_tensor:, set_sampler:, buffer sizes,
+    // ...) through `tracing` so the host's subscriber filters it like any other
+    // library output (`RUST_LOG=error` hides the info/debug chatter). Without
+    // this llama.cpp writes straight to stderr, unfiltered. Hosts with no
+    // tracing subscriber can opt back into llama.cpp's native stderr logging.
+    if !gguf_env_is_truthy("KAPSL_GGUF_NATIVE_LLAMA_LOGS") {
+        llama_cpp_2::send_logs_to_tracing(llama_cpp_2::LogOptions::default());
+    }
     let backend = LlamaBackend::init()
         .map_err(|e| EngineError::backend(format!("llama backend init failed: {e}")))?;
     let arc = Arc::new(backend);
@@ -1750,6 +2025,47 @@ struct ActiveSeq {
     _memory_guard: Option<RequestGuard>,
 }
 
+/// Every token that ends a generation, not just the vocabulary's single EOS id.
+///
+/// GGUF conversions routinely disagree with the model about which id closes a
+/// turn: a chat-tuned model may emit `<|im_end|>` while `tokenizer.ggml.eos_token_id`
+/// names `<|endoftext|>`, or the reverse. llama.cpp already classifies the
+/// end-of-generation tokens (`llama_vocab_is_eog`: EOS, EOT, EOM and the known
+/// turn markers), so the decode loop retires a sequence on any of them. Matching
+/// only the EOS id let the other marker through as literal text, after which the
+/// model carried on writing into a fresh turn.
+#[cfg(feature = "gguf")]
+#[derive(Debug, Clone)]
+struct GgufEndTokens {
+    ids: Vec<LlamaToken>,
+}
+
+#[cfg(feature = "gguf")]
+impl GgufEndTokens {
+    fn from_model(model: &LlamaModel) -> Self {
+        let eos = model.token_eos();
+        let n_vocab = model.n_vocab();
+        let mut ids = vec![eos];
+        ids.extend(
+            (0..n_vocab)
+                .map(LlamaToken::new)
+                .filter(|token| *token != eos && model.is_eog_token(*token)),
+        );
+        Self { ids }
+    }
+
+    fn contains(&self, token: LlamaToken) -> bool {
+        self.ids.contains(&token)
+    }
+
+    fn logit_bias(&self, bias: f32) -> Vec<LlamaLogitBias> {
+        self.ids
+            .iter()
+            .map(|token| LlamaLogitBias::new(*token, bias))
+            .collect()
+    }
+}
+
 #[cfg(feature = "gguf")]
 struct GgufBackendSamplers {
     // One [logit_bias(eos), greedy] chain per slot, installed once and kept for the context
@@ -1758,15 +2074,15 @@ struct GgufBackendSamplers {
     chains: Vec<LlamaSampler>,
     installed_by_seq_id: Vec<bool>,
     mode_by_seq_id: Vec<bool>,
-    eos_token: LlamaToken,
+    end_tokens: GgufEndTokens,
     sample: LlamaSampler,
 }
 
 #[cfg(feature = "gguf")]
 impl GgufBackendSamplers {
-    fn new(model: &LlamaModel, max_concurrent: usize, eos_token: LlamaToken) -> Self {
+    fn new(model: &LlamaModel, max_concurrent: usize, end_tokens: GgufEndTokens) -> Self {
         let n_vocab = model.n_vocab();
-        let eos_bias = [LlamaLogitBias::new(eos_token, 0.0)];
+        let eos_bias = end_tokens.logit_bias(0.0);
         let chains = (0..max_concurrent)
             .map(|_| {
                 LlamaSampler::chain_simple([
@@ -1780,7 +2096,7 @@ impl GgufBackendSamplers {
             chains,
             installed_by_seq_id: vec![false; max_concurrent],
             mode_by_seq_id: vec![false; max_concurrent],
-            eos_token,
+            end_tokens,
             sample: LlamaSampler::greedy(),
         }
     }
@@ -1799,7 +2115,7 @@ impl GgufBackendSamplers {
         };
         if self.mode_by_seq_id[slot] != suppress_eos {
             let bias = if suppress_eos { f32::NEG_INFINITY } else { 0.0 };
-            if !chain.chain_logit_bias_set(0, &[LlamaLogitBias::new(self.eos_token, bias)]) {
+            if !chain.chain_logit_bias_set(0, &self.end_tokens.logit_bias(bias)) {
                 return false;
             }
             self.mode_by_seq_id[slot] = suppress_eos;
@@ -1950,6 +2266,27 @@ impl GgufExternalKvPool {
         guard: Box<dyn Send>,
         usage_bytes: Arc<dyn Fn() -> usize + Send + Sync>,
     ) -> Result<Self, String> {
+        // The descriptor names the engine device; llama.cpp needs the CUDA ordinal.
+        let ordinal = crate::cuda_ordinal::to_cuda_ordinal(geometry.device_id)
+            .map_err(|error| error.to_string())?;
+        // SAFETY: forwarded unchanged from this function's contract.
+        unsafe { Self::from_raw_on_ordinal(geometry, desc, guard, usage_bytes, ordinal) }
+    }
+
+    /// [`Self::from_raw`] with the CUDA ordinal of `geometry.device_id` already
+    /// resolved. `desc.device_id` is checked against the engine id in
+    /// `geometry`, then rewritten to `cuda_ordinal` for llama.cpp.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`Self::from_raw`].
+    unsafe fn from_raw_on_ordinal(
+        geometry: GgufExternalKvPoolGeometry,
+        mut desc: llama_kapsl_kv_pool_desc,
+        guard: Box<dyn Send>,
+        usage_bytes: Arc<dyn Fn() -> usize + Send + Sync>,
+        cuda_ordinal: usize,
+    ) -> Result<Self, String> {
         if desc.device_id as usize != geometry.device_id
             || desc.block_size as usize != geometry.block_size_tokens
             || desc.num_kv_heads as usize != geometry.num_kv_heads
@@ -1990,6 +2327,8 @@ impl GgufExternalKvPool {
         topology
             .validate()
             .map_err(|error| format!("external GGUF KV topology: {error}"))?;
+        desc.device_id = u32::try_from(cuda_ordinal)
+            .map_err(|_| format!("CUDA ordinal {cuda_ordinal} does not fit the descriptor"))?;
         Ok(Self {
             desc: Box::new(desc),
             topology,
@@ -2062,7 +2401,7 @@ impl GgufActiveKvPool {
             }
             let kv_heads = pool.state.handle.pool.num_kv_heads();
             let head_dim = pool.state.handle.pool.head_dim();
-            let device_id = pool.desc.device_id as usize;
+            let device_id = pool.state.device_id;
             let sched = gguf_global_kv_scheduler().lock().unwrap();
             log::debug!(
             "[gguf] idle: device {} pressure={:.2} free_blocks={} ({}h×{}d), cross-device registered=[{}]",
@@ -2216,6 +2555,7 @@ impl GgufSharedKvPool {
         handle: GpuPoolHandle,
         metrics: Arc<Mutex<EngineMetrics>>,
         device_id: usize,
+        cuda_ordinal: usize,
         n_layers: usize,
         ctx_per_seq: usize,
         max_concurrent: usize,
@@ -2274,7 +2614,9 @@ impl GgufSharedKvPool {
         let pool = &state.handle.pool;
         let desc = Box::new(llama_kapsl_kv_pool_desc {
             user_data: state_ptr.cast(),
-            device_id: device_id as u32,
+            // llama.cpp wraps the pool with ggml's CUDA backend, which numbers
+            // devices by CUDA ordinal; the engine id stays in `state.device_id`.
+            device_id: cuda_ordinal as u32,
             block_size: pool.block_size() as u32,
             // Physical block ids are relative to the whole device backing, so
             // GGML's buffer must cover the whole addressable span. Allocation
@@ -2340,7 +2682,7 @@ impl GgufSharedKvPool {
         let fp = inner.model_fingerprint;
         let pool = state.handle.pool.clone();
         let n_layers = state.n_layers;
-        let device_id = self.desc.device_id as usize;
+        let device_id = state.device_id;
         let mut c = match cache.lock() {
             Ok(c) => c,
             Err(_) => return,
@@ -3430,6 +3772,10 @@ pub struct GgufBackend {
     metrics: Arc<Mutex<EngineMetrics>>,
     #[cfg(feature = "gguf")]
     device_id: usize,
+    /// Process-unique id of this backend instance (replica); see
+    /// `GGUF_INSTANCE_COUNTER`.
+    #[cfg(feature = "gguf")]
+    instance_id: u64,
     #[cfg(feature = "gguf-cuda-shared-kv")]
     pool_slot: Arc<Mutex<Option<GpuPoolHandle>>>,
     /// Runtime-owned backing pool. Geometry is not known until `load()`.
@@ -3457,6 +3803,13 @@ pub struct GgufBackend {
 #[cfg(feature = "gguf")]
 struct GgufInner {
     weights: Arc<GgufWeights>,
+    /// Compute buffers of the scheduler thread's context, published once the
+    /// scheduler reservation is final.
+    compute_memory: ComputeMemorySlot,
+    scratch_allocation_id: String,
+    /// Allocation id of this replica's native KV cache (see
+    /// `gguf_kv_allocation_id`).
+    kv_allocation_id: String,
     request_tx: std_mpsc::Sender<GgufRequest>,
     scheduler_thread: Option<std::thread::JoinHandle<()>>,
     max_concurrent: usize,
@@ -3474,6 +3827,8 @@ impl GgufBackend {
             metrics: Arc::new(Mutex::new(EngineMetrics::new())),
             #[cfg(feature = "gguf")]
             device_id: 0,
+            #[cfg(feature = "gguf")]
+            instance_id: GGUF_INSTANCE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             #[cfg(feature = "gguf-cuda-shared-kv")]
             pool_slot: Arc::new(Mutex::new(None)),
             #[cfg(feature = "gguf-cuda-shared-kv")]
@@ -3512,6 +3867,8 @@ impl GgufBackend {
             inner: None,
             metrics: Arc::new(Mutex::new(EngineMetrics::new())),
             device_id,
+            #[cfg(feature = "gguf")]
+            instance_id: GGUF_INSTANCE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             pool_slot: Arc::new(Mutex::new(handle)),
             device_pool: None,
             external_kv_factory: None,
@@ -3653,6 +4010,93 @@ impl Default for GgufBackend {
 
 #[cfg(feature = "gguf")]
 impl GgufBackend {
+    /// Planned rows for a model that has not been loaded, classified with the
+    /// same rules as the reported rows: the offloaded fraction of weights and KV
+    /// goes to the primary device's domain, the rest to the host.
+    fn planned_placement(
+        &self,
+        model_path: &Path,
+        weights: usize,
+        kv: usize,
+        scratch: usize,
+    ) -> Result<PlacementReport, EngineError> {
+        // llama.cpp enumerates its devices only once the backend is initialized.
+        let _backend = global_gguf_backend()?;
+        let devices = llama_device_list();
+        let engine = engine_devices();
+        let n_layers = kapsl_loader::gguf_loader::GgufFile::open(model_path)
+            .ok()
+            .and_then(|file| file.extract_config().ok())
+            .map(|config| config.num_hidden_layers)
+            .unwrap_or(1)
+            .max(1);
+        let primary = primary_llama_device(&devices, &engine, self.device_id);
+        let report = plan_rows(
+            primary,
+            &devices,
+            &engine,
+            Some(self.device_id),
+            PlanInput {
+                weights,
+                kv,
+                scratch,
+                n_layers,
+                n_gpu_layers: configured_n_gpu_layers(),
+            },
+        );
+        for warning in &report.warnings {
+            log::warn!("[gguf] {warning}");
+        }
+        Ok(report)
+    }
+
+    /// Where the loaded model's memory physically lives right now: weights, KV
+    /// cache and compute buffers per llama device (plus the host-resident
+    /// remainder), mapped to memory domains by `gguf_placement`.
+    fn actual_placement(&self) -> PlacementReport {
+        let Some(inner) = self.inner.as_ref() else {
+            return PlacementReport::default();
+        };
+        let devices = llama_device_list();
+        let context = inner
+            .compute_memory
+            .lock()
+            .map(|slot| slot.clone())
+            .unwrap_or_default();
+        let named = |rows: &[(String, u64)], name: &str| {
+            rows.iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, bytes)| *bytes)
+                .unwrap_or(0)
+        };
+        let weights = inner.weights.model.device_memory();
+        let per_device: Vec<(usize, DeviceBytes)> = weights
+            .iter()
+            .filter_map(|(name, weight_bytes)| {
+                let index = devices.iter().position(|d| &d.name == name)?;
+                Some((
+                    index,
+                    DeviceBytes {
+                        weights: *weight_bytes,
+                        kv: named(&context.kv, name),
+                        compute: named(&context.compute, name),
+                    },
+                ))
+            })
+            .collect();
+        let report = place_bytes(
+            &devices,
+            &engine_devices(),
+            Some(self.device_id),
+            &per_device,
+            context.host,
+        );
+        for warning in &report.warnings {
+            log::warn!("[gguf] {warning}");
+        }
+        report
+    }
+
     /// Bind an integration's engine request identity to the scheduler slot.
     /// The returned binding guard outlives KV use and is released before the
     /// terminal response. The hook does not serialize independent requests.
@@ -3826,9 +4270,9 @@ fn sequence_needs_kv_after_first(
     max_tokens: i32,
     min_tokens: i32,
     first_tok: LlamaToken,
-    eos_token: LlamaToken,
+    end_tokens: &GgufEndTokens,
 ) -> bool {
-    max_tokens > 1 && !(first_tok == eos_token && min_tokens <= 0)
+    max_tokens > 1 && !(end_tokens.contains(first_tok) && min_tokens <= 0)
 }
 
 #[cfg(feature = "gguf")]
@@ -3858,7 +4302,7 @@ fn finish_or_activate_prefilled_sequence(
     max_tokens: i32,
     min_tokens: i32,
     response: GgufResponse,
-    eos_token: LlamaToken,
+    end_tokens: &GgufEndTokens,
     first_tok: LlamaToken,
     first_piece: Option<&[u8]>,
     suppress_eos_sampler: bool,
@@ -3880,7 +4324,7 @@ fn finish_or_activate_prefilled_sequence(
     let mut output = Vec::with_capacity((max_tokens.max(0) as usize).saturating_mul(4));
     let mut stop_filter = GgufStopFilter::new();
 
-    if max_tokens <= 0 || (first_tok == eos_token && min_tokens <= 0) {
+    if max_tokens <= 0 || (end_tokens.contains(first_tok) && min_tokens <= 0) {
         release_sequence_slot(ctx, available_ids, seq_id);
         drop(memory_guard);
         record_gguf_token_metrics(metrics, prompt_len.max(0) as usize, 0);
@@ -4096,6 +4540,7 @@ fn run_scheduler(
     config: GgufServingConfig,
     metrics: Arc<Mutex<EngineMetrics>>,
     ready_tx: std_mpsc::SyncSender<Result<(), String>>,
+    compute_memory: ComputeMemorySlot,
     #[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
     mut shared_kv_pool: Option<GgufActiveKvPool>,
 ) {
@@ -4153,8 +4598,8 @@ fn run_scheduler(
         total_ctx.saturating_mul(config.kv_bytes_per_cell) / (1024 * 1024),
         config.kv_bytes_per_cell
     );
-    let eos_token = model.token_eos();
-    let mut samplers = GgufBackendSamplers::new(&model, config.max_concurrent, eos_token);
+    let end_tokens = GgufEndTokens::from_model(&model);
+    let mut samplers = GgufBackendSamplers::new(&model, config.max_concurrent, end_tokens.clone());
     // Pre-install a sampler for every seq slot up front so the installed-sampler
     // set (and thus the compute-graph topology) is stable from the first decode.
     // `set_sampler` flips `sched_need_reserve`, forcing a worst-case
@@ -4166,6 +4611,24 @@ fn run_scheduler(
         if !samplers.set_for_sequence(&mut ctx, seq_id, false) {
             log::warn!("[gguf] failed to pre-install sampler for seq slot {seq_id}");
         }
+    }
+    // The sampler set is final, so reserve the steady-state compute buffers now
+    // (llama.cpp would otherwise do it lazily on the first decode) and publish
+    // their size for memory accounting before the model reports ready.
+    ctx.reserve_compute_buffers();
+    let published = ContextMemory {
+        compute: ctx.device_compute_memory(),
+        kv: ctx.device_context_memory(),
+        host: ctx.host_memory(),
+    };
+    log::info!(
+        "[gguf] Compute buffers per device: {:?}; KV per device: {:?}; host-resident (model, kv, compute): {:?}",
+        published.compute,
+        published.kv,
+        published.host
+    );
+    if let Ok(mut slot) = compute_memory.lock() {
+        *slot = published;
     }
     let batch_cap = n_batch as usize;
     let mut batch = LlamaBatch::new(batch_cap, 1);
@@ -4532,9 +4995,9 @@ fn run_scheduler(
             let prompt_len = pref.tokens.len() as i32;
 
             let emits_first_piece =
-                pref.max_tokens > 0 && !(first_tok == eos_token && pref.min_tokens <= 0);
+                pref.max_tokens > 0 && !(end_tokens.contains(first_tok) && pref.min_tokens <= 0);
             let copy_emits_first_piece = pref.copies.iter().any(|copy| {
-                copy.max_tokens > 0 && !(first_tok == eos_token && copy.min_tokens <= 0)
+                copy.max_tokens > 0 && !(end_tokens.contains(first_tok) && copy.min_tokens <= 0)
             });
 
             let first_piece = if emits_first_piece || copy_emits_first_piece {
@@ -4563,7 +5026,7 @@ fn run_scheduler(
                     copy.max_tokens,
                     copy.min_tokens,
                     first_tok,
-                    eos_token,
+                    &end_tokens,
                 ) {
                     if let Err(e) = ctx.copy_kv_cache_seq(
                         pref.seq_id,
@@ -4625,7 +5088,7 @@ fn run_scheduler(
                 pref.max_tokens,
                 pref.min_tokens,
                 pref.response,
-                eos_token,
+                &end_tokens,
                 first_tok,
                 first_piece.as_deref(),
                 suppress_eos_sampler,
@@ -4656,7 +5119,7 @@ fn run_scheduler(
                     copy.max_tokens,
                     copy.min_tokens,
                     copy.response,
-                    eos_token,
+                    &end_tokens,
                     first_tok,
                     first_piece.as_deref(),
                     copy_suppress_eos_sampler,
@@ -4700,7 +5163,7 @@ fn run_scheduler(
             let next_tok = samplers.sample_token(&ctx, batch_pos);
             seq.pos += 1;
 
-            let eos_and_ready = next_tok == eos_token && seq.n_generated >= seq.min_tokens;
+            let eos_and_ready = end_tokens.contains(next_tok) && seq.n_generated >= seq.min_tokens;
             let next_generated = seq.n_generated + 1;
             let max_reached = next_generated >= seq.max_tokens;
             // A chat stop-marker may only retire the sequence once the
@@ -4831,31 +5294,10 @@ impl Engine for GgufBackend {
     }
 
     fn planned_memory(&self, model_path: &Path) -> Result<MemoryReport, EngineError> {
-        let bytes = std::fs::metadata(model_path)
+        let weights = std::fs::metadata(model_path)
             .map_err(|error| EngineError::backend(format!("stat GGUF model: {error}")))?
             .len() as usize;
-        let mut report = MemoryReport {
-            allocations: vec![
-                MemoryAllocation {
-                    allocation_id: gguf_allocation_id(model_path),
-                    domain: MemoryDomain::Cuda {
-                        device_id: self.device_id,
-                    },
-                    class: MemoryAllocationClass::PersistentWeights,
-                    source: MemoryAllocationSource::BackendManaged,
-                    bytes,
-                },
-                MemoryAllocation {
-                    allocation_id: format!("gguf-scratch:{}", gguf_model_key(model_path).display()),
-                    domain: MemoryDomain::Cuda {
-                        device_id: self.device_id,
-                    },
-                    class: MemoryAllocationClass::TransientWorkspace,
-                    source: MemoryAllocationSource::BackendManaged,
-                    bytes: (bytes / 8).max(256 * 1024 * 1024),
-                },
-            ],
-        };
+        let scratch = planned_gguf_scratch_bytes(model_path, weights);
         #[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
         let runtime_kv = self.runtime_owned_kv_configured()
             && !gguf_env_is_truthy("KAPSL_GGUF_DISABLE_SHARED_KV");
@@ -4870,52 +5312,68 @@ impl Engine for GgufBackend {
         } else {
             planned_gguf_kv_bytes(model_path)?
         };
-        report.push(MemoryAllocation {
-            allocation_id: format!("gguf-kv:{}", gguf_model_key(model_path).display()),
-            domain: MemoryDomain::Cuda {
-                device_id: self.device_id,
-            },
-            class: MemoryAllocationClass::KvCache,
-            source: if runtime_kv {
-                MemoryAllocationSource::RuntimeManaged
-            } else {
-                MemoryAllocationSource::BackendManaged
-            },
-            bytes: kv_bytes,
-        });
-        Ok(report)
+        let placement = self.planned_placement(model_path, weights, kv_bytes, scratch)?;
+        let kv_id = gguf_kv_allocation_id(model_path, self.instance_id);
+        let mut allocations = allocations_from_placement(
+            &placement,
+            &gguf_allocation_id(model_path, self.device_id),
+            &kv_id,
+            &gguf_scratch_allocation_id(model_path, self.instance_id),
+        );
+        if runtime_kv {
+            // The runtime pool owns KV: an explicit zero-byte row keeps the plan
+            // and the later report on the same id.
+            allocations.retain(|allocation| allocation.class != MemoryAllocationClass::KvCache);
+            allocations.push(MemoryAllocation {
+                allocation_id: kv_id,
+                domain: MemoryDomain::Cuda {
+                    device_id: self.device_id,
+                },
+                class: MemoryAllocationClass::KvCache,
+                source: MemoryAllocationSource::RuntimeManaged,
+                bytes: 0,
+            });
+        }
+        Ok(MemoryReport { allocations })
     }
 
     fn planned_external_device_memory(
         &self,
         model_path: &Path,
     ) -> Result<ExternalDeviceMemoryReport, EngineError> {
-        let bytes = std::fs::metadata(model_path)
+        let weights = std::fs::metadata(model_path)
             .map_err(|e| EngineError::backend(format!("stat GGUF model: {e}")))?
             .len() as usize;
-        Ok(ExternalDeviceMemoryReport {
-            allocations: vec![
-                ExternalDeviceMemory {
-                    allocation_id: gguf_allocation_id(model_path),
-                    device_id: self.device_id,
-                    bytes,
-                },
-                ExternalDeviceMemory {
-                    allocation_id: format!("gguf-scratch:{}", gguf_model_key(model_path).display()),
-                    device_id: self.device_id,
-                    bytes: (bytes / 8).max(256 * 1024 * 1024),
-                },
-            ],
+        let scratch = planned_gguf_scratch_bytes(model_path, weights);
+        let placement = self.planned_placement(model_path, weights, 0, scratch)?;
+        // The device pool's legacy view: CUDA devices only, weights and scratch.
+        let allocations = allocations_from_placement(
+            &placement,
+            &gguf_allocation_id(model_path, self.device_id),
+            &gguf_kv_allocation_id(model_path, self.instance_id),
+            &gguf_scratch_allocation_id(model_path, self.instance_id),
+        )
+        .into_iter()
+        .filter_map(|allocation| match allocation.domain {
+            MemoryDomain::Cuda { device_id } => Some(ExternalDeviceMemory {
+                allocation_id: allocation.allocation_id,
+                device_id,
+                bytes: allocation.bytes,
+            }),
+            _ => None,
         })
+        .collect();
+        Ok(ExternalDeviceMemoryReport { allocations })
     }
 
     async fn load(&mut self, model_path: &Path) -> Result<(), EngineError> {
         let model_path_key = gguf_model_key(model_path);
+        let weights_key = gguf_weights_key(model_path, self.device_id);
 
         let cached = gguf_weights_cache()
             .lock()
             .unwrap()
-            .get(&model_path_key)
+            .get(&weights_key)
             .and_then(|w| w.upgrade());
 
         let weights = if let Some(shared) = cached {
@@ -4944,12 +5402,12 @@ impl Engine for GgufBackend {
                 backend: backend_for_load,
                 model: Arc::new(model),
                 n_ctx_train,
-                allocation_id: gguf_allocation_id(&model_path_key),
+                allocation_id: gguf_allocation_id(&model_path_key, self.device_id),
             });
             gguf_weights_cache()
                 .lock()
                 .unwrap()
-                .insert(model_path_key, Arc::downgrade(&arc));
+                .insert(weights_key, Arc::downgrade(&arc));
             arc
         };
 
@@ -5119,8 +5577,11 @@ impl Engine for GgufBackend {
                             n_head_kv,
                             head_dim
                         );
-                                let device = CudaDevice::new(effective_device_id)
-                                    .map_err(|e| EngineError::backend(format!("CUDA: {e}")))?;
+                                let device = CudaDevice::new(
+                                    crate::cuda_ordinal::to_cuda_ordinal(effective_device_id)
+                                        .map_err(|e| EngineError::backend(e.to_string()))?,
+                                )
+                                .map_err(|e| EngineError::backend(format!("CUDA: {e}")))?;
                                 let pool = Arc::new(
                                     GpuBlockPool::new(
                                         device,
@@ -5138,8 +5599,11 @@ impl Engine for GgufBackend {
                                 handle
                             }
                         } else {
-                            let device = CudaDevice::new(effective_device_id)
-                                .map_err(|e| EngineError::backend(format!("CUDA: {e}")))?;
+                            let device = CudaDevice::new(
+                                crate::cuda_ordinal::to_cuda_ordinal(effective_device_id)
+                                    .map_err(|e| EngineError::backend(e.to_string()))?,
+                            )
+                            .map_err(|e| EngineError::backend(format!("CUDA: {e}")))?;
                             let pool = Arc::new(
                                 GpuBlockPool::new(
                                     device,
@@ -5197,6 +5661,8 @@ impl Engine for GgufBackend {
                             handle,
                             self.metrics.clone(),
                             effective_device_id,
+                            crate::cuda_ordinal::to_cuda_ordinal(effective_device_id)
+                                .map_err(|e| EngineError::backend(e.to_string()))?,
                             n_layers,
                             config.ctx_per_seq as usize,
                             config.max_concurrent,
@@ -5241,6 +5707,8 @@ impl Engine for GgufBackend {
         let model_clone = Arc::clone(&weights.model);
         let backend_clone = Arc::clone(&weights.backend);
         let metrics = Arc::clone(&self.metrics);
+        let compute_memory: ComputeMemorySlot = Arc::new(Mutex::new(ContextMemory::default()));
+        let compute_memory_clone = Arc::clone(&compute_memory);
         let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
         let scheduler_thread = std::thread::spawn(move || {
             run_scheduler(
@@ -5250,6 +5718,7 @@ impl Engine for GgufBackend {
                 config,
                 metrics,
                 ready_tx,
+                compute_memory_clone,
                 #[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
                 shared_kv_pool,
             );
@@ -5296,6 +5765,9 @@ impl Engine for GgufBackend {
 
         self.inner = Some(GgufInner {
             weights,
+            compute_memory,
+            scratch_allocation_id: gguf_scratch_allocation_id(model_path, self.instance_id),
+            kv_allocation_id: gguf_kv_allocation_id(model_path, self.instance_id),
             request_tx: tx,
             scheduler_thread: Some(scheduler_thread),
             max_concurrent: config.max_concurrent,
@@ -5308,59 +5780,38 @@ impl Engine for GgufBackend {
     }
 
     fn actual_external_device_memory(&self) -> ExternalDeviceMemoryReport {
+        // The device pool's legacy view: CUDA devices only, weights and compute.
         let Some(inner) = self.inner.as_ref() else {
             return ExternalDeviceMemoryReport::default();
         };
-        let fallback_device = self.device_id;
-        let allocations = inner
-            .weights
-            .model
-            .device_memory()
+        let report = self.actual_placement();
+        ExternalDeviceMemoryReport {
+            allocations: allocations_from_placement(
+                &report,
+                &inner.weights.allocation_id,
+                &inner.kv_allocation_id,
+                &inner.scratch_allocation_id,
+            )
             .into_iter()
-            .enumerate()
-            .filter_map(|(index, (name, bytes))| {
-                if bytes == 0 {
-                    return None;
-                }
-                let device_id = name
-                    .strip_prefix("CUDA")
-                    .and_then(|suffix| suffix.parse::<usize>().ok())
-                    .unwrap_or(fallback_device + index);
-                Some(ExternalDeviceMemory {
-                    allocation_id: inner.weights.allocation_id.clone(),
+            .filter(|allocation| allocation.class != MemoryAllocationClass::KvCache)
+            .filter_map(|allocation| match allocation.domain {
+                MemoryDomain::Cuda { device_id } => Some(ExternalDeviceMemory {
+                    allocation_id: allocation.allocation_id,
                     device_id,
-                    bytes: bytes as usize,
-                })
+                    bytes: allocation.bytes,
+                }),
+                _ => None,
             })
-            .collect();
-        ExternalDeviceMemoryReport { allocations }
+            .collect(),
+        }
     }
 
     fn actual_memory(&self) -> MemoryReport {
-        let external = self.actual_external_device_memory();
-        let mut report = MemoryReport {
-            allocations: external
-                .allocations
-                .iter()
-                .map(|allocation| MemoryAllocation {
-                    allocation_id: allocation.allocation_id.clone(),
-                    domain: MemoryDomain::Cuda {
-                        device_id: allocation.device_id,
-                    },
-                    class: MemoryAllocationClass::PersistentWeights,
-                    source: MemoryAllocationSource::BackendManaged,
-                    bytes: allocation.bytes,
-                })
-                .collect(),
+        let Some(inner) = self.inner.as_ref() else {
+            return MemoryReport::default();
         };
+        let placement = self.actual_placement();
         let metrics = self.metrics_snapshot();
-        let fallback_domain = external
-            .allocations
-            .first()
-            .map(|allocation| MemoryDomain::Cuda {
-                device_id: allocation.device_id,
-            })
-            .unwrap_or(MemoryDomain::Host);
         #[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
         let runtime_kv =
             self.kv_path.load(std::sync::atomic::Ordering::Acquire) == GgufKvPath::SharedKv.as_u8();
@@ -5372,30 +5823,61 @@ impl Engine for GgufBackend {
             .unwrap_or(metrics.kv_cache_bytes_used);
         #[cfg(not(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv")))]
         let runtime_kv_bytes = metrics.kv_cache_bytes_used;
-        report.push(MemoryAllocation {
-            allocation_id: "gguf:active-kv".to_string(),
-            domain: if runtime_kv {
-                MemoryDomain::Cuda {
+
+        // The native KV rows must carry the same id as the planned ones, so the
+        // engine reconciles the plan to them instead of charging both, and so
+        // replicas of one model are each charged for their own cache. A
+        // runtime-owned pool row is a label only (added below).
+        let mut report = MemoryReport {
+            allocations: allocations_from_placement(
+                &PlacementReport {
+                    rows: placement
+                        .rows
+                        .iter()
+                        .filter(|row| !(runtime_kv && row.class == MemoryAllocationClass::KvCache))
+                        .cloned()
+                        .collect(),
+                    warnings: Vec::new(),
+                },
+                &inner.weights.allocation_id,
+                &inner.kv_allocation_id,
+                &inner.scratch_allocation_id,
+            ),
+        };
+
+        if runtime_kv {
+            report.push(MemoryAllocation {
+                allocation_id: "gguf:active-kv".to_string(),
+                domain: MemoryDomain::Cuda {
                     device_id: self.device_id,
-                }
-            } else {
-                fallback_domain
-            },
-            class: MemoryAllocationClass::KvCache,
-            source: if runtime_kv {
-                MemoryAllocationSource::RuntimeManaged
-            } else {
-                MemoryAllocationSource::BackendManaged
-            },
-            // llama.cpp's native context owns fixed backing capacity. The
-            // runtime shared pool allocates blocks elastically, so report its
-            // exact owner usage and let the load lease reconcile to zero.
-            bytes: if runtime_kv {
-                runtime_kv_bytes
-            } else {
-                metrics.kv_cache_bytes_capacity
-            },
-        });
+                },
+                class: MemoryAllocationClass::KvCache,
+                source: MemoryAllocationSource::RuntimeManaged,
+                // The runtime shared pool allocates blocks elastically, so report
+                // its exact owner usage and let the load lease reconcile to zero.
+                bytes: runtime_kv_bytes,
+            });
+        } else if !placement
+            .rows
+            .iter()
+            .any(|row| row.class == MemoryAllocationClass::KvCache)
+        {
+            // llama.cpp reported no KV bytes (accessor not ready): fall back to the
+            // backend's own capacity figure, in the domain of the first row or
+            // the host, never in a CUDA domain by default.
+            let domain = placement
+                .rows
+                .first()
+                .map(|row| row.domain.clone())
+                .unwrap_or(MemoryDomain::Host);
+            report.push(MemoryAllocation {
+                allocation_id: inner.kv_allocation_id.clone(),
+                domain,
+                class: MemoryAllocationClass::KvCache,
+                source: MemoryAllocationSource::BackendManaged,
+                bytes: metrics.kv_cache_bytes_capacity,
+            });
+        }
         report
     }
 
@@ -5709,7 +6191,85 @@ impl Engine for GgufBackend {
 mod scheduler_lifecycle_tests;
 
 #[cfg(all(test, feature = "gguf"))]
+#[path = "chat_stop_tests.rs"]
+mod chat_stop_tests;
+
+#[cfg(all(test, feature = "gguf"))]
 mod tests {
+
+    /// `(n_embd, n_ff, n_ubatch, n_ctx, measured compute-buffer bytes)` read from
+    /// `LlamaContext::device_compute_memory` after the scheduler reserve, on
+    /// Metal with the kapsl llama.cpp fork, via
+    /// `tests/gguf_memory_probe.rs`. All rows have n_vocab = 151,936.
+    #[cfg(feature = "gguf")]
+    const COMPUTE_BUFFER_MEASUREMENTS: &[(usize, usize, usize, usize, usize)] = &[
+        // Qwen2.5-0.5B-Instruct Q4_K_M
+        (896, 4864, 544, 65536, 668_252_480),
+        (896, 4864, 520, 16384, 638_797_568),
+        (896, 4864, 514, 4096, 631_433_920),
+        (896, 4864, 136, 16384, 168_126_720),
+        (896, 4864, 1032, 16384, 1_267_169_024),
+        (896, 4864, 520, 4096, 637_466_368),
+        (896, 4864, 520, 65536, 651_577_088),
+        // Qwen2.5-3B-Instruct Q4_K_M
+        (2048, 11008, 544, 65536, 670_759_232),
+        (2048, 11008, 520, 16384, 641_193_728),
+        (2048, 11008, 514, 4096, 633_802_432),
+        (2048, 11008, 136, 16384, 168_753_408),
+        (2048, 11008, 1032, 16384, 1_271_924_480),
+        (2048, 11008, 520, 4096, 642_258_688),
+        (2048, 11008, 520, 65536, 653_973_248),
+    ];
+
+    #[cfg(feature = "gguf")]
+    #[test]
+    fn compute_buffer_estimate_covers_measurements_without_wild_overshoot() {
+        for &(n_embd, n_ff, n_ubatch, n_ctx, measured) in COMPUTE_BUFFER_MEASUREMENTS {
+            let planned = super::estimate_compute_buffer_bytes(super::ComputeBufferShape {
+                n_vocab: 151_936,
+                n_embd,
+                n_ff,
+                n_ubatch,
+                n_ctx,
+            });
+            let ratio = planned as f64 / measured as f64;
+            assert!(
+                planned >= measured,
+                "estimate {planned} below measured {measured} \
+                 (n_embd={n_embd} n_ubatch={n_ubatch} n_ctx={n_ctx})"
+            );
+            assert!(
+                ratio <= 1.20,
+                "estimate {planned} is {ratio:.3}x measured {measured} \
+                 (n_embd={n_embd} n_ubatch={n_ubatch} n_ctx={n_ctx})"
+            );
+        }
+    }
+
+    #[cfg(feature = "gguf")]
+    #[test]
+    fn compute_buffer_estimate_scales_with_ubatch_and_never_underflows_the_floor() {
+        let shape = |n_ubatch| super::ComputeBufferShape {
+            n_vocab: 151_936,
+            n_embd: 896,
+            n_ff: 4864,
+            n_ubatch,
+            n_ctx: 4096,
+        };
+        assert!(
+            super::estimate_compute_buffer_bytes(shape(1024))
+                > super::estimate_compute_buffer_bytes(shape(512))
+        );
+        let tiny = super::ComputeBufferShape {
+            n_vocab: 1,
+            n_embd: 1,
+            n_ff: 1,
+            n_ubatch: 1,
+            n_ctx: 1,
+        };
+        assert_eq!(super::estimate_compute_buffer_bytes(tiny), 64 * 1024 * 1024);
+    }
+
     #[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
     use super::gguf_external_kv_block_count;
     use super::{
@@ -5810,11 +6370,67 @@ mod tests {
         let geometry = external_test_geometry();
         let descriptor = external_test_descriptor(geometry);
         let pool = unsafe {
-            GgufExternalKvPool::from_raw(geometry, descriptor, Box::new(()), Arc::new(|| 4096))
+            GgufExternalKvPool::from_raw_on_ordinal(
+                geometry,
+                descriptor,
+                Box::new(()),
+                Arc::new(|| 4096),
+                geometry.device_id,
+            )
         }
         .expect("valid runtime-owned descriptor");
         assert_eq!((pool.usage_bytes)(), 4096);
         pool.topology.validate().expect("valid derived topology");
+    }
+
+    #[cfg(feature = "gguf-cuda")]
+    #[test]
+    fn weights_are_keyed_and_charged_per_device() {
+        use super::{gguf_allocation_id, gguf_weights_key};
+        let path = std::path::Path::new("/models/qwen.gguf");
+        // Replicas of one model on different GPUs must not share a loaded model
+        // (it lives on one GPU) nor an allocation id (each device is charged).
+        assert_ne!(gguf_weights_key(path, 0), gguf_weights_key(path, 1));
+        assert_ne!(gguf_allocation_id(path, 0), gguf_allocation_id(path, 1));
+        // Replicas on one device still share.
+        assert_eq!(gguf_weights_key(path, 1), gguf_weights_key(path, 1));
+        assert_eq!(gguf_allocation_id(path, 1), gguf_allocation_id(path, 1));
+        assert!(gguf_allocation_id(path, 1).starts_with("llama-gguf:"));
+    }
+
+    #[cfg(feature = "gguf-external-kv")]
+    #[test]
+    fn external_kv_descriptor_reaches_llama_cpp_with_the_cuda_ordinal() {
+        // Engine device 2 is CUDA ordinal 0 (CUDA_VISIBLE_DEVICES=2): the
+        // descriptor is validated against the engine id, then llama.cpp gets 0.
+        let geometry = external_test_geometry();
+        assert_eq!(geometry.device_id, 2);
+        let descriptor = external_test_descriptor(geometry);
+        assert_eq!(descriptor.device_id, 2);
+        let pool = unsafe {
+            GgufExternalKvPool::from_raw_on_ordinal(
+                geometry,
+                descriptor,
+                Box::new(()),
+                Arc::new(|| 0),
+                0,
+            )
+        }
+        .expect("valid runtime-owned descriptor");
+        assert_eq!(pool.desc.device_id, 0);
+        // A descriptor that names another engine device is still refused.
+        let mut other = external_test_descriptor(geometry);
+        other.device_id = 0;
+        assert!(unsafe {
+            GgufExternalKvPool::from_raw_on_ordinal(
+                geometry,
+                other,
+                Box::new(()),
+                Arc::new(|| 0),
+                0,
+            )
+        }
+        .is_err());
     }
 
     #[cfg(feature = "gguf-external-kv")]

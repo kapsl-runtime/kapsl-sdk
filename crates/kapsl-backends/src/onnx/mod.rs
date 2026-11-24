@@ -1,4 +1,8 @@
 use crate::env_util::read_env_flag;
+use crate::memory_measure::{
+    creation_tracker, measured_report, process_resident_bytes, unattributed_domain, MemoryMeter,
+    MeterConfig, Placement, PoolUsage,
+};
 use async_trait::async_trait;
 use half::f16;
 use kapsl_engine_api::{
@@ -70,6 +74,8 @@ pub struct OnnxBackend {
     external_allocation_id: String,
     #[cfg_attr(not(feature = "onnx-cuda-pool"), allow(dead_code))]
     memory_owner: Option<(u32, u32)>,
+    /// Measured memory of every live session, behind `actual_memory`.
+    meter: Arc<MemoryMeter>,
 }
 
 #[derive(Default)]
@@ -86,6 +92,7 @@ struct SessionPool {
     waits_total: AtomicU64,
     wait_micros_total: AtomicU64,
     max_sessions: usize,
+    meter: Arc<MemoryMeter>,
 }
 
 struct PooledSession<'a> {
@@ -94,7 +101,7 @@ struct PooledSession<'a> {
 }
 
 impl SessionPool {
-    fn new(initial: Session, max_sessions: usize) -> Self {
+    fn new(initial: Session, max_sessions: usize, meter: Arc<MemoryMeter>) -> Self {
         Self {
             sessions: Mutex::new(vec![initial]),
             condvar: Condvar::new(),
@@ -102,6 +109,7 @@ impl SessionPool {
             waits_total: AtomicU64::new(0),
             wait_micros_total: AtomicU64::new(0),
             max_sessions: max_sessions.max(1),
+            meter,
         }
     }
 
@@ -216,11 +224,23 @@ struct SessionPoolStats {
     wait_seconds_total: f64,
 }
 
+impl Drop for SessionPool {
+    fn drop(&mut self) {
+        // Idle sessions are the only ones a dropping pool can still hold.
+        if let Ok(sessions) = self.sessions.get_mut() {
+            for session in sessions.iter() {
+                self.meter.forget(session);
+            }
+        }
+    }
+}
+
 impl PooledSession<'_> {
     fn discard(&mut self) {
-        let Some(_session) = self.session.take() else {
+        let Some(session) = self.session.take() else {
             return;
         };
+        self.pool.meter.forget(&session);
 
         self.pool.total_sessions.fetch_sub(1, Ordering::AcqRel);
         self.pool.condvar.notify_one();
@@ -260,6 +280,64 @@ impl Drop for PooledSession<'_> {
                 self.pool.total_sessions.fetch_sub(1, Ordering::AcqRel);
                 self.pool.condvar.notify_one();
             }
+        }
+    }
+}
+
+/// Apple silicon CPUs, GPU and Neural Engine share one memory.
+fn apple_silicon_unified_memory() -> bool {
+    cfg!(all(target_os = "macos", target_arch = "aarch64"))
+}
+
+/// The execution providers for a CUDA or TensorRT session on CUDA `ordinal`.
+///
+/// The CUDA provider is registered with `error_on_failure`: without it ONNX
+/// Runtime logs "may fall back to CPU" and builds a CPU session, which the engine
+/// would then charge to a GPU it never touches. A TensorRT request keeps CUDA as
+/// its documented fallback for graphs TensorRT rejects, so TensorRT alone may fail
+/// to register, but the session is never left with neither.
+pub(crate) fn cuda_execution_providers(
+    tensorrt: bool,
+    ordinal: i32,
+) -> Vec<ort::execution_providers::ExecutionProviderDispatch> {
+    use ort::execution_providers::{CUDAExecutionProvider, TensorRTExecutionProvider};
+    let mut providers = Vec::new();
+    if tensorrt {
+        providers.push(
+            TensorRTExecutionProvider::default()
+                .with_device_id(ordinal)
+                .build(),
+        );
+    }
+    providers.push(
+        CUDAExecutionProvider::default()
+            .with_device_id(ordinal)
+            .build()
+            .error_on_failure(),
+    );
+    providers
+}
+
+/// CUDA ordinal for an engine device id, as a load failure when the device has
+/// none (hidden from this process, unmatched): never another GPU's ordinal.
+fn cuda_ordinal_for_load(device_id: i32, model_path: &Path) -> Result<i32, EngineError> {
+    kapsl_llm::cuda_ordinal::to_cuda_ordinal_i32(device_id).map_err(|error| {
+        EngineError::ModelLoadError {
+            path: model_path.to_string_lossy().into_owned(),
+            source: Box::new(error),
+        }
+    })
+}
+
+/// CUDA ordinal for accounting queries made after (or independent of) a load.
+/// `None` means there is no such device for this process; the load itself fails
+/// in [`cuda_ordinal_for_load`], so a query never selects a device.
+fn mapped_cuda_ordinal(device_id: i32) -> Option<i32> {
+    match kapsl_llm::cuda_ordinal::to_cuda_ordinal_i32(device_id) {
+        Ok(ordinal) => Some(ordinal),
+        Err(error) => {
+            log::error!("{error}");
+            None
         }
     }
 }
@@ -451,6 +529,26 @@ impl OnnxBackendBuilder {
                 NEXT_ONNX_EXTERNAL_ALLOCATION_ID.fetch_add(1, Ordering::Relaxed)
             ),
             memory_owner: self.memory_owner,
+            meter: Arc::new(
+                MemoryMeter::new(MeterConfig {
+                    device_arena: matches!(
+                        self.provider,
+                        ExecutionProvider::CUDA | ExecutionProvider::TensorRT
+                    )
+                    .then(|| mapped_cuda_ordinal(self.device_id))
+                    .flatten()
+                    .map(|ordinal| (ort::memory::AllocationDevice::CUDA, ordinal)),
+                    use_creation_rss: matches!(
+                        self.provider,
+                        ExecutionProvider::CPU | ExecutionProvider::CoreML
+                    ),
+                })
+                .with_label(
+                    self.memory_owner,
+                    &format!("{:?}", self.provider).to_ascii_lowercase(),
+                    self.device_id,
+                ),
+            ),
         }
     }
 }
@@ -467,7 +565,8 @@ impl OnnxBackend {
         if !matches!(
             self.provider,
             ExecutionProvider::CUDA | ExecutionProvider::TensorRT
-        ) || !crate::ort_pool_allocator::is_registered(self.device_id)
+        ) || !mapped_cuda_ordinal(self.device_id)
+            .is_some_and(crate::ort_pool_allocator::is_registered)
         {
             return None;
         }
@@ -512,6 +611,75 @@ impl OnnxBackend {
             .build())
     }
 
+    /// Where this provider's model memory physically lives.
+    fn memory_placement(&self) -> Placement {
+        match self.provider {
+            ExecutionProvider::CPU => Placement::Host,
+            ExecutionProvider::CoreML if apple_silicon_unified_memory() => Placement::Host,
+            ExecutionProvider::CoreML => Placement::Unattributed,
+            ExecutionProvider::CUDA | ExecutionProvider::TensorRT => Placement::Cuda {
+                device_id: self.device_id as usize,
+                pooled: !self.uses_external_cuda_memory(),
+            },
+            provider => Placement::Provider {
+                name: format!("{provider:?}").to_ascii_lowercase(),
+                device_id: self.device_id as usize,
+            },
+        }
+    }
+
+    /// What the Kapsl GPU pool attributes to this replica, when ORT draws
+    /// device memory from it and the replica's owner is known.
+    fn pool_usage(&self) -> Option<PoolUsage> {
+        #[cfg(feature = "onnx-cuda-pool")]
+        {
+            let (model_id, replica_id) = self.memory_owner?;
+            let ordinal = mapped_cuda_ordinal(self.device_id)?;
+            let usage = |class| {
+                crate::ort_pool_allocator::owner_usage_bytes(
+                    ordinal,
+                    PoolOwner::onnx(model_id, replica_id, class),
+                )
+            };
+            Some(PoolUsage {
+                weights: usage(PoolAllocationClass::PersistentWeights)?,
+                workspace: usage(PoolAllocationClass::TransientWorkspace)?,
+            })
+        }
+        #[cfg(not(feature = "onnx-cuda-pool"))]
+        {
+            None
+        }
+    }
+
+    /// Debug-level `[onnx-mem]` lines (arena statistics per session, pool owner
+    /// usage) for `stage` = `load` or `warmup`. Free when the target is off.
+    fn log_memory_stage(&self, stage: &str) {
+        if !MemoryMeter::log_enabled() {
+            return;
+        }
+        self.refresh_idle_sessions();
+        self.meter.log_stage(stage);
+        self.meter.log_pool(stage, self.pool_usage());
+    }
+
+    /// Refresh the statistics of sessions that are idle right now; busy ones
+    /// refresh themselves when their run finishes.
+    fn refresh_idle_sessions(&self) {
+        let Ok(session_guard) = self.session.try_read() else {
+            return;
+        };
+        let Some(pool) = session_guard.as_ref() else {
+            return;
+        };
+        let idle = pool.sessions.try_lock();
+        if let Ok(sessions) = idle {
+            for session in sessions.iter() {
+                self.meter.refresh(session, true);
+            }
+        }
+    }
+
     fn session_pool_size(&self) -> usize {
         self.peak_concurrency_hint.unwrap_or(1).max(1) as usize
     }
@@ -525,7 +693,9 @@ impl OnnxBackend {
         }
         #[cfg(feature = "onnx-cuda-pool")]
         {
-            !crate::ort_pool_allocator::is_registered(self.device_id)
+            // A device with no CUDA ordinal cannot be pooled: count it as external.
+            !mapped_cuda_ordinal(self.device_id)
+                .is_some_and(crate::ort_pool_allocator::is_registered)
         }
         #[cfg(not(feature = "onnx-cuda-pool"))]
         {
@@ -534,7 +704,11 @@ impl OnnxBackend {
     }
 
     fn create_session_pool(&self, session: Session) -> Arc<SessionPool> {
-        Arc::new(SessionPool::new(session, self.session_pool_size()))
+        Arc::new(SessionPool::new(
+            session,
+            self.session_pool_size(),
+            Arc::clone(&self.meter),
+        ))
     }
 
     fn prewarm_session_pool(
@@ -695,7 +869,26 @@ impl OnnxBackend {
         split_batched_output(&output, &row_counts)
     }
 
+    /// Create a session and record what it cost: the resident-size growth
+    /// around creation (when no other creation overlapped) and the arena
+    /// statistics right after load, before any run.
     fn create_session(
+        &self,
+        model_path: &Path,
+        opt_level: GraphOptimizationLevel,
+    ) -> Result<Session, EngineError> {
+        let window = creation_tracker().begin();
+        let rss_before = process_resident_bytes();
+        let session = self.create_session_unmeasured(model_path, opt_level);
+        let rss_after = process_resident_bytes();
+        let alone = window.finish();
+        let session = session?;
+        self.meter
+            .register_creation(&session, rss_before, rss_after, alone);
+        Ok(session)
+    }
+
+    fn create_session_unmeasured(
         &self,
         model_path: &Path,
         opt_level: GraphOptimizationLevel,
@@ -730,12 +923,19 @@ impl OnnxBackend {
         // When a shared Kapsl GPU pool is registered with ORT for this
         // device, opt into env allocators so this session's device memory is
         // carved out of the same pool as the GGUF KV cache.
-        #[cfg(feature = "onnx-cuda-pool")]
-        if matches!(
+        // An engine device this process cannot see has no CUDA ordinal: fail the
+        // load instead of opening another GPU or taking the unpooled path.
+        #[cfg_attr(not(feature = "onnx-cuda-pool"), allow(unused_variables))]
+        let cuda_ordinal = if matches!(
             self.provider,
             ExecutionProvider::CUDA | ExecutionProvider::TensorRT
-        ) && crate::ort_pool_allocator::is_registered(self.device_id)
-        {
+        ) {
+            Some(cuda_ordinal_for_load(self.device_id, model_path)?)
+        } else {
+            None
+        };
+        #[cfg(feature = "onnx-cuda-pool")]
+        if cuda_ordinal.is_some_and(crate::ort_pool_allocator::is_registered) {
             builder = builder
                 .with_config_entry(crate::ort_pool_allocator::USE_ENV_ALLOCATORS_KEY, "1")
                 .map_err(|e| EngineError::ModelLoadError {
@@ -763,14 +963,16 @@ impl OnnxBackend {
                     });
                 }
                 builder
-                    .with_execution_providers([
-                        ort::execution_providers::CUDAExecutionProvider::default()
-                            .with_device_id(self.device_id)
-                            .build(),
-                    ])
+                    .with_execution_providers(cuda_execution_providers(
+                        false,
+                        cuda_ordinal_for_load(self.device_id, model_path)?,
+                    ))
                     .map_err(|e| EngineError::ModelLoadError {
                         path: model_path.to_string_lossy().into_owned(),
-                        source: Box::new(std::io::Error::other(e.to_string())),
+                        source: Box::new(std::io::Error::other(format!(
+                            "the CUDA execution provider could not be registered, so ONNX Runtime \
+                             would run this model on the CPU: {e}"
+                        ))),
                     })?
             }
             ExecutionProvider::TensorRT => {
@@ -784,18 +986,16 @@ impl OnnxBackend {
                     });
                 }
                 builder
-                    .with_execution_providers([
-                        ort::execution_providers::TensorRTExecutionProvider::default()
-                            .with_device_id(self.device_id)
-                            .build(),
-                        // Fallback to CUDA if TensorRT has issues with some nodes
-                        ort::execution_providers::CUDAExecutionProvider::default()
-                            .with_device_id(self.device_id)
-                            .build(),
-                    ])
+                    .with_execution_providers(cuda_execution_providers(
+                        true,
+                        cuda_ordinal_for_load(self.device_id, model_path)?,
+                    ))
                     .map_err(|e| EngineError::ModelLoadError {
                         path: model_path.to_string_lossy().into_owned(),
-                        source: Box::new(std::io::Error::other(e.to_string())),
+                        source: Box::new(std::io::Error::other(format!(
+                            "neither the TensorRT nor the CUDA execution provider could be \
+                             registered, so ONNX Runtime would run this model on the CPU: {e}"
+                        ))),
                     })?
             }
             ExecutionProvider::DirectML => {
@@ -1487,8 +1687,29 @@ fn run_inference_with_pooled_session(
     shape_usize: Vec<usize>,
     main_input_tensor: SessionInputValue<'_>,
 ) -> Result<BinaryTensorPacket, EngineError> {
+    // The window also tells the meter whether anything else ran meanwhile, so
+    // a resident-size delta is only trusted when this run was alone.
+    let window = creation_tracker().begin();
+    let first_run_rss = session
+        .pool
+        .meter
+        .wants_first_run_rss(session)
+        .then(process_resident_bytes)
+        .flatten();
     let result =
         run_inference_with_session(session, request, metadata, shape_usize, main_input_tensor);
+    let alone = window.finish();
+    if first_run_rss.is_some() {
+        session.pool.meter.record_first_run(
+            session,
+            first_run_rss,
+            process_resident_bytes(),
+            alone,
+        );
+    }
+    if result.is_ok() {
+        session.pool.meter.refresh(session, false);
+    }
     if result.is_err() {
         log::warn!("Discarding ONNX session after inference failure");
         session.discard();
@@ -1615,6 +1836,24 @@ impl Engine for OnnxBackend {
                 },
             ),
             ExecutionProvider::CPU => return Ok(report),
+            ExecutionProvider::CoreML => {
+                // CoreML on Apple silicon runs in unified memory: count it
+                // where it lives. Elsewhere the placement is unknown.
+                let domain = if apple_silicon_unified_memory() {
+                    MemoryDomain::Host
+                } else {
+                    unattributed_domain()
+                };
+                report.allocations[0].domain = domain.clone();
+                report.push(MemoryAllocation {
+                    allocation_id: format!("{}:workspace", self.external_allocation_id),
+                    domain,
+                    class: MemoryAllocationClass::TransientWorkspace,
+                    source: MemoryAllocationSource::BackendManaged,
+                    bytes: (model_bytes / 4).max(64 * 1024 * 1024),
+                });
+                return Ok(report);
+            }
             provider => (
                 MemoryDomain::Provider {
                     provider: format!("{provider:?}").to_ascii_lowercase(),
@@ -1769,6 +2008,7 @@ impl Engine for OnnxBackend {
 
         // Reset warmup state
         self.warmed_up.store(false, Ordering::SeqCst);
+        self.log_memory_stage("load");
 
         Ok(())
     }
@@ -1889,18 +2129,33 @@ impl Engine for OnnxBackend {
             // so we leave it as is or update if we had a way.
         }
 
-        // Mark as warmed up
-        self.warmed_up.store(true, Ordering::SeqCst);
+        // Mark as warmed up; the first successful inference is the warm-up.
+        if !self.warmed_up.swap(true, Ordering::SeqCst) {
+            self.log_memory_stage("warmup");
+        }
 
         Ok(output_packet)
     }
 
     fn actual_memory(&self) -> MemoryReport {
         let model_path = self.model_path.read().ok().and_then(|path| path.clone());
-        model_path
-            .as_deref()
-            .and_then(|path| self.planned_memory(path).ok())
-            .unwrap_or_default()
+        let Some(path) = model_path.as_deref() else {
+            return MemoryReport::default();
+        };
+        let Ok(plan) = self.planned_memory(path) else {
+            return MemoryReport::default();
+        };
+        let model_bytes = std::fs::metadata(path).map_or(0, |meta| meta.len() as usize);
+        self.refresh_idle_sessions();
+        measured_report(
+            &self.external_allocation_id,
+            &self.memory_placement(),
+            &self
+                .meter
+                .totals(model_bytes, (model_bytes / 4).max(64 * 1024 * 1024)),
+            self.pool_usage(),
+            &plan,
+        )
     }
 
     fn planned_request_memory(&self, request: &InferenceRequest) -> MemoryReport {

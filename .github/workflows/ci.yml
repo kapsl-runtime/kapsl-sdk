@@ -33,7 +33,7 @@ jobs:
         run: rustup component add rustfmt clippy
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-bin: true
           shared-key: quality
@@ -50,8 +50,33 @@ jobs:
       - name: Lint SDK workspace
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      # Exercise allocation publication and failure accounting without loading
+      # a CUDA driver. The physical CUDA regression remains explicitly ignored.
+      - name: Test KV initialization ownership on the host
+        run: >-
+          cargo test -p kapsl-hal --lib --locked
+          --features cuda,cudarc/cuda-12060 gpu_arena::initialization_tests
+          -- --test-threads=1
+
+      - name: Test pool admission queries on the host
+        run: >-
+          cargo test -p kapsl-hal --lib --locked
+          --features cuda,cudarc/cuda-12060 gpu_arena::admission_tests
+          -- --test-threads=1
+
+      - name: Test GPU physical region lifetimes on the host
+        run: >-
+          cargo test -p kapsl-hal --lib --locked
+          --features cuda,cudarc/cuda-12060
+          -- gpu_region gpu_ipc_region gpu_vmm_region --test-threads=1
+
       - name: Check optional gRPC facade
         run: cargo check -p kapsl-communication --no-default-features --features grpc --locked
+
+      # The engine turns on `nvml` through its gpu-device-pool feature. Nothing
+      # else in this workspace builds it, so check it here.
+      - name: Check optional NVML probe
+        run: cargo check -p kapsl-hal --features nvml --locked
 
       - name: Install unused-dependency checker
         # The published tool lockfile currently pins vulnerable transitive crates.
@@ -79,7 +104,7 @@ jobs:
         uses: ./.github/actions/setup-rust # zizmor: ignore[self-repository] actionlint does not support `$/` yet.
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-bin: true
           shared-key: security-audit
@@ -119,7 +144,7 @@ jobs:
         uses: ./.github/actions/setup-rust # zizmor: ignore[self-repository] actionlint does not support `$/` yet.
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Check LLM ORT provider feature isolation
         run: bash scripts/test-llm-ort-feature-contract.sh
@@ -146,7 +171,7 @@ jobs:
         uses: ./.github/actions/setup-rust # zizmor: ignore[self-repository] actionlint does not support `$/` yet.
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Run tests
         run: cargo test --workspace --all-targets --locked
@@ -183,7 +208,7 @@ jobs:
         uses: ./.github/actions/setup-rust # zizmor: ignore[self-repository] actionlint does not support `$/` yet.
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Build sdist
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
@@ -213,7 +238,7 @@ jobs:
           msrv: true
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: msrv
 

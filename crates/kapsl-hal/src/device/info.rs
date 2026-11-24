@@ -697,7 +697,16 @@ impl DeviceInfo {
     fn detect_cuda_gpus_nvml(cuda_version: Option<&str>) -> Option<Vec<Device>> {
         use nvml_wrapper::Nvml;
 
-        let nvml = Nvml::init().ok()?;
+        // nvml-wrapper loads `libnvidia-ml.so`; containers that inject the driver
+        // libraries only carry `libnvidia-ml.so.1`.
+        let nvml = Nvml::init()
+            .or_else(|first| {
+                Nvml::builder()
+                    .lib_path(std::ffi::OsStr::new("libnvidia-ml.so.1"))
+                    .init()
+                    .map_err(|_| first)
+            })
+            .ok()?;
         let driver_version = nvml.sys_driver_version().ok();
         let count = nvml.device_count().ok()?;
 
@@ -722,7 +731,7 @@ impl DeviceInfo {
             let cc = dev
                 .cuda_compute_capability()
                 .ok()
-                .map(|(maj, min)| format!("{maj}.{min}"));
+                .map(|cc| format!("{}.{}", cc.major, cc.minor));
 
             // UUID is a stable per-device identifier (e.g. "GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx")
             // that survives index reordering. For MIG compute instances NVML would return a

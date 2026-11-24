@@ -112,6 +112,13 @@ impl Engine for PreprocessBackend {
         self.inner.kv_topology()
     }
 
+    fn planned_memory(
+        &self,
+        model_path: &Path,
+    ) -> Result<kapsl_engine_api::MemoryReport, EngineError> {
+        self.inner.planned_memory(model_path)
+    }
+
     fn planned_external_device_memory(
         &self,
         model_path: &Path,
@@ -125,6 +132,10 @@ impl Engine for PreprocessBackend {
 
     fn actual_external_device_memory(&self) -> kapsl_engine_api::ExternalDeviceMemoryReport {
         self.inner.actual_external_device_memory()
+    }
+
+    fn actual_memory(&self) -> kapsl_engine_api::MemoryReport {
+        self.inner.actual_memory()
     }
 
     fn infer(&self, request: &InferenceRequest) -> Result<BinaryTensorPacket, EngineError> {

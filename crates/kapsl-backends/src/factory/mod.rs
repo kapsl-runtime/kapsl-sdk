@@ -35,15 +35,34 @@ use ort::session::builder::GraphOptimizationLevel;
 ))]
 use std::sync::Arc;
 
-fn use_registered_env_allocator(device_id: i32) -> bool {
+/// Whether ORT should draw device memory from the registered Kapsl pool for
+/// `device_id`. `provider` is the execution provider when the caller knows it.
+///
+/// A CUDA/TensorRT provider on a device with no CUDA ordinal (hidden from this
+/// process, unmatched) is an error, not "no pool registered": the load must
+/// fail instead of continuing unpooled on a device the engine does not manage.
+/// With no known provider the answer is `false` for such a device; if the
+/// runtime then picks CUDA, the provider setup in the ONNX backend fails the
+/// load with the same error.
+fn use_registered_env_allocator(provider: Option<&str>, device_id: i32) -> Result<bool, String> {
     #[cfg(feature = "onnx-cuda-pool")]
     {
-        crate::ort_pool_allocator::is_registered(device_id)
+        let is_cuda = provider.is_some_and(|provider| {
+            provider.eq_ignore_ascii_case("cuda") || provider.eq_ignore_ascii_case("tensorrt")
+        });
+        match kapsl_llm::cuda_ordinal::to_cuda_ordinal_i32(device_id) {
+            Ok(ordinal) => Ok(crate::ort_pool_allocator::is_registered(ordinal)),
+            Err(error) if is_cuda => Err(error.to_string()),
+            Err(error) => {
+                log::debug!("no pool allocator for device {device_id}: {error}");
+                Ok(false)
+            }
+        }
     }
     #[cfg(not(feature = "onnx-cuda-pool"))]
     {
-        let _ = device_id;
-        false
+        let _ = (provider, device_id);
+        Ok(false)
     }
 }
 
@@ -61,6 +80,30 @@ pub struct OnnxRuntimeTuning {
 
 /// Error for a declared-but-unimplemented engine cell (e.g. ONNX classification).
 /// The triple is valid; there is just no backend yet.
+/// Numeric comparison of dotted versions: `13.0 >= 9.0` (a string compare says
+/// otherwise). Missing trailing parts count as zero. Either side failing to
+/// parse is a failed requirement (fail closed).
+pub(crate) fn cuda_version_at_least(device_version: &str, min_version: &str) -> bool {
+    fn parse(version: &str) -> Option<Vec<u64>> {
+        version
+            .trim()
+            .split('.')
+            .map(|part| part.trim().parse::<u64>().ok())
+            .collect()
+    }
+    let (Some(device), Some(min)) = (parse(device_version), parse(min_version)) else {
+        return false;
+    };
+    for i in 0..device.len().max(min.len()) {
+        let d = device.get(i).copied().unwrap_or(0);
+        let m = min.get(i).copied().unwrap_or(0);
+        if d != m {
+            return d > m;
+        }
+    }
+    true
+}
+
 fn unimplemented_engine_error(kind: EngineKind) -> String {
     format!(
         "model kind `{}` is declared but not yet implemented by a backend",
@@ -102,7 +145,7 @@ fn manifest_metadata_bool(manifest: &Manifest, section: &str, key: &str, default
 }
 
 /// Wrap a freshly built ONNX engine in the task post-processor the manifest asks
-/// for (embedding pooling, classification softmax, or detection box-decode+NMS);
+/// for (embedding pooling, classification softmax, or transcription decoding);
 /// otherwise return it unchanged.
 fn maybe_wrap_onnx_postprocess(
     engine_kind: EngineKind,
@@ -125,21 +168,6 @@ fn maybe_wrap_onnx_postprocess(
                 apply_softmax,
             )))
         }
-        EngineKind::OnnxDetect => {
-            let spec = manifest
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("detect"))
-                .ok_or_else(|| {
-                    "detect task requires a `metadata.detect` block (num_classes at minimum)"
-                        .to_string()
-                })?;
-            let cfg: crate::onnx_detect::DetectConfig = serde_yaml::from_value(spec.clone())
-                .map_err(|e| format!("invalid metadata.detect: {e}"))?;
-            let backend = crate::onnx_detect::OnnxDetectBackend::new(inner, cfg)
-                .map_err(|e| format!("detector init failed: {e}"))?;
-            Ok(Box::new(backend))
-        }
         EngineKind::OnnxTranscribe => {
             // metadata.transcribe is optional (defaults to blank-0, collapse on).
             let cfg = match manifest.metadata.as_ref().and_then(|m| m.get("transcribe")) {
@@ -153,6 +181,45 @@ fn maybe_wrap_onnx_postprocess(
         }
         _ => Ok(inner),
     }
+}
+
+/// The `metadata.preprocess` block as a [`VisionConfig`], when it is a vision one.
+fn vision_preprocess_config(
+    manifest: &Manifest,
+) -> Result<Option<crate::preprocess::vision::VisionConfig>, String> {
+    let Some(spec) = manifest.metadata.as_ref().and_then(|m| m.get("preprocess")) else {
+        return Ok(None);
+    };
+    if spec.get("kind").and_then(|k| k.as_str()) != Some("vision") {
+        return Ok(None);
+    }
+    serde_yaml::from_value(spec.clone())
+        .map(Some)
+        .map_err(|e| format!("invalid metadata.preprocess (vision): {e}"))
+}
+
+/// Wrap `inner` in the detection post-processor. `inner` must already include
+/// any input preprocessor: the detector sits *outside* it so it sees the raw
+/// encoded image and can map boxes back to the original image's coordinates.
+fn wrap_onnx_detect(
+    manifest: &Manifest,
+    inner: Box<dyn Engine>,
+) -> Result<Box<dyn Engine>, String> {
+    let spec = manifest
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("detect"))
+        .ok_or_else(|| {
+            "detect task requires a `metadata.detect` block (num_classes at minimum)".to_string()
+        })?;
+    let cfg: crate::onnx_detect::DetectConfig = serde_yaml::from_value(spec.clone())
+        .map_err(|e| format!("invalid metadata.detect: {e}"))?;
+    let mut backend = crate::onnx_detect::OnnxDetectBackend::new(inner, cfg)
+        .map_err(|e| format!("detector init failed: {e}"))?;
+    if let Some(vision) = vision_preprocess_config(manifest)? {
+        backend = backend.with_image_input(vision);
+    }
+    Ok(Box::new(backend))
 }
 
 /// Wrap an ONNX engine in the input *pre*-processing stage its manifest asks for
@@ -208,6 +275,12 @@ fn finalize_onnx_pipeline(
     manifest: &Manifest,
     inner: Box<dyn Engine>,
 ) -> Result<Box<dyn Engine>, String> {
+    if engine_kind == EngineKind::OnnxDetect {
+        // Detection reverses the preprocessor's resize/pad, so it wraps the
+        // preprocessor (`onnx -> preprocess -> detect`) rather than the reverse.
+        let pre = maybe_wrap_onnx_preprocess(engine_kind, manifest, inner)?;
+        return wrap_onnx_detect(manifest, pre);
+    }
     let post = maybe_wrap_onnx_postprocess(engine_kind, manifest, inner)?;
     maybe_wrap_onnx_preprocess(engine_kind, manifest, post)
 }
@@ -329,12 +402,33 @@ impl BackendFactory {
         )
     }
 
+    /// Give the GGUF backends the engine's accelerator inventory so llama.cpp
+    /// devices are matched to engine devices by PCI bus id, not by position.
+    ///
+    /// The `create_gguf_*` constructors take no device list, so a host that calls
+    /// them directly (the engine does) must call this first; without it a host
+    /// with several CUDA devices cannot map an engine device to a llama.cpp one.
+    pub fn register_gguf_engine_devices(device_info: &DeviceInfo) {
+        let devices = device_info
+            .devices
+            .iter()
+            .filter(|device| !matches!(device.backend, kapsl_hal::device::DeviceBackend::Cpu))
+            .map(|device| kapsl_llm::gguf_placement::EngineDeviceInfo {
+                id: device.id,
+                backend: device.backend.to_string(),
+                pci_bus_id: device.pci_bus_id.clone(),
+            })
+            .collect();
+        kapsl_llm::gguf_placement::register_engine_devices(devices);
+    }
+
     fn create_best_backend_with_tuning_for_owner(
         manifest: &Manifest,
         device_info: &DeviceInfo,
         tuning: &OnnxRuntimeTuning,
         memory_owner: Option<(u32, u32)>,
     ) -> Result<Box<dyn Engine>, String> {
+        Self::register_gguf_engine_devices(device_info);
         let engine_kind = resolve_dispatch_engine_kind(manifest)?;
 
         // GGUF: prefer native CUDA kernels when gguf-native feature is compiled in.
@@ -394,8 +488,10 @@ impl BackendFactory {
                         "✓ Using LLMBackend with manifest provider override: {}",
                         provider
                     );
+                    let env_allocators =
+                        use_registered_env_allocator(Some(provider.as_str()), device_id)?;
                     let mut backend = LLMBackend::with_device(provider, device_id)
-                        .with_env_allocators(use_registered_env_allocator(device_id));
+                        .with_env_allocators(env_allocators);
                     if let Some((model_id, replica_id)) = memory_owner {
                         backend = backend.with_memory_owner(model_id, replica_id);
                     }
@@ -405,7 +501,7 @@ impl BackendFactory {
             log::info!("✓ Using LLMBackend with runtime fastest-provider selection");
             let device_id = requirements.device_id.unwrap_or(0);
             let mut backend = LLMBackend::with_device_id(device_id)
-                .with_env_allocators(use_registered_env_allocator(device_id));
+                .with_env_allocators(use_registered_env_allocator(None, device_id)?);
             if let Some((model_id, replica_id)) = memory_owner {
                 backend = backend.with_memory_owner(model_id, replica_id);
             }
@@ -524,6 +620,7 @@ impl BackendFactory {
         tuning: &OnnxRuntimeTuning,
         memory_owner: Option<(u32, u32)>,
     ) -> Result<Box<dyn Engine>, String> {
+        Self::register_gguf_engine_devices(device_info);
         let engine_kind = resolve_dispatch_engine_kind(manifest)?;
 
         // Native safetensors: route to custom CUDA kernel backend
@@ -573,8 +670,10 @@ impl BackendFactory {
                     "✓ Using LLMBackend with manifest provider override: {}",
                     provider
                 );
+                let env_allocators =
+                    use_registered_env_allocator(Some(provider), device_id as i32)?;
                 let mut backend = LLMBackend::with_device(provider.to_string(), device_id as i32)
-                    .with_env_allocators(use_registered_env_allocator(device_id as i32));
+                    .with_env_allocators(env_allocators);
                 if let Some((model_id, replica_id)) = memory_owner {
                     backend = backend.with_memory_owner(model_id, replica_id);
                 }
@@ -585,7 +684,7 @@ impl BackendFactory {
                 "✓ Using LLMBackend with device pinning and runtime provider auto-selection"
             );
             let mut backend = LLMBackend::with_device_id(device_id as i32)
-                .with_env_allocators(use_registered_env_allocator(device_id as i32));
+                .with_env_allocators(use_registered_env_allocator(None, device_id as i32)?);
             if let Some((model_id, replica_id)) = memory_owner {
                 backend = backend.with_memory_owner(model_id, replica_id);
             }
@@ -983,7 +1082,7 @@ impl BackendFactory {
                     if backend_key == "cuda" {
                         if let Some(min_ver) = &requirements.min_cuda_version {
                             if let Some(dev_ver) = &device.cuda_version {
-                                if dev_ver < min_ver {
+                                if !cuda_version_at_least(dev_ver, min_ver) {
                                     return false;
                                 }
                             } else {
@@ -1036,7 +1135,7 @@ impl BackendFactory {
                 if backend_key == "cuda" {
                     if let Some(min_ver) = &requirements.min_cuda_version {
                         if let Some(dev_ver) = &device.cuda_version {
-                            if dev_ver < min_ver {
+                            if !cuda_version_at_least(dev_ver, min_ver) {
                                 reasons.push(format!(
                                     "CUDA version too old: {} < required {}",
                                     dev_ver, min_ver
