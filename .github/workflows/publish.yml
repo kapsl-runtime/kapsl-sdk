@@ -1,0 +1,411 @@
+name: Publish SDK packages
+
+# One release pipeline for every package in this repository: the workspace
+# crates (crates.io) and the Python distributions (PyPI), as declared in
+# .github/release-packages.toml. Run it from main. It works out what to
+# release, builds and checks all of it, then waits for a maintainer to approve
+# the sdk-release environment before anything is published. RELEASING.md
+# describes the process and the one-time repository setup.
+
+on:
+  workflow_dispatch:
+    inputs:
+      packages:
+        description: >-
+          "changed" releases every package changed since its last release whose
+          version is not published yet. Or name packages: "kapsl-hal, kapsl-llm".
+        type: string
+        default: changed
+        required: true
+      publish:
+        description: Publish after approval (unchecked = dry run)
+        type: boolean
+        default: false
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-sdk-packages
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Plan the release
+    runs-on: ubuntu-latest
+    outputs:
+      publish: ${{ steps.plan.outputs.publish }}
+      release: ${{ steps.plan.outputs.release }}
+      packages: ${{ steps.plan.outputs.packages }}
+      names: ${{ steps.plan.outputs.names }}
+      crates: ${{ steps.plan.outputs.crates }}
+      crate-order: ${{ steps.plan.outputs.crate-order }}
+      crate-submodules: ${{ steps.plan.outputs.crate-submodules }}
+      new-crates: ${{ steps.plan.outputs.new-crates }}
+      existing-crates: ${{ steps.plan.outputs.existing-crates }}
+      python: ${{ steps.plan.outputs.python }}
+      maturin: ${{ steps.plan.outputs.maturin }}
+      setuptools: ${{ steps.plan.outputs.setuptools }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Release tags and history, to find what changed since each release.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust # zizmor: ignore[self-repository] actionlint does not support `$/` yet.
+
+      - name: Decide what to release
+        id: plan
+        env:
+          PACKAGES: ${{ inputs.packages }}
+          PUBLISH: ${{ inputs.publish }}
+        run: python scripts/release_plan.py plan --packages "$PACKAGES" --publish "$PUBLISH"
+
+  check-crates:
+    name: Check ${{ matrix.crate.name }} ${{ matrix.crate.version }}
+    needs: plan
+    if: needs.plan.outputs.crate-order != ''
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: ${{ fromJSON(needs.plan.outputs.crates) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: ${{ matrix.crate.submodules && 'recursive' || 'false' }}
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust # zizmor: ignore[self-repository] actionlint does not support `$/` yet.
+
+      - name: Run release checks
+        env:
+          PACKAGE: ${{ matrix.crate.name }}
+        run: |
+          python scripts/release_plan.py checks --package "$PACKAGE" --output "$RUNNER_TEMP/release-checks.sh"
+          bash "$RUNNER_TEMP/release-checks.sh"
+
+  package-crates:
+    name: Package crates
+    needs: plan
+    if: needs.plan.outputs.crate-order != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: ${{ needs.plan.outputs.crate-submodules == 'true' && 'recursive' || 'false' }}
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust # zizmor: ignore[self-repository] actionlint does not support `$/` yet.
+
+      # A single multi-package dry run verifies each crate against the
+      # versions of its workspace dependencies that are released with it.
+      - name: Verify the crates.io packages
+        env:
+          CRATE_ORDER: ${{ needs.plan.outputs.crate-order }}
+        run: |
+          read -ra crates <<<"$CRATE_ORDER"
+          args=()
+          for name in "${crates[@]}"; do
+            args+=(-p "$name")
+          done
+          cargo publish --dry-run --locked "${args[@]}"
+
+      - name: Upload the packaged crates
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: crates
+          path: target/package/*.crate
+          if-no-files-found: error
+          retention-days: 14
+
+  python-sdk-tests:
+    name: Python SDK tests
+    needs: plan
+    if: contains(fromJSON(needs.plan.outputs.names), 'kapsl-sdk')
+    permissions:
+      contents: read
+    uses: ./.github/workflows/python-sdk-tests.yml # zizmor: ignore[self-repository] actionlint does not support `$/` yet.
+
+  build-maturin-wheels:
+    name: Build ${{ matrix.package.name }} wheel (${{ matrix.os }})
+    needs: plan
+    if: needs.plan.outputs.maturin != '[]'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        package: ${{ fromJSON(needs.plan.outputs.maturin) }}
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    env:
+      PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust # zizmor: ignore[self-repository] actionlint does not support `$/` yet.
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
+        with:
+          command: build
+          args: --release --locked --out dist
+          working-directory: ${{ matrix.package.path }}
+
+      - name: Run release checks
+        shell: bash
+        env:
+          PACKAGE: ${{ matrix.package.name }}
+        run: |
+          python scripts/release_plan.py checks --package "$PACKAGE" --output "$RUNNER_TEMP/release-checks.sh"
+          bash "$RUNNER_TEMP/release-checks.sh"
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: python-${{ matrix.package.name }}--wheel-${{ matrix.os }}
+          path: ${{ matrix.package.path }}/dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  build-maturin-sdist:
+    name: Build ${{ matrix.package.name }} sdist
+    needs: plan
+    if: needs.plan.outputs.maturin != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        package: ${{ fromJSON(needs.plan.outputs.maturin) }}
+    env:
+      PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust # zizmor: ignore[self-repository] actionlint does not support `$/` yet.
+
+      - name: Build source distribution
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
+        with:
+          command: sdist
+          args: --out dist
+          working-directory: ${{ matrix.package.path }}
+
+      - name: Verify the source distribution builds a wheel
+        working-directory: ${{ matrix.package.path }}
+        run: |
+          python -m pip install --disable-pip-version-check 'maturin==1.12.6'
+          python -m pip wheel --no-build-isolation --no-deps dist/*.tar.gz --wheel-dir "$RUNNER_TEMP/sdist-check"
+
+      - name: Upload sdist
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: python-${{ matrix.package.name }}--sdist
+          path: ${{ matrix.package.path }}/dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  build-setuptools:
+    name: Build ${{ matrix.package.name }}
+    needs: plan
+    if: needs.plan.outputs.setuptools != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        package: ${{ fromJSON(needs.plan.outputs.setuptools) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Build wheel and source distribution
+        env:
+          PACKAGE_PATH: ${{ matrix.package.path }}
+        run: |
+          python -m pip install --disable-pip-version-check "build==1.5.0" "twine==6.2.0"
+          python -m build --outdir "$PACKAGE_PATH/dist" "$PACKAGE_PATH"
+          python -m twine check --strict "$PACKAGE_PATH"/dist/*
+
+      - name: Run release checks
+        env:
+          PACKAGE: ${{ matrix.package.name }}
+        run: |
+          python scripts/release_plan.py checks --package "$PACKAGE" --output "$RUNNER_TEMP/release-checks.sh"
+          bash "$RUNNER_TEMP/release-checks.sh"
+
+      - name: Upload distributions
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: python-${{ matrix.package.name }}--dist
+          path: ${{ matrix.package.path }}/dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  # Everything above only reads the repository. The jobs below publish, and
+  # each one waits for a required reviewer of the sdk-release environment.
+  # They all wait on every build, so one approval releases the whole plan,
+  # and nothing is published unless every package built and passed its checks.
+
+  publish-crates:
+    name: Publish crates to crates.io
+    needs: [plan, check-crates, package-crates, python-sdk-tests, build-maturin-wheels, build-maturin-sdist, build-setuptools]
+    if: >-
+      ${{ !cancelled() && !failure()
+      && needs.plan.outputs.publish == 'true'
+      && needs.plan.outputs.crate-order != '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # exchanged for a short-lived crates.io token (trusted publishing)
+    environment: sdk-release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: ${{ needs.plan.outputs.crate-submodules == 'true' && 'recursive' || 'false' }}
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust # zizmor: ignore[self-repository] actionlint does not support `$/` yet.
+
+      - name: Authenticate with crates.io
+        id: crates-io-auth
+        if: needs.plan.outputs.existing-crates == 'true'
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+      - name: Publish in dependency order
+        env:
+          CRATES: ${{ needs.plan.outputs.crates }}
+          OIDC_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
+          # crates.io accepts trusted publishing only for a crate that already
+          # exists, so a crate's first release needs an API token. The secret
+          # is read only when the plan holds a crate crates.io has never seen.
+          BOOTSTRAP_TOKEN: ${{ needs.plan.outputs.new-crates == 'true' && secrets.CRATES_IO_TOKEN || '' }}
+        run: python scripts/release_plan.py publish-crates
+
+  publish-pypi:
+    name: Publish ${{ matrix.package.name }} to PyPI
+    needs: [plan, check-crates, package-crates, python-sdk-tests, build-maturin-wheels, build-maturin-sdist, build-setuptools]
+    if: >-
+      ${{ !cancelled() && !failure()
+      && needs.plan.outputs.publish == 'true'
+      && needs.plan.outputs.python != '[]' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # exchanged for a short-lived PyPI token (trusted publishing)
+    environment: sdk-release
+    strategy:
+      fail-fast: false
+      matrix:
+        package: ${{ fromJSON(needs.plan.outputs.python) }}
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: python-${{ matrix.package.name }}--*
+          path: dist
+          merge-multiple: true
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Check distribution metadata
+        run: |
+          python -m pip install --disable-pip-version-check "twine==6.2.0"
+          python -m twine check dist/*
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          packages-dir: dist
+          verbose: true
+          # Lets a re-run finish an upload that stopped part way.
+          skip-existing: true
+
+      - name: Upload to R2
+        if: matrix.package.r2_prefix != ''
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: us-east-1
+          R2_PREFIX: ${{ matrix.package.r2_prefix }}
+          RELEASE_VERSION: ${{ matrix.package.version }}
+        run: |
+          aws s3 cp dist/ \
+            "s3://kapsl-installer/${R2_PREFIX}/v${RELEASE_VERSION}/" \
+            --recursive \
+            --no-progress \
+            --endpoint-url https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
+
+  tag:
+    name: Tag released versions
+    needs: [plan, publish-crates, publish-pypi]
+    # Also runs after a partial failure, so whatever did reach a registry is
+    # tagged and becomes the base for the next change detection.
+    if: >-
+      ${{ !cancelled()
+      && needs.plan.outputs.publish == 'true'
+      && needs.plan.outputs.release == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # creates the <package>-v<version> release tags
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Tag each published version
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASES: ${{ needs.plan.outputs.packages }}
+          CRATES_RESULT: ${{ needs.publish-crates.result }}
+          PYPI_RESULT: ${{ needs.publish-pypi.result }}
+        run: python scripts/release_plan.py tag

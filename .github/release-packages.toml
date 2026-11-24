@@ -1,0 +1,123 @@
+# Packages that .github/workflows/publish.yml can release.
+#
+# Every workspace crate that Cargo can publish must be declared here; CI fails
+# otherwise. Declaring a package is what makes it releasable, and the registry
+# name is also its release tag prefix: <name>-v<version>.
+# RELEASING.md explains the release process.
+#
+# [crate.<name>]   a workspace crate, published to crates.io
+#   checks         shell commands run from the repository root before release
+#                  (default: cargo test -p <name> --locked)
+#   submodules     check out git submodules to build it (default: false)
+#
+# [python.<name>]  a Python distribution, published to PyPI
+#   path           directory holding its pyproject.toml (static version)
+#   build          "maturin": abi3 wheels for Linux, macOS and Windows + sdist
+#                  "setuptools": wheel + sdist with python -m build
+#   watch          paths whose changes count as changes to the package
+#                  (default: path)
+#   crate          Rust crate compiled into the wheel; it and every workspace
+#                  crate it depends on are watched too
+#   version-files  other pyproject.toml files that must carry the same version
+#   checks         shell commands run from the repository root after the build,
+#                  on every platform it is built for; distributions are in
+#                  <path>/dist (default: none)
+#   r2-prefix      also upload the distributions to R2 under <prefix>/v<version>/
+
+[crate.kapsl-backend-abi]
+checks = [
+  "cargo test -p kapsl-backend-abi --locked",
+  "bash scripts/test-backend-abi-header.sh",
+]
+
+[crate.kapsl-backends]
+
+[crate.kapsl-communication]
+checks = [
+  "cargo test -p kapsl-communication --locked",
+  "cargo check -p kapsl-communication --no-default-features --features grpc --locked",
+]
+
+[crate.kapsl-core]
+
+[crate.kapsl-engine-api]
+
+[crate.kapsl-grpc]
+
+[crate.kapsl-hal]
+# The CUDA tests below run on a host without a GPU; see the CI quality job.
+checks = [
+  "cargo test -p kapsl-hal --locked",
+  "cargo test -p kapsl-hal --lib --locked --features cuda,cudarc/cuda-12060 gpu_arena::initialization_tests -- --test-threads=1",
+  "cargo test -p kapsl-hal --lib --locked --features cuda,cudarc/cuda-12060 gpu_arena::admission_tests -- --test-threads=1",
+  "cargo test -p kapsl-hal --lib --locked --features cuda,cudarc/cuda-12060 -- gpu_region gpu_ipc_region gpu_vmm_region --test-threads=1",
+  "cargo check -p kapsl-hal --features nvml --locked",
+]
+
+[crate.kapsl-ipc]
+
+[crate.kapsl-kernels]
+
+[crate.kapsl-kv-abi]
+checks = [
+  "cargo test -p kapsl-kv-abi --locked",
+  "bash scripts/test-backend-abi-header.sh",
+]
+
+[crate.kapsl-llm]
+submodules = true
+checks = [
+  "bash scripts/test-llm-ort-feature-contract.sh",
+  "cargo test -p kapsl-llm --no-default-features --features onnx --lib --test device_kv_binding --locked",
+  "cargo test -p kapsl-llm --lib --locked",
+  "cargo test -p kapsl-llm --no-default-features --features gguf-external-kv --lib --locked",
+]
+
+[crate.kapsl-loader]
+
+[crate.kapsl-managed-abi]
+checks = [
+  "cargo test -p kapsl-managed-abi --locked",
+  "bash scripts/test-backend-abi-header.sh",
+]
+
+[crate.kapsl-monitor]
+
+[crate.kapsl-quantization]
+
+[crate.kapsl-rag]
+
+[crate.kapsl-rag-sdk]
+
+[crate.kapsl-scheduler]
+
+[crate.kapsl-shm]
+
+[crate.kapsl-transport]
+
+[python.kapsl-sdk]
+path = "."
+build = "maturin"
+crate = "kapsl-pyo3"
+watch = ["pyproject.toml", "README.md"]
+version-files = ["crates/kapsl-pyo3/pyproject.toml"]
+checks = [
+  "cargo build -p kapsl-communication --example python_test_server --locked",
+  "python -m pip install --disable-pip-version-check pytest",
+  "python scripts/test-python-wheel.py",
+]
+r2-prefix = "sdk"
+
+[python.kapsl-vllm-connector]
+path = "integrations/vllm"
+build = "setuptools"
+checks = [
+  "PYTHONPATH=integrations/vllm/src python -m unittest discover -s integrations/vllm/tests -v",
+  "python integrations/vllm/scripts/check_dist_artifacts.py integrations/vllm/dist",
+  """
+  python -m pip install --disable-pip-version-check --no-deps --force-reinstall integrations/vllm/dist/*.whl
+  schema_file="$(mktemp)"
+  kapsl-vllm-plan --print-schema > "$schema_file"
+  python -m json.tool "$schema_file" >/dev/null
+  """,
+]
