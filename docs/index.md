@@ -10,7 +10,7 @@ Use `kapsl-sdk` to connect a Python application to a running `kapsl-runtime` ins
 - **`KapslShmClient`** — zero-copy shared-memory client for maximum local throughput
 - **`KapslHybridClient`** — combines IPC signaling with shared-memory payloads
 - Bundled voice embeddings for TTS models (`load_voice`, `list_voices`)
-- CPython 3.9 – 3.13 support via PyO3 / Maturin
+- CPython 3.10 – 3.14 support via PyO3 / Maturin
 
 ## When to use it
 
