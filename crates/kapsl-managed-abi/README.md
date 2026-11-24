@@ -169,10 +169,11 @@ PR conformance is host-only: no GPU provisioning or performance thresholds.
 Engine neutrality additionally requires signed fake native and managed packs
 to install, select, load, exercise and unload using an existing engine binary.
 
-Publication uses `publish-host-contracts.yml` with a matching
-`kapsl-managed-abi-vX.Y.Z` tag already merged into `main`, under the protected
-`crates-io-backend-abi` environment. Version 0.1.0 has a one-time token bootstrap
+Publication uses the repository's single publish workflow,
+`.github/workflows/publish.yml`, from `main`, once a required reviewer approves
+the protected `sdk-release` environment; each release is tagged
+`kapsl-managed-abi-vX.Y.Z`. The first release uses that environment's API token
 because crates.io cannot configure a trusted publisher before the crate exists.
-After that publication, register this repository, workflow and environment as
-the crate's trusted publisher; later versions use OIDC. No branch, mismatched
-tag or prerelease can publish.
+After it, register this repository, `publish.yml` and `sdk-release` as the
+crate's trusted publisher; later versions use OIDC. No branch or prerelease can
+publish.
