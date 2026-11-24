@@ -502,6 +502,13 @@ pub struct LlamaBackendDevice {
     pub memory_free: usize,
     /// Device type
     pub device_type: LlamaBackendDeviceType,
+    /// PCI bus id as `domain:bus:device.function` (e.g. `0000:01:00.0`) when the
+    /// backend reports one (CUDA, HIP, MUSA, Vulkan); `None` otherwise. MIG
+    /// instances of one GPU all report the parent GPU's bus id.
+    pub pci_bus_id: Option<String>,
+    /// Whether the device's memory is the host's system memory (CPU, Apple
+    /// Silicon unified memory, integrated GPUs).
+    pub unified_memory: bool,
 }
 
 /// List ggml backend devices
@@ -531,6 +538,8 @@ pub fn list_llama_ggml_backend_devices() -> Vec<LlamaBackendDevice> {
         let backend = cstr_to_string(backend_name);
         let memory_total = props.memory_total;
         let memory_free = props.memory_free;
+        let pci_bus_id = Some(cstr_to_string(props.device_id)).filter(|id| !id.is_empty());
+        let unified_memory = props.unified_memory;
         let device_type = match props.type_ {
             llama_cpp_sys_2::GGML_BACKEND_DEVICE_TYPE_CPU => LlamaBackendDeviceType::Cpu,
             llama_cpp_sys_2::GGML_BACKEND_DEVICE_TYPE_ACCEL => LlamaBackendDeviceType::Accelerator,
@@ -546,6 +555,8 @@ pub fn list_llama_ggml_backend_devices() -> Vec<LlamaBackendDevice> {
             memory_total,
             memory_free,
             device_type,
+            pci_bus_id,
+            unified_memory,
         });
     }
     devices

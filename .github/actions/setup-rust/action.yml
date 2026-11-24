@@ -36,7 +36,7 @@ runs:
         echo "version=$version" >> "$GITHUB_OUTPUT"
 
     - name: Install Rust ${{ steps.toolchain.outputs.version }}
-      uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+      uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # zizmor: ignore[ref-version-mismatch] SHA is a master commit, not a tag; v1 has since moved
       with:
         toolchain: ${{ steps.toolchain.outputs.version }}
         targets: ${{ inputs.targets }}

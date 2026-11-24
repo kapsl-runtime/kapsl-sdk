@@ -197,6 +197,35 @@ mod tests {
     }
 
     #[test]
+    fn cuda_versions_compare_numerically() {
+        use crate::factory::cuda_version_at_least as at_least;
+        assert!(at_least("13.0", "9.0"));
+        assert!(!at_least("9.0", "13.0"));
+        assert!(at_least("12.10", "12.9"));
+        assert!(at_least("12", "12.0"));
+        assert!(!at_least("11.8", "12.0"));
+        assert!(!at_least("", "12.0"));
+        assert!(!at_least("12.x", "12.0"));
+    }
+
+    #[test]
+    fn test_validate_cuda_version_numeric_not_string() {
+        let mut info = mock_device_info();
+        for d in info.devices.iter_mut() {
+            if d.id == 1 {
+                d.cuda_version = Some("13.0".to_string());
+            }
+        }
+        let req = HardwareRequirements {
+            preferred_provider: Some("cuda".to_string()),
+            device_id: Some(1),
+            min_cuda_version: Some("9.0".to_string()), // "13.0" < "9.0" as strings
+            ..Default::default()
+        };
+        assert!(BackendFactory::validate_requirements(&req, &info).is_ok());
+    }
+
+    #[test]
     fn test_validate_missing_provider_failure() {
         let info = mock_device_info();
         let req = HardwareRequirements {
