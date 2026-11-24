@@ -35,7 +35,7 @@ harness = false
 [dependencies]
 
 [dev-dependencies.criterion]
-version = "0.5"
+version = "0.8"
 
 [build-dependencies.cc]
 version = "1.0"
