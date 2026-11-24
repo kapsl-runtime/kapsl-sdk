@@ -412,6 +412,43 @@ mod tests {
     }
 
     #[test]
+    fn test_accelerators_keep_one_session_pool_for_every_input_shape() {
+        let request = |seq: i64| InferenceRequest {
+            input: BinaryTensorPacket {
+                shape: vec![1, seq, 2],
+                dtype: TensorDtype::Float32,
+                data: f32_bytes(&vec![0.0f32; (seq * 2) as usize]),
+            },
+            additional_inputs: Vec::new(),
+            session_id: None,
+            metadata: None,
+            cancellation: None,
+        };
+
+        let cpu = OnnxBackend::builder()
+            .with_provider(ExecutionProvider::CPU)
+            .with_max_bucket_sessions(8)
+            .build();
+        assert_eq!(cpu.max_bucket_sessions, 8);
+        assert_ne!(
+            cpu.bucket_key_for_request(&request(2)),
+            cpu.bucket_key_for_request(&request(200))
+        );
+
+        // Each extra bucket session would upload another copy of the weights
+        // into the fixed device pool (kapsl-engine#250).
+        for provider in [ExecutionProvider::CUDA, ExecutionProvider::TensorRT] {
+            let backend = OnnxBackend::builder()
+                .with_provider(provider)
+                .with_max_bucket_sessions(8)
+                .build();
+            assert_eq!(backend.max_bucket_sessions, 1, "{provider:?}");
+            assert_eq!(backend.bucket_key_for_request(&request(2)), None);
+            assert_eq!(backend.bucket_key_for_request(&request(200)), None);
+        }
+    }
+
+    #[test]
     fn test_peak_concurrency_hint_controls_session_pool_size() {
         let backend = OnnxBackend::builder().with_peak_concurrency_hint(8).build();
 

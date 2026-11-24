@@ -27,6 +27,21 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
+/// How many session pools a model may keep: the primary pool plus one per extra
+/// input-shape bucket.
+///
+/// On CPU, a bucket pool keeps a session whose memory pattern fits that shape
+/// range. On CUDA/TensorRT every extra session uploads another full copy of the
+/// weights into the fixed device pool, so a few distinct input lengths exhaust
+/// it and the next workspace allocation fails (kapsl-engine#250). ORT already
+/// serves dynamic shapes from one session, so those providers keep a single pool.
+fn effective_bucket_sessions(provider: ExecutionProvider, configured: usize) -> usize {
+    match provider {
+        ExecutionProvider::CUDA | ExecutionProvider::TensorRT => 1,
+        _ => configured,
+    }
+}
+
 // TODO: Consider adding support for OpenVINO and other backends
 #[derive(Debug, Clone, Copy)]
 pub enum ExecutionProvider {
@@ -516,7 +531,7 @@ impl OnnxBackendBuilder {
             device_id: self.device_id,
             memory_pattern: self.memory_pattern,
             disable_cpu_mem_arena: self.disable_cpu_mem_arena,
-            max_bucket_sessions: self.max_bucket_sessions,
+            max_bucket_sessions: effective_bucket_sessions(self.provider, self.max_bucket_sessions),
             bucket_dim_granularity: self.bucket_dim_granularity,
             bucket_max_dims: self.bucket_max_dims,
             peak_concurrency_hint: self.peak_concurrency_hint,
