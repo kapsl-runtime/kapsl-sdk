@@ -72,10 +72,10 @@ and invalid ownership, cancellation, synchronization failure and cleanup.
 
 ## Publication
 
-The `publish-host-contracts.yml` workflow publishes from an exact
-`kapsl-kv-abi-vX.Y.Z` tag already merged into `main`. It uses OIDC through the
-protected `crates-io-backend-abi` environment. Before publishing through this
-workflow, configure `kapsl-runtime/kapsl-sdk`, `publish-host-contracts.yml`, and
-that environment as the crate's trusted publisher. Branches, prereleases and
-mismatched tags cannot publish. Engine/integration consumers use the published
+The repository's single publish workflow, `.github/workflows/publish.yml`,
+publishes stable versions from `main` once a required reviewer approves the
+protected `sdk-release` environment, and tags each release
+`kapsl-kv-abi-vX.Y.Z`. It uses OIDC, so configure `kapsl-runtime/kapsl-sdk`,
+`publish.yml` and that environment as the crate's trusted publisher. Branches
+and prereleases cannot publish. Engine/integration consumers use the published
 crate version, without a temporary patch or cross-repository path dependency.

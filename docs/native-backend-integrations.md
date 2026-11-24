@@ -73,11 +73,12 @@ feature because enabling it in a cross-platform default makes Linux binaries
 fail to link. The default is not a pack profile. An external adapter must never
 inherit it and then claim a CPU-only artifact.
 
-Stable `kapsl-llm` releases use `.github/workflows/publish-llm.yml`. Publication
-requires an exact `kapsl-llm-vX.Y.Z` tag whose commit is already on `main`, a
-stable package version with no prerelease suffix, and the `crates-io-llm`
-trusted-publisher environment. Branch, beta, and mismatched-tag publication fail
-before crates.io authentication.
+Stable `kapsl-llm` releases use the repository's single publish workflow,
+`.github/workflows/publish.yml`. Publication requires a run from `main`, a
+stable package version with no prerelease suffix, and approval of the
+`sdk-release` trusted-publisher environment; each release is tagged
+`kapsl-llm-vX.Y.Z`. Branch and prerelease publication fail before crates.io
+authentication. See `RELEASING.md`.
 
 ## Migration sequence
 
