@@ -13,7 +13,7 @@ static NEXT_DEVICE_POOL_ID: AtomicU64 = AtomicU64::new(1);
 /// One stable backing allocation and byte-range allocator for a CUDA device.
 pub struct GpuArenaRegion {
     pool_id: u64,
-    device: Arc<CudaDevice>,
+    device: Arc<CudaStream>,
     // Kept optional so Drop can release the cudaMallocAsync allocation before
     // trimming CUDA's default memory pool. CudaSlice::drop alone returns the
     // range to that pool, but the driver is free to retain the physical pages.
@@ -38,7 +38,7 @@ unsafe impl Send for GpuArenaRegion {}
 unsafe impl Sync for GpuArenaRegion {}
 
 impl GpuArenaRegion {
-    pub fn new(device: Arc<CudaDevice>, capacity_bytes: usize) -> Result<Self, ArenaError> {
+    pub fn new(device: Arc<CudaStream>, capacity_bytes: usize) -> Result<Self, ArenaError> {
         if capacity_bytes == 0 {
             return Err(ArenaError::InvalidAllocationRequest);
         }
@@ -80,9 +80,8 @@ impl GpuArenaRegion {
     }
 
     fn zero_allocation_sync(&self, allocation: &GpuAllocation) -> Result<(), ArenaError> {
-        self.device.bind_to_thread()?;
-        let device_ptr =
-            self.allocation_ptr(allocation) as usize as cudarc::driver::sys::CUdeviceptr;
+        self.device.context().bind_to_thread()?;
+        let device_ptr = self.allocation_ptr(allocation) as usize as sys::CUdeviceptr;
         // SAFETY: `allocation` is still live in this pool, its full byte range
         // is exclusively owned by the allocating caller, and an all-zero bit
         // pattern is valid for KV storage. Even cuMemsetD8 (without Async in
@@ -90,7 +89,7 @@ impl GpuArenaRegion {
         // retained pool stream and explicitly wait before exposing the pointer
         // to a consumer that may execute on a different nonblocking stream.
         unsafe {
-            result::memset_d8_async(device_ptr, 0, allocation.bytes(), *self.device.cu_stream())?
+            result::memset_d8_async(device_ptr, 0, allocation.bytes(), self.device.cu_stream())?
         };
         self.device.synchronize()?;
         Ok(())
@@ -217,7 +216,7 @@ impl GpuArenaRegion {
         let storage = unsafe { &*self.storage.get() }
             .as_ref()
             .expect("live GPU device pool storage");
-        *storage.device_ptr() as *mut std::ffi::c_void
+        storage.device_ptr(storage.stream()).0 as *mut std::ffi::c_void
     }
 
     pub fn allocation_ptr(&self, allocation: &GpuAllocation) -> *mut std::ffi::c_void {
@@ -232,7 +231,7 @@ impl GpuArenaRegion {
         storage.len()
     }
 
-    pub fn device(&self) -> &Arc<CudaDevice> {
+    pub fn device(&self) -> &Arc<CudaStream> {
         &self.device
     }
 
@@ -264,6 +263,10 @@ impl Drop for GpuArenaRegion {
             .take()
             .map(|storage| {
                 let capacity = storage.len();
+                // cudarc 0.19 no longer makes the context current before
+                // freeing, so bind it as 0.12's CudaSlice::drop did.
+                let context = self.device.context();
+                context.record_err(context.bind_to_thread());
                 // On memory-pool-capable devices this enqueues cudaFreeAsync.
                 drop(storage);
                 capacity
@@ -284,9 +287,8 @@ impl Drop for GpuArenaRegion {
 
         let memory_pools_supported = self
             .device
-            .attribute(
-                cudarc::driver::sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED,
-            )
+            .context()
+            .attribute(sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED)
             .map(|supported| supported > 0)
             .unwrap_or(false);
         if !memory_pools_supported {
@@ -298,13 +300,10 @@ impl Drop for GpuArenaRegion {
         }
 
         let trim_result = unsafe {
-            use cudarc::driver::sys;
-
             let mut default_pool = std::ptr::null_mut();
-            sys::lib()
-                .cuDeviceGetDefaultMemPool(&mut default_pool, *self.device.cu_device())
+            sys::cuDeviceGetDefaultMemPool(&mut default_pool, self.device.context().cu_device())
                 .result()
-                .and_then(|()| sys::lib().cuMemPoolTrimTo(default_pool, 0).result())
+                .and_then(|()| sys::cuMemPoolTrimTo(default_pool, 0).result())
         };
         match trim_result {
             Ok(()) => log::info!(
@@ -326,7 +325,7 @@ impl GpuRegion for GpuArenaRegion {
 
     fn physical_snapshot(&self) -> GpuRegionSnapshot {
         GpuRegionSnapshot {
-            device_id: self.device.ordinal(),
+            device_id: self.device.context().ordinal(),
             kind: self.kind(),
             committed_bytes: self.capacity_bytes(),
             mapped_bytes: self.capacity_bytes(),

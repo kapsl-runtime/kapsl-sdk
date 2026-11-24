@@ -49,7 +49,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "gguf-cuda-shared-kv")]
-use cudarc::driver::{CudaDevice, CudaSlice, DevicePtr};
+use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr, DeviceRepr, DriverError};
 #[cfg(feature = "gguf-cuda-shared-kv")]
 use kapsl_hal::cpu_block_store::CpuBlockStore;
 #[cfg(feature = "gguf-cuda-shared-kv")]
@@ -2470,6 +2470,23 @@ impl Drop for GgufSharedKvPool {
     }
 }
 
+/// cudarc 0.12's `htod_sync_copy`: the upload must have landed before the
+/// table's address is handed to llama.cpp, which reads it on its own stream.
+#[cfg(feature = "gguf-cuda-shared-kv")]
+fn htod_sync_copy<T: DeviceRepr>(
+    device: &Arc<CudaStream>,
+    src: &[T],
+) -> Result<CudaSlice<T>, DriverError> {
+    let dst = device.clone_htod(src)?;
+    device.synchronize()?;
+    Ok(dst)
+}
+
+#[cfg(feature = "gguf-cuda-shared-kv")]
+fn block_table_ptr(table: &CudaSlice<u32>) -> *mut u32 {
+    table.device_ptr(table.stream()).0 as *mut u32
+}
+
 /// Single-sequence reservation state for windowed (Phase 2) allocation.
 ///
 /// Unlike [`GgufSharedKvReservation`]'s flat `[layer * n_new + pos]` layout,
@@ -2927,7 +2944,7 @@ fn gguf_windowed_reserve_impl(
     // Fast path: the current reservation already covers the request.
     if inner.block_table.is_some() && inner.n_logical_blocks >= logical {
         inner.n_tokens_reserved = inner.n_tokens_reserved.max(tokens_needed);
-        let ptr = *inner.block_table.as_ref()?.device_ptr() as *mut u32;
+        let ptr = block_table_ptr(inner.block_table.as_ref()?);
         GGUF_TIMING_KV_FAST_PATH_CALLS.fetch_add(1, Ordering::Relaxed);
         return Some((ptr, inner.n_logical_blocks));
     }
@@ -2967,7 +2984,7 @@ fn gguf_windowed_reserve_impl(
         }
     }
 
-    let table = match pool.device().htod_sync_copy(&host_table) {
+    let table = match htod_sync_copy(pool.device(), &host_table) {
         Ok(t) => t,
         Err(_) => {
             // Roll back the extension; established blocks keep their KV data.
@@ -2979,7 +2996,7 @@ fn gguf_windowed_reserve_impl(
             return None;
         }
     };
-    let table_ptr = *table.device_ptr() as *mut u32;
+    let table_ptr = block_table_ptr(&table);
 
     inner.block_table = Some(table);
     inner.n_logical_blocks = logical;
@@ -3061,7 +3078,7 @@ fn gguf_restore_from_cpu(
         }
     }
 
-    let table = match pool.device().htod_sync_copy(&host_table) {
+    let table = match htod_sync_copy(pool.device(), &host_table) {
         Ok(t) => t,
         Err(_) => {
             for b in new_blocks {
@@ -3071,7 +3088,7 @@ fn gguf_restore_from_cpu(
             return false;
         }
     };
-    let table_ptr = *table.device_ptr() as *mut u32;
+    let table_ptr = block_table_ptr(&table);
 
     let mut inner = state.inner.lock().unwrap();
     gguf_release_reservation_inner(&mut inner, &state.prefix_cache, pool, n_layers);
@@ -3167,7 +3184,7 @@ unsafe extern "C" fn gguf_kapsl_kv_reserve(
                 new_blocks[layer * logical_blocks + pos];
         }
     }
-    let table = match state.handle.pool.device().htod_sync_copy(&host_table) {
+    let table = match htod_sync_copy(state.handle.pool.device(), &host_table) {
         Ok(t) => t,
         Err(_) => {
             for b in new_blocks {
@@ -3176,7 +3193,7 @@ unsafe extern "C" fn gguf_kapsl_kv_reserve(
             return false;
         }
     };
-    let table_ptr = *table.device_ptr() as *mut u32;
+    let table_ptr = block_table_ptr(&table);
 
     let mut inner = state.inner.lock().unwrap();
     gguf_release_reservation_inner(
@@ -3304,7 +3321,7 @@ unsafe extern "C" fn gguf_kapsl_kv_reserve_seq(
     *block_table_device_out = m
         .combined_device
         .as_ref()
-        .map(|table| *table.device_ptr() as *mut u32)
+        .map(block_table_ptr)
         .unwrap_or(std::ptr::null_mut());
     *n_blocks_out = logical as u32;
     true
@@ -3322,7 +3339,7 @@ unsafe extern "C" fn gguf_kapsl_kv_commit_seq(
     let mut m = state.multi.lock().unwrap();
 
     if m.combined_dirty || m.combined_device.is_none() {
-        let table = match state.handle.pool.device().htod_sync_copy(&m.combined_host) {
+        let table = match htod_sync_copy(state.handle.pool.device(), &m.combined_host) {
             Ok(t) => t,
             Err(_) => return false,
         };
@@ -3333,7 +3350,7 @@ unsafe extern "C" fn gguf_kapsl_kv_commit_seq(
     let Some(table) = m.combined_device.as_ref() else {
         return false;
     };
-    *block_table_device_out = *table.device_ptr() as *mut u32;
+    *block_table_device_out = block_table_ptr(table);
     true
 }
 
@@ -3427,7 +3444,7 @@ unsafe extern "C" fn gguf_kapsl_kv_reserve_prefix(
             inner.model_fingerprint = fp;
             inner.n_tokens_reserved = inner.n_tokens_reserved.max(n_tokens_usize);
             let table_ptr = match inner.block_table.as_ref() {
-                Some(table) => *table.device_ptr() as *mut u32,
+                Some(table) => block_table_ptr(table),
                 None => {
                     return false;
                 }
@@ -3482,7 +3499,7 @@ unsafe extern "C" fn gguf_kapsl_kv_reserve_prefix(
                 }
             }
 
-            let table = match state.handle.pool.device().htod_sync_copy(&host_table) {
+            let table = match htod_sync_copy(state.handle.pool.device(), &host_table) {
                 Ok(table) => table,
                 Err(_) => {
                     for block in added_blocks {
@@ -3491,7 +3508,7 @@ unsafe extern "C" fn gguf_kapsl_kv_reserve_prefix(
                     return false;
                 }
             };
-            let table_ptr = *table.device_ptr() as *mut u32;
+            let table_ptr = block_table_ptr(&table);
 
             inner.owned_blocks = owned_blocks;
             inner.n_new_logical = new_n_new;
@@ -3597,7 +3614,7 @@ unsafe extern "C" fn gguf_kapsl_kv_reserve_prefix(
         }
     }
 
-    let table = match state.handle.pool.device().htod_sync_copy(&host_table) {
+    let table = match htod_sync_copy(state.handle.pool.device(), &host_table) {
         Ok(t) => t,
         Err(_) => {
             for b in new_blocks {
@@ -3611,7 +3628,7 @@ unsafe extern "C" fn gguf_kapsl_kv_reserve_prefix(
             return false;
         }
     };
-    let table_ptr = *table.device_ptr() as *mut u32;
+    let table_ptr = block_table_ptr(&table);
 
     let mut inner = state.inner.lock().unwrap();
     gguf_release_reservation_inner(
@@ -5577,11 +5594,12 @@ impl Engine for GgufBackend {
                             n_head_kv,
                             head_dim
                         );
-                                let device = CudaDevice::new(
+                                let device = CudaContext::new(
                                     crate::cuda_ordinal::to_cuda_ordinal(effective_device_id)
                                         .map_err(|e| EngineError::backend(e.to_string()))?,
                                 )
-                                .map_err(|e| EngineError::backend(format!("CUDA: {e}")))?;
+                                .map_err(|e| EngineError::backend(format!("CUDA: {e}")))?
+                                .default_stream();
                                 let pool = Arc::new(
                                     GpuBlockPool::new(
                                         device,
@@ -5599,11 +5617,12 @@ impl Engine for GgufBackend {
                                 handle
                             }
                         } else {
-                            let device = CudaDevice::new(
+                            let device = CudaContext::new(
                                 crate::cuda_ordinal::to_cuda_ordinal(effective_device_id)
                                     .map_err(|e| EngineError::backend(e.to_string()))?,
                             )
-                            .map_err(|e| EngineError::backend(format!("CUDA: {e}")))?;
+                            .map_err(|e| EngineError::backend(format!("CUDA: {e}")))?
+                            .default_stream();
                             let pool = Arc::new(
                                 GpuBlockPool::new(
                                     device,

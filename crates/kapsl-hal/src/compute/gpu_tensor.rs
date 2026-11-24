@@ -4,7 +4,7 @@
 //! used by CUDA kernels and cuBLAS calls in the native backend.
 
 #[cfg(feature = "cuda")]
-use cudarc::driver::{CudaDevice, CudaSlice};
+use cudarc::driver::{CudaSlice, CudaStream};
 #[cfg(feature = "cuda")]
 use std::sync::Arc;
 
@@ -19,7 +19,7 @@ pub struct GpuTensor<T: cudarc::driver::DeviceRepr> {
 impl<T: cudarc::driver::DeviceRepr> GpuTensor<T> {
     /// Allocate a zeroed tensor on `device`.
     pub fn zeros(
-        device: &Arc<CudaDevice>,
+        device: &Arc<CudaStream>,
         shape: &[usize],
     ) -> Result<Self, cudarc::driver::DriverError>
     where

@@ -10,7 +10,7 @@
 //! - NCCL library installed
 
 use crate::device_mesh::{DType, MeshComm, ReduceOp};
-use cudarc::driver::{CudaDevice, CudaSlice, DevicePtr, DevicePtrMut};
+use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
 use cudarc::nccl::{Comm, Id, ReduceOp as NcclReduceOp};
 use std::sync::Arc;
 
@@ -20,7 +20,7 @@ pub struct NcclComm {
     /// The NCCL communicator
     comm: Comm,
     /// CUDA device for memory operations
-    device: Arc<CudaDevice>,
+    device: Arc<CudaStream>,
     /// This rank's ID
     pub rank: usize,
     /// Total number of ranks
@@ -46,7 +46,7 @@ impl NcclComm {
     /// let comm = NcclComm::new(device, &id, rank, world_size)?;
     /// ```
     pub fn new(
-        device: Arc<CudaDevice>,
+        device: Arc<CudaStream>,
         nccl_id: &Id,
         rank: usize,
         world_size: usize,
@@ -90,7 +90,8 @@ impl NcclComm {
     /// Helper to copy host buffer to device
     fn host_to_device(&self, data: &[u8]) -> Result<CudaSlice<u8>, String> {
         self.device
-            .htod_sync_copy(data)
+            .clone_htod(data)
+            .and_then(|slice| self.device.synchronize().map(|()| slice))
             .map_err(|e| format!("Failed to copy to device: {:?}", e))
     }
 
@@ -101,7 +102,8 @@ impl NcclComm {
         host_buf: &mut [u8],
     ) -> Result<(), String> {
         self.device
-            .dtoh_sync_copy_into(device_buf, host_buf)
+            .memcpy_dtoh(device_buf, host_buf)
+            .and_then(|()| self.device.synchronize())
             .map_err(|e| format!("Failed to copy to host: {:?}", e))
     }
 }
@@ -127,8 +129,8 @@ impl MeshComm for NcclComm {
                 let f32_count = buf.len() / 4;
                 unsafe {
                     // Create a view of the device buffer as f32
-                    let send_ptr = *device_buf.device_ptr() as *const f32;
-                    let recv_ptr = *device_buf.device_ptr_mut() as *mut f32;
+                    let send_ptr = device_buf.device_ptr(&self.device).0 as *const f32;
+                    let recv_ptr = device_buf.device_ptr_mut(&self.device).0 as *mut f32;
 
                     self.comm
                         .all_reduce(send_ptr, recv_ptr, f32_count, Self::to_nccl_op(op))
@@ -138,8 +140,8 @@ impl MeshComm for NcclComm {
             DType::Float64 => {
                 let f64_count = buf.len() / 8;
                 unsafe {
-                    let send_ptr = *device_buf.device_ptr() as *const f64;
-                    let recv_ptr = *device_buf.device_ptr_mut() as *mut f64;
+                    let send_ptr = device_buf.device_ptr(&self.device).0 as *const f64;
+                    let recv_ptr = device_buf.device_ptr_mut(&self.device).0 as *mut f64;
 
                     self.comm
                         .all_reduce(send_ptr, recv_ptr, f64_count, Self::to_nccl_op(op))
@@ -149,8 +151,8 @@ impl MeshComm for NcclComm {
             DType::Int32 => {
                 let i32_count = buf.len() / 4;
                 unsafe {
-                    let send_ptr = *device_buf.device_ptr() as *const i32;
-                    let recv_ptr = *device_buf.device_ptr_mut() as *mut i32;
+                    let send_ptr = device_buf.device_ptr(&self.device).0 as *const i32;
+                    let recv_ptr = device_buf.device_ptr_mut(&self.device).0 as *mut i32;
 
                     self.comm
                         .all_reduce(send_ptr, recv_ptr, i32_count, Self::to_nccl_op(op))
@@ -187,8 +189,8 @@ impl MeshComm for NcclComm {
 
         match dtype {
             DType::Float32 => unsafe {
-                let send_ptr = *device_local.device_ptr() as *const f32;
-                let recv_ptr = *device_out.device_ptr_mut() as *mut f32;
+                let send_ptr = device_local.device_ptr(&self.device).0 as *const f32;
+                let recv_ptr = device_out.device_ptr_mut(&self.device).0 as *mut f32;
 
                 self.comm
                     .all_gather(send_ptr, recv_ptr, local_count)
@@ -213,7 +215,7 @@ impl MeshComm for NcclComm {
         let count = buf.len();
 
         unsafe {
-            let ptr = *device_buf.device_ptr_mut() as *mut u8;
+            let ptr = device_buf.device_ptr_mut(&self.device).0 as *mut u8;
             self.comm
                 .broadcast(ptr, ptr, count, root_rank)
                 .map_err(|e| format!("NCCL broadcast failed: {:?}", e))?;
@@ -233,12 +235,13 @@ impl MeshComm for NcclComm {
         let dummy: [f32; 1] = [0.0];
         let device_dummy = self
             .device
-            .htod_sync_copy(&dummy)
+            .clone_htod(&dummy)
+            .and_then(|slice| self.device.synchronize().map(|()| slice))
             .map_err(|e| format!("Barrier failed: {:?}", e))?;
 
         unsafe {
-            let ptr = *device_dummy.device_ptr() as *const f32;
-            let mut_ptr = *device_dummy.device_ptr() as *mut f32;
+            let ptr = device_dummy.device_ptr(&self.device).0 as *const f32;
+            let mut_ptr = device_dummy.device_ptr(&self.device).0 as *mut f32;
             self.comm
                 .all_reduce(ptr, mut_ptr, 1, NcclReduceOp::Sum)
                 .map_err(|e| format!("Barrier all_reduce failed: {:?}", e))?;
@@ -254,7 +257,7 @@ impl MeshComm for NcclComm {
         let device_buf = self.host_to_device(buf)?;
 
         unsafe {
-            let ptr = *device_buf.device_ptr() as *const u8;
+            let ptr = device_buf.device_ptr(&self.device).0 as *const u8;
             self.comm
                 .send(ptr, buf.len(), dest_rank)
                 .map_err(|e| format!("NCCL send failed: {:?}", e))?;
@@ -270,7 +273,7 @@ impl MeshComm for NcclComm {
         let mut device_buf = self.host_to_device(buf)?;
 
         unsafe {
-            let ptr = *device_buf.device_ptr_mut() as *mut u8;
+            let ptr = device_buf.device_ptr_mut(&self.device).0 as *mut u8;
             self.comm
                 .recv(ptr, buf.len(), src_rank)
                 .map_err(|e| format!("NCCL recv failed: {:?}", e))?;

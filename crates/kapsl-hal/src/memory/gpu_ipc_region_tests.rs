@@ -194,7 +194,10 @@ fn failed_reassignment_zero_disables_further_exports() {
 #[test]
 #[ignore = "requires CUDA hardware; no workers import the handle in this smoke test"]
 fn hardware_ipc_initialization_export_and_release() {
-    let device = CudaDevice::new_with_stream(0).unwrap();
+    let device = cudarc::driver::CudaContext::new(0)
+        .unwrap()
+        .new_stream()
+        .unwrap();
     let region = GpuIpcRegion::allocate(device, 4096).unwrap();
     region.initialize_zeroed().unwrap();
     assert_eq!(region.physical_snapshot().ready_bytes, Some(4096));

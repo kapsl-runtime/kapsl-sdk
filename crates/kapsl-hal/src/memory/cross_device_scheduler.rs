@@ -686,12 +686,14 @@ mod inner {
     mod tests {
         use super::*;
         use crate::gpu_arena::GpuBlockPool;
-        use cudarc::driver::CudaDevice;
+        use cudarc::driver::CudaContext;
 
         // Small pool: 8 blocks, 4 tokens/block, 2 KV heads, 8-dim.
         // Requires CUDA device 0.
         fn small_pool() -> Arc<GpuBlockPool> {
-            let device = CudaDevice::new(0).expect("CUDA device 0 required");
+            let device = CudaContext::new(0)
+                .expect("CUDA device 0 required")
+                .default_stream();
             Arc::new(GpuBlockPool::new(device, 8, 4, 2, 8).unwrap())
         }
 
