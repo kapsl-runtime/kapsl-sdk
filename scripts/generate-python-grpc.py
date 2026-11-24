@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Regenerate the bundled clients with grpcio-tools==1.71.2.
 
-The runtime supports Python 3.9; newer grpcio-tools releases require 3.10.
+The runtime supports Python 3.10 and later.
 Generated modules use package-relative imports and a private descriptor pool
 so applications can also import Triton's overlapping protobuf definitions.
 """

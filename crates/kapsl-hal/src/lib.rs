@@ -13,8 +13,18 @@ pub mod device_mesh;
 #[path = "memory/gpu_arena.rs"]
 pub mod gpu_arena;
 #[cfg(feature = "cuda")]
+pub use gpu_arena::arena_region as gpu_arena_region;
+#[cfg(feature = "cuda")]
+#[path = "memory/gpu_ipc_region.rs"]
+pub mod gpu_ipc_region;
+#[path = "memory/gpu_region.rs"]
+pub mod gpu_region;
+#[cfg(feature = "cuda")]
 #[path = "compute/gpu_tensor.rs"]
 pub mod gpu_tensor;
+#[cfg(all(feature = "cuda", unix))]
+#[path = "memory/gpu_vmm_region.rs"]
+pub mod gpu_vmm_region;
 #[path = "compute/kernel.rs"]
 pub mod kernel;
 #[path = "communication/mock.rs"]
