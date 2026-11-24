@@ -7,7 +7,7 @@ name = "kapsl-sdk"
 version = "0.2.0"
 description = "Python SDK for Kapsl inference, native transports, and optional gRPC streaming"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = { text = "Proprietary" }
 keywords = ["inference", "llm", "machine-learning", "ai", "python-sdk", "kapsl"]
 classifiers = [
@@ -18,7 +18,6 @@ classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",

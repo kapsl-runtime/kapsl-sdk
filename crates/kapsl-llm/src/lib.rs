@@ -8,11 +8,14 @@ compile_error!("the `onnx-directml` feature is supported only on Windows");
 pub mod allocation_scope;
 #[path = "cache/block_manager.rs"]
 pub mod block_manager;
+pub mod cuda_ordinal;
 #[cfg(feature = "onnx")]
 #[path = "engine/onnx.rs"]
 pub mod engine;
 #[path = "gguf/backend.rs"]
 pub mod gguf_backend;
+#[path = "gguf/placement.rs"]
+pub mod gguf_placement;
 #[cfg(any(feature = "gguf", test))]
 #[path = "gguf/sequence_admission.rs"]
 mod gguf_sequence_admission;
