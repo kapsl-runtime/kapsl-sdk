@@ -266,13 +266,12 @@ dependencies = [
  "cexpr",
  "clang-sys",
  "log",
- "prettyplease",
  "proc-macro2",
  "quote",
  "regex",
  "rustc-hash",
  "shlex 2.0.1",
- "syn 3.0.10",
+ "syn 2.0.117",
 ]
 
 [[package]]
