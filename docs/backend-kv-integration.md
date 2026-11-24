@@ -134,7 +134,8 @@ the main product advantage.
 
 ### vLLM
 
-`integrations/vllm` is an out-of-tree `KVConnectorBase_V1` package. Its default
+[`kapsl-integrations/integrations/vllm`](https://github.com/kapsl-runtime/kapsl-integrations/tree/main/integrations/vllm)
+is an out-of-tree `KVConnectorBase_V1` package. Its default
 mode registers as `kv_connected` with opaque metadata and obtains a Kapsl
 capacity lease from vLLM's one-shot `on_new_request` hook. It reports no
 external prefix hits and performs no KV copies, so it cannot accidentally skip
