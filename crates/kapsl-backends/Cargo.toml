@@ -42,6 +42,9 @@ gguf-cuda-shared-kv = ["kapsl-llm/gguf-cuda-shared-kv", "kapsl-hal/cuda", "onnx-
 # ORT custom CUDA allocator backed by the runtime-owned GpuDevicePool, so ONNX
 # sessions draw device memory from the same allocation as GGUF KV views.
 onnx-cuda-pool = ["kapsl-hal/cuda", "kapsl-llm/onnx-cuda-pool"]
+# CuTe tensor-core kernels for the native backends; combine with `native` or
+# `gguf-native`. Needs nvcc and the third_party/cutlass submodule to build.
+cute = ["kapsl-kernels?/cute"]
 native = [
     "dep:kapsl-kernels",
     "dep:kapsl-loader",
