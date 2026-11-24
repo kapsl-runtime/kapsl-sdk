@@ -67,15 +67,11 @@ packaged and released.
 
 ## Release policy
 
-Every release is built and tested from an exact `kapsl-backend-abi-vX.Y.Z`
-stable tag whose commit is already present on `main`. The crates.io publication
-job is protected by the `crates-io-backend-abi` GitHub environment. Branch,
-beta, release-candidate, and mismatched tags cannot publish this crate.
-
-Because crates.io cannot configure a trusted publisher before a crate exists,
-the `0.1.0` job is a one-time bootstrap guarded by that environment and its API
-token. After `0.1.0` is published, register `kapsl-runtime/kapsl-sdk`,
-`publish-backend-abi.yml`, and the `crates-io-backend-abi` environment as the
-crate's trusted publisher. Every later stable release obtains a short-lived
-crates.io credential through GitHub OIDC; the bootstrap job cannot publish any
-version other than `0.1.0`.
+Releases go through the repository's single publish workflow,
+`.github/workflows/publish.yml`. It publishes only stable `X.Y.Z` versions,
+only from `main`, and only after a required reviewer approves the protected
+`sdk-release` GitHub environment. It obtains a short-lived crates.io credential
+through GitHub OIDC, so `kapsl-runtime/kapsl-sdk`, `publish.yml` and the
+`sdk-release` environment must be registered as the crate's trusted publisher.
+Each release is tagged `kapsl-backend-abi-vX.Y.Z`. The repository's
+`RELEASING.md` describes the process.

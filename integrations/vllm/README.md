@@ -234,17 +234,14 @@ instead of risking a use-after-free.
 
 ## Release
 
-The connector has an isolated PyPI release workflow at
-`.github/workflows/publish-vllm-connector.yml`. A release tag must exactly
-match the version in `pyproject.toml`, for example
-`kapsl-vllm-connector-v0.7.0`. This namespace intentionally does not begin
-with `v`, so it cannot trigger the root `kapsl-sdk` package's `v*` workflow.
-
-The workflow's manual dispatch is build-only by default. Selecting
-`publish: true` is accepted only when the dispatch ref is the same matching
-connector tag. Before the first upload, configure the PyPI pending/trusted
-publisher for this repository, workflow `publish-vllm-connector.yml`, and
-GitHub environment `pypi-vllm-connector`.
+The connector is released to PyPI by the repository's single publish
+workflow, `.github/workflows/publish.yml`, which reads the version from
+`pyproject.toml` and tags each release `kapsl-vllm-connector-vX.Y.Z`. A run
+is build-only unless `publish` is selected; publishing is accepted only from
+`main` and waits for a required reviewer to approve the `sdk-release`
+environment. Before the first upload, configure the PyPI pending/trusted
+publisher for this repository, workflow `publish.yml`, and GitHub environment
+`sdk-release`. The repository's `RELEASING.md` describes the process.
 
 Every release runs the host suite on Python 3.12, builds one universal wheel
 and one source distribution, runs strict Twine metadata checks, and verifies
