@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 description = "Compute kernels for matrix operations and attention in Kapsl"
 
+[package.metadata.cargo-machete]
+ignored = ["cc"] # Used by build.rs only (finds the host compiler for nvcc under `cute`).
+
 [dependencies]
 kapsl-hal = { version = "0.3.0", path = "../kapsl-hal" }
 log = "0.4"
