@@ -108,8 +108,17 @@ path = "src/lib.rs"
 
 [dependencies]
 
+# The build script emits bindings through bindgen's default formatter and never
+# selects `prettyplease`. Leave that feature off: bindgen 0.73 accepts syn 2 or
+# 3 while prettyplease 0.2 is syn 2 only, and Cargo can resolve the two to
+# different syn majors, which fails to compile inside bindgen.
 [build-dependencies.bindgen]
-version = "0.72.1"
+version = "0.73.2"
+default-features = false
+features = [
+    "logging",
+    "runtime",
+]
 
 [build-dependencies.cc]
 version = "1.2.61"

@@ -7,6 +7,12 @@ updates:
       interval: weekly
     cooldown:
       default-days: 7
+    ignore:
+      # ort is pinned to an exact release candidate on purpose. Each release
+      # ships a different ONNX Runtime and changes the bindings that the CUDA
+      # pool allocator and the accelerator provider packs are built against,
+      # so upgrade it as planned work with GPU validation, not as a bump PR.
+      - dependency-name: "ort"
 
   - package-ecosystem: cargo
     directory: "/patches/esaxx-rs"
