@@ -318,7 +318,7 @@ dependencies = [
 
 [[package]]
 name = "kapsl-llama-cpp-2"
-version = "0.1.146-kapsl.1"
+version = "0.1.146-kapsl.2"
 dependencies = [
  "encoding_rs",
  "enumflags2",
@@ -333,7 +333,7 @@ dependencies = [
 
 [[package]]
 name = "kapsl-llama-cpp-sys-2"
-version = "0.1.146-kapsl.1"
+version = "0.1.146-kapsl.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "765c5401676911eda782c7a3f9f9dec068f820f31c6f4c49b7442f126f395beb"
 dependencies = [
