@@ -379,9 +379,12 @@ jobs:
           R2_PREFIX: ${{ matrix.package.r2_prefix }}
           RELEASE_VERSION: ${{ matrix.package.version }}
         run: |
+          # The PyPI step leaves *.publish.attestation files in dist/; R2 gets
+          # only the distributions, as before.
           aws s3 cp dist/ \
             "s3://kapsl-installer/${R2_PREFIX}/v${RELEASE_VERSION}/" \
             --recursive \
+            --exclude "*.publish.attestation" \
             --no-progress \
             --endpoint-url https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
 
