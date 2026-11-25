@@ -107,17 +107,3 @@ checks = [
   "python scripts/test-python-wheel.py",
 ]
 r2-prefix = "sdk"
-
-[python.kapsl-vllm-connector]
-path = "integrations/vllm"
-build = "setuptools"
-checks = [
-  "PYTHONPATH=integrations/vllm/src python -m unittest discover -s integrations/vllm/tests -v",
-  "python integrations/vllm/scripts/check_dist_artifacts.py integrations/vllm/dist",
-  """
-  python -m pip install --disable-pip-version-check --no-deps --force-reinstall integrations/vllm/dist/*.whl
-  schema_file="$(mktemp)"
-  kapsl-vllm-plan --print-schema > "$schema_file"
-  python -m json.tool "$schema_file" >/dev/null
-  """,
-]

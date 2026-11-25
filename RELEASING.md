@@ -15,7 +15,6 @@ checks each must pass, are listed in
      root `Cargo.toml` for crates that inherit it
    - `kapsl-sdk`: `pyproject.toml` and `crates/kapsl-pyo3/pyproject.toml`,
      which must match
-   - `kapsl-vllm-connector`: `integrations/vllm/pyproject.toml`
 2. **Merge to `main`.**
 3. **Run the workflow** from Actions → Publish SDK packages → Run workflow,
    on branch `main`:
@@ -100,8 +99,9 @@ PyPI. Releases fail until they are done.
    the old workflows. Do this for `kapsl-managed-abi` after its first release.
 3. **PyPI trusted publishing.** For `kapsl-sdk`, open Manage → Publishing and
    add a GitHub publisher with the same four values. `kapsl-vllm-connector`
-   is not on PyPI yet, so add a *pending* publisher for it with the same
-   values.
+   is released from
+   [`kapsl-integrations`](https://github.com/kapsl-runtime/kapsl-integrations),
+   so do not add a `kapsl-sdk` publisher for it.
 4. **Tag rules.** If a ruleset restricts tag creation, allow GitHub Actions to
    create tags matching `*-v*`.
 5. **Clean up.** Once releases work, delete the old environments:
