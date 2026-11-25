@@ -1,5 +1,5 @@
 use super::*;
-use crate::allocator::{SharedShmAllocator, SharedShmLease};
+use crate::shm::allocator::{SharedShmAllocator, SharedShmLease};
 
 const ERROR_LEN_PREFIX_BYTES: usize = std::mem::size_of::<u64>();
 

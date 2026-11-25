@@ -1,12 +1,12 @@
-use crate::allocator::SharedShmAllocator;
-use crate::mailbox::ResponseMailboxRegistry;
-use crate::memory::{ShmManager, TensorHeader};
-use crate::protocol::{ShmRequest, ShmResponse, SHM_PROTOCOL_VERSION, SHM_QUEUE_CAPACITY};
-use crate::ring_buffer::LockFreeRingBuffer;
+use crate::shm::allocator::SharedShmAllocator;
+use crate::shm::mailbox::ResponseMailboxRegistry;
+use crate::shm::memory::{ShmManager, TensorHeader};
+use crate::shm::protocol::{ShmRequest, ShmResponse, SHM_PROTOCOL_VERSION, SHM_QUEUE_CAPACITY};
+use crate::shm::ring_buffer::LockFreeRingBuffer;
+use crate::transport::{ResponseMetadata, TransportError, TransportServer};
 use async_trait::async_trait;
 use kapsl_engine_api::{BinaryTensorPacket, InferenceRequest, TensorDtype};
 use kapsl_engine_api::{Priority, ReplicaScheduler};
-use kapsl_transport::{ResponseMetadata, TransportError, TransportServer};
 use prometheus::Registry;
 use std::collections::HashMap;
 use std::sync::Arc;

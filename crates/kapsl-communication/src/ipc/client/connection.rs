@@ -1,9 +1,9 @@
 //! Pooled client connections for platform-native IPC transports.
 
+use crate::transport::connection_pool::{ConnectionFactory, ConnectionPool, PoolConfig};
+use crate::transport::{TransportClient, TransportError};
 use async_trait::async_trait;
 use kapsl_engine_api::{BinaryTensorPacket, InferenceRequest};
-use kapsl_transport::connection_pool::{ConnectionFactory, ConnectionPool, PoolConfig};
-use kapsl_transport::{TransportClient, TransportError};
 
 #[cfg(unix)]
 use tokio::net::UnixStream;
@@ -42,7 +42,7 @@ impl ConnectionFactory for IpcConnectionFactory {
         return UnixStream::connect(&self.socket_path).await;
 
         #[cfg(windows)]
-        return kapsl_transport::named_pipe::connect(&self.socket_path).await;
+        return crate::transport::named_pipe::connect(&self.socket_path).await;
     }
 
     async fn is_valid(&self, _conn: &Self::Connection) -> bool {
@@ -75,7 +75,7 @@ impl IpcClient {
             .get()
             .await
             .map_err(|e| TransportError::Connection(e.to_string()))?;
-        kapsl_transport::protocol::asynchronous::infer_request_over_stream(
+        crate::transport::protocol::asynchronous::infer_request_over_stream(
             &mut *conn, model_id, request,
         )
         .await
@@ -120,10 +120,10 @@ impl TransportClient for IpcClient {
             .map_err(|error| TransportError::Connection(error.to_string()))?;
         connection.discard_on_drop();
         let request = InferenceRequest::new(input);
-        kapsl_transport::protocol::asynchronous::write_request_value(
+        crate::transport::protocol::asynchronous::write_request_value(
             &mut *connection,
             model_id,
-            kapsl_transport::protocol::OP_INFER_STREAM,
+            crate::transport::protocol::OP_INFER_STREAM,
             &request,
         )
         .await
@@ -131,16 +131,16 @@ impl TransportClient for IpcClient {
 
         let responses = futures::stream::unfold(Some(connection), |state| async move {
             let mut connection = state?;
-            match kapsl_transport::protocol::asynchronous::read_stream_packet(
+            match crate::transport::protocol::asynchronous::read_stream_packet(
                 &mut *connection,
-                kapsl_transport::protocol::DEFAULT_MAX_FRAME_PAYLOAD_BYTES,
+                crate::transport::protocol::DEFAULT_MAX_FRAME_PAYLOAD_BYTES,
             )
             .await
             {
-                Ok(kapsl_transport::protocol::StreamResponse::Chunk(packet)) => {
+                Ok(crate::transport::protocol::StreamResponse::Chunk(packet)) => {
                     Some((Ok(packet), Some(connection)))
                 }
-                Ok(kapsl_transport::protocol::StreamResponse::End) => {
+                Ok(crate::transport::protocol::StreamResponse::End) => {
                     connection.recycle_on_drop();
                     None
                 }

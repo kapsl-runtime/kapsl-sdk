@@ -1,8 +1,8 @@
-use crate::allocator::SharedShmAllocator;
-use crate::mailbox::{
+use crate::shm::allocator::SharedShmAllocator;
+use crate::shm::mailbox::{
     mailbox_alignment, mailbox_bytes, ResponseMailboxRegistry, RESPONSE_MAILBOX_COUNT,
 };
-use crate::protocol::{ShmRequest, SHM_QUEUE_CAPACITY};
+use crate::shm::protocol::{ShmRequest, SHM_QUEUE_CAPACITY};
 use shared_memory::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 

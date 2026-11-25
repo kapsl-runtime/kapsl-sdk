@@ -1,5 +1,5 @@
 use super::ShmAllocatorSnapshot;
-use crate::memory::ShmManager;
+use crate::shm::memory::ShmManager;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

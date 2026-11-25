@@ -1,10 +1,15 @@
 //! Platform-native IPC server and inference request dispatch.
 
-use crate::protocol::{
+use crate::ipc::protocol::{
     HybridRequest, HybridResponse, HYBRID_SHM_PROTOCOL_VERSION, OP_HYBRID_INFER, OP_INFER,
     OP_INFER_STREAM, OP_OPENAI_WIRE, OP_OPENAI_WIRE_STREAM, STATUS_ERR, STATUS_OK,
     STATUS_OPENAI_WIRE_CHUNK, STATUS_OPENAI_WIRE_HEAD, STATUS_STREAM_CHUNK, STATUS_STREAM_END,
 };
+use crate::transport::protocol::{
+    asynchronous as wire, decode_inference_request, CodecError, DEFAULT_MAX_FRAME_PAYLOAD_BYTES,
+    MAX_OPENAI_WIRE_REQUEST_PAYLOAD_BYTES,
+};
+use crate::transport::{ResponseMetadata, TransportError, TransportServer};
 use async_trait::async_trait;
 #[cfg(feature = "hybrid")]
 use kapsl_engine_api::TensorDtype;
@@ -12,11 +17,6 @@ use kapsl_engine_api::{
     BinaryTensorPacket, CancellationToken, InferenceRequest, OpenAiWireFormat, OpenAiWireRequest,
 };
 use kapsl_engine_api::{Priority, ReplicaScheduler};
-use kapsl_transport::protocol::{
-    asynchronous as wire, decode_inference_request, CodecError, DEFAULT_MAX_FRAME_PAYLOAD_BYTES,
-    MAX_OPENAI_WIRE_REQUEST_PAYLOAD_BYTES,
-};
-use kapsl_transport::{ResponseMetadata, TransportError, TransportServer};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
@@ -29,9 +29,9 @@ use tokio::net::windows::named_pipe::ServerOptions;
 use tokio::net::{UnixListener, UnixStream};
 
 #[cfg(feature = "hybrid")]
-use kapsl_shm::allocator::{SharedShmAllocator, SharedShmLease};
+use crate::shm::allocator::{SharedShmAllocator, SharedShmLease};
 #[cfg(feature = "hybrid")]
-use kapsl_shm::memory::{ShmManager, TensorHeader};
+use crate::shm::memory::{ShmManager, TensorHeader};
 
 pub type SchedulerLookup =
     Arc<dyn Fn(u32) -> Option<Arc<dyn ReplicaScheduler + Send + Sync>> + Send + Sync>;
@@ -922,14 +922,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::connection_pool::PoolConfig;
+    use crate::transport::protocol::ResponseFrame;
+    use crate::transport::tcp::TcpClient;
     use futures::Stream;
     use kapsl_engine_api::{
         EngineError, EngineMetrics, OpenAiWireEndpoint, OpenAiWireMetadata, OpenAiWireResponse,
         OpenAiWireResponseHead, OpenAiWireStreamResponse, RequestMetadata, TensorDtype,
     };
-    use kapsl_transport::connection_pool::PoolConfig;
-    use kapsl_transport::protocol::ResponseFrame;
-    use kapsl_transport::tcp::TcpClient;
     use std::pin::Pin;
     use std::sync::Mutex;
     use tokio::io::{duplex, AsyncWriteExt, DuplexStream};
@@ -1345,7 +1345,7 @@ mod tests {
 
         for _ in 0..2 {
             let output =
-                kapsl_transport::protocol::infer_over_stream(&mut client, 7, input.clone())
+                crate::transport::protocol::infer_over_stream(&mut client, 7, input.clone())
                     .await
                     .expect("inference round trip");
             assert_eq!(output.shape, input.shape);
@@ -1388,7 +1388,7 @@ mod tests {
             None,
         ));
         let request = HybridRequest {
-            metadata: kapsl_transport::RequestMetadata::new(44, 7, 1, false),
+            metadata: crate::transport::RequestMetadata::new(44, 7, 1, false),
             shm_offset: 100,
             shm_size: 80,
             shm_lease: 55,
@@ -1431,7 +1431,7 @@ mod tests {
         let (mut client, server) = duplex(4096);
         let task = tokio::spawn(handle_connection(server, lookup_for(scheduler), None, None));
         let request = HybridRequest {
-            metadata: kapsl_transport::RequestMetadata::new(45, 7, 1, false),
+            metadata: crate::transport::RequestMetadata::new(45, 7, 1, false),
             shm_offset: 100,
             shm_size: 80,
             shm_lease: 55,
@@ -1512,7 +1512,7 @@ mod tests {
 
     #[tokio::test]
     async fn openai_wire_envelope_authenticates_before_dispatching_clean_policy_request() {
-        use kapsl_transport::protocol::OpenAiWireStreamFrame;
+        use crate::transport::protocol::OpenAiWireStreamFrame;
 
         let seen = Arc::new(Mutex::new(Vec::new()));
         let scheduler: Arc<dyn ReplicaScheduler + Send + Sync> =
@@ -1606,7 +1606,7 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_wire_stream_client_cancels_idle_server_request_and_exits_handler() {
-        use kapsl_transport::protocol::OpenAiWireStreamFrame;
+        use crate::transport::protocol::OpenAiWireStreamFrame;
 
         let cancellation = Arc::new(Mutex::new(None));
         let scheduler: Arc<dyn ReplicaScheduler + Send + Sync> =

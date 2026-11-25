@@ -1,6 +1,6 @@
 use super::*;
-use crate::memory::{ShmError, ShmManager};
-use kapsl_transport::ResponseMetadata;
+use crate::shm::memory::{ShmError, ShmManager};
+use crate::transport::ResponseMetadata;
 use std::collections::HashSet;
 
 fn test_registry(label: &str) -> Option<ResponseMailboxRegistry> {

@@ -1,6 +1,6 @@
+use crate::transport::{TransportError, TransportServer};
 use async_trait::async_trait;
 use kapsl_engine_api::ReplicaScheduler;
-use kapsl_transport::{TransportError, TransportServer};
 use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
@@ -18,7 +18,7 @@ pub enum CommunicationError {
     /// Shared-memory mapping creation failed.
     #[cfg(feature = "shm")]
     #[error(transparent)]
-    SharedMemory(#[from] kapsl_shm::memory::ShmError),
+    SharedMemory(#[from] crate::shm::memory::ShmError),
 
     /// The selected transport cannot be built from the supplied settings.
     #[error("Invalid communication configuration: {0}")]
@@ -37,7 +37,7 @@ impl CommunicationServer {
     #[cfg(feature = "ipc")]
     pub fn ipc(socket_path: &str, scheduler_lookup: SchedulerLookup) -> Self {
         Self {
-            inner: Arc::new(kapsl_ipc::IpcServer::new_socket_with_lookup(
+            inner: Arc::new(crate::ipc::IpcServer::new_socket_with_lookup(
                 socket_path,
                 scheduler_lookup,
             )),
@@ -53,7 +53,7 @@ impl CommunicationServer {
         scheduler_lookup: SchedulerLookup,
         auth_token: Option<&str>,
     ) -> Self {
-        let server = kapsl_ipc::TcpServer::new_with_lookup(bind_addr, port, scheduler_lookup);
+        let server = crate::ipc::TcpServer::new_with_lookup(bind_addr, port, scheduler_lookup);
         let server = match auth_token.map(str::trim).filter(|token| !token.is_empty()) {
             Some(token) => server.with_auth_token(token.to_string()),
             None => server,
@@ -74,7 +74,7 @@ impl CommunicationServer {
         metrics_registry: Option<Arc<prometheus::Registry>>,
     ) -> Self {
         Self {
-            inner: Arc::new(kapsl_shm::ShmServer::new_with_lookup_and_registry(
+            inner: Arc::new(crate::shm::ShmServer::new_with_lookup_and_registry(
                 name,
                 size,
                 scheduler_lookup,
@@ -93,9 +93,9 @@ impl CommunicationServer {
         shm_size: usize,
         scheduler_lookup: SchedulerLookup,
     ) -> Result<Self, CommunicationError> {
-        let shm = Arc::new(kapsl_shm::ShmManager::create(shm_name, shm_size)?);
+        let shm = Arc::new(crate::shm::ShmManager::create(shm_name, shm_size)?);
         let server =
-            kapsl_ipc::IpcServer::new_with_lookup(socket_path, scheduler_lookup, Some(shm));
+            crate::ipc::IpcServer::new_with_lookup(socket_path, scheduler_lookup, Some(shm));
         Ok(Self {
             inner: Arc::new(server),
             endpoint: format!("{socket_path} (shm: {shm_name})"),

@@ -1,4 +1,4 @@
-use crate::allocator::ShmAllocatorSnapshot;
+use crate::shm::allocator::ShmAllocatorSnapshot;
 use prometheus::{IntCounter, IntGauge, Opts, Registry};
 use std::sync::Arc;
 

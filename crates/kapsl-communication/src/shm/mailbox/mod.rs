@@ -1,7 +1,7 @@
 //! Request-specific response routing inside the shared-memory control region.
 
-use crate::memory::ShmManager;
-use crate::protocol::ShmResponse;
+use crate::shm::memory::ShmManager;
+use crate::shm::protocol::ShmResponse;
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -55,7 +55,7 @@ pub struct ResponseMailboxClaim {
 }
 
 impl ResponseMailboxClaim {
-    /// Zero-based mailbox index carried by [`crate::protocol::ShmRequest`].
+    /// Zero-based mailbox index carried by [`crate::shm::protocol::ShmRequest`].
     pub fn index(self) -> u32 {
         self.index
     }

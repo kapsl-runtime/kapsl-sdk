@@ -7,7 +7,6 @@ members = [
     "crates/kapsl-engine-api",
     "crates/kapsl-grpc",
     "crates/kapsl-hal",
-    "crates/kapsl-ipc",
     "crates/kapsl-kernels",
     "crates/kapsl-kv-abi",
     "crates/kapsl-managed-abi",
@@ -18,8 +17,6 @@ members = [
     "crates/kapsl-rag",
     "crates/kapsl-rag-sdk",
     "crates/kapsl-scheduler",
-    "crates/kapsl-shm",
-    "crates/kapsl-transport",
 ]
 exclude = [
     "patches/esaxx-rs",
@@ -34,7 +31,6 @@ default-members = [
     "crates/kapsl-engine-api",
     "crates/kapsl-grpc",
     "crates/kapsl-hal",
-    "crates/kapsl-ipc",
     "crates/kapsl-kernels",
     "crates/kapsl-kv-abi",
     "crates/kapsl-managed-abi",
@@ -44,8 +40,6 @@ default-members = [
     "crates/kapsl-rag",
     "crates/kapsl-rag-sdk",
     "crates/kapsl-scheduler",
-    "crates/kapsl-shm",
-    "crates/kapsl-transport",
 ]
 
 resolver = "2"
