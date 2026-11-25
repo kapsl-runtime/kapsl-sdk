@@ -12,7 +12,7 @@
 [package]
 edition = "2021"
 name = "kapsl-llama-cpp-2"
-version = "0.1.146-kapsl.1"
+version = "0.1.146-kapsl.2"
 build = "build.rs"
 autolib = false
 autobins = false
@@ -67,7 +67,7 @@ version = "0.7.12"
 
 [dependencies.llama-cpp-sys-2]
 package = "kapsl-llama-cpp-sys-2"
-version = "=0.1.146-kapsl.1"
+version = "=0.1.146-kapsl.2"
 
 [dependencies.llguidance]
 version = "1.7.2"
@@ -95,7 +95,7 @@ features = ["json"]
 
 [target.'cfg(all(target_os = "macos", any(target_arch = "aarch64", target_arch = "arm64")))'.dependencies.llama-cpp-sys-2]
 package = "kapsl-llama-cpp-sys-2"
-version = "=0.1.146-kapsl.1"
+version = "=0.1.146-kapsl.2"
 features = ["metal"]
 
 [lints.clippy.pedantic]

@@ -1,20 +1,7 @@
 use kapsl_engine_api::{InferenceRequest, OpenAiWireMetadata, OpenAiWireRequest, RequestMetadata};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Priority {
-    LatencyCritical,
-    Throughput,
-}
-
-impl Priority {
-    /// Engine metadata convention: 0 = latency-critical, 1 = throughput.
-    pub(crate) fn engine_metadata_value(self) -> u8 {
-        match self {
-            Self::LatencyCritical => 0,
-            Self::Throughput => 1,
-        }
-    }
-}
+/// Defined in `kapsl-engine-api` so transports can use it without this crate.
+pub use kapsl_engine_api::Priority;
 
 pub(crate) fn stamp_engine_priority(request: &mut InferenceRequest, priority: Priority) {
     request

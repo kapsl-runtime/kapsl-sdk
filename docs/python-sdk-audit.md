@@ -61,7 +61,7 @@ Capturing that request and decoding it with the exact published
 Relevant source:
 
 - [Current request metadata](../crates/kapsl-engine-api/src/lib.rs)
-- [Transport compatibility decoder](../crates/kapsl-transport/src/protocol.rs)
+- [Transport compatibility decoder](../crates/kapsl-communication/src/transport/protocol.rs)
 - [Current Python request construction](../crates/kapsl-pyo3/src/client.rs)
 
 This failure concerns the native framed transport. The new gRPC API sends

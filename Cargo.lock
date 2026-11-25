@@ -179,13 +179,13 @@ dependencies = [
 
 [[package]]
 name = "async-trait"
-version = "0.1.89"
+version = "0.1.92"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9035ad2d096bed7955a320ee7e2230574d28fd3c3a0f186cbea1ff3c7eed5dbb"
+checksum = "82f6aeea286b8eb4dd3431a1be1b59d290ace00f5bfd8e2a159bc2a05e2c1667"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 3.0.10",
 ]
 
 [[package]]
@@ -285,7 +285,7 @@ dependencies = [
  "regex",
  "rustc-hash",
  "shlex 2.0.1",
- "syn 2.0.117",
+ "syn 3.0.10",
 ]
 
 [[package]]
@@ -1426,7 +1426,6 @@ dependencies = [
  "num-traits",
  "rand 0.9.4",
  "rand_distr",
- "serde",
  "zerocopy",
 ]
 
@@ -1448,8 +1447,6 @@ version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4f467dd6dccf739c208452f8014c75c18bb8301b050ad1cfb27153803edb0f51"
 dependencies = [
- "allocator-api2",
- "equivalent",
  "foldhash 0.2.0",
 ]
 
@@ -1907,7 +1904,7 @@ dependencies = [
  "half",
  "image",
  "kapsl-core",
- "kapsl-engine-api 0.3.0",
+ "kapsl-engine-api",
  "kapsl-hal",
  "kapsl-kernels",
  "kapsl-llama-cpp-2",
@@ -1928,18 +1925,18 @@ dependencies = [
 
 [[package]]
 name = "kapsl-communication"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "async-trait",
+ "bincode",
  "futures",
- "kapsl-engine-api 0.3.0",
+ "kapsl-engine-api",
  "kapsl-grpc",
- "kapsl-ipc",
- "kapsl-scheduler",
- "kapsl-shm",
- "kapsl-transport",
+ "log",
  "prometheus",
+ "serde",
  "serde_json",
+ "shared_memory",
  "thiserror 1.0.69",
  "tokio",
 ]
@@ -1951,7 +1948,7 @@ dependencies = [
  "flate2",
  "fs2",
  "hex",
- "kapsl-engine-api 0.3.0",
+ "kapsl-engine-api",
  "log",
  "parking_lot",
  "serde",
@@ -1965,31 +1962,17 @@ dependencies = [
 
 [[package]]
 name = "kapsl-engine-api"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
  "bincode",
  "futures",
- "kapsl-kv-abi 0.6.1",
+ "kapsl-kv-abi",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
-]
-
-[[package]]
-name = "kapsl-engine-api"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "279a1f1abe9afc205c22bc0951df3ccd165cd3010ee4f0f360bad47f399f9931"
-dependencies = [
- "async-trait",
- "base64 0.22.1",
- "futures",
- "kapsl-kv-abi 0.6.0",
- "serde",
- "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -2001,7 +1984,7 @@ dependencies = [
  "http",
  "http-body-util",
  "hyper-util",
- "kapsl-engine-api 0.3.0",
+ "kapsl-engine-api",
  "log",
  "prost",
  "prost-build",
@@ -2030,39 +2013,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "kapsl-ipc"
-version = "0.4.0"
-dependencies = [
- "async-trait",
- "futures",
- "kapsl-engine-api 0.3.0",
- "kapsl-scheduler",
- "kapsl-shm",
- "kapsl-transport",
- "log",
- "serde",
- "tokio",
-]
-
-[[package]]
 name = "kapsl-kernels"
 version = "0.3.0"
 dependencies = [
+ "cc",
  "cudarc",
  "half",
  "kapsl-hal",
  "log",
  "rayon",
-]
-
-[[package]]
-name = "kapsl-kv-abi"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "975e66b4912d45b0e8aaf6c9ea787c68966b0141174ffc435fe202ff7c406ffc"
-dependencies = [
- "serde",
- "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -2076,7 +2035,7 @@ dependencies = [
 
 [[package]]
 name = "kapsl-llama-cpp-2"
-version = "0.1.146-kapsl.1"
+version = "0.1.146-kapsl.2"
 dependencies = [
  "encoding_rs",
  "enumflags2",
@@ -2088,7 +2047,7 @@ dependencies = [
 
 [[package]]
 name = "kapsl-llama-cpp-sys-2"
-version = "0.1.146-kapsl.1"
+version = "0.1.146-kapsl.2"
 dependencies = [
  "bindgen",
  "cc",
@@ -2100,8 +2059,9 @@ dependencies = [
 
 [[package]]
 name = "kapsl-llm"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
+ "anyhow",
  "async-stream",
  "async-trait",
  "cudarc",
@@ -2109,13 +2069,12 @@ dependencies = [
  "futures",
  "half",
  "kapsl-core",
- "kapsl-engine-api 0.3.0",
+ "kapsl-engine-api",
  "kapsl-hal",
- "kapsl-kv-abi 0.6.1",
+ "kapsl-kv-abi",
  "kapsl-llama-cpp-2",
  "kapsl-llama-cpp-sys-2",
  "kapsl-loader",
- "kapsl-quantization",
  "log",
  "ndarray",
  "ort",
@@ -2126,6 +2085,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokenizers",
  "tokio",
+ "turboquant-rs",
  "uuid",
 ]
 
@@ -2137,7 +2097,7 @@ dependencies = [
  "kapsl-hal",
  "log",
  "memmap2",
- "safetensors 0.4.5",
+ "safetensors",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -2145,9 +2105,9 @@ dependencies = [
 
 [[package]]
 name = "kapsl-managed-abi"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
- "kapsl-engine-api 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "kapsl-engine-api",
  "serde",
  "serde_json",
 ]
@@ -2158,7 +2118,7 @@ version = "0.3.0"
 dependencies = [
  "async-trait",
  "futures",
- "kapsl-engine-api 0.3.0",
+ "kapsl-engine-api",
  "prometheus",
  "tokio",
 ]
@@ -2168,20 +2128,9 @@ name = "kapsl-pyo3"
 version = "0.3.0"
 dependencies = [
  "kapsl-communication",
- "kapsl-engine-api 0.3.0",
+ "kapsl-engine-api",
  "pyo3",
  "tokio",
-]
-
-[[package]]
-name = "kapsl-quantization"
-version = "0.3.0"
-dependencies = [
- "anyhow",
- "half",
- "safetensors 0.3.3",
- "serde",
- "turboquant-rs",
 ]
 
 [[package]]
@@ -2226,39 +2175,12 @@ dependencies = [
  "cron",
  "futures",
  "kapsl-core",
- "kapsl-engine-api 0.3.0",
+ "kapsl-engine-api",
  "kapsl-hal",
  "log",
  "parking_lot",
  "rayon",
  "serde",
- "tokio",
-]
-
-[[package]]
-name = "kapsl-shm"
-version = "0.4.0"
-dependencies = [
- "async-trait",
- "kapsl-engine-api 0.3.0",
- "kapsl-scheduler",
- "kapsl-transport",
- "log",
- "prometheus",
- "shared_memory",
- "tokio",
-]
-
-[[package]]
-name = "kapsl-transport"
-version = "0.4.0"
-dependencies = [
- "async-trait",
- "bincode",
- "futures",
- "kapsl-engine-api 0.3.0",
- "serde",
- "thiserror 1.0.69",
  "tokio",
 ]
 
@@ -2360,9 +2282,9 @@ checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
 name = "lru"
-version = "0.18.2"
+version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d2f2f9b4ba7e6b24d95e7e899329d35be83bcded72c8540cdd5368932d1d90a"
+checksum = "4a9f71e3591c7ec44d3e563e87bf14ddc2bada8519dca046e5b0e560cd004e2d"
 dependencies = [
  "hashbrown 0.17.0",
 ]
@@ -3477,9 +3399,9 @@ dependencies = [
 
 [[package]]
 name = "rusqlite"
-version = "0.42.0"
+version = "0.43.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a4edff0039f148731aee2fd80f76dbfeb12d204ab3d1c544838d34e02151049b"
+checksum = "f172c4812a19b26d1c23cdb0070e69db335503dfa378b910eb857386e5b8beba"
 dependencies = [
  "bitflags 2.11.1",
  "fallible-iterator",
@@ -3592,16 +3514,6 @@ name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
-
-[[package]]
-name = "safetensors"
-version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d93279b86b3de76f820a8854dd06cbc33cfa57a417b19c47f6a25280112fb1df"
-dependencies = [
- "serde",
- "serde_json",
-]
 
 [[package]]
 name = "safetensors"

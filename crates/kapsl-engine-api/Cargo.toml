@@ -1,6 +1,8 @@
 [package]
 name = "kapsl-engine-api"
-version.workspace = true
+# Its own version: 0.3.1 adds Priority and ReplicaScheduler, which the
+# transport crates require, without bumping every workspace-versioned crate.
+version = "0.3.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

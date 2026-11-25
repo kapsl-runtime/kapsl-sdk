@@ -392,10 +392,7 @@ fn build_scheduler_for_queue_tests(
     queue_size: usize,
     cpu_active: usize,
 ) -> Scheduler {
-    let cpu_pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(1)
-        .build()
-        .expect("Failed to create CPU thread pool");
+    let cpu_pool = CpuPool::new(1).expect("Failed to create CPU thread pool");
 
     let high_queue = crate::gpu_executor::WorkQueue::new(queue_size);
     let low_queue = crate::gpu_executor::WorkQueue::new(queue_size);
@@ -411,7 +408,7 @@ fn build_scheduler_for_queue_tests(
         cpu_active_count: Arc::new(AtomicUsize::new(cpu_active)),
         gpu_in_flight_count: Arc::new(AtomicUsize::new(0)),
         gpu_stream_in_flight_count: Arc::new(AtomicUsize::new(0)),
-        gpu_stream_admission: PriorityAdmission::new(queue_size.max(1)),
+        gpu_stream_admission: PriorityAdmission::new(queue_size.max(1), "GPU stream"),
         router: MeshRouter::new(None, 1),
         max_micro_batch: 1,
         queue_overflow_policy: QueueOverflowPolicy::Block,
@@ -507,19 +504,142 @@ async fn zero_cpu_workers_retains_rayon_auto_selection() {
     let engine: EngineHandle = Arc::new(MockEngine::new(EngineMetrics::default()));
     let scheduler = Scheduler::new(vec![engine], 0, 1, 1, false, 1, 0, None);
 
-    assert!(scheduler.cpu_pool.current_num_threads() > 0);
+    assert!(scheduler.cpu_pool.threads() > 0);
 }
 
-#[test]
-fn non_blocking_cpu_admission_reserves_capacity_atomically() {
+async fn hold_cpu_thread(scheduler: &Scheduler) -> PriorityAdmissionPermit {
+    scheduler
+        .cpu_pool
+        .acquire(Priority::Throughput, QueueOverflowPolicy::DropNewest, None)
+        .await
+        .expect("a free CPU thread")
+}
+
+#[tokio::test]
+async fn non_blocking_cpu_infer_fails_fast_when_every_thread_is_taken() {
     let engine: EngineHandle = Arc::new(MockEngine::new(EngineMetrics::default()));
     let scheduler = build_scheduler_for_queue_tests(vec![engine], 1, 0);
 
-    assert!(scheduler.try_reserve_cpu_slot());
-    assert!(!scheduler.try_reserve_cpu_slot());
-    scheduler.cpu_active_count.fetch_sub(1, Ordering::Release);
-    assert!(scheduler.try_reserve_cpu_slot());
-    scheduler.cpu_active_count.fetch_sub(1, Ordering::Release);
+    let held = hold_cpu_thread(&scheduler).await;
+    let error = scheduler
+        .try_infer(make_inference_request(None), Priority::Throughput, true)
+        .await
+        .unwrap_err();
+    assert!(error.is_overloaded(), "{error}");
+    assert_eq!(scheduler.get_queue_depth().0, 0);
+
+    drop(held);
+    scheduler
+        .try_infer(make_inference_request(None), Priority::Throughput, true)
+        .await
+        .expect("a released thread admits the next request");
+}
+
+#[tokio::test]
+async fn cpu_infer_applies_the_drop_newest_policy() {
+    let engine: EngineHandle = Arc::new(MockEngine::new(EngineMetrics::default()));
+    let scheduler = build_scheduler_for_queue_tests(vec![engine], 1, 0)
+        .with_queue_overflow_policy(QueueOverflowPolicy::DropNewest);
+
+    let _held = hold_cpu_thread(&scheduler).await;
+    let error = scheduler
+        .infer(
+            make_inference_request(None),
+            Priority::LatencyCritical,
+            true,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.is_overloaded(), "{error}");
+}
+
+#[tokio::test]
+async fn blocked_cpu_infer_waits_for_a_thread_and_counts_as_queued() {
+    let engine: EngineHandle = Arc::new(MockEngine::new(EngineMetrics::default()));
+    let scheduler = Arc::new(build_scheduler_for_queue_tests(vec![engine], 1, 0));
+
+    let held = hold_cpu_thread(&scheduler).await;
+    let waiting = tokio::spawn({
+        let scheduler = Arc::clone(&scheduler);
+        async move {
+            scheduler
+                .infer(make_inference_request(None), Priority::Throughput, true)
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!waiting.is_finished());
+    assert_eq!(scheduler.get_queue_depth().0, 1);
+
+    drop(held);
+    waiting
+        .await
+        .unwrap()
+        .expect("admitted once the thread frees");
+    assert_eq!(scheduler.get_queue_depth().0, 0);
+}
+
+#[tokio::test]
+async fn cancelled_cpu_waiter_leaves_without_leaking_capacity() {
+    let engine: EngineHandle = Arc::new(MockEngine::new(EngineMetrics::default()));
+    let scheduler = Arc::new(build_scheduler_for_queue_tests(vec![engine], 1, 0));
+    let cancellation = CancellationToken::new();
+
+    let held = hold_cpu_thread(&scheduler).await;
+    let waiting = tokio::spawn({
+        let scheduler = Arc::clone(&scheduler);
+        let mut request = make_inference_request(None);
+        request.cancellation = Some(cancellation.clone());
+        async move { scheduler.infer(request, Priority::Throughput, true).await }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    cancellation.cancel();
+    let error = waiting.await.unwrap().unwrap_err();
+    assert!(matches!(error, EngineError::Cancelled { .. }));
+    assert_eq!(scheduler.get_queue_depth().0, 0);
+    assert_eq!(scheduler.cpu_pool.active(), 1);
+    drop(held);
+    assert_eq!(scheduler.cpu_pool.active(), 0);
+}
+
+#[tokio::test]
+async fn schedulers_sharing_a_cpu_pool_share_its_capacity() {
+    let pool = CpuPool::new(1).unwrap();
+    let make = |pool: CpuPool| {
+        let engine: EngineHandle = Arc::new(MockEngine::new(EngineMetrics::default()));
+        Scheduler::new_with_cpu_pool(vec![engine], pool, 1, 1, 1, 0, None)
+    };
+    let first = make(pool.clone());
+    let second = make(pool.clone());
+
+    let held = hold_cpu_thread(&first).await;
+    assert_eq!(pool.active(), 1);
+    // The only thread is taken, whichever scheduler asks.
+    let error = second
+        .try_infer(make_inference_request(None), Priority::Throughput, true)
+        .await
+        .unwrap_err();
+    assert!(error.is_overloaded(), "{error}");
+
+    drop(held);
+    second
+        .try_infer(make_inference_request(None), Priority::Throughput, true)
+        .await
+        .expect("the shared thread is free again");
+    assert_eq!(pool.active(), 0);
+}
+
+#[tokio::test]
+async fn shared_cpu_pool_keeps_per_scheduler_queue_depth() {
+    let pool = CpuPool::new(1).unwrap();
+    let engine: EngineHandle = Arc::new(MockEngine::new(EngineMetrics::default()));
+    let busy = Scheduler::new_with_cpu_pool(vec![engine], pool.clone(), 1, 1, 1, 0, None);
+    let engine: EngineHandle = Arc::new(MockEngine::new(EngineMetrics::default()));
+    let idle = Scheduler::new_with_cpu_pool(vec![engine], pool, 1, 1, 1, 0, None);
+
+    busy.cpu_active_count.fetch_add(1, Ordering::AcqRel);
+    assert_eq!(busy.get_queue_depth().0, 1);
+    assert_eq!(idle.get_queue_depth().0, 0);
 }
 
 #[tokio::test]
@@ -1342,6 +1462,42 @@ async fn test_scheduler_wire_token_cancelled_while_queued_never_dispatches() {
     assert_eq!(scheduler.gpu_stream_admission.available_permits(), 0);
     drop(held);
     assert_eq!(scheduler.gpu_stream_admission.available_permits(), 1);
+}
+
+#[tokio::test]
+async fn cpu_stream_holds_a_cpu_thread_until_dropped() {
+    let engine: EngineHandle = Arc::new(PendingStreamEngine);
+    let scheduler = build_scheduler_for_queue_tests(vec![engine], 1, 0)
+        .with_queue_overflow_policy(QueueOverflowPolicy::DropNewest);
+
+    let stream = ReplicaScheduler::infer_stream(
+        &scheduler,
+        make_inference_request(None),
+        Priority::Throughput,
+        true,
+    )
+    .await
+    .expect("first CPU stream should be admitted");
+    assert_eq!(scheduler.get_queue_depth(), (1, 0));
+    assert_eq!(scheduler.cpu_pool.active(), 1);
+
+    let second = ReplicaScheduler::infer_stream(
+        &scheduler,
+        make_inference_request(None),
+        Priority::Throughput,
+        true,
+    )
+    .await;
+    assert!(matches!(second, Err(ref error) if error.is_overloaded()));
+    let unary = scheduler
+        .try_infer(make_inference_request(None), Priority::Throughput, true)
+        .await
+        .unwrap_err();
+    assert!(unary.is_overloaded(), "{unary}");
+
+    drop(stream);
+    assert_eq!(scheduler.get_queue_depth(), (0, 0));
+    assert_eq!(scheduler.cpu_pool.active(), 0);
 }
 
 #[tokio::test]

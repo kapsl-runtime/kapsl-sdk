@@ -1,6 +1,6 @@
 [package]
 name = "kapsl-llm"
-version = "0.3.7"
+version = "0.3.8"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -12,7 +12,6 @@ readme = "README.md"
 kapsl-core = { version = "0.3.0", path = "../kapsl-core" }
 kapsl-engine-api = { version = "0.3.0", path = "../kapsl-engine-api" }
 kapsl-kv-abi = { version = "0.6.0", path = "../kapsl-kv-abi" }
-kapsl-quantization = { version = "0.3.0", path = "../kapsl-quantization" }
 kapsl-loader = { version = "0.3.0", path = "../kapsl-loader", optional = true }
 tokio = { version = "1.32", features = ["full"] }
 uuid = { version = "1.4", features = ["v4"] }
@@ -26,6 +25,9 @@ tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 ndarray = "0.17"
 serde_json = "1.0"
 half = "2.1"
+# TurboQuant KV-cache compression (src/cache/turboquant.rs).
+turboquant_rs = { package = "turboquant-rs", version = "0.3.1" }
+anyhow = "1.0.103"
 async-trait = "0.1.89"
 parking_lot = "0.12"
 cudarc = { version = "0.12", features = ["cuda-version-from-build-system"], optional = true }
@@ -64,23 +66,23 @@ onnx-cuda-pool = ["onnx-cuda", "kapsl-hal/cuda"]
 
 [target.'cfg(target_os = "macos")'.dependencies.llama-cpp-2]
 package = "kapsl-llama-cpp-2"
-version = "=0.1.146-kapsl.1"
+version = "=0.1.146-kapsl.2"
 optional = true
 features = ["metal"]
 
 [target.'cfg(target_os = "macos")'.dependencies.llama-cpp-sys-2]
 package = "kapsl-llama-cpp-sys-2"
-version = "=0.1.146-kapsl.1"
+version = "=0.1.146-kapsl.2"
 optional = true
 
 [target.'cfg(not(target_os = "macos"))'.dependencies.llama-cpp-2]
 package = "kapsl-llama-cpp-2"
-version = "=0.1.146-kapsl.1"
+version = "=0.1.146-kapsl.2"
 optional = true
 
 [target.'cfg(not(target_os = "macos"))'.dependencies.llama-cpp-sys-2]
 package = "kapsl-llama-cpp-sys-2"
-version = "=0.1.146-kapsl.1"
+version = "=0.1.146-kapsl.2"
 optional = true
 
 [dev-dependencies]

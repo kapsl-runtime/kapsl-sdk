@@ -5,10 +5,9 @@ use kapsl_communication::{
 };
 use kapsl_engine_api::{
     BinaryTensorPacket, EngineError, EngineMetrics, EngineModelInfo, EngineStream,
-    InferenceRequest, TensorDtype,
+    InferenceRequest, Priority, ReplicaScheduler, TensorDtype,
 };
 use kapsl_grpc::{tonic::Status, EngineFacade, GrpcServerConfig, Model, RequestAuthorizer};
-use kapsl_scheduler::{Priority, ReplicaScheduler};
 use std::{
     collections::HashMap,
     fs::{File, OpenOptions},

@@ -132,7 +132,7 @@ jobs:
           cargo package --locked --no-verify --registry crates-io "${args[@]}"
 
       - name: Upload the packaged crates
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: crates
           path: target/package/*.crate
@@ -188,7 +188,7 @@ jobs:
           bash "$RUNNER_TEMP/release-checks.sh"
 
       - name: Upload wheel
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: python-${{ matrix.package.name }}--wheel-${{ matrix.os }}
           path: ${{ matrix.package.path }}/dist/*
@@ -233,7 +233,7 @@ jobs:
           python -m pip wheel --no-build-isolation --no-deps dist/*.tar.gz --wheel-dir "$RUNNER_TEMP/sdist-check"
 
       - name: Upload sdist
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: python-${{ matrix.package.name }}--sdist
           path: ${{ matrix.package.path }}/dist/*
@@ -275,7 +275,7 @@ jobs:
           bash "$RUNNER_TEMP/release-checks.sh"
 
       - name: Upload distributions
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: python-${{ matrix.package.name }}--dist
           path: ${{ matrix.package.path }}/dist/*
@@ -370,6 +370,8 @@ jobs:
           # Lets a re-run finish an upload that stopped part way.
           skip-existing: true
 
+      # gh-action-pypi-publish writes a .publish.attestation file next to each
+      # distribution in dist/; R2 gets the distributions only.
       - name: Upload to R2
         if: matrix.package.r2_prefix != ''
         env:
@@ -382,6 +384,7 @@ jobs:
           aws s3 cp dist/ \
             "s3://kapsl-installer/${R2_PREFIX}/v${RELEASE_VERSION}/" \
             --recursive \
+            --exclude "*.publish.attestation" \
             --no-progress \
             --endpoint-url https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
 
