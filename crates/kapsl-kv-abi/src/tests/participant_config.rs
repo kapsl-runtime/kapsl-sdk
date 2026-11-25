@@ -81,9 +81,11 @@ fn participant_config_tolerates_unknown_fields_and_defaults_optional_ones() {
     .is_err());
 }
 
+type Mutation = Box<dyn Fn(&mut KvParticipantConfig)>;
+
 #[test]
 fn participant_config_rejects_incomplete_or_inconsistent_documents() {
-    let invalid: Vec<(&str, Box<dyn Fn(&mut KvParticipantConfig)>)> = vec![
+    let invalid: Vec<(&str, Mutation)> = vec![
         (
             "empty endpoint",
             Box::new(|config| config.control_endpoint = " ".to_string()),
@@ -144,19 +146,17 @@ fn participant_config_rejects_incomplete_or_inconsistent_documents() {
         assert!(config.validate().is_err(), "{name} must be rejected");
     }
 
-    for (name, mutate) in [
+    let invalid_when_opaque: Vec<(&str, Mutation)> = vec![
         (
             "opaque live resize",
-            Box::new(|config: &mut KvParticipantConfig| config.live_resize = true)
-                as Box<dyn Fn(&mut KvParticipantConfig)>,
+            Box::new(|config| config.live_resize = true),
         ),
         (
             "opaque grant",
-            Box::new(|config: &mut KvParticipantConfig| {
-                config.provisioning_grant = shared_pool_config().provisioning_grant
-            }),
+            Box::new(|config| config.provisioning_grant = shared_pool_config().provisioning_grant),
         ),
-    ] {
+    ];
+    for (name, mutate) in invalid_when_opaque {
         let mut config = opaque_config();
         mutate(&mut config);
         assert!(config.validate().is_err(), "{name} must be rejected");
