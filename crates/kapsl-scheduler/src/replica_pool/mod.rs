@@ -498,56 +498,8 @@ where
     }
 }
 
-/// Trait that replica schedulers must implement
-#[async_trait::async_trait]
-pub trait ReplicaScheduler: Send + Sync {
-    fn get_queue_depth(&self) -> (usize, usize);
-    fn is_healthy(&self) -> bool;
-    fn get_metrics(&self) -> kapsl_engine_api::EngineMetrics;
-    fn model_info(&self) -> Option<kapsl_engine_api::EngineModelInfo> {
-        None
-    }
-    async fn infer(
-        &self,
-        request: &InferenceRequest,
-        priority: Priority,
-        force_cpu: bool,
-    ) -> Result<BinaryTensorPacket, EngineError>;
-
-    async fn infer_openai_wire(
-        &self,
-        _request: OpenAiWireRequest,
-        _priority: Priority,
-        _force_cpu: bool,
-    ) -> Result<OpenAiWireResponse, EngineError> {
-        Err(EngineError::backend(
-            "scheduler does not support protocol-native OpenAI requests",
-        ))
-    }
-
-    async fn infer_openai_wire_stream(
-        &self,
-        _request: OpenAiWireRequest,
-        _priority: Priority,
-        _force_cpu: bool,
-    ) -> Result<OpenAiWireStreamResponse, EngineError> {
-        Err(EngineError::backend(
-            "scheduler does not support protocol-native OpenAI streams",
-        ))
-    }
-
-    async fn infer_stream(
-        &self,
-        request: InferenceRequest,
-        priority: Priority,
-        force_cpu: bool,
-    ) -> Result<
-        std::pin::Pin<
-            Box<dyn futures::Stream<Item = Result<BinaryTensorPacket, EngineError>> + Send>,
-        >,
-        EngineError,
-    >;
-}
+/// Defined in `kapsl-engine-api` so transports can use it without this crate.
+pub use kapsl_engine_api::ReplicaScheduler;
 
 #[cfg(test)]
 mod tests;

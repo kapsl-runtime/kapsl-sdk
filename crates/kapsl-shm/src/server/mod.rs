@@ -5,7 +5,7 @@ use crate::protocol::{ShmRequest, ShmResponse, SHM_PROTOCOL_VERSION, SHM_QUEUE_C
 use crate::ring_buffer::LockFreeRingBuffer;
 use async_trait::async_trait;
 use kapsl_engine_api::{BinaryTensorPacket, InferenceRequest, TensorDtype};
-use kapsl_scheduler::{Priority, ReplicaScheduler};
+use kapsl_engine_api::{Priority, ReplicaScheduler};
 use kapsl_transport::{ResponseMetadata, TransportError, TransportServer};
 use prometheus::Registry;
 use std::collections::HashMap;

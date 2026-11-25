@@ -1,7 +1,7 @@
 //! Authenticated TCP server for remote inference clients.
 
 use async_trait::async_trait;
-use kapsl_scheduler::ReplicaScheduler;
+use kapsl_engine_api::ReplicaScheduler;
 use kapsl_transport::{TransportError, TransportServer};
 use std::collections::HashMap;
 use std::net::IpAddr;

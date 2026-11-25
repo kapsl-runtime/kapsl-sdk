@@ -15,6 +15,9 @@ use thiserror::Error;
 
 pub use kapsl_kv_abi::{KvBackendCapabilities, KvIntegrationTier, KvMetadataMode, KvTopology};
 
+mod scheduling;
+pub use scheduling::{Priority, ReplicaScheduler};
+
 #[derive(Error, Debug)]
 pub enum EngineError {
     #[error("Backend error: {message}")]
