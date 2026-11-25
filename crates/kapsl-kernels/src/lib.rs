@@ -4,6 +4,9 @@
 pub mod attention;
 #[path = "cpu/backend.rs"]
 pub mod backend;
+#[cfg(feature = "cute")]
+#[path = "cuda/cute.rs"]
+mod cute;
 #[path = "cpu/mlp.rs"]
 pub mod mlp;
 #[cfg(feature = "cuda")]
