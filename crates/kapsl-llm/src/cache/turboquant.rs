@@ -1,12 +1,14 @@
 //! TurboQuant KV-cache quantization.
 //!
 //! Wraps [`turboquant_rs::QuantizedKVCache`] with a configuration type and
-//! error handling that matches the rest of `kapsl-quantization`.
+//! `anyhow` error handling. [`crate::kv_cache`] uses it to compress cached
+//! keys and values. This was the `kv_cache` module of the former
+//! `kapsl-quantization` crate.
 //!
 //! # Example
 //!
 //! ```rust
-//! use kapsl_quantization::kv_cache::{KvCacheConfig, KvCacheQuantizer};
+//! use kapsl_llm::turboquant::{KvCacheConfig, KvCacheQuantizer};
 //!
 //! let config = KvCacheConfig::new(3, 128, 32).unwrap();
 //! let mut cache = KvCacheQuantizer::new(config, 42);
