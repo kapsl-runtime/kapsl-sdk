@@ -127,6 +127,9 @@ jobs:
             args+=(-p "$name")
           done
           cargo publish --dry-run --locked --registry crates-io "${args[@]}"
+          # The dry run verifies but does not keep the .crate archives; write
+          # them, unverified this time, for the upload below.
+          cargo package --locked --no-verify --registry crates-io "${args[@]}"
 
       - name: Upload the packaged crates
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
