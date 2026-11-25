@@ -159,13 +159,14 @@ impl DeviceMesh {
         rank: usize,
     ) -> Result<Self, String> {
         use crate::nccl_comm::NcclComm;
-        use cudarc::driver::CudaDevice;
+        use cudarc::driver::CudaContext;
 
         let world_size = devices.len();
 
         // Get the CUDA device for this rank
-        let cuda_device = CudaDevice::new(rank)
-            .map_err(|e| format!("Failed to get CUDA device {}: {:?}", rank, e))?;
+        let cuda_device = CudaContext::new(rank)
+            .map_err(|e| format!("Failed to get CUDA device {}: {:?}", rank, e))?
+            .default_stream();
 
         let nccl_comm = NcclComm::new(cuda_device, nccl_id, rank, world_size)?;
 

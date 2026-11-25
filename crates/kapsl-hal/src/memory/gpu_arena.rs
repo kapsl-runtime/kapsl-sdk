@@ -18,8 +18,8 @@
 
 #[cfg(feature = "cuda")]
 use cudarc::driver::{
-    result, CudaDevice, CudaSlice, CudaView, CudaViewMut, DevicePtr, DevicePtrMut, DeviceRepr,
-    DeviceSlice, ValidAsZeroBits,
+    result, sys, CudaSlice, CudaStream, CudaView, CudaViewMut, DevicePtr, DevicePtrMut, DeviceRepr,
+    DeviceSlice, LaunchArgs, PushKernelArg, SyncOnDrop, ValidAsZeroBits,
 };
 #[cfg(feature = "cuda")]
 use std::cell::Cell;
@@ -747,6 +747,9 @@ impl<T: DeviceRepr> GpuPoolBuffer<T> {
             return Err(ArenaError::InvalidAllocationRequest);
         }
         let alignment = 256usize.max(std::mem::align_of::<T>());
+        // cudarc 0.19's `upgrade_device_ptr` creates stream events and panics
+        // if the context reports an error; report a pending one here instead.
+        pool.device().context().bind_to_thread()?;
         let allocation = pool.alloc(owner, bytes, alignment)?;
         let ptr = pool.allocation_ptr(&allocation) as usize as u64;
         // SAFETY: the allocation owns `bytes == len * size_of::<T>()` live
@@ -768,10 +771,9 @@ impl<T: DeviceRepr> GpuPoolBuffer<T> {
         // SAFETY: the synchronous host-to-device copy below initializes the
         // complete allocation before it is returned.
         let mut buffer = unsafe { Self::uninitialized(pool, owner, data.len())? };
-        buffer
-            .pool
-            .device()
-            .htod_sync_copy_into(data, buffer.slice.as_mut().expect("pool buffer slice"))?;
+        let device = buffer.pool.device();
+        device.memcpy_htod(data, buffer.slice.as_mut().expect("pool buffer slice"))?;
+        device.synchronize()?;
         Ok(buffer)
     }
 
@@ -853,13 +855,15 @@ pub enum GpuBuffer<T> {
 #[cfg(feature = "cuda")]
 impl<T: DeviceRepr> GpuBuffer<T> {
     pub fn from_host(
-        device: &Arc<CudaDevice>,
+        device: &Arc<CudaStream>,
         pool: Option<&Arc<GpuDevicePool>>,
         owner: PoolOwner,
         data: &[T],
     ) -> Result<Self, ArenaError> {
         if data.is_empty() || pool.is_none() {
-            return Ok(Self::Device(device.htod_sync_copy(data)?));
+            let slice = device.clone_htod(data)?;
+            device.synchronize()?;
+            return Ok(Self::Device(slice));
         }
         let pool = Arc::clone(pool.expect("pool checked above"));
         if !Arc::ptr_eq(pool.device(), device) {
@@ -876,7 +880,7 @@ impl<T: DeviceRepr> GpuBuffer<T> {
 #[cfg(feature = "cuda")]
 impl<T: ValidAsZeroBits + DeviceRepr> GpuBuffer<T> {
     pub fn zeros(
-        device: &Arc<CudaDevice>,
+        device: &Arc<CudaStream>,
         pool: Option<&Arc<GpuDevicePool>>,
         owner: PoolOwner,
         len: usize,
@@ -919,33 +923,44 @@ impl<T> DeviceSlice<T> for GpuBuffer<T> {
     fn len(&self) -> usize {
         self.deref().len()
     }
+
+    fn stream(&self) -> &Arc<CudaStream> {
+        self.deref().stream()
+    }
 }
 
 #[cfg(feature = "cuda")]
 impl<T> DevicePtr<T> for GpuBuffer<T> {
-    fn device_ptr(&self) -> &cudarc::driver::sys::CUdeviceptr {
-        self.deref().device_ptr()
+    fn device_ptr<'a>(&'a self, stream: &'a CudaStream) -> (sys::CUdeviceptr, SyncOnDrop<'a>) {
+        self.deref().device_ptr(stream)
     }
 }
 
 #[cfg(feature = "cuda")]
 impl<T> DevicePtrMut<T> for GpuBuffer<T> {
-    fn device_ptr_mut(&mut self) -> &mut cudarc::driver::sys::CUdeviceptr {
-        self.deref_mut().device_ptr_mut()
+    fn device_ptr_mut<'a>(
+        &'a mut self,
+        stream: &'a CudaStream,
+    ) -> (sys::CUdeviceptr, SyncOnDrop<'a>) {
+        self.deref_mut().device_ptr_mut(stream)
+    }
+}
+
+// cudarc 0.19 replaced `DeviceRepr::as_kernel_param` with `PushKernelArg`: a
+// buffer is passed to a kernel exactly like the slice it wraps.
+#[cfg(feature = "cuda")]
+unsafe impl<'a, 'b: 'a, T: DeviceRepr> PushKernelArg<&'b GpuBuffer<T>> for LaunchArgs<'a> {
+    #[inline(always)]
+    fn arg(&mut self, arg: &'b GpuBuffer<T>) -> &mut Self {
+        self.arg(arg.deref())
     }
 }
 
 #[cfg(feature = "cuda")]
-unsafe impl<T: DeviceRepr> DeviceRepr for &GpuBuffer<T> {
-    fn as_kernel_param(&self) -> *mut std::ffi::c_void {
-        self.device_ptr() as *const cudarc::driver::sys::CUdeviceptr as *mut std::ffi::c_void
-    }
-}
-
-#[cfg(feature = "cuda")]
-unsafe impl<T: DeviceRepr> DeviceRepr for &mut GpuBuffer<T> {
-    fn as_kernel_param(&self) -> *mut std::ffi::c_void {
-        self.device_ptr() as *const cudarc::driver::sys::CUdeviceptr as *mut std::ffi::c_void
+unsafe impl<'a, 'b: 'a, T: DeviceRepr> PushKernelArg<&'b mut GpuBuffer<T>> for LaunchArgs<'a> {
+    #[inline(always)]
+    fn arg(&mut self, arg: &'b mut GpuBuffer<T>) -> &mut Self {
+        self.arg(arg.deref_mut())
     }
 }
 
@@ -953,7 +968,7 @@ unsafe impl<T: DeviceRepr> DeviceRepr for &mut GpuBuffer<T> {
 
 #[cfg(feature = "cuda")]
 pub struct GpuArena {
-    device: Arc<CudaDevice>,
+    device: Arc<CudaStream>,
     buffer: CudaSlice<u8>,
     capacity: usize,
     cursor: usize,
@@ -962,7 +977,7 @@ pub struct GpuArena {
 #[cfg(feature = "cuda")]
 impl GpuArena {
     /// Allocate a new arena of `bytes` on the given CUDA device.
-    pub fn new(device: Arc<CudaDevice>, bytes: usize) -> Result<Self, ArenaError> {
+    pub fn new(device: Arc<CudaStream>, bytes: usize) -> Result<Self, ArenaError> {
         let buffer = device.alloc_zeros::<u8>(bytes)?;
         log::info!("GPU arena allocated: {} MiB", bytes / (1024 * 1024));
         Ok(Self {
@@ -995,10 +1010,11 @@ impl GpuArena {
 
     /// Upload host data to a previously allocated region at `offset`.
     pub fn upload(&mut self, offset: usize, data: &[u8]) -> Result<(), ArenaError> {
-        self.device.htod_sync_copy_into(
+        self.device.memcpy_htod(
             data,
             &mut self.buffer.slice_mut(offset..offset + data.len()),
         )?;
+        self.device.synchronize()?;
         Ok(())
     }
 
@@ -1014,7 +1030,7 @@ impl GpuArena {
         self.cursor
     }
 
-    pub fn device(&self) -> &Arc<CudaDevice> {
+    pub fn device(&self) -> &Arc<CudaStream> {
         &self.device
     }
 
@@ -1074,7 +1090,7 @@ impl GpuKvPoolView {
     /// should create one [`GpuDevicePool`] per device and call
     /// [`from_device_pool`](Self::from_device_pool) instead.
     pub fn new(
-        device: Arc<CudaDevice>,
+        device: Arc<CudaStream>,
         num_blocks: usize,
         block_size: usize,
         num_kv_heads: usize,
@@ -1353,9 +1369,11 @@ impl GpuKvPoolView {
         // SAFETY: validate_live_block proves this view owns the requested
         // extent for the duration of this synchronous copy.
         let storage = unsafe { self.storage() };
-        Ok(self
+        let block = self
             .device()
-            .dtoh_sync_copy(&storage.slice(base..base + elems))?)
+            .clone_dtoh(&storage.slice(base..base + elems))?;
+        self.device().synchronize()?;
+        Ok(block)
     }
 
     /// Copy one block from this pool to a block in another pool (same or different device).
@@ -1428,7 +1446,7 @@ impl GpuKvPoolView {
         Err(ArenaError::InvalidFree { owner: self.owner })
     }
 
-    pub fn device(&self) -> &Arc<CudaDevice> {
+    pub fn device(&self) -> &Arc<CudaStream> {
         self.device_pool.device()
     }
 
@@ -1462,18 +1480,20 @@ impl GpuKvPoolView {
         {
             // SAFETY: validate_live_block proves this view owns the extent.
             let mut storage = unsafe { self.storage_mut() };
-            self.device().htod_sync_copy_into(
+            self.device().memcpy_htod(
                 host_key,
                 &mut storage.slice_mut(key_offset..key_offset + half_block),
             )?;
+            self.device().synchronize()?;
         }
         {
             // SAFETY: validate_live_block proves this view owns the extent.
             let mut storage = unsafe { self.storage_mut() };
-            self.device().htod_sync_copy_into(
+            self.device().memcpy_htod(
                 host_val,
                 &mut storage.slice_mut(val_offset..val_offset + half_block),
             )?;
+            self.device().synchronize()?;
         }
         Ok(())
     }
@@ -1606,6 +1626,7 @@ impl Default for BlockTable {
 #[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::*;
+    use cudarc::driver::CudaContext;
     use half::f16;
 
     #[test]
@@ -1811,7 +1832,9 @@ mod tests {
     // A tiny pool: 8 blocks, 4 tokens/block, 2 KV heads, 8-dim.
     // Requires CUDA device 0.
     fn small_pool() -> Arc<GpuBlockPool> {
-        let device = CudaDevice::new(0).expect("CUDA device 0 required for these tests");
+        let device = CudaContext::new(0)
+            .expect("CUDA device 0 required for these tests")
+            .default_stream();
         Arc::new(GpuBlockPool::new(device, 8, 4, 2, 8).unwrap())
     }
 
@@ -1949,7 +1972,9 @@ mod tests {
 
     #[test]
     fn recycled_block_is_zeroed_before_new_owner_can_read_it() {
-        let device = CudaDevice::new(0).expect("CUDA device 0 required for these tests");
+        let device = CudaContext::new(0)
+            .expect("CUDA device 0 required for these tests")
+            .default_stream();
         let block_bytes = 2 * 2 * 4 * 8 * std::mem::size_of::<f16>();
         let device_pool = Arc::new(GpuDevicePool::new(device, block_bytes).unwrap());
         let first_owner = PoolOwner::native(1, 0, PoolAllocationClass::KvCache);

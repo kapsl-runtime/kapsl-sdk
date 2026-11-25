@@ -6,7 +6,7 @@
 use crate::gpu_region::{
     driver_error, GpuRegion, GpuRegionError, GpuRegionKind, GpuRegionObserver, GpuRegionSnapshot,
 };
-use cudarc::driver::{result, sys, CudaDevice};
+use cudarc::driver::{result, sys, CudaStream};
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -44,7 +44,7 @@ pub struct GpuVmmRegion {
 }
 
 impl GpuVmmRegion {
-    pub fn allocation_granularity(device: &Arc<CudaDevice>) -> Result<usize, GpuRegionError> {
+    pub fn allocation_granularity(device: &Arc<CudaStream>) -> Result<usize, GpuRegionError> {
         let driver = CudaVmmDriver(device.clone());
         driver.bind()?;
         driver.granularity()
@@ -52,7 +52,7 @@ impl GpuVmmRegion {
 
     /// Reserve addresses only. No physical bytes are committed until `grow_to`.
     /// Splitting these steps keeps partial growth failures owned by the caller.
-    pub fn reserve(device: Arc<CudaDevice>, virtual_bytes: usize) -> Result<Self, GpuRegionError> {
+    pub fn reserve(device: Arc<CudaStream>, virtual_bytes: usize) -> Result<Self, GpuRegionError> {
         Ok(Self {
             inner: VmmRegion::reserve(CudaVmmDriver(device), virtual_bytes)?,
         })
@@ -482,11 +482,11 @@ impl<D: VmmDriver> Drop for VmmRegion<D> {
     }
 }
 
-struct CudaVmmDriver(Arc<CudaDevice>);
+struct CudaVmmDriver(Arc<CudaStream>);
 
 impl CudaVmmDriver {
     fn properties(&self) -> Result<sys::CUmemAllocationProp, GpuRegionError> {
-        let id = i32::try_from(self.0.ordinal())
+        let id = i32::try_from(self.0.context().ordinal())
             .map_err(|_| GpuRegionError::InvalidRequest("device ordinal exceeds CUDA range"))?;
         Ok(sys::CUmemAllocationProp {
             type_: sys::CUmemAllocationType::CU_MEM_ALLOCATION_TYPE_PINNED,
@@ -496,17 +496,24 @@ impl CudaVmmDriver {
                 type_: sys::CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE,
                 id,
             },
-            ..Default::default()
+            win32HandleMetaData: std::ptr::null_mut(),
+            allocFlags: sys::CUmemAllocationProp_st__bindgen_ty_1 {
+                compressionType: 0,
+                gpuDirectRDMACapable: 0,
+                usage: 0,
+                reserved: [0; 4],
+            },
         })
     }
 }
 
 impl VmmDriver for CudaVmmDriver {
     fn device_id(&self) -> usize {
-        self.0.ordinal()
+        self.0.context().ordinal()
     }
     fn bind(&self) -> Result<(), GpuRegionError> {
         self.0
+            .context()
             .bind_to_thread()
             .map_err(driver_error("bind VMM context"))
     }
@@ -514,13 +521,12 @@ impl VmmDriver for CudaVmmDriver {
         let properties = self.properties()?;
         let mut granularity = 0;
         unsafe {
-            sys::lib()
-                .cuMemGetAllocationGranularity(
-                    &mut granularity,
-                    &properties,
-                    sys::CUmemAllocationGranularity_flags::CU_MEM_ALLOC_GRANULARITY_MINIMUM,
-                )
-                .result()
+            sys::cuMemGetAllocationGranularity(
+                &mut granularity,
+                &properties,
+                sys::CUmemAllocationGranularity_flags::CU_MEM_ALLOC_GRANULARITY_MINIMUM,
+            )
+            .result()
         }
         .map_err(driver_error("query VMM granularity"))?;
         if granularity == 0 {
@@ -532,27 +538,19 @@ impl VmmDriver for CudaVmmDriver {
     }
     fn reserve(&self, bytes: usize, alignment: usize) -> Result<u64, GpuRegionError> {
         let mut pointer = 0;
-        unsafe {
-            sys::lib()
-                .cuMemAddressReserve(&mut pointer, bytes, alignment, 0, 0)
-                .result()
-        }
-        .map_err(driver_error("reserve VMM addresses"))?;
+        unsafe { sys::cuMemAddressReserve(&mut pointer, bytes, alignment, 0, 0).result() }
+            .map_err(driver_error("reserve VMM addresses"))?;
         Ok(pointer)
     }
     fn create(&self, bytes: usize) -> Result<u64, GpuRegionError> {
         let mut handle = 0;
         let properties = self.properties()?;
-        unsafe {
-            sys::lib()
-                .cuMemCreate(&mut handle, bytes, &properties, 0)
-                .result()
-        }
-        .map_err(driver_error("create VMM backing"))?;
+        unsafe { sys::cuMemCreate(&mut handle, bytes, &properties, 0).result() }
+            .map_err(driver_error("create VMM backing"))?;
         Ok(handle)
     }
     fn map(&self, pointer: u64, bytes: usize, handle: u64) -> Result<(), GpuRegionError> {
-        unsafe { sys::lib().cuMemMap(pointer, bytes, 0, handle, 0).result() }
+        unsafe { sys::cuMemMap(pointer, bytes, 0, handle, 0).result() }
             .map_err(driver_error("map VMM segment"))
     }
     fn initialize(&self, pointer: u64, bytes: usize) -> Result<(), GpuRegionError> {
@@ -560,13 +558,9 @@ impl VmmDriver for CudaVmmDriver {
             location: self.properties()?.location,
             flags: sys::CUmemAccess_flags::CU_MEM_ACCESS_FLAGS_PROT_READWRITE,
         };
-        unsafe {
-            sys::lib()
-                .cuMemSetAccess(pointer, bytes, &access, 1)
-                .result()
-        }
-        .map_err(driver_error("set VMM segment access"))?;
-        unsafe { result::memset_d8_async(pointer, 0, bytes, *self.0.cu_stream()) }
+        unsafe { sys::cuMemSetAccess(pointer, bytes, &access, 1).result() }
+            .map_err(driver_error("set VMM segment access"))?;
+        unsafe { result::memset_d8_async(pointer, 0, bytes, self.0.cu_stream()) }
             .map_err(driver_error("zero VMM segment"))
     }
     fn synchronize(&self) -> Result<(), GpuRegionError> {
@@ -575,28 +569,26 @@ impl VmmDriver for CudaVmmDriver {
             .map_err(driver_error("synchronize VMM backing"))
     }
     fn unmap(&self, pointer: u64, bytes: usize) -> Result<(), GpuRegionError> {
-        unsafe { sys::lib().cuMemUnmap(pointer, bytes).result() }
+        unsafe { sys::cuMemUnmap(pointer, bytes).result() }
             .map_err(driver_error("unmap VMM segment"))
     }
     fn release_handle(&self, handle: u64) -> Result<(), GpuRegionError> {
-        unsafe { sys::lib().cuMemRelease(handle).result() }
-            .map_err(driver_error("release VMM handle"))
+        unsafe { sys::cuMemRelease(handle).result() }.map_err(driver_error("release VMM handle"))
     }
     fn free_address(&self, pointer: u64, bytes: usize) -> Result<(), GpuRegionError> {
-        unsafe { sys::lib().cuMemAddressFree(pointer, bytes).result() }
+        unsafe { sys::cuMemAddressFree(pointer, bytes).result() }
             .map_err(driver_error("free VMM addresses"))
     }
     fn export(&self, handle: u64) -> Result<OwnedFd, GpuRegionError> {
         let mut fd = -1i32;
         unsafe {
-            sys::lib()
-                .cuMemExportToShareableHandle(
-                    (&mut fd as *mut i32).cast(),
-                    handle,
-                    sys::CUmemAllocationHandleType::CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
-                    0,
-                )
-                .result()
+            sys::cuMemExportToShareableHandle(
+                (&mut fd as *mut i32).cast(),
+                handle,
+                sys::CUmemAllocationHandleType::CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
+                0,
+            )
+            .result()
         }
         .map_err(driver_error("export VMM handle"))?;
         if fd < 0 {

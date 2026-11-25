@@ -24,7 +24,10 @@ mod inner {
 
     use async_trait::async_trait;
     use cudarc::cublas::{CudaBlas, Gemm};
-    use cudarc::driver::{CudaDevice, CudaSlice, DeviceSlice};
+    use cudarc::driver::{
+        CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, DeviceRepr, DeviceSlice,
+        DriverError,
+    };
     use half::f16;
     use rand::{Rng, SeedableRng};
 
@@ -53,6 +56,26 @@ mod inner {
 
     pub(super) fn native_batching_policy() -> BatchingPolicy {
         BatchingPolicy::continuous(MAX_BATCH)
+    }
+
+    // cudarc 0.19 dropped the synchronous copy helpers; these keep 0.12's
+    // copy-then-wait behaviour on the device stream.
+    fn htod_sync_copy_into<T: DeviceRepr, Dst: DevicePtrMut<T>>(
+        device: &Arc<CudaStream>,
+        src: &[T],
+        dst: &mut Dst,
+    ) -> Result<(), DriverError> {
+        device.memcpy_htod(src, dst)?;
+        device.synchronize()
+    }
+
+    fn dtoh_sync_copy<T: DeviceRepr, Src: DevicePtr<T>>(
+        device: &Arc<CudaStream>,
+        src: &Src,
+    ) -> Result<Vec<T>, DriverError> {
+        let host = device.clone_dtoh(src)?;
+        device.synchronize()?;
+        Ok(host)
     }
 
     // ── GPU weights ──────────────────────────────────────────────────────
@@ -154,7 +177,7 @@ mod inner {
     }
 
     fn upload_tensor(
-        device: &Arc<CudaDevice>,
+        device: &Arc<CudaStream>,
         pool: Option<&Arc<GpuDevicePool>>,
         owner: PoolOwner,
         t: &TensorData,
@@ -164,7 +187,7 @@ mod inner {
     }
 
     fn upload_f16(
-        device: &Arc<CudaDevice>,
+        device: &Arc<CudaStream>,
         pool: Option<&Arc<GpuDevicePool>>,
         owner: PoolOwner,
         v: &[f16],
@@ -174,7 +197,7 @@ mod inner {
     }
 
     fn upload_staged(
-        device: &Arc<CudaDevice>,
+        device: &Arc<CudaStream>,
         pool: Option<&Arc<GpuDevicePool>>,
         owner: PoolOwner,
         s: &StagedF16Weights,
@@ -211,7 +234,7 @@ mod inner {
     }
 
     fn upload_weights(
-        device: &Arc<CudaDevice>,
+        device: &Arc<CudaStream>,
         pool: Option<&Arc<GpuDevicePool>>,
         owner: PoolOwner,
         w: &ModelWeights,
@@ -307,7 +330,7 @@ mod inner {
 
     impl PrefillScratch {
         fn new(
-            device: &Arc<CudaDevice>,
+            device: &Arc<CudaStream>,
             pool: Option<&Arc<GpuDevicePool>>,
             owner: PoolOwner,
             h: usize,
@@ -362,7 +385,7 @@ mod inner {
 
     impl BatchDecodeScratch {
         fn new(
-            device: &Arc<CudaDevice>,
+            device: &Arc<CudaStream>,
             pool: Option<&Arc<GpuDevicePool>>,
             owner: PoolOwner,
             cap: usize,
@@ -426,7 +449,7 @@ mod inner {
     // ── BackendInner ──────────────────────────────────────────────────────
 
     struct BackendInner {
-        device: Arc<CudaDevice>,
+        device: Arc<CudaStream>,
         device_pool: Option<Arc<GpuDevicePool>>,
         pool_owner: PoolOwner,
         blas: Arc<CudaBlas>,
@@ -754,7 +777,7 @@ mod inner {
             for (i, &tok) in token_ids.iter().enumerate() {
                 let off = tok as usize * h;
                 self.device
-                    .dtod_copy(
+                    .memcpy_dtod(
                         &self.weights.embed_tokens.slice(off..off + h),
                         &mut self.prefill.hidden.slice_mut(i * h..(i + 1) * h),
                     )
@@ -1036,9 +1059,7 @@ mod inner {
                 },
             )
             .map_err(|s| EngineError::backend(s))?;
-            let ids: Vec<u32> = self
-                .device
-                .dtoh_sync_copy(&self.argmax_buf)
+            let ids: Vec<u32> = dtoh_sync_copy(&self.device, &self.argmax_buf)
                 .map_err(|err| e(format!("argmax dl: {err}")))?;
             Ok(ids[0])
         }
@@ -1051,9 +1072,7 @@ mod inner {
         ) -> Result<Vec<f32>, EngineError> {
             let e = |s: String| EngineError::backend(s);
             self.prefill_compute(token_ids, start_position, block_tables)?;
-            let f16v: Vec<f16> = self
-                .device
-                .dtoh_sync_copy(&self.logits_buf)
+            let f16v: Vec<f16> = dtoh_sync_copy(&self.device, &self.logits_buf)
                 .map_err(|err| e(format!("logits dl: {err}")))?;
             Ok(f16v.iter().map(|v| v.to_f32()).collect())
         }
@@ -1094,19 +1113,17 @@ mod inner {
                 seqs.iter().map(|s| (s.context_len - 1) as i32).collect();
             let ctx_lens_host: Vec<i32> = seqs.iter().map(|s| s.context_len as i32).collect();
             let mut positions_device = self.batch.positions.slice_mut(..b);
-            self.device
-                .htod_sync_copy_into(&positions_host, &mut positions_device)
+            htod_sync_copy_into(&self.device, &positions_host, &mut positions_device)
                 .map_err(|err| e(format!("positions upload: {err}")))?;
             let mut ctx_lens_device = self.batch.ctx_lens.slice_mut(..b);
-            self.device
-                .htod_sync_copy_into(&ctx_lens_host, &mut ctx_lens_device)
+            htod_sync_copy_into(&self.device, &ctx_lens_host, &mut ctx_lens_device)
                 .map_err(|err| e(format!("ctx_lens upload: {err}")))?;
 
             // Embed lookup: copy one embed row per sequence into batch.hidden.
             for (i, seq) in seqs.iter().enumerate() {
                 let off = seq.next_token as usize * h;
                 self.device
-                    .dtod_copy(
+                    .memcpy_dtod(
                         &self.weights.embed_tokens.slice(off..off + h),
                         &mut self.batch.hidden.slice_mut(i * h..(i + 1) * h),
                     )
@@ -1409,15 +1426,11 @@ mod inner {
                     },
                 )
                 .map_err(|s| EngineError::backend(s))?;
-                let winners: Vec<u32> = self
-                    .device
-                    .dtoh_sync_copy(&self.batch.argmax)
+                let winners: Vec<u32> = dtoh_sync_copy(&self.device, &self.batch.argmax)
                     .map_err(|err| e(format!("argmax dl: {err}")))?;
                 Ok(winners[..b].to_vec())
             } else {
-                let all_f16: Vec<f16> = self
-                    .device
-                    .dtoh_sync_copy(&self.batch.logits)
+                let all_f16: Vec<f16> = dtoh_sync_copy(&self.device, &self.batch.logits)
                     .map_err(|err| e(format!("logits dl: {err}")))?;
                 // Collect into f32 rows, then sample each.  We can't call self.sample()
                 // inside the iterator because it borrows self mutably; collect first.
@@ -1780,7 +1793,7 @@ mod inner {
     impl NativeBackend {
         pub fn new(device_id: i32) -> Result<Self, EngineError> {
             static NEXT_ALLOCATION_ID: AtomicU64 = AtomicU64::new(1);
-            CudaDevice::new(
+            CudaContext::new(
                 kapsl_llm::cuda_ordinal::to_cuda_ordinal(device_id as usize)
                     .map_err(|e| EngineError::backend(e.to_string()))?,
             )
@@ -1974,11 +1987,12 @@ mod inner {
             let device = if let Some((pool, _)) = self.device_pool.as_ref() {
                 Arc::clone(pool.device())
             } else {
-                CudaDevice::new(
+                CudaContext::new(
                     kapsl_llm::cuda_ordinal::to_cuda_ordinal(self.device_id as usize)
                         .map_err(|e| EngineError::backend(e.to_string()))?,
                 )
                 .map_err(|e| EngineError::backend(format!("CUDA: {e}")))?
+                .default_stream()
             };
             let blas = Arc::new(
                 CudaBlas::new(device.clone())

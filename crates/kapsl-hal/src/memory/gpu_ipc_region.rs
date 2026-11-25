@@ -3,7 +3,7 @@
 use crate::gpu_region::{
     driver_error, GpuRegion, GpuRegionError, GpuRegionKind, GpuRegionObserver, GpuRegionSnapshot,
 };
-use cudarc::driver::{result, sys, CudaDevice};
+use cudarc::driver::{result, sys, CudaStream};
 use std::sync::{Arc, Mutex};
 
 /// Raw CUDA IPC handle. Encoding it for a worker protocol belongs to the adapter.
@@ -32,7 +32,7 @@ pub struct GpuIpcRegion {
 impl GpuIpcRegion {
     /// Allocate uninitialized backing. Export and local access remain disabled
     /// until `initialize_zeroed` has completed its CUDA fence.
-    pub fn allocate(device: Arc<CudaDevice>, bytes: usize) -> Result<Self, GpuRegionError> {
+    pub fn allocate(device: Arc<CudaStream>, bytes: usize) -> Result<Self, GpuRegionError> {
         Ok(Self {
             inner: IpcRegion::allocate(CudaIpcDriver(device), bytes)?,
         })
@@ -260,14 +260,15 @@ impl<D: IpcDriver> Drop for IpcRegion<D> {
     }
 }
 
-struct CudaIpcDriver(Arc<CudaDevice>);
+struct CudaIpcDriver(Arc<CudaStream>);
 
 impl IpcDriver for CudaIpcDriver {
     fn device_id(&self) -> usize {
-        self.0.ordinal()
+        self.0.context().ordinal()
     }
     fn bind(&self) -> Result<(), GpuRegionError> {
         self.0
+            .context()
             .bind_to_thread()
             .map_err(driver_error("bind IPC context"))
     }
@@ -276,7 +277,7 @@ impl IpcDriver for CudaIpcDriver {
         unsafe { result::malloc_sync(bytes) }.map_err(driver_error("allocate IPC backing"))
     }
     fn zero(&self, pointer: u64, bytes: usize) -> Result<(), GpuRegionError> {
-        unsafe { result::memset_d8_async(pointer, 0, bytes, *self.0.cu_stream()) }
+        unsafe { result::memset_d8_async(pointer, 0, bytes, self.0.cu_stream()) }
             .map_err(driver_error("zero IPC backing"))
     }
     fn synchronize(&self) -> Result<(), GpuRegionError> {
@@ -285,8 +286,8 @@ impl IpcDriver for CudaIpcDriver {
             .map_err(driver_error("synchronize IPC backing"))
     }
     fn export(&self, pointer: u64) -> Result<GpuIpcHandle, GpuRegionError> {
-        let mut handle = sys::CUipcMemHandle::default();
-        unsafe { sys::lib().cuIpcGetMemHandle(&mut handle, pointer).result() }
+        let mut handle = sys::CUipcMemHandle { reserved: [0; 64] };
+        unsafe { sys::cuIpcGetMemHandle(&mut handle, pointer).result() }
             .map_err(driver_error("export IPC handle"))?;
         Ok(GpuIpcHandle(handle.reserved.map(|byte| byte as u8)))
     }

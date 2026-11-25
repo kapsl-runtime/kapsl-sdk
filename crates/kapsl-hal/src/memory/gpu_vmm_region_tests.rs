@@ -342,7 +342,10 @@ fn observers_do_not_retain_unexported_allocations() {
 #[test]
 #[ignore = "requires Linux CUDA VMM hardware; no remote mappings are created"]
 fn hardware_vmm_growth_preserves_base_and_releases_physical_tail() {
-    let device = CudaDevice::new_with_stream(0).unwrap();
+    let device = cudarc::driver::CudaContext::new(0)
+        .unwrap()
+        .new_stream()
+        .unwrap();
     let granularity = GpuVmmRegion::allocation_granularity(&device).unwrap();
     let region = GpuVmmRegion::reserve(device, 4 * granularity).unwrap();
     let first = region.grow_to(granularity).unwrap();

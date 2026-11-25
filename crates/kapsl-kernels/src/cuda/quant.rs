@@ -10,7 +10,7 @@
 #[cfg(feature = "cuda")]
 mod inner {
     use crate::nvrtc_util::cuda_compile_opts;
-    use cudarc::driver::{CudaDevice, CudaSlice, LaunchAsync, LaunchConfig};
+    use cudarc::driver::{CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
     use cudarc::nvrtc::compile_ptx_with_opts;
     use half::f16;
     use std::sync::{Arc, OnceLock};
@@ -142,17 +142,22 @@ extern "C" __global__ void q4_k_gemv(
     static Q8_0_FN: OnceLock<cudarc::driver::CudaFunction> = OnceLock::new();
     static Q4_K_FN: OnceLock<cudarc::driver::CudaFunction> = OnceLock::new();
 
-    fn load_functions(device: &Arc<CudaDevice>) {
+    fn load_functions(device: &Arc<CudaStream>) {
         if Q8_0_FN.get().is_some() {
             return;
         }
         let ptx = compile_ptx_with_opts(KERNEL_SRC, cuda_compile_opts())
             .expect("kapsl: failed to compile quant GEMV kernels");
-        device
-            .load_ptx(ptx, "kapsl_quant_gemv", &["q8_0_gemv", "q4_k_gemv"])
+        let module = device
+            .context()
+            .load_module(ptx)
             .expect("kapsl: failed to load quant GEMV PTX");
-        let f8 = device.get_func("kapsl_quant_gemv", "q8_0_gemv").unwrap();
-        let f4k = device.get_func("kapsl_quant_gemv", "q4_k_gemv").unwrap();
+        let f8 = module
+            .load_function("q8_0_gemv")
+            .expect("kapsl: failed to load quant GEMV PTX");
+        let f4k = module
+            .load_function("q4_k_gemv")
+            .expect("kapsl: failed to load quant GEMV PTX");
         let _ = Q8_0_FN.set(f8);
         let _ = Q4_K_FN.set(f4k);
     }
@@ -174,7 +179,7 @@ extern "C" __global__ void q4_k_gemv(
     const ROWS: u32 = 4;
 
     pub fn launch_q8_0_gemv(
-        device: &Arc<CudaDevice>,
+        device: &Arc<CudaStream>,
         p: &mut QuantGemvParams,
     ) -> Result<(), String> {
         load_functions(device);
@@ -184,18 +189,24 @@ extern "C" __global__ void q4_k_gemv(
             block_dim: (32, ROWS, 1),
             shared_mem_bytes: 0,
         };
+        let (m, k, b) = (p.m as i32, p.k as i32, p.b as i32);
         unsafe {
-            f.clone()
-                .launch(
-                    cfg,
-                    (&mut *p.out, p.w, p.x, p.m as i32, p.k as i32, p.b as i32),
-                )
+            device
+                .launch_builder(f)
+                .arg(&mut *p.out)
+                .arg(p.w)
+                .arg(p.x)
+                .arg(&m)
+                .arg(&k)
+                .arg(&b)
+                .launch(cfg)
+                .map(|_| ())
                 .map_err(|e| format!("q8_0_gemv launch: {e}"))
         }
     }
 
     pub fn launch_q4_k_gemv(
-        device: &Arc<CudaDevice>,
+        device: &Arc<CudaStream>,
         p: &mut QuantGemvParams,
     ) -> Result<(), String> {
         load_functions(device);
@@ -205,12 +216,18 @@ extern "C" __global__ void q4_k_gemv(
             block_dim: (32, ROWS, 1),
             shared_mem_bytes: 0,
         };
+        let (m, k, b) = (p.m as i32, p.k as i32, p.b as i32);
         unsafe {
-            f.clone()
-                .launch(
-                    cfg,
-                    (&mut *p.out, p.w, p.x, p.m as i32, p.k as i32, p.b as i32),
-                )
+            device
+                .launch_builder(f)
+                .arg(&mut *p.out)
+                .arg(p.w)
+                .arg(p.x)
+                .arg(&m)
+                .arg(&k)
+                .arg(&b)
+                .launch(cfg)
+                .map(|_| ())
                 .map_err(|e| format!("q4_k_gemv launch: {e}"))
         }
     }

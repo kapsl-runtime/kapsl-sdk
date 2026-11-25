@@ -67,7 +67,7 @@ fn invalid_requests_and_quota_failure_do_not_submit_initialization() {
     }
 }
 
-use cudarc::driver::{result, sys, CudaDevice};
+use cudarc::driver::{result, sys, CudaContext};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -94,7 +94,11 @@ fn kv_zero_completes_on_the_pool_stream_before_publication() {
         std::env::var("CUDA_LAUNCH_BLOCKING").unwrap_or_default(),
         "0"
     );
-    let device = CudaDevice::new_with_stream(0).unwrap();
+    let context = CudaContext::new(0).unwrap();
+    // cudarc 0.12 had no cross-stream event tracking; keep this probe's raw
+    // stream ordering identical to `CudaDevice::new_with_stream`.
+    unsafe { context.disable_event_tracking() };
+    let device = context.new_stream().unwrap();
     let pool = GpuDevicePool::new(device.clone(), 1024 * 1024).unwrap();
     device.synchronize().unwrap();
     let workspace = PoolOwner::new(
@@ -110,7 +114,7 @@ fn kv_zero_completes_on_the_pool_stream_before_publication() {
     let dirty = pool.alloc(workspace, 64, 16).unwrap();
     let pointer = pool.allocation_ptr(&dirty) as usize as sys::CUdeviceptr;
     unsafe {
-        result::memset_d8_async(pointer, 0xab, 64, *device.cu_stream()).unwrap();
+        result::memset_d8_async(pointer, 0xab, 64, device.cu_stream()).unwrap();
     }
     device.synchronize().unwrap();
     pool.free(dirty).unwrap();
@@ -119,17 +123,15 @@ fn kv_zero_completes_on_the_pool_stream_before_publication() {
         timed_out: AtomicBool::new(false),
     });
     unsafe {
-        let driver = sys::lib();
         let mut host = std::ptr::null_mut();
-        driver.cuMemHostAlloc(&mut host, 64, 0).result().unwrap();
-        driver
-            .cuLaunchHostFunc(
-                std::ptr::null_mut(),
-                Some(block_default_stream),
-                (&mut *gate as *mut Gate).cast(),
-            )
-            .result()
-            .unwrap();
+        sys::cuMemHostAlloc(&mut host, 64, 0).result().unwrap();
+        sys::cuLaunchHostFunc(
+            std::ptr::null_mut(),
+            Some(block_default_stream),
+            (&mut *gate as *mut Gate).cast(),
+        )
+        .result()
+        .unwrap();
         let mut allocation = None;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let started = Instant::now();
@@ -139,17 +141,15 @@ fn kv_zero_completes_on_the_pool_stream_before_publication() {
             allocation = Some(item);
             assert_eq!(actual_pointer, pointer);
             let default_pending_after_alloc =
-                driver.cuStreamQuery(std::ptr::null_mut()) == sys::CUresult::CUDA_ERROR_NOT_READY;
-            driver
-                .cuMemcpyDtoHAsync_v2(host, pointer, 64, *device.cu_stream())
+                sys::cuStreamQuery(std::ptr::null_mut()) == sys::CUresult::CUDA_ERROR_NOT_READY;
+            sys::cuMemcpyDtoHAsync_v2(host, pointer, 64, device.cu_stream())
                 .result()
                 .unwrap();
             device.synchronize().unwrap();
             let before = std::slice::from_raw_parts(host.cast::<u8>(), 64).to_vec();
             gate.release.store(true, Ordering::Release);
-            driver.cuCtxSynchronize().result().unwrap();
-            driver
-                .cuMemcpyDtoHAsync_v2(host, pointer, 64, *device.cu_stream())
+            sys::cuCtxSynchronize().result().unwrap();
+            sys::cuMemcpyDtoHAsync_v2(host, pointer, 64, device.cu_stream())
                 .result()
                 .unwrap();
             device.synchronize().unwrap();
@@ -176,11 +176,11 @@ fn kv_zero_completes_on_the_pool_stream_before_publication() {
             );
         }));
         gate.release.store(true, Ordering::Release);
-        driver.cuCtxSynchronize().result().unwrap();
+        sys::cuCtxSynchronize().result().unwrap();
         if let Some(item) = allocation {
             pool.free(item).unwrap();
         }
-        driver.cuMemFreeHost(host).result().unwrap();
+        sys::cuMemFreeHost(host).result().unwrap();
         if let Err(error) = result {
             std::panic::resume_unwind(error);
         }

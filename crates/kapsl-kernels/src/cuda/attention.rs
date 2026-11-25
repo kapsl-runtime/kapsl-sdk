@@ -9,8 +9,10 @@
 
 #[cfg(feature = "cuda")]
 mod inner {
-    use crate::nvrtc_util::cuda_compile_opts;
-    use cudarc::driver::{CudaDevice, CudaSlice, CudaView, CudaViewMut, LaunchAsync, LaunchConfig};
+    use crate::nvrtc_util::{cuda_compile_opts, get_func, load_ptx};
+    use cudarc::driver::{
+        CudaSlice, CudaStream, CudaView, CudaViewMut, LaunchConfig, PushKernelArg,
+    };
     use cudarc::nvrtc::compile_ptx_with_opts;
     use half::f16;
     use std::sync::Arc;
@@ -160,15 +162,14 @@ __global__ void paged_attention_v1(
 "#;
 
     /// Ensure the PTX module is loaded on `device`. Idempotent.
-    fn ensure_module(device: &Arc<CudaDevice>) -> Result<(), String> {
-        // cudarc caches modules by name, so second call is a no-op.
-        if device.get_func(MODULE_NAME, KERNEL_NAME).is_some() {
+    fn ensure_module(device: &Arc<CudaStream>) -> Result<(), String> {
+        // Modules are cached by name per device, so second call is a no-op.
+        if get_func(device, MODULE_NAME, KERNEL_NAME).is_some() {
             return Ok(());
         }
         let ptx = compile_ptx_with_opts(KERNEL_SRC, cuda_compile_opts())
             .map_err(|e| format!("NVRTC compile failed: {e}"))?;
-        device
-            .load_ptx(ptx, MODULE_NAME, &[KERNEL_NAME])
+        load_ptx(device, ptx, MODULE_NAME, &[KERNEL_NAME])
             .map_err(|e| format!("PTX load failed: {e}"))?;
         Ok(())
     }
@@ -196,13 +197,12 @@ __global__ void paged_attention_v1(
 
     /// Launch the paged attention CUDA kernel.
     pub fn launch_paged_attention(
-        device: &Arc<CudaDevice>,
+        device: &Arc<CudaStream>,
         params: &mut PagedAttentionParams<'_>,
     ) -> Result<(), String> {
         ensure_module(device)?;
 
-        let func = device
-            .get_func(MODULE_NAME, KERNEL_NAME)
+        let func = get_func(device, MODULE_NAME, KERNEL_NAME)
             .ok_or("kernel function not found after load")?;
 
         // Thread block size: 256 is a good default for Ampere/Hopper.
@@ -221,24 +221,26 @@ __global__ void paged_attention_v1(
             shared_mem_bytes: shared_bytes,
         };
 
+        let num_q_heads = params.num_q_heads as i32;
+        let num_kv_heads = params.num_kv_heads as i32;
+        let head_dim = params.head_dim as i32;
+        let block_size = params.block_size as i32;
+        let max_blocks_per_seq = params.max_blocks_per_seq as i32;
         unsafe {
-            func.clone()
-                .launch(
-                    cfg,
-                    (
-                        &mut *params.out,
-                        params.q,
-                        &params.kv_cache,
-                        params.block_tables,
-                        params.context_lens,
-                        params.scale,
-                        params.num_q_heads as i32,
-                        params.num_kv_heads as i32,
-                        params.head_dim as i32,
-                        params.block_size as i32,
-                        params.max_blocks_per_seq as i32,
-                    ),
-                )
+            device
+                .launch_builder(&func)
+                .arg(&mut *params.out)
+                .arg(params.q)
+                .arg(&params.kv_cache)
+                .arg(params.block_tables)
+                .arg(params.context_lens)
+                .arg(&params.scale)
+                .arg(&num_q_heads)
+                .arg(&num_kv_heads)
+                .arg(&head_dim)
+                .arg(&block_size)
+                .arg(&max_blocks_per_seq)
+                .launch(cfg)
                 .map_err(|e| format!("kernel launch failed: {e}"))?;
         }
         Ok(())
@@ -300,19 +302,16 @@ __global__ void rms_norm(
     }
 
     pub fn launch_rms_norm(
-        device: &Arc<CudaDevice>,
+        device: &Arc<CudaStream>,
         params: &mut RmsNormParams<'_>,
     ) -> Result<(), String> {
-        if device.get_func(RMSNORM_MODULE, RMSNORM_KERNEL).is_none() {
+        if get_func(device, RMSNORM_MODULE, RMSNORM_KERNEL).is_none() {
             let ptx = compile_ptx_with_opts(RMSNORM_SRC, cuda_compile_opts())
                 .map_err(|e| format!("NVRTC rmsnorm compile: {e}"))?;
-            device
-                .load_ptx(ptx, RMSNORM_MODULE, &[RMSNORM_KERNEL])
+            load_ptx(device, ptx, RMSNORM_MODULE, &[RMSNORM_KERNEL])
                 .map_err(|e| format!("PTX load: {e}"))?;
         }
-        let func = device
-            .get_func(RMSNORM_MODULE, RMSNORM_KERNEL)
-            .ok_or("rmsnorm not found")?;
+        let func = get_func(device, RMSNORM_MODULE, RMSNORM_KERNEL).ok_or("rmsnorm not found")?;
 
         let threads = 256u32.min(params.dim);
         let shared_bytes = threads * 4;
@@ -321,18 +320,16 @@ __global__ void rms_norm(
             block_dim: (threads, 1, 1),
             shared_mem_bytes: shared_bytes,
         };
+        let dim = params.dim as i32;
         unsafe {
-            func.clone()
-                .launch(
-                    cfg,
-                    (
-                        &mut *params.out,
-                        &params.input,
-                        params.weight,
-                        params.dim as i32,
-                        params.eps,
-                    ),
-                )
+            device
+                .launch_builder(&func)
+                .arg(&mut *params.out)
+                .arg(&params.input)
+                .arg(params.weight)
+                .arg(&dim)
+                .arg(&params.eps)
+                .launch(cfg)
                 .map_err(|e| format!("rmsnorm launch: {e}"))?;
         }
         Ok(())
@@ -363,22 +360,19 @@ __global__ void fused_swiglu(
     static SWIGLU_KERNEL: &str = "fused_swiglu";
 
     pub fn launch_fused_swiglu(
-        device: &Arc<CudaDevice>,
+        device: &Arc<CudaStream>,
         out: &mut CudaSlice<f16>,
         gate: &CudaSlice<f16>,
         up: &CudaSlice<f16>,
         n: u32,
     ) -> Result<(), String> {
-        if device.get_func(SWIGLU_MODULE, SWIGLU_KERNEL).is_none() {
+        if get_func(device, SWIGLU_MODULE, SWIGLU_KERNEL).is_none() {
             let ptx = compile_ptx_with_opts(SWIGLU_SRC, cuda_compile_opts())
                 .map_err(|e| format!("NVRTC swiglu compile: {e}"))?;
-            device
-                .load_ptx(ptx, SWIGLU_MODULE, &[SWIGLU_KERNEL])
+            load_ptx(device, ptx, SWIGLU_MODULE, &[SWIGLU_KERNEL])
                 .map_err(|e| format!("PTX load: {e}"))?;
         }
-        let func = device
-            .get_func(SWIGLU_MODULE, SWIGLU_KERNEL)
-            .ok_or("swiglu not found")?;
+        let func = get_func(device, SWIGLU_MODULE, SWIGLU_KERNEL).ok_or("swiglu not found")?;
 
         let threads = 256u32;
         let blocks = n.div_ceil(threads);
@@ -387,9 +381,15 @@ __global__ void fused_swiglu(
             block_dim: (threads, 1, 1),
             shared_mem_bytes: 0,
         };
+        let n = n as i32;
         unsafe {
-            func.clone()
-                .launch(cfg, (out, gate, up, n as i32))
+            device
+                .launch_builder(&func)
+                .arg(out)
+                .arg(gate)
+                .arg(up)
+                .arg(&n)
+                .launch(cfg)
                 .map_err(|e| format!("swiglu launch: {e}"))?;
         }
         Ok(())
@@ -464,19 +464,16 @@ __global__ void rope_forward(
     }
 
     pub fn launch_rope(
-        device: &Arc<CudaDevice>,
+        device: &Arc<CudaStream>,
         params: &mut RopeParams<'_>,
     ) -> Result<(), String> {
-        if device.get_func(ROPE_MODULE, ROPE_KERNEL).is_none() {
+        if get_func(device, ROPE_MODULE, ROPE_KERNEL).is_none() {
             let ptx = compile_ptx_with_opts(ROPE_SRC, cuda_compile_opts())
                 .map_err(|e| format!("NVRTC rope compile: {e}"))?;
-            device
-                .load_ptx(ptx, ROPE_MODULE, &[ROPE_KERNEL])
+            load_ptx(device, ptx, ROPE_MODULE, &[ROPE_KERNEL])
                 .map_err(|e| format!("PTX load: {e}"))?;
         }
-        let func = device
-            .get_func(ROPE_MODULE, ROPE_KERNEL)
-            .ok_or("rope not found")?;
+        let func = get_func(device, ROPE_MODULE, ROPE_KERNEL).ok_or("rope not found")?;
 
         let max_heads = params.num_q_heads.max(params.num_kv_heads);
         let half_dim = params.head_dim / 2;
@@ -485,20 +482,21 @@ __global__ void rope_forward(
             block_dim: (half_dim, 1, 1),
             shared_mem_bytes: 0,
         };
+        let num_q_heads = params.num_q_heads as i32;
+        let num_kv_heads = params.num_kv_heads as i32;
+        let head_dim = params.head_dim as i32;
+        let position = params.position as i32;
         unsafe {
-            func.clone()
-                .launch(
-                    cfg,
-                    (
-                        &mut *params.q,
-                        &mut *params.k,
-                        params.num_q_heads as i32,
-                        params.num_kv_heads as i32,
-                        params.head_dim as i32,
-                        params.position as i32,
-                        params.theta,
-                    ),
-                )
+            device
+                .launch_builder(&func)
+                .arg(&mut *params.q)
+                .arg(&mut *params.k)
+                .arg(&num_q_heads)
+                .arg(&num_kv_heads)
+                .arg(&head_dim)
+                .arg(&position)
+                .arg(&params.theta)
+                .launch(cfg)
                 .map_err(|e| format!("rope launch: {e}"))?;
         }
         Ok(())
@@ -560,40 +558,40 @@ __global__ void write_kv_to_pool(
     }
 
     pub fn launch_kv_write(
-        device: &Arc<CudaDevice>,
+        device: &Arc<CudaStream>,
         params: &mut KvWriteParams<'_>,
     ) -> Result<(), String> {
-        if device.get_func(KV_WRITE_MODULE, KV_WRITE_KERNEL).is_none() {
+        if get_func(device, KV_WRITE_MODULE, KV_WRITE_KERNEL).is_none() {
             let ptx = compile_ptx_with_opts(KV_WRITE_SRC, cuda_compile_opts())
                 .map_err(|e| format!("NVRTC kv_write compile: {e}"))?;
-            device
-                .load_ptx(ptx, KV_WRITE_MODULE, &[KV_WRITE_KERNEL])
+            load_ptx(device, ptx, KV_WRITE_MODULE, &[KV_WRITE_KERNEL])
                 .map_err(|e| format!("PTX load: {e}"))?;
         }
-        let func = device
-            .get_func(KV_WRITE_MODULE, KV_WRITE_KERNEL)
-            .ok_or("kv_write not found")?;
+        let func =
+            get_func(device, KV_WRITE_MODULE, KV_WRITE_KERNEL).ok_or("kv_write not found")?;
 
         let cfg = LaunchConfig {
             grid_dim: (params.num_kv_heads, 1, 1),
             block_dim: (params.head_dim, 1, 1),
             shared_mem_bytes: 0,
         };
+        let physical_block = params.physical_block as i32;
+        let pos_in_block = params.pos_in_block as i32;
+        let num_kv_heads = params.num_kv_heads as i32;
+        let block_size = params.block_size as i32;
+        let head_dim = params.head_dim as i32;
         unsafe {
-            func.clone()
-                .launch(
-                    cfg,
-                    (
-                        &mut params.kv_cache,
-                        params.k_vec,
-                        params.v_vec,
-                        params.physical_block as i32,
-                        params.pos_in_block as i32,
-                        params.num_kv_heads as i32,
-                        params.block_size as i32,
-                        params.head_dim as i32,
-                    ),
-                )
+            device
+                .launch_builder(&func)
+                .arg(&mut params.kv_cache)
+                .arg(params.k_vec)
+                .arg(params.v_vec)
+                .arg(&physical_block)
+                .arg(&pos_in_block)
+                .arg(&num_kv_heads)
+                .arg(&block_size)
+                .arg(&head_dim)
+                .launch(cfg)
                 .map_err(|e| format!("kv_write launch: {e}"))?;
         }
         Ok(())
@@ -625,22 +623,20 @@ __global__ void residual_add(
     static RESIDUAL_KERNEL: &str = "residual_add";
 
     pub fn launch_residual_add(
-        device: &Arc<CudaDevice>,
+        device: &Arc<CudaStream>,
         out: &mut CudaSlice<f16>,
         a: &CudaSlice<f16>,
         b: &CudaSlice<f16>,
         n: u32,
     ) -> Result<(), String> {
-        if device.get_func(RESIDUAL_MODULE, RESIDUAL_KERNEL).is_none() {
+        if get_func(device, RESIDUAL_MODULE, RESIDUAL_KERNEL).is_none() {
             let ptx = compile_ptx_with_opts(RESIDUAL_ADD_SRC, cuda_compile_opts())
                 .map_err(|e| format!("NVRTC residual compile: {e}"))?;
-            device
-                .load_ptx(ptx, RESIDUAL_MODULE, &[RESIDUAL_KERNEL])
+            load_ptx(device, ptx, RESIDUAL_MODULE, &[RESIDUAL_KERNEL])
                 .map_err(|e| format!("PTX load: {e}"))?;
         }
-        let func = device
-            .get_func(RESIDUAL_MODULE, RESIDUAL_KERNEL)
-            .ok_or("residual_add not found")?;
+        let func =
+            get_func(device, RESIDUAL_MODULE, RESIDUAL_KERNEL).ok_or("residual_add not found")?;
 
         let threads = 256u32;
         let blocks = n.div_ceil(threads);
@@ -649,9 +645,15 @@ __global__ void residual_add(
             block_dim: (threads, 1, 1),
             shared_mem_bytes: 0,
         };
+        let n = n as i32;
         unsafe {
-            func.clone()
-                .launch(cfg, (out, a, b, n as i32))
+            device
+                .launch_builder(&func)
+                .arg(out)
+                .arg(a)
+                .arg(b)
+                .arg(&n)
+                .launch(cfg)
                 .map_err(|e| format!("residual_add launch: {e}"))?;
         }
         Ok(())
@@ -719,22 +721,17 @@ __global__ void batch_rope_forward(
     }
 
     pub fn launch_batch_rope(
-        device: &Arc<CudaDevice>,
+        device: &Arc<CudaStream>,
         p: &mut BatchRopeParams<'_>,
     ) -> Result<(), String> {
-        if device
-            .get_func(BATCH_ROPE_MODULE, BATCH_ROPE_KERNEL)
-            .is_none()
-        {
+        if get_func(device, BATCH_ROPE_MODULE, BATCH_ROPE_KERNEL).is_none() {
             let ptx = compile_ptx_with_opts(BATCH_ROPE_SRC, cuda_compile_opts())
                 .map_err(|e| format!("NVRTC batch_rope compile: {e}"))?;
-            device
-                .load_ptx(ptx, BATCH_ROPE_MODULE, &[BATCH_ROPE_KERNEL])
+            load_ptx(device, ptx, BATCH_ROPE_MODULE, &[BATCH_ROPE_KERNEL])
                 .map_err(|e| format!("PTX load: {e}"))?;
         }
-        let func = device
-            .get_func(BATCH_ROPE_MODULE, BATCH_ROPE_KERNEL)
-            .ok_or("batch_rope not found")?;
+        let func =
+            get_func(device, BATCH_ROPE_MODULE, BATCH_ROPE_KERNEL).ok_or("batch_rope not found")?;
 
         let max_heads = p.num_q_heads.max(p.num_kv_heads);
         let cfg = LaunchConfig {
@@ -742,20 +739,21 @@ __global__ void batch_rope_forward(
             block_dim: (p.head_dim / 2, 1, 1),
             shared_mem_bytes: 0,
         };
+        let num_q_heads = p.num_q_heads as i32;
+        let num_kv_heads = p.num_kv_heads as i32;
+        let head_dim = p.head_dim as i32;
+        let position_offset = p.position_offset as i32;
         unsafe {
-            func.clone()
-                .launch(
-                    cfg,
-                    (
-                        &mut *p.q,
-                        &mut *p.k,
-                        p.num_q_heads as i32,
-                        p.num_kv_heads as i32,
-                        p.head_dim as i32,
-                        p.position_offset as i32,
-                        p.theta,
-                    ),
-                )
+            device
+                .launch_builder(&func)
+                .arg(&mut *p.q)
+                .arg(&mut *p.k)
+                .arg(&num_q_heads)
+                .arg(&num_kv_heads)
+                .arg(&head_dim)
+                .arg(&position_offset)
+                .arg(&p.theta)
+                .launch(cfg)
                 .map_err(|e| format!("batch_rope launch: {e}"))?;
         }
         Ok(())
@@ -869,21 +867,16 @@ __global__ void prefill_attention(
     }
 
     pub fn launch_prefill_attention(
-        device: &Arc<CudaDevice>,
+        device: &Arc<CudaStream>,
         p: &mut PrefillAttnParams<'_>,
     ) -> Result<(), String> {
-        if device
-            .get_func(PREFILL_ATTN_MODULE, PREFILL_ATTN_KERNEL)
-            .is_none()
-        {
+        if get_func(device, PREFILL_ATTN_MODULE, PREFILL_ATTN_KERNEL).is_none() {
             let ptx = compile_ptx_with_opts(PREFILL_ATTN_SRC, cuda_compile_opts())
                 .map_err(|e| format!("NVRTC prefill_attn compile: {e}"))?;
-            device
-                .load_ptx(ptx, PREFILL_ATTN_MODULE, &[PREFILL_ATTN_KERNEL])
+            load_ptx(device, ptx, PREFILL_ATTN_MODULE, &[PREFILL_ATTN_KERNEL])
                 .map_err(|e| format!("PTX load: {e}"))?;
         }
-        let func = device
-            .get_func(PREFILL_ATTN_MODULE, PREFILL_ATTN_KERNEL)
+        let func = get_func(device, PREFILL_ATTN_MODULE, PREFILL_ATTN_KERNEL)
             .ok_or("prefill_attention not found")?;
 
         let threads = 256u32;
@@ -893,22 +886,23 @@ __global__ void prefill_attention(
             block_dim: (threads, 1, 1),
             shared_mem_bytes: shared,
         };
+        let seq_len = p.seq_len as i32;
+        let num_q_heads = p.num_q_heads as i32;
+        let num_kv_heads = p.num_kv_heads as i32;
+        let head_dim = p.head_dim as i32;
         unsafe {
-            func.clone()
-                .launch(
-                    cfg,
-                    (
-                        &mut *p.out,
-                        p.q,
-                        p.k,
-                        p.v,
-                        p.scale,
-                        p.seq_len as i32,
-                        p.num_q_heads as i32,
-                        p.num_kv_heads as i32,
-                        p.head_dim as i32,
-                    ),
-                )
+            device
+                .launch_builder(&func)
+                .arg(&mut *p.out)
+                .arg(p.q)
+                .arg(p.k)
+                .arg(p.v)
+                .arg(&p.scale)
+                .arg(&seq_len)
+                .arg(&num_q_heads)
+                .arg(&num_kv_heads)
+                .arg(&head_dim)
+                .launch(cfg)
                 .map_err(|e| format!("prefill_attn launch: {e}"))?;
         }
         Ok(())
@@ -972,21 +966,16 @@ __global__ void batch_kv_write(
     }
 
     pub fn launch_batch_kv_write(
-        device: &Arc<CudaDevice>,
+        device: &Arc<CudaStream>,
         p: &mut BatchKvWriteParams<'_>,
     ) -> Result<(), String> {
-        if device
-            .get_func(BATCH_KV_WRITE_MODULE, BATCH_KV_WRITE_KERNEL)
-            .is_none()
-        {
+        if get_func(device, BATCH_KV_WRITE_MODULE, BATCH_KV_WRITE_KERNEL).is_none() {
             let ptx = compile_ptx_with_opts(BATCH_KV_WRITE_SRC, cuda_compile_opts())
                 .map_err(|e| format!("NVRTC batch_kv_write compile: {e}"))?;
-            device
-                .load_ptx(ptx, BATCH_KV_WRITE_MODULE, &[BATCH_KV_WRITE_KERNEL])
+            load_ptx(device, ptx, BATCH_KV_WRITE_MODULE, &[BATCH_KV_WRITE_KERNEL])
                 .map_err(|e| format!("PTX load: {e}"))?;
         }
-        let func = device
-            .get_func(BATCH_KV_WRITE_MODULE, BATCH_KV_WRITE_KERNEL)
+        let func = get_func(device, BATCH_KV_WRITE_MODULE, BATCH_KV_WRITE_KERNEL)
             .ok_or("batch_kv_write not found")?;
 
         let cfg = LaunchConfig {
@@ -994,21 +983,21 @@ __global__ void batch_kv_write(
             block_dim: (p.head_dim, 1, 1),
             shared_mem_bytes: 0,
         };
+        let num_kv_heads = p.num_kv_heads as i32;
+        let block_size = p.block_size as i32;
+        let head_dim = p.head_dim as i32;
         unsafe {
-            func.clone()
-                .launch(
-                    cfg,
-                    (
-                        &mut p.kv_cache,
-                        p.k,
-                        p.v,
-                        p.physical_blocks,
-                        p.pos_in_blocks,
-                        p.num_kv_heads as i32,
-                        p.block_size as i32,
-                        p.head_dim as i32,
-                    ),
-                )
+            device
+                .launch_builder(&func)
+                .arg(&mut p.kv_cache)
+                .arg(p.k)
+                .arg(p.v)
+                .arg(p.physical_blocks)
+                .arg(p.pos_in_blocks)
+                .arg(&num_kv_heads)
+                .arg(&block_size)
+                .arg(&head_dim)
+                .launch(cfg)
                 .map_err(|e| format!("batch_kv_write launch: {e}"))?;
         }
         Ok(())
@@ -1019,8 +1008,8 @@ __global__ void batch_kv_write(
 
 #[cfg(feature = "cuda")]
 mod argmax_inner {
-    use crate::nvrtc_util::cuda_compile_opts;
-    use cudarc::driver::{CudaDevice, CudaSlice, LaunchAsync, LaunchConfig};
+    use crate::nvrtc_util::{cuda_compile_opts, get_func, load_ptx};
+    use cudarc::driver::{CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
     use cudarc::nvrtc::compile_ptx_with_opts;
     use half::f16;
     use std::sync::Arc;
@@ -1078,25 +1067,27 @@ __global__ void argmax_f16(
         pub vocab_size: u32,
     }
 
-    pub fn launch_argmax(device: &Arc<CudaDevice>, p: &mut ArgmaxParams<'_>) -> Result<(), String> {
-        if device.get_func(ARGMAX_MODULE, ARGMAX_KERNEL).is_none() {
+    pub fn launch_argmax(device: &Arc<CudaStream>, p: &mut ArgmaxParams<'_>) -> Result<(), String> {
+        if get_func(device, ARGMAX_MODULE, ARGMAX_KERNEL).is_none() {
             let ptx = compile_ptx_with_opts(ARGMAX_SRC, cuda_compile_opts())
                 .map_err(|e| format!("NVRTC argmax compile: {e}"))?;
-            device
-                .load_ptx(ptx, ARGMAX_MODULE, &[ARGMAX_KERNEL])
+            load_ptx(device, ptx, ARGMAX_MODULE, &[ARGMAX_KERNEL])
                 .map_err(|e| format!("PTX load: {e}"))?;
         }
-        let func = device
-            .get_func(ARGMAX_MODULE, ARGMAX_KERNEL)
-            .ok_or("argmax not found")?;
+        let func = get_func(device, ARGMAX_MODULE, ARGMAX_KERNEL).ok_or("argmax not found")?;
         let cfg = LaunchConfig {
             grid_dim: (1, 1, 1),
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
+        let vocab_size = p.vocab_size as i32;
         unsafe {
-            func.clone()
-                .launch(cfg, (p.input, &mut *p.output, p.vocab_size as i32))
+            device
+                .launch_builder(&func)
+                .arg(p.input)
+                .arg(&mut *p.output)
+                .arg(&vocab_size)
+                .launch(cfg)
                 .map_err(|e| format!("argmax launch: {e}"))?;
         }
         Ok(())
@@ -1168,21 +1159,21 @@ __global__ void batch_decode_rope(
     }
 
     pub fn launch_batch_decode_rope(
-        device: &Arc<CudaDevice>,
+        device: &Arc<CudaStream>,
         p: &mut BatchDecodeRopeParams<'_>,
     ) -> Result<(), String> {
-        if device
-            .get_func(BATCH_DECODE_ROPE_MODULE, BATCH_DECODE_ROPE_KERNEL)
-            .is_none()
-        {
+        if get_func(device, BATCH_DECODE_ROPE_MODULE, BATCH_DECODE_ROPE_KERNEL).is_none() {
             let ptx = compile_ptx_with_opts(BATCH_DECODE_ROPE_SRC, cuda_compile_opts())
                 .map_err(|e| format!("NVRTC batch_decode_rope compile: {e}"))?;
-            device
-                .load_ptx(ptx, BATCH_DECODE_ROPE_MODULE, &[BATCH_DECODE_ROPE_KERNEL])
-                .map_err(|e| format!("PTX load: {e}"))?;
+            load_ptx(
+                device,
+                ptx,
+                BATCH_DECODE_ROPE_MODULE,
+                &[BATCH_DECODE_ROPE_KERNEL],
+            )
+            .map_err(|e| format!("PTX load: {e}"))?;
         }
-        let func = device
-            .get_func(BATCH_DECODE_ROPE_MODULE, BATCH_DECODE_ROPE_KERNEL)
+        let func = get_func(device, BATCH_DECODE_ROPE_MODULE, BATCH_DECODE_ROPE_KERNEL)
             .ok_or("batch_decode_rope not found")?;
 
         let max_heads = p.num_q_heads.max(p.num_kv_heads);
@@ -1191,20 +1182,20 @@ __global__ void batch_decode_rope(
             block_dim: (p.head_dim / 2, 1, 1),
             shared_mem_bytes: 0,
         };
+        let num_q_heads = p.num_q_heads as i32;
+        let num_kv_heads = p.num_kv_heads as i32;
+        let head_dim = p.head_dim as i32;
         unsafe {
-            func.clone()
-                .launch(
-                    cfg,
-                    (
-                        &mut *p.q,
-                        &mut *p.k,
-                        p.positions,
-                        p.num_q_heads as i32,
-                        p.num_kv_heads as i32,
-                        p.head_dim as i32,
-                        p.theta,
-                    ),
-                )
+            device
+                .launch_builder(&func)
+                .arg(&mut *p.q)
+                .arg(&mut *p.k)
+                .arg(p.positions)
+                .arg(&num_q_heads)
+                .arg(&num_kv_heads)
+                .arg(&head_dim)
+                .arg(&p.theta)
+                .launch(cfg)
                 .map_err(|e| format!("batch_decode_rope launch: {e}"))?;
         }
         Ok(())
@@ -1271,30 +1262,30 @@ __global__ void batch_argmax_f16(
     }
 
     pub fn launch_batch_argmax(
-        device: &Arc<CudaDevice>,
+        device: &Arc<CudaStream>,
         p: &mut BatchArgmaxParams<'_>,
     ) -> Result<(), String> {
-        if device
-            .get_func(BATCH_ARGMAX_MODULE, BATCH_ARGMAX_KERNEL)
-            .is_none()
-        {
+        if get_func(device, BATCH_ARGMAX_MODULE, BATCH_ARGMAX_KERNEL).is_none() {
             let ptx = compile_ptx_with_opts(BATCH_ARGMAX_SRC, cuda_compile_opts())
                 .map_err(|e| format!("NVRTC batch_argmax compile: {e}"))?;
-            device
-                .load_ptx(ptx, BATCH_ARGMAX_MODULE, &[BATCH_ARGMAX_KERNEL])
+            load_ptx(device, ptx, BATCH_ARGMAX_MODULE, &[BATCH_ARGMAX_KERNEL])
                 .map_err(|e| format!("PTX load: {e}"))?;
         }
-        let func = device
-            .get_func(BATCH_ARGMAX_MODULE, BATCH_ARGMAX_KERNEL)
+        let func = get_func(device, BATCH_ARGMAX_MODULE, BATCH_ARGMAX_KERNEL)
             .ok_or("batch_argmax not found")?;
         let cfg = LaunchConfig {
             grid_dim: (p.batch_size, 1, 1),
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
+        let vocab_size = p.vocab_size as i32;
         unsafe {
-            func.clone()
-                .launch(cfg, (p.input, &mut *p.output, p.vocab_size as i32))
+            device
+                .launch_builder(&func)
+                .arg(p.input)
+                .arg(&mut *p.output)
+                .arg(&vocab_size)
+                .launch(cfg)
                 .map_err(|e| format!("batch_argmax launch: {e}"))?;
         }
         Ok(())
