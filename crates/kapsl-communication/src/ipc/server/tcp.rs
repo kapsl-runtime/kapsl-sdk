@@ -1,8 +1,8 @@
 //! Authenticated TCP server for remote inference clients.
 
+use crate::transport::{TransportError, TransportServer};
 use async_trait::async_trait;
 use kapsl_engine_api::ReplicaScheduler;
-use kapsl_transport::{TransportError, TransportServer};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -12,7 +12,7 @@ use tokio::net::TcpListener;
 pub struct TcpServer {
     bind_addr: String,
     port: u16,
-    scheduler_lookup: crate::server::SchedulerLookup,
+    scheduler_lookup: crate::ipc::server::SchedulerLookup,
     auth_token: Option<Arc<str>>,
 }
 
@@ -23,7 +23,7 @@ impl TcpServer {
         schedulers: HashMap<u32, Arc<dyn ReplicaScheduler + Send + Sync>>,
     ) -> Self {
         let schedulers = Arc::new(schedulers);
-        let scheduler_lookup: crate::server::SchedulerLookup =
+        let scheduler_lookup: crate::ipc::server::SchedulerLookup =
             Arc::new(move |model_id| schedulers.get(&model_id).cloned());
         Self::new_with_lookup(bind_addr, port, scheduler_lookup)
     }
@@ -31,7 +31,7 @@ impl TcpServer {
     pub fn new_with_lookup(
         bind_addr: &str,
         port: u16,
-        scheduler_lookup: crate::server::SchedulerLookup,
+        scheduler_lookup: crate::ipc::server::SchedulerLookup,
     ) -> Self {
         Self {
             bind_addr: bind_addr.to_string(),
@@ -64,7 +64,7 @@ impl TcpServer {
 
         log::info!("TCP Server listening on {}", addr);
         log::info!("TCP Server bound to {}", addr);
-        if wire_policy == crate::server::OpenAiWireTransportPolicy::PlaintextRemote {
+        if wire_policy == crate::ipc::server::OpenAiWireTransportPolicy::PlaintextRemote {
             log::warn!(
                 "Protocol-native OpenAI operations are disabled on non-loopback plaintext TCP listener {}",
                 addr
@@ -79,7 +79,7 @@ impl TcpServer {
             log::info!("New TCP connection from {}", peer_addr);
 
             tokio::spawn(async move {
-                if let Err(e) = crate::server::handle_connection_with_wire_policy(
+                if let Err(e) = crate::ipc::server::handle_connection_with_wire_policy(
                     stream,
                     scheduler_lookup,
                     None,
@@ -96,11 +96,11 @@ impl TcpServer {
     }
 }
 
-fn openai_wire_policy(bind_ip: IpAddr) -> crate::server::OpenAiWireTransportPolicy {
+fn openai_wire_policy(bind_ip: IpAddr) -> crate::ipc::server::OpenAiWireTransportPolicy {
     if bind_ip.is_loopback() {
-        crate::server::OpenAiWireTransportPolicy::Local
+        crate::ipc::server::OpenAiWireTransportPolicy::Local
     } else {
-        crate::server::OpenAiWireTransportPolicy::PlaintextRemote
+        crate::ipc::server::OpenAiWireTransportPolicy::PlaintextRemote
     }
 }
 
@@ -132,7 +132,7 @@ impl TransportServer for TcpServer {
 #[cfg(test)]
 mod tests {
     use super::{openai_wire_policy, validate_tcp_exposure};
-    use crate::server::OpenAiWireTransportPolicy;
+    use crate::ipc::server::OpenAiWireTransportPolicy;
 
     #[test]
     fn unauthenticated_tcp_is_limited_to_loopback() {

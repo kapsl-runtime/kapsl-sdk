@@ -4,7 +4,7 @@
 //! framing defined here. Keeping byte I/O in this lower-level crate lets the
 //! IPC server, Rust clients, and language bindings share one implementation.
 
-use crate::TransportError;
+use crate::transport::TransportError;
 use bincode::Options;
 use kapsl_engine_api::{
     BinaryTensorPacket, InferenceRequest, OpenAiWireFormat, OpenAiWireRequest, OpenAiWireResponse,

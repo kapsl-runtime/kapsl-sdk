@@ -1,7 +1,7 @@
 use super::*;
+use crate::transport::RequestMetadata;
 use async_trait::async_trait;
 use kapsl_engine_api::{EngineError, EngineMetrics, EngineStream};
-use kapsl_transport::RequestMetadata;
 use std::sync::Mutex;
 
 struct EchoScheduler;
@@ -44,9 +44,9 @@ fn test_region(label: &str, size: usize) -> Option<Arc<ShmManager>> {
     let name = format!("/ksv_{}_{}", label, std::process::id());
     match ShmManager::create(&name, size) {
         Ok(manager) => Some(Arc::new(manager)),
-        Err(crate::memory::ShmError::ShmemError(shared_memory::ShmemError::MapCreateFailed(_))) => {
-            None
-        }
+        Err(crate::shm::memory::ShmError::ShmemError(
+            shared_memory::ShmemError::MapCreateFailed(_),
+        )) => None,
         Err(error) => panic!("create test SHM: {error}"),
     }
 }
@@ -58,8 +58,8 @@ fn scheduler_lookup() -> SchedulerLookup {
 
 fn request_for(
     request_id: u64,
-    mailbox: crate::mailbox::ResponseMailboxClaim,
-    lease: crate::allocator::SharedShmLease,
+    mailbox: crate::shm::mailbox::ResponseMailboxClaim,
+    lease: crate::shm::allocator::SharedShmLease,
     encoded_size: usize,
 ) -> ShmRequest {
     ShmRequest {

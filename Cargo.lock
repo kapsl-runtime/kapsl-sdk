@@ -1925,17 +1925,18 @@ dependencies = [
 
 [[package]]
 name = "kapsl-communication"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "async-trait",
+ "bincode",
  "futures",
  "kapsl-engine-api 0.3.1",
  "kapsl-grpc",
- "kapsl-ipc",
- "kapsl-shm",
- "kapsl-transport",
+ "log",
  "prometheus",
+ "serde",
  "serde_json",
+ "shared_memory",
  "thiserror 1.0.69",
  "tokio",
 ]
@@ -2023,20 +2024,6 @@ dependencies = [
  "serde_json",
  "sys-info",
  "thiserror 2.0.21",
-]
-
-[[package]]
-name = "kapsl-ipc"
-version = "0.4.0"
-dependencies = [
- "async-trait",
- "futures",
- "kapsl-engine-api 0.3.1",
- "kapsl-shm",
- "kapsl-transport",
- "log",
- "serde",
- "tokio",
 ]
 
 [[package]]
@@ -2218,32 +2205,6 @@ dependencies = [
  "parking_lot",
  "rayon",
  "serde",
- "tokio",
-]
-
-[[package]]
-name = "kapsl-shm"
-version = "0.4.0"
-dependencies = [
- "async-trait",
- "kapsl-engine-api 0.3.1",
- "kapsl-transport",
- "log",
- "prometheus",
- "shared_memory",
- "tokio",
-]
-
-[[package]]
-name = "kapsl-transport"
-version = "0.4.0"
-dependencies = [
- "async-trait",
- "bincode",
- "futures",
- "kapsl-engine-api 0.3.1",
- "serde",
- "thiserror 1.0.69",
  "tokio",
 ]
 

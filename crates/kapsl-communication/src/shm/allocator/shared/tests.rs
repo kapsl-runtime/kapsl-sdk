@@ -11,7 +11,7 @@ fn test_region(label: &str) -> Option<(String, Arc<ShmManager>)> {
     }
 }
 
-use crate::memory::ShmError;
+use crate::shm::memory::ShmError;
 
 #[test]
 fn allocators_connected_to_one_region_never_overlap_live_slots() {

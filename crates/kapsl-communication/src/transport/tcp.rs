@@ -1,5 +1,5 @@
-use crate::connection_pool::{ConnectionFactory, ConnectionPool, PoolConfig};
-use crate::{TransportClient, TransportError};
+use crate::transport::connection_pool::{ConnectionFactory, ConnectionPool, PoolConfig};
+use crate::transport::{TransportClient, TransportError};
 use async_trait::async_trait;
 use kapsl_engine_api::{BinaryTensorPacket, InferenceRequest};
 use tokio::net::TcpStream;
@@ -58,9 +58,11 @@ impl TcpClient {
             .get()
             .await
             .map_err(|error| TransportError::Connection(error.to_string()))?;
-        crate::protocol::asynchronous::infer_request_over_stream(&mut *conn, model_id, request)
-            .await
-            .map_err(TransportError::from)
+        crate::transport::protocol::asynchronous::infer_request_over_stream(
+            &mut *conn, model_id, request,
+        )
+        .await
+        .map_err(TransportError::from)
     }
 }
 
@@ -101,10 +103,10 @@ impl TransportClient for TcpClient {
             .map_err(|error| TransportError::Connection(error.to_string()))?;
         connection.discard_on_drop();
         let request = InferenceRequest::new(input);
-        crate::protocol::asynchronous::write_request_value(
+        crate::transport::protocol::asynchronous::write_request_value(
             &mut *connection,
             model_id,
-            crate::protocol::OP_INFER_STREAM,
+            crate::transport::protocol::OP_INFER_STREAM,
             &request,
         )
         .await
@@ -112,16 +114,16 @@ impl TransportClient for TcpClient {
 
         let responses = futures::stream::unfold(Some(connection), |state| async move {
             let mut connection = state?;
-            match crate::protocol::asynchronous::read_stream_packet(
+            match crate::transport::protocol::asynchronous::read_stream_packet(
                 &mut *connection,
-                crate::protocol::DEFAULT_MAX_FRAME_PAYLOAD_BYTES,
+                crate::transport::protocol::DEFAULT_MAX_FRAME_PAYLOAD_BYTES,
             )
             .await
             {
-                Ok(crate::protocol::StreamResponse::Chunk(packet)) => {
+                Ok(crate::transport::protocol::StreamResponse::Chunk(packet)) => {
                     Some((Ok(packet), Some(connection)))
                 }
-                Ok(crate::protocol::StreamResponse::End) => {
+                Ok(crate::transport::protocol::StreamResponse::End) => {
                     connection.recycle_on_drop();
                     None
                 }

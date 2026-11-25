@@ -54,8 +54,6 @@ checks = [
   "cargo check -p kapsl-hal --features nvml --locked",
 ]
 
-[crate.kapsl-ipc]
-
 [crate.kapsl-kernels]
 
 [crate.kapsl-kv-abi]
@@ -88,10 +86,6 @@ checks = [
 [crate.kapsl-rag-sdk]
 
 [crate.kapsl-scheduler]
-
-[crate.kapsl-shm]
-
-[crate.kapsl-transport]
 
 [python.kapsl-sdk]
 path = "."

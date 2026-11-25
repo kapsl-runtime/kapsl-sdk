@@ -1,4 +1,4 @@
-use kapsl_transport::{RequestMetadata, ResponseMetadata};
+use crate::transport::{RequestMetadata, ResponseMetadata};
 
 /// Number of entries reserved for each shared-memory metadata queue.
 pub const SHM_QUEUE_CAPACITY: usize = 1024;
