@@ -1,6 +1,6 @@
 [package]
 name = "kapsl-llm"
-version = "0.3.7"
+version = "0.3.8"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -64,23 +64,23 @@ onnx-cuda-pool = ["onnx-cuda", "kapsl-hal/cuda"]
 
 [target.'cfg(target_os = "macos")'.dependencies.llama-cpp-2]
 package = "kapsl-llama-cpp-2"
-version = "=0.1.146-kapsl.1"
+version = "=0.1.146-kapsl.2"
 optional = true
 features = ["metal"]
 
 [target.'cfg(target_os = "macos")'.dependencies.llama-cpp-sys-2]
 package = "kapsl-llama-cpp-sys-2"
-version = "=0.1.146-kapsl.1"
+version = "=0.1.146-kapsl.2"
 optional = true
 
 [target.'cfg(not(target_os = "macos"))'.dependencies.llama-cpp-2]
 package = "kapsl-llama-cpp-2"
-version = "=0.1.146-kapsl.1"
+version = "=0.1.146-kapsl.2"
 optional = true
 
 [target.'cfg(not(target_os = "macos"))'.dependencies.llama-cpp-sys-2]
 package = "kapsl-llama-cpp-sys-2"
-version = "=0.1.146-kapsl.1"
+version = "=0.1.146-kapsl.2"
 optional = true
 
 [dev-dependencies]

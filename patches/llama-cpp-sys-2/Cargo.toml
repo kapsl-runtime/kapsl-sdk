@@ -12,7 +12,7 @@
 [package]
 edition = "2021"
 name = "kapsl-llama-cpp-sys-2"
-version = "0.1.146-kapsl.1"
+version = "0.1.146-kapsl.2"
 build = "build.rs"
 links = "llama"
 include = [
