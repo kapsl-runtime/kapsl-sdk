@@ -27,7 +27,7 @@ mod tests {
     use std::time::Duration;
     use tokenizers::decoders::byte_fallback::ByteFallback;
     use tokenizers::decoders::metaspace::Metaspace;
-    use tokenizers::models::bpe::BPE;
+    use tokenizers::models::bpe::{Vocab, BPE};
     use tokenizers::Tokenizer;
     use tokio::sync::mpsc;
 
@@ -824,6 +824,8 @@ mod tests {
     }
 
     fn bpe_tokenizer(vocab: HashMap<String, u32>) -> Tokenizer {
+        // tokenizers 0.23 stores vocabularies in its own hash map type.
+        let vocab: Vocab = vocab.into_iter().collect();
         let model = BPE::builder()
             .vocab_and_merges(vocab, Vec::new())
             .byte_fallback(true)

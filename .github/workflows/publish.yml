@@ -115,6 +115,8 @@ jobs:
 
       # A single multi-package dry run verifies each crate against the
       # versions of its workspace dependencies that are released with it.
+      # Cargo needs --registry when the crates' `publish` fields differ
+      # (kapsl-backend-abi sets publish = ["crates-io"], others leave it unset).
       - name: Verify the crates.io packages
         env:
           CRATE_ORDER: ${{ needs.plan.outputs.crate-order }}
@@ -124,7 +126,10 @@ jobs:
           for name in "${crates[@]}"; do
             args+=(-p "$name")
           done
-          cargo publish --dry-run --locked "${args[@]}"
+          cargo publish --dry-run --locked --registry crates-io "${args[@]}"
+          # The dry run verifies but does not keep the .crate archives; write
+          # them, unverified this time, for the upload below.
+          cargo package --locked --no-verify --registry crates-io "${args[@]}"
 
       - name: Upload the packaged crates
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
