@@ -2048,6 +2048,7 @@ dependencies = [
 name = "kapsl-kernels"
 version = "0.3.0"
 dependencies = [
+ "cc",
  "cudarc",
  "half",
  "kapsl-hal",

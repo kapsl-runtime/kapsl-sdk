@@ -1,3 +1,7 @@
 [submodule "third_party/llama.cpp-kapsl"]
 	path = third_party/llama.cpp-kapsl
 	url = https://github.com/kapsl-runtime/llama.cpp
+[submodule "third_party/cutlass"]
+	path = third_party/cutlass
+	url = https://github.com/NVIDIA/cutlass
+	shallow = true
