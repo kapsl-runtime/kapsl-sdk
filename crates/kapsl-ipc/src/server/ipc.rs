@@ -11,7 +11,7 @@ use kapsl_engine_api::TensorDtype;
 use kapsl_engine_api::{
     BinaryTensorPacket, CancellationToken, InferenceRequest, OpenAiWireFormat, OpenAiWireRequest,
 };
-use kapsl_scheduler::{Priority, ReplicaScheduler};
+use kapsl_engine_api::{Priority, ReplicaScheduler};
 use kapsl_transport::protocol::{
     asynchronous as wire, decode_inference_request, CodecError, DEFAULT_MAX_FRAME_PAYLOAD_BYTES,
     MAX_OPENAI_WIRE_REQUEST_PAYLOAD_BYTES,

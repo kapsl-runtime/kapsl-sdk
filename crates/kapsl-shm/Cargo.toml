@@ -9,8 +9,7 @@ description = "Shared memory transport for high-throughput inter-process tensor 
 
 [dependencies]
 kapsl-transport = { version = "0.4.0", path = "../kapsl-transport" }
-kapsl-engine-api = { version = "0.3.0", path = "../kapsl-engine-api" }
-kapsl-scheduler = { version = "0.3.0", path = "../kapsl-scheduler" }
+kapsl-engine-api = { version = "0.3.1", path = "../kapsl-engine-api" }
 shared_memory = "0.12"
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
