@@ -1426,7 +1426,6 @@ dependencies = [
  "num-traits",
  "rand 0.9.4",
  "rand_distr",
- "serde",
  "zerocopy",
 ]
 
@@ -2099,6 +2098,7 @@ dependencies = [
 name = "kapsl-llm"
 version = "0.3.8"
 dependencies = [
+ "anyhow",
  "async-stream",
  "async-trait",
  "cudarc",
@@ -2112,7 +2112,6 @@ dependencies = [
  "kapsl-llama-cpp-2",
  "kapsl-llama-cpp-sys-2",
  "kapsl-loader",
- "kapsl-quantization",
  "log",
  "ndarray",
  "ort",
@@ -2123,6 +2122,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokenizers",
  "tokio",
+ "turboquant-rs",
  "uuid",
 ]
 
@@ -2134,7 +2134,7 @@ dependencies = [
  "kapsl-hal",
  "log",
  "memmap2",
- "safetensors 0.4.5",
+ "safetensors",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -2168,17 +2168,6 @@ dependencies = [
  "kapsl-engine-api 0.3.1",
  "pyo3",
  "tokio",
-]
-
-[[package]]
-name = "kapsl-quantization"
-version = "0.3.0"
-dependencies = [
- "anyhow",
- "half",
- "safetensors 0.3.3",
- "serde",
- "turboquant-rs",
 ]
 
 [[package]]
@@ -3588,16 +3577,6 @@ name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
-
-[[package]]
-name = "safetensors"
-version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d93279b86b3de76f820a8854dd06cbc33cfa57a417b19c47f6a25280112fb1df"
-dependencies = [
- "serde",
- "serde_json",
-]
 
 [[package]]
 name = "safetensors"

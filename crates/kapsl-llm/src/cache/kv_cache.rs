@@ -1,8 +1,8 @@
 //! Dense and paged host KV-cache implementations.
 
 use crate::radix_tree::RadixTree;
+use crate::turboquant::{KvCacheConfig as TqConfig, KvCacheQuantizer};
 use half::f16;
-use kapsl_quantization::kv_cache::{KvCacheConfig as TqConfig, KvCacheQuantizer};
 use ndarray::Array4;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;

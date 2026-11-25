@@ -83,8 +83,6 @@ checks = [
 
 [crate.kapsl-monitor]
 
-[crate.kapsl-quantization]
-
 [crate.kapsl-rag]
 
 [crate.kapsl-rag-sdk]

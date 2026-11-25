@@ -45,5 +45,7 @@ pub mod rag;
 pub mod scheduler;
 #[path = "scheduling/sequence.rs"]
 pub mod sequence;
+#[path = "cache/turboquant.rs"]
+pub mod turboquant;
 
 pub use gguf_backend::GgufBackend;
