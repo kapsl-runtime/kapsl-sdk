@@ -26,6 +26,8 @@ mod control;
 mod error;
 #[path = "contract/leases.rs"]
 mod leases;
+#[path = "contract/participant_config.rs"]
+mod participant_config;
 #[path = "contract/registration.rs"]
 mod registration;
 #[path = "contract/resize.rs"]
@@ -42,6 +44,7 @@ pub use capacity::*;
 pub use control::*;
 pub use error::*;
 pub use leases::*;
+pub use participant_config::*;
 pub use registration::*;
 pub use resize::*;
 pub use shared_pool::*;

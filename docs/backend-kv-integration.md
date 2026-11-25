@@ -117,6 +117,35 @@ geometries, so hybrid attention/SSM backends do not inherit llama.cpp's uniform
 K/V limitation. Serialized handles never contain an unchecked raw pointer;
 in-process adapters map a validated pool ID and block index to local storage.
 
+## Participant configuration
+
+A runtime that launches a backend chooses the participant's identity before
+the process exists. `KvParticipantConfig` in `kapsl-kv-abi` is that handoff: one
+JSON object whose field names are shared by every adapter.
+
+| Field | Required | Meaning |
+|---|---|---|
+| `kapsl_control_endpoint` | yes | the runtime's control endpoint, for example `unix:///run/kapsl/kv-control.sock` |
+| `kapsl_participant_id` | yes | base identity; the participant registers as this value or `<base>:<suffix>` |
+| `kapsl_model_fingerprint` | yes | model identity repeated in the registration |
+| `kapsl_kv_mode` | yes | `opaque` or `shared_pool` |
+| `kapsl_memory_domains` | yes | the pool's physical domains, in the runtime's device namespace |
+| `kapsl_lease_ttl_ms` | yes | lease TTL to request; never above the runtime maximum |
+| `kapsl_rank_device_map` | no | runtime device ID of each parallel rank, keyed by decimal rank |
+| `kapsl_timeout_ms` | no | control round-trip timeout; the adapter's default applies if absent |
+| `kapsl_live_resize`, `kapsl_vmm_conformance` | no | shared-pool options, default `false` |
+| `kapsl_provisioning_grant` | no | pre-start reservation proof for a runtime-owned pool |
+
+The document reaches the adapter through whatever configuration channel the
+backend has. vLLM carries it as `kv_connector_extra_config`. A backend with no
+such channel reads it from the `KAPSL_KV_PARTICIPANT_CONFIG` environment
+variable (`KV_PARTICIPANT_CONFIG_ENV`). An adapter ignores fields it does not
+know and refuses a mode it does not implement.
+
+`tests/fixtures/participant_config_opaque.json` and
+`participant_config_shared_pool.json` in the crate are the reference documents.
+Adapters in other languages check their parsers against verbatim copies.
+
 ## Backend paths
 
 ### llama.cpp

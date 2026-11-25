@@ -5,6 +5,11 @@ leases, ownership, shared mappings, completion, resize and detach. The existing
 transport-neutral JSON contract and its version negotiation remain unchanged.
 It does not define backend launching or general inference.
 
+`KvParticipantConfig` is the one piece of pre-registration state the contract
+does define: the control endpoint, identity, memory domains and lease TTL a
+managing runtime assigns to a participant. How a runtime starts the backend
+stays outside this crate.
+
 ## Native shared KV v1
 
 `native::KapslNativeKvHostV1` and `include/kapsl_kv_native_v1.h` publish a C
