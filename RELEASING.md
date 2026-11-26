@@ -49,9 +49,11 @@ files it ships changed since its last release:
 - *Files it ships* are a crate's directory. For a Python package they are its
   `watch` paths; for `kapsl-sdk` they also include every workspace crate
   compiled into the wheel.
-- Crates published before this workflow existed may have no release tag.
-  Until their first release through the workflow, they are judged on version
-  alone.
+- A crate with no release tag is judged on version alone. Crates published
+  before this workflow existed were given baseline tags on 2026-11-26, each
+  at the commit that crates.io's `.cargo_vcs_info.json` records for the
+  published version. To add one for another crate, tag that commit
+  `<name>-v<version>` after checking that the packaged files match it.
 - A workspace-wide version bump does not, on its own, release the crates that
   did not change.
 
@@ -127,6 +129,10 @@ The top of `release-packages.toml` documents every setting.
   time; versions that already reached crates.io are skipped, and PyPI uploads
   skip files that already exist. The tag job tags whatever reached its
   registry, even after a partial failure.
+- **Only the tag job failed.** The packages are already published. The job
+  retries GitHub API errors for about four minutes; if GitHub is down for
+  longer, re-run the job once it recovers. Until the tag exists, the next run
+  compares the package with its previous tag and asks for a version bump.
 
 ## What changed from the previous process
 
