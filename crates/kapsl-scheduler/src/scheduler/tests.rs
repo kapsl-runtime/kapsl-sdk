@@ -630,6 +630,23 @@ async fn schedulers_sharing_a_cpu_pool_share_its_capacity() {
 }
 
 #[tokio::test]
+async fn a_finished_cpu_request_frees_its_thread_before_answering() {
+    // One thread, and `try_infer` never waits for it: each request is
+    // admitted only if the previous one gave its thread back before its
+    // caller saw the answer.
+    let engine: EngineHandle = Arc::new(MockEngine::new(EngineMetrics::default()));
+    let scheduler = build_scheduler_for_queue_tests(vec![engine], 1, 0);
+    for round in 0..2000 {
+        scheduler
+            .try_infer(make_inference_request(None), Priority::Throughput, true)
+            .await
+            .unwrap_or_else(|error| panic!("round {round}: {error}"));
+        assert_eq!(scheduler.cpu_pool.active(), 0, "round {round}");
+        assert_eq!(scheduler.get_queue_depth().0, 0, "round {round}");
+    }
+}
+
+#[tokio::test]
 async fn shared_cpu_pool_keeps_per_scheduler_queue_depth() {
     let pool = CpuPool::new(1).unwrap();
     let engine: EngineHandle = Arc::new(MockEngine::new(EngineMetrics::default()));

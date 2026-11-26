@@ -270,8 +270,7 @@ impl Scheduler {
         let engine_idx = self.get_worker_index(&None) % self.engines.len();
         let engine = self.engines[engine_idx].clone();
 
-        self.cpu_pool.spawn(slot, move || {
-            let _depth = depth;
+        self.cpu_pool.spawn(slot, move |slot| {
             let result = if request
                 .input
                 .cancellation
@@ -282,6 +281,12 @@ impl Scheduler {
             } else {
                 engine.infer(&request.input)
             };
+            // Give back the thread and the queue depth before answering. A
+            // caller that sends its next request as soon as this one returns
+            // would otherwise be refused, under a drop policy, for the slot
+            // this request was about to release.
+            drop(slot);
+            drop(depth);
             let _ = request.response_tx.send(result);
         });
         Ok(())
