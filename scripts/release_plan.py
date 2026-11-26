@@ -615,7 +615,15 @@ def command_publish_crates(args) -> int:
 
 
 class GitHub:
-    def __init__(self, repository: str, token: str, api: str = "https://api.github.com"):
+    def __init__(
+        self,
+        repository: str,
+        token: str,
+        api: str = "https://api.github.com",
+        attempts: int = 8,
+        sleep=time.sleep,
+        urlopen=urllib.request.urlopen,
+    ):
         self.base = f"{api}/repos/{repository}"
         self.headers = {
             "Authorization": f"Bearer {token}",
@@ -623,12 +631,34 @@ class GitHub:
             "X-GitHub-Api-Version": "2022-11-28",
             "User-Agent": USER_AGENT,
         }
+        self.attempts = attempts
+        self.sleep = sleep
+        self.urlopen = urlopen
 
     def request(self, method: str, path: str, body: dict | None = None):
+        """Send an API request, retrying rate limits, server errors and network failures.
+
+        The tags are made after the packages are already on their registries,
+        so a brief GitHub outage should delay the tag, not fail the release.
+        The waits add up to about four minutes.
+        """
         data = json.dumps(body).encode() if body is not None else None
-        request = urllib.request.Request(self.base + path, data=data, method=method, headers=self.headers)
-        with urllib.request.urlopen(request, timeout=30) as response:
-            return json.loads(response.read().decode("utf-8"))
+        for attempt in range(1, self.attempts + 1):
+            request = urllib.request.Request(self.base + path, data=data, method=method, headers=self.headers)
+            try:
+                with self.urlopen(request, timeout=30) as response:
+                    return json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError as error:
+                if attempt == self.attempts or not (error.code == 429 or error.code >= 500):
+                    raise
+                error.close()
+                print(f"GitHub answered {error.code} to {method} {path}; retrying")
+            except (urllib.error.URLError, TimeoutError) as error:
+                if attempt == self.attempts:
+                    raise
+                print(f"{method} {path} failed ({error}); retrying")
+            self.sleep(min(5 * 2 ** (attempt - 1), 60))
+        raise AssertionError("unreachable")
 
     def tag_commit(self, ref: str) -> str | None:
         """The commit a tag points at, or None if the tag does not exist."""
@@ -636,6 +666,7 @@ class GitHub:
             target = self.request("GET", f"/git/ref/tags/{ref}")["object"]
         except urllib.error.HTTPError as error:
             if error.code == 404:
+                error.close()
                 return None
             raise
         while target["type"] == "tag":
@@ -645,7 +676,14 @@ class GitHub:
     def create_tag(self, tag: str, sha: str, message: str) -> None:
         """Create an annotated tag, like the existing release tags."""
         tag_object = self.request("POST", "/git/tags", {"tag": tag, "message": message, "object": sha, "type": "commit"})
-        self.request("POST", "/git/refs", {"ref": f"refs/tags/{tag}", "sha": tag_object["sha"]})
+        try:
+            self.request("POST", "/git/refs", {"ref": f"refs/tags/{tag}", "sha": tag_object["sha"]})
+        except urllib.error.HTTPError as error:
+            # An attempt that got a 5xx back may still have created the ref,
+            # and then the retry is refused because the ref exists.
+            if error.code != 422 or self.tag_commit(tag) != sha:
+                raise
+            error.close()
 
 
 def tag_releases(releases, sha, results, github, lookup=registry_versions, sleep=time.sleep) -> list[str]:

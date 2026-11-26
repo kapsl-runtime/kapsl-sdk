@@ -125,7 +125,15 @@ jobs:
           inputs: .github
 
       - name: Scan repository history for secrets
-        run: go run github.com/zricethezav/gitleaks/v8@v8.30.1 git --no-banner --redact
+        # Scan the history being checked (for a pull request, main plus its
+        # commits), not every branch the full-depth checkout fetched: by
+        # default gitleaks scans `--all`, so a test value on any other branch
+        # failed every pull request. These are gitleaks' default options with
+        # HEAD in place of --all. --verbose names the file, line and rule of a
+        # finding; --redact still hides the matched value.
+        run: >-
+          go run github.com/zricethezav/gitleaks/v8@v8.30.1 git --no-banner --redact --verbose
+          --log-opts="--full-history --diff-filter=tuxdb HEAD"
 
   cargo-check:
     name: Cargo check (${{ matrix.os }})
