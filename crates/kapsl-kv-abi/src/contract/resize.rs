@@ -1,6 +1,7 @@
 //! Shared-pool release completion and live-resize coordination.
 
 use super::*;
+use crate::shared_pool::{check_segment_coverage, checked_stripe_count, SegmentCoverageError};
 use crate::topology::validate_shard;
 
 /// Proof that a backend has stopped accessing a shared-pool lease before its
@@ -74,13 +75,24 @@ pub struct KvPoolResizeOperation {
     pub stage: KvPoolResizeStage,
     pub from_block_count: u64,
     pub target_block_count: u64,
+    /// Bytes of one block, summed over all stripes of a striped binding.
     pub bytes_per_block: u64,
     pub allocation_granularity_bytes: u64,
+    /// The binding's stripe count, absent for a single range. A striped
+    /// resize changes every stripe by the same tail, and worker phases carry
+    /// segments covering that tail in each stripe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stripe_count: Option<u32>,
     #[serde(default)]
     pub segments: Vec<KvVmmSegmentDescriptor>,
 }
 
 impl KvPoolResizeOperation {
+    /// Number of virtual ranges the resized binding backs: 1 unless striped.
+    pub fn stripe_count(&self) -> u32 {
+        self.stripe_count.unwrap_or(1)
+    }
+
     pub fn validate(&self) -> Result<(), KvContractError> {
         if self.participant_epoch == 0
             || self.resize_generation == 0
@@ -108,16 +120,20 @@ impl KvPoolResizeOperation {
                 "resize stage ordering does not match its growth or shrink direction",
             ));
         }
-        let from_bytes = self
-            .from_block_count
-            .checked_mul(self.bytes_per_block)
-            .ok_or_else(|| KvContractError::invalid_request("resize byte size overflow"))?;
-        let target_bytes = self
-            .target_block_count
-            .checked_mul(self.bytes_per_block)
-            .ok_or_else(|| KvContractError::invalid_request("resize byte size overflow"))?;
-        if from_bytes % self.allocation_granularity_bytes != 0
-            || target_bytes % self.allocation_granularity_bytes != 0
+        let stripes = checked_stripe_count(self.stripe_count, self.bytes_per_block)
+            .map_err(KvContractError::invalid_request)?;
+        // As for the binding: whole-binding sizes must not overflow, while
+        // alignment and segment offsets are per stripe.
+        let stripe_bytes = |block_count: u64| {
+            block_count
+                .checked_mul(self.bytes_per_block)
+                .map(|bytes| bytes / u64::from(stripes))
+                .ok_or_else(|| KvContractError::invalid_request("resize byte size overflow"))
+        };
+        let from_bytes = stripe_bytes(self.from_block_count)?;
+        let target_bytes = stripe_bytes(self.target_block_count)?;
+        if !from_bytes.is_multiple_of(self.allocation_granularity_bytes)
+            || !target_bytes.is_multiple_of(self.allocation_granularity_bytes)
         {
             return Err(KvContractError::invalid_request(
                 "resize endpoints must align to CUDA VMM allocation granularity",
@@ -132,33 +148,31 @@ impl KvPoolResizeOperation {
                 "worker resize phases require segment ranges and scheduler phases must not carry them",
             ));
         }
-        let expected_start = from_bytes.min(target_bytes);
-        let expected_end = from_bytes.max(target_bytes);
-        let mut ordered = self.segments.iter().collect::<Vec<_>>();
-        ordered.sort_by_key(|segment| segment.offset_bytes);
-        let mut expected_offset = expected_start;
-        let mut segment_ids = BTreeSet::new();
-        let mut handle_indices = BTreeSet::new();
-        for segment in ordered {
-            segment.validate(self.allocation_granularity_bytes)?;
-            if segment.offset_bytes != expected_offset
-                || !segment_ids.insert(segment.segment_id.as_str())
-                || !handle_indices.insert(segment.handle_index)
-            {
-                return Err(KvContractError::invalid_request(
-                    "resize segments must uniquely and densely cover the changed physical tail",
-                ));
+        if !physical_stage {
+            return Ok(());
+        }
+        check_segment_coverage(
+            &self.segments,
+            stripes,
+            self.allocation_granularity_bytes,
+            from_bytes.min(target_bytes),
+            from_bytes.max(target_bytes),
+        )
+        .map_err(|error| match error {
+            SegmentCoverageError::Segment(error) => error,
+            SegmentCoverageError::UnknownStripe => KvContractError::invalid_request(
+                "resize segments must name a stripe of their binding",
+            ),
+            SegmentCoverageError::NotDense => KvContractError::invalid_request(
+                "resize segments must uniquely and densely cover the changed physical tail",
+            ),
+            SegmentCoverageError::Overflow => {
+                KvContractError::invalid_request("resize segment overflow")
             }
-            expected_offset = expected_offset
-                .checked_add(segment.length_bytes)
-                .ok_or_else(|| KvContractError::invalid_request("resize segment overflow"))?;
-        }
-        if physical_stage && expected_offset != expected_end {
-            return Err(KvContractError::invalid_request(
-                "resize segments must exactly cover the changed physical tail",
-            ));
-        }
-        Ok(())
+            SegmentCoverageError::Incomplete => KvContractError::invalid_request(
+                "resize segments must exactly cover the changed physical tail in every stripe",
+            ),
+        })
     }
 }
 

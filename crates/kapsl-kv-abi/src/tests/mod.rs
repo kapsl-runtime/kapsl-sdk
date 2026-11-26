@@ -1,5 +1,7 @@
 use super::*;
 
+mod striped;
+
 fn cuda_domains() -> Vec<KvMemoryDomain> {
     vec![KvMemoryDomain::Cuda { device_id: 0 }]
 }
@@ -421,6 +423,8 @@ fn cuda_vmm_receipt_separates_virtual_and_mapped_capacity() {
     .expect("shared registration fixture");
     registration.capabilities = KvBackendCapabilities::cuda_vmm_shared_pool()
         .with_feature(KvFeature::ParticipantBlockSelection);
+    // The fixture is a 1.5 connector document; keep its capabilities at 1.5.
+    registration.capabilities.abi_version = KvAbiVersion::new(1, 5);
     registration.capacity_model.groups[0].max_allocations = Some(64);
     registration.capacity_model.groups[0].bytes_per_allocation = 4096;
 
@@ -444,8 +448,10 @@ fn cuda_vmm_receipt_separates_virtual_and_mapped_capacity() {
                 maximum_block_count: 64,
                 allocation_granularity_bytes: 65_536,
                 resize_alignment_blocks: 16,
+                stripe_count: None,
                 segments: vec![KvVmmSegmentDescriptor {
                     segment_id: "initial-0".to_string(),
+                    stripe: 0,
                     offset_bytes: 0,
                     length_bytes: 131_072,
                     handle_index: 0,
@@ -501,8 +507,10 @@ fn resize_operation_enforces_worker_then_scheduler_ordering() {
         target_block_count: 48,
         bytes_per_block: 4096,
         allocation_granularity_bytes: 65_536,
+        stripe_count: None,
         segments: vec![KvVmmSegmentDescriptor {
             segment_id: "grow-7-0".to_string(),
+            stripe: 0,
             offset_bytes: 131_072,
             length_bytes: 65_536,
             handle_index: 0,
@@ -564,6 +572,7 @@ fn attachment_evidence_is_bounded_and_pointer_free_on_the_wire() {
                 index: 0,
                 name: Some("model.layers.0.attn".to_string()),
             },
+            stripe: 0,
             offset_bytes: 128,
             length_bytes: 1024,
         }],
@@ -600,6 +609,7 @@ fn attachment_view_cannot_extend_past_the_imported_binding() {
         views: vec![KvAttachmentView {
             group_id: "group-0".to_string(),
             layer: KvLayerId::indexed(0),
+            stripe: 0,
             offset_bytes: 32,
             length_bytes: 64,
         }],
@@ -638,7 +648,11 @@ fn opaque_registration_matches_out_of_tree_connector_fixture() {
         participant_id: "vllm-0".to_string(),
         backend: "vllm".to_string(),
         model_fingerprint: "sha256:model".to_string(),
-        capabilities: KvBackendCapabilities::opaque_connected(),
+        // The out-of-tree connector fixture speaks ABI 1.5.
+        capabilities: KvBackendCapabilities {
+            abi_version: KvAbiVersion::new(1, 5),
+            ..KvBackendCapabilities::opaque_connected()
+        },
         capacity_model: KvCapacityModel {
             groups: vec![KvCapacityGroup {
                 group_id: "vllm.group.0".to_string(),

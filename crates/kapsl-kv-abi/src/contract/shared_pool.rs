@@ -23,15 +23,116 @@ pub enum KvSharedPoolAllocationMode {
     ParticipantManaged,
 }
 
+/// Most stripes one elastic binding may declare.
+///
+/// Registration and every growth step map at least one new segment per
+/// stripe, and each segment's handle travels in the same `SCM_RIGHTS` message
+/// as the JSON response. Linux refuses more than 253 descriptors in one
+/// message (`SCM_MAX_FD`), so a binding with more stripes could not grow in
+/// one step. 253 still covers the per-layer K and V buffers of a 126-layer
+/// model (252 stripes), the deepest dense model in common use.
+pub const KV_MAX_POOL_STRIPES: u32 = 253;
+
 /// One runtime-owned CUDA VMM allocation mapped into a stable participant
 /// virtual-address range. `handle_index` identifies the POSIX file descriptor
 /// transferred alongside the JSON response with `SCM_RIGHTS`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KvVmmSegmentDescriptor {
     pub segment_id: String,
+    /// Stripe this segment backs; `offset_bytes` is relative to the start of
+    /// that stripe. Always 0 in a binding without stripes. Omitted from the
+    /// wire when 0.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub stripe: u32,
     pub offset_bytes: u64,
     pub length_bytes: u64,
     pub handle_index: u32,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
+}
+
+/// Effective stripe count of a binding or resize step: 1 for `None`. A
+/// present count lies in `2..=KV_MAX_POOL_STRIPES`, so a single range has one
+/// representation (the field is omitted), and it divides `bytes_per_block`.
+pub(crate) fn checked_stripe_count(
+    stripe_count: Option<u32>,
+    bytes_per_block: u64,
+) -> Result<u32, &'static str> {
+    let Some(stripes) = stripe_count else {
+        return Ok(1);
+    };
+    if !(2..=KV_MAX_POOL_STRIPES).contains(&stripes) {
+        return Err(
+            "stripe_count must lie between 2 and KV_MAX_POOL_STRIPES; omit it for a single range",
+        );
+    }
+    if !bytes_per_block.is_multiple_of(u64::from(stripes)) {
+        return Err("bytes_per_block must divide evenly across stripes");
+    }
+    Ok(stripes)
+}
+
+/// Why a set of CUDA VMM segments does not cover its byte range.
+pub(crate) enum SegmentCoverageError {
+    /// A segment failed [`KvVmmSegmentDescriptor::validate`].
+    Segment(KvContractError),
+    /// A segment names a stripe the binding does not have.
+    UnknownStripe,
+    /// A duplicate segment ID or handle index, a gap, or an overlap.
+    NotDense,
+    Overflow,
+    /// A stripe has no segments, or its segments end short of or past the
+    /// range.
+    Incomplete,
+}
+
+/// Check that `segments` cover `[start, end)` of every one of `stripes`
+/// stripes exactly, so that no segment crosses a stripe boundary, with
+/// segment IDs and handle indices unique across all stripes.
+pub(crate) fn check_segment_coverage(
+    segments: &[KvVmmSegmentDescriptor],
+    stripes: u32,
+    allocation_granularity_bytes: u64,
+    start: u64,
+    end: u64,
+) -> Result<(), SegmentCoverageError> {
+    let mut ordered = segments.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|segment| (segment.stripe, segment.offset_bytes));
+    let mut segment_ids = BTreeSet::new();
+    let mut handle_indices = BTreeSet::new();
+    let mut stripe = 0u32;
+    let mut expected_offset = start;
+    for segment in ordered {
+        segment
+            .validate(allocation_granularity_bytes)
+            .map_err(SegmentCoverageError::Segment)?;
+        if segment.stripe >= stripes {
+            return Err(SegmentCoverageError::UnknownStripe);
+        }
+        if segment.stripe != stripe {
+            // The previous stripe must be complete and no stripe skipped.
+            if expected_offset != end || segment.stripe != stripe + 1 {
+                return Err(SegmentCoverageError::Incomplete);
+            }
+            stripe = segment.stripe;
+            expected_offset = start;
+        }
+        if !segment_ids.insert(segment.segment_id.as_str())
+            || !handle_indices.insert(segment.handle_index)
+            || segment.offset_bytes != expected_offset
+        {
+            return Err(SegmentCoverageError::NotDense);
+        }
+        expected_offset = expected_offset
+            .checked_add(segment.length_bytes)
+            .ok_or(SegmentCoverageError::Overflow)?;
+    }
+    if stripe + 1 != stripes || expected_offset != end {
+        return Err(SegmentCoverageError::Incomplete);
+    }
+    Ok(())
 }
 
 impl KvVmmSegmentDescriptor {
@@ -67,10 +168,22 @@ pub struct KvElasticPoolDescriptor {
     pub maximum_block_count: u64,
     pub allocation_granularity_bytes: u64,
     pub resize_alignment_blocks: u64,
+    /// Number of contiguous virtual ranges (stripes) the binding backs in the
+    /// participant, from 2 to [`KV_MAX_POOL_STRIPES`]. Absent means one range.
+    /// Every stripe holds `bytes_per_block / stripe_count` bytes of each block,
+    /// block `j` sits at the same offset in every stripe, and the block counts
+    /// above apply to every stripe alike.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stripe_count: Option<u32>,
     pub segments: Vec<KvVmmSegmentDescriptor>,
 }
 
 impl KvElasticPoolDescriptor {
+    /// Number of virtual ranges the binding backs: 1 unless striped.
+    pub fn stripe_count(&self) -> u32 {
+        self.stripe_count.unwrap_or(1)
+    }
+
     fn validate(
         &self,
         virtual_block_count: u64,
@@ -95,60 +208,53 @@ impl KvElasticPoolDescriptor {
                 "elastic pool geometry requires an aligned minimum and mapped capacity within the maximum virtual capacity",
             ));
         }
-        let minimum_bytes = self
-            .minimum_block_count
-            .checked_mul(bytes_per_block)
-            .ok_or_else(|| {
-                KvContractError::invalid_capabilities("elastic pool byte size overflow")
-            })?;
-        let mapped_bytes = self
-            .mapped_block_count
-            .checked_mul(bytes_per_block)
-            .ok_or_else(|| {
-                KvContractError::invalid_capabilities("elastic pool byte size overflow")
-            })?;
-        let maximum_bytes = self
-            .maximum_block_count
-            .checked_mul(bytes_per_block)
-            .ok_or_else(|| {
-                KvContractError::invalid_capabilities("elastic pool byte size overflow")
-            })?;
+        let stripes = checked_stripe_count(self.stripe_count, bytes_per_block)
+            .map_err(KvContractError::invalid_capabilities)?;
+        // Whole-binding sizes are checked for overflow so consumers may
+        // multiply block counts by `bytes_per_block`; alignment applies to
+        // each stripe, which divides them exactly.
+        let stripe_bytes = |block_count: u64| {
+            block_count
+                .checked_mul(bytes_per_block)
+                .map(|bytes| bytes / u64::from(stripes))
+                .ok_or_else(|| {
+                    KvContractError::invalid_capabilities("elastic pool byte size overflow")
+                })
+        };
+        let minimum_bytes = stripe_bytes(self.minimum_block_count)?;
+        let mapped_bytes = stripe_bytes(self.mapped_block_count)?;
+        let maximum_bytes = stripe_bytes(self.maximum_block_count)?;
         if !minimum_bytes.is_multiple_of(self.allocation_granularity_bytes)
             || !mapped_bytes.is_multiple_of(self.allocation_granularity_bytes)
             || !maximum_bytes.is_multiple_of(self.allocation_granularity_bytes)
         {
             return Err(KvContractError::invalid_capabilities(
-                "elastic pool mapped and maximum sizes must align to CUDA VMM granularity",
+                "elastic pool minimum, mapped and maximum sizes (per stripe) must align to CUDA VMM granularity",
             ));
         }
 
-        let mut segment_ids = BTreeSet::new();
-        let mut handle_indices = BTreeSet::new();
-        let mut ordered = self.segments.iter().collect::<Vec<_>>();
-        ordered.sort_by_key(|segment| segment.offset_bytes);
-        let mut expected_offset = 0u64;
-        for segment in ordered {
-            segment.validate(self.allocation_granularity_bytes)?;
-            if !segment_ids.insert(segment.segment_id.as_str())
-                || !handle_indices.insert(segment.handle_index)
-                || segment.offset_bytes != expected_offset
-            {
-                return Err(KvContractError::invalid_capabilities(
-                    "elastic pool segments must have unique IDs/handles and densely cover the mapped prefix",
-                ));
+        check_segment_coverage(
+            &self.segments,
+            stripes,
+            self.allocation_granularity_bytes,
+            0,
+            mapped_bytes,
+        )
+        .map_err(|error| match error {
+            SegmentCoverageError::Segment(error) => error,
+            SegmentCoverageError::UnknownStripe => KvContractError::invalid_capabilities(
+                "elastic pool segments must name a stripe of their binding",
+            ),
+            SegmentCoverageError::NotDense => KvContractError::invalid_capabilities(
+                "elastic pool segments must have unique IDs/handles and densely cover the mapped prefix",
+            ),
+            SegmentCoverageError::Overflow => {
+                KvContractError::invalid_capabilities("elastic segment range overflow")
             }
-            expected_offset = expected_offset
-                .checked_add(segment.length_bytes)
-                .ok_or_else(|| {
-                    KvContractError::invalid_capabilities("elastic segment range overflow")
-                })?;
-        }
-        if expected_offset != mapped_bytes {
-            return Err(KvContractError::invalid_capabilities(
-                "elastic pool segments must exactly cover mapped physical bytes",
-            ));
-        }
-        Ok(())
+            SegmentCoverageError::Incomplete => KvContractError::invalid_capabilities(
+                "elastic pool segments must exactly cover mapped physical bytes in every stripe",
+            ),
+        })
     }
 }
 
@@ -160,6 +266,7 @@ pub struct KvSharedPoolDescriptor {
     pub group_ids: Vec<String>,
     pub memory_domain: KvMemoryDomain,
     pub block_count: u64,
+    /// Bytes of one block, summed over all stripes of a striped binding.
     pub bytes_per_block: u64,
     #[serde(default)]
     pub allocation_mode: KvSharedPoolAllocationMode,
@@ -238,6 +345,11 @@ impl KvAdapterProfile {
 pub struct KvAttachmentView {
     pub group_id: String,
     pub layer: KvLayerId,
+    /// Stripe of a striped binding holding this view; `offset_bytes` is
+    /// relative to the start of that stripe. Always 0 for a binding without
+    /// stripes. Omitted from the wire when 0.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub stripe: u32,
     pub offset_bytes: u64,
     pub length_bytes: u64,
 }
@@ -269,12 +381,16 @@ pub struct KvSharedPoolAttachment {
     pub binding_id: String,
     pub shard: KvShard,
     pub profile: KvAdapterProfile,
-    /// Stable virtual span backing all tensor views.
+    /// Stable virtual span backing all tensor views, summed over all stripes
+    /// of a striped binding.
     pub imported_bytes: u64,
-    /// Physical prefix currently mapped into the virtual span. Absent for
-    /// fixed CUDA IPC pools and required for CUDA VMM pools.
+    /// Physical prefix currently mapped into the virtual span, summed over
+    /// all stripes. Absent for fixed CUDA IPC pools and required for CUDA VMM
+    /// pools.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mapped_bytes: Option<u64>,
+    /// A view per group, layer and stripe. The coordinator checks stripe
+    /// indices and per-stripe bounds against the binding.
     pub views: Vec<KvAttachmentView>,
 }
 
@@ -302,9 +418,9 @@ impl KvSharedPoolAttachment {
                     "attachment tensor view exceeds the imported binding",
                 ));
             }
-            if !layers.insert((view.group_id.as_str(), view.layer.index)) {
+            if !layers.insert((view.group_id.as_str(), view.layer.index, view.stripe)) {
                 return Err(KvContractError::invalid_request(
-                    "attachment tensor views must identify unique group/layer pairs",
+                    "attachment tensor views must identify unique group/layer/stripe triples",
                 ));
             }
         }
@@ -455,6 +571,10 @@ impl KvRegistrationReceipt {
             .capabilities
             .features
             .contains(&KvFeature::LivePoolResize);
+        let striped = registration
+            .capabilities
+            .features
+            .contains(&KvFeature::StripedElasticPool);
         for binding in &self.shared_pools {
             binding.validate()?;
             if !binding_ids.insert(binding.binding_id.as_str()) {
@@ -485,6 +605,17 @@ impl KvRegistrationReceipt {
             {
                 return Err(KvContractError::invalid_capabilities(format!(
                     "shared-pool binding '{}' live-resize transport does not match participant capabilities",
+                    binding.binding_id
+                )));
+            }
+            if binding
+                .elastic
+                .as_ref()
+                .is_some_and(|elastic| elastic.stripe_count.is_some())
+                != striped
+            {
+                return Err(KvContractError::invalid_capabilities(format!(
+                    "shared-pool binding '{}' stripe layout does not match participant capabilities",
                     binding.binding_id
                 )));
             }
