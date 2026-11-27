@@ -335,7 +335,7 @@ dependencies = [
 name = "kapsl-llama-cpp-sys-2"
 version = "0.1.146-kapsl.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "765c5401676911eda782c7a3f9f9dec068f820f31c6f4c49b7442f126f395beb"
+checksum = "30d254c52efc2def11444bb4ef0725ea2a7fbcc02e6148d7fea1d67fe13aafe2"
 dependencies = [
  "bindgen",
  "cc",
