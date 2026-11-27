@@ -194,10 +194,18 @@ pub enum KvControlResponse {
 /// Validate and dispatch one transport-decoded control request. Transport
 /// servers should always serialize the returned envelope, including contract
 /// errors, so clients retain request correlation and machine-readable causes.
+///
+/// The response carries the version negotiated with the request (see
+/// [`KvAbiVersion::negotiate`]), so a participant built for an older minor
+/// keeps receiving its own version. A rejected version is answered with this
+/// host's version.
 pub fn dispatch_control_request(
     coordinator: &(impl KvCoordinator + ?Sized),
     envelope: KvControlRequestEnvelope,
 ) -> KvControlResponseEnvelope {
+    let response_version = KAPSL_KV_ABI_VERSION
+        .negotiate(envelope.abi_version)
+        .unwrap_or(KAPSL_KV_ABI_VERSION);
     let request_id = envelope.request_id;
     let response = if request_id.trim().is_empty() {
         Err(KvContractError::invalid_request(
@@ -284,7 +292,7 @@ pub fn dispatch_control_request(
     .unwrap_or_else(|error| KvControlResponse::Error { error });
 
     KvControlResponseEnvelope {
-        abi_version: KAPSL_KV_ABI_VERSION,
+        abi_version: response_version,
         request_id,
         response,
     }

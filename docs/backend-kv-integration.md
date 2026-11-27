@@ -117,6 +117,51 @@ geometries, so hybrid attention/SSM backends do not inherit llama.cpp's uniform
 K/V limitation. Serialized handles never contain an unchecked raw pointer;
 in-process adapters map a validated pool ID and block index to local storage.
 
+## Striped elastic pools (ABI 1.6)
+
+An elastic `cuda_vmm` binding normally backs one contiguous virtual range in
+the participant, and its segments cover that range's mapped prefix. A CUDA
+allocation maps only from offset zero and unmaps only whole, so one segment
+backs one contiguous piece of one buffer. A backend that keeps its cache in
+several buffers indexed by the same slot, such as SGLang with one K and one V
+tensor per layer, would have to rebuild them as views of one range. A striped
+binding backs each buffer instead:
+
+- `elastic.stripe_count` is the number of ranges (stripes), from 2 to
+  `KV_MAX_POOL_STRIPES` (253). A single range omits it; an explicit 1 is
+  refused, so each layout has one form.
+- Stripes share the block geometry. `bytes_per_block` is the total over all
+  stripes and must divide by the stripe count. Each stripe holds an equal part
+  of every block, and block `j` sits at the same offset in every stripe. The
+  minimum, mapped and maximum block counts apply to every stripe, and each
+  stripe's sizes must be multiples of the allocation granularity.
+- Each segment names its `stripe` (omitted for stripe 0) and its offset is
+  relative to that stripe. Every stripe's segments densely cover the same
+  mapped prefix, so no segment crosses into another stripe. Segment IDs and
+  handle indices are unique across the binding.
+- A resize operation carries the binding's `stripe_count` and changes every
+  stripe by the same tail: worker phases carry segments covering the changed
+  range in each stripe.
+- Attachment views name their stripe and are unique per group, layer and
+  stripe. `imported_bytes` and `mapped_bytes` remain totals over all stripes.
+- A participant opts in with the `striped_elastic_pool` feature, which needs
+  ABI 1.6 and `live_pool_resize`. It then receives only striped bindings, and
+  a participant without the feature never receives one.
+
+Use stripes when the backend's attention already reads separate buffers and
+changing how it allocates them would be invasive. Prefer one range when the
+backend can take strided views of a single allocation: each growth step then
+maps one segment instead of one per stripe. All handles of a response travel in
+one `SCM_RIGHTS` message, and Linux accepts at most 253 descriptors per message,
+which sets the stripe bound; a response covering several tensor-parallel
+bindings must stay within it as well. Segments already address a stripe and an
+offset, so mapping pages anywhere in a stripe later only relaxes the
+dense-prefix rule.
+
+A 1.6 host still accepts 1.5 participants and answers every request in the
+version the request carried (`KvAbiVersion::negotiate`), so a 1.5 participant
+that checks the response version is unaffected.
+
 ## Backend paths
 
 ### llama.cpp

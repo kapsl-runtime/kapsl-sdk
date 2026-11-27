@@ -5,6 +5,12 @@ leases, ownership, shared mappings, completion, resize and detach. The existing
 transport-neutral JSON contract and its version negotiation remain unchanged.
 It does not define backend launching or general inference.
 
+ABI 1.6 adds striped elastic pools: a CUDA VMM binding may back several
+identically shaped virtual ranges (for example one per layer K or V buffer)
+for participants that advertise `striped_elastic_pool`. Hosts answer each
+request in the version it carried, so 1.5 participants are unaffected. See
+`docs/backend-kv-integration.md` in the kapsl-sdk repository.
+
 ## Native shared KV v1
 
 `native::KapslNativeKvHostV1` and `include/kapsl_kv_native_v1.h` publish a C

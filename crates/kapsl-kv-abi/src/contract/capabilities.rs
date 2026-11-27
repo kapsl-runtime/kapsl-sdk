@@ -3,7 +3,11 @@
 use super::*;
 
 /// Version implemented by this crate.
-pub const KAPSL_KV_ABI_VERSION: KvAbiVersion = KvAbiVersion::new(1, 5);
+pub const KAPSL_KV_ABI_VERSION: KvAbiVersion = KvAbiVersion::new(1, 6);
+
+/// First version in which a participant may advertise
+/// [`KvFeature::StripedElasticPool`].
+pub const KV_STRIPED_POOL_ABI_VERSION: KvAbiVersion = KvAbiVersion::new(1, 6);
 
 /// Semantic version of the KV participant contract.
 ///
@@ -23,6 +27,20 @@ impl KvAbiVersion {
     /// Return whether `self`, as the host, can accept `participant`.
     pub const fn accepts(self, participant: Self) -> bool {
         self.major == participant.major && self.minor >= participant.minor
+    }
+
+    /// Version that `self`, as the host, speaks to `participant`: the
+    /// participant's own version when the host accepts it. Hosts stamp it on
+    /// responses, so a participant built for an older minor never receives a
+    /// version it would reject. The host sends such a participant nothing from
+    /// a newer minor, because each newer construct is gated by a feature the
+    /// older participant cannot advertise.
+    pub const fn negotiate(self, participant: Self) -> Option<Self> {
+        if self.accepts(participant) {
+            Some(participant)
+        } else {
+            None
+        }
     }
 }
 
@@ -92,6 +110,11 @@ pub enum KvFeature {
     /// A runtime-owned shared pool exposes a stable virtual address while its
     /// mapped physical tail can grow and shrink at cache-block boundaries.
     LivePoolResize,
+    /// Each elastic binding backs several identically shaped virtual ranges
+    /// (stripes) in the participant, for example one per layer K or V buffer,
+    /// instead of one range. Requires ABI 1.6 and [`Self::LivePoolResize`].
+    /// A participant that advertises it receives only striped bindings.
+    StripedElasticPool,
 }
 
 /// Data-plane mechanism used to identify or transfer KV blocks.
@@ -238,6 +261,15 @@ impl KvBackendCapabilities {
         {
             return Err(KvContractError::invalid_capabilities(
                 "live pool resize requires an externally attached runtime-owned CUDA VMM shared pool",
+            ));
+        }
+
+        if self.features.contains(&KvFeature::StripedElasticPool)
+            && (!self.abi_version.accepts(KV_STRIPED_POOL_ABI_VERSION)
+                || !self.features.contains(&KvFeature::LivePoolResize))
+        {
+            return Err(KvContractError::invalid_capabilities(
+                "striped elastic pools require KV ABI 1.6 or later and live pool resize",
             ));
         }
 
