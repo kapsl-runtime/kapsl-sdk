@@ -1,0 +1,30 @@
+{
+  "kapsl_control_endpoint": "unix:///run/kapsl/kv-control.sock",
+  "kapsl_participant_id": "kapsl-model-1-0",
+  "kapsl_model_fingerprint": "sha256:model",
+  "kapsl_kv_mode": "shared_pool",
+  "kapsl_memory_domains": [
+    {
+      "kind": "cuda",
+      "device_id": 2
+    },
+    {
+      "kind": "cuda",
+      "device_id": 3
+    }
+  ],
+  "kapsl_rank_device_map": {
+    "0": 2,
+    "1": 3
+  },
+  "kapsl_lease_ttl_ms": 30000,
+  "kapsl_timeout_ms": 2000,
+  "kapsl_live_resize": true,
+  "kapsl_vmm_conformance": false,
+  "kapsl_provisioning_grant": {
+    "token": "kvg1_test",
+    "geometry_digest": "sha256:0221ae33b2c0585d8b3d97c875bbd9e8ceb6a8b7df5f4accd4ff435b6708b697",
+    "authority_generation": 7,
+    "expires_at_unix_ms": 1900000000000
+  }
+}

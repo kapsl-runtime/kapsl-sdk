@@ -1,0 +1,15 @@
+{
+  "kapsl_control_endpoint": "unix:///run/kapsl/kv-control.sock",
+  "kapsl_participant_id": "kapsl-model-1-0",
+  "kapsl_model_fingerprint": "sha256:model",
+  "kapsl_kv_mode": "opaque",
+  "kapsl_memory_domains": [
+    {
+      "kind": "cuda",
+      "device_id": 0
+    }
+  ],
+  "kapsl_lease_ttl_ms": 30000,
+  "kapsl_live_resize": false,
+  "kapsl_vmm_conformance": false
+}
