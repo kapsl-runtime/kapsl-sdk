@@ -12,7 +12,7 @@ readme = "README.md"
 kapsl-core = { version = "0.3.0", path = "../kapsl-core" }
 kapsl-engine-api = { version = "0.3.0", path = "../kapsl-engine-api" }
 kapsl-kv-abi = { version = "0.6.0", path = "../kapsl-kv-abi" }
-kapsl-loader = { version = "0.3.0", path = "../kapsl-loader", optional = true }
+kapsl-loader = { version = "0.3.1", path = "../kapsl-loader", optional = true }
 tokio = { version = "1.32", features = ["full"] }
 uuid = { version = "1.4", features = ["v4"] }
 thiserror = "1.0"
