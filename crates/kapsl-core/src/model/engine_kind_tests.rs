@@ -239,16 +239,91 @@ fn validate_rejects_llm_tag_on_gguf_file() {
 }
 
 #[test]
-fn validate_rejects_non_causal_gguf() {
+fn gguf_resolves_pooled_tasks_by_task() {
+    let cases = [
+        ("embedding", "embed", EngineKind::GgufEmbed),
+        ("causal-lm", "embed", EngineKind::GgufEmbed),
+        ("seq-classifier", "rerank", EngineKind::GgufRerank),
+        ("seq-classifier", "classify", EngineKind::GgufClassify),
+        ("causal-lm", "generate", EngineKind::GgufGenerate),
+    ];
+    for (model_type, task, expected) in cases {
+        let manifest = mk("gguf", Some("gguf"), Some(model_type), Some(task), "m.gguf");
+        assert!(
+            EngineKind::validate(&manifest).is_ok(),
+            "{model_type}/{task} must validate"
+        );
+        assert_eq!(
+            EngineKind::resolve(&manifest),
+            expected,
+            "{model_type}/{task}"
+        );
+    }
+}
+
+#[test]
+fn gguf_kind_predicates_split_generation_from_pooled_tasks() {
+    for kind in [
+        EngineKind::GgufEmbed,
+        EngineKind::GgufRerank,
+        EngineKind::GgufClassify,
+    ] {
+        assert!(kind.is_gguf(), "{kind:?}");
+        assert!(kind.is_gguf_pooled(), "{kind:?}");
+        assert!(!kind.is_gguf_generate(), "{kind:?}");
+        assert!(!kind.is_generative(), "{kind:?}");
+        assert!(!kind.uses_onnx_session(), "{kind:?}");
+        assert!(kind.is_implemented(), "{kind:?}");
+    }
+    assert!(EngineKind::GgufGenerate.is_gguf_generate());
+    assert!(!EngineKind::GgufGenerate.is_gguf_pooled());
+    assert_eq!(EngineKind::GgufRerank.label(), "gguf-rerank");
+}
+
+#[test]
+fn validate_rejects_gguf_combinations_without_a_backend() {
+    for (model_type, task) in [
+        ("causal-lm", "forward"),
+        ("opaque", "forward"),
+        ("seq2seq", "generate"),
+        ("detector", "detect"),
+    ] {
+        let err = EngineKind::validate(&mk(
+            "gguf",
+            Some("gguf"),
+            Some(model_type),
+            Some(task),
+            "m.gguf",
+        ))
+        .expect_err("GGUF combination without a backend must fail closed");
+        assert!(
+            err.contains("GGUF models are served as"),
+            "unexpected: {err}"
+        );
+    }
+}
+
+#[test]
+fn validate_rejects_rerank_outside_gguf() {
+    // An ONNX reranker would otherwise resolve to a raw forward pass.
     let err = EngineKind::validate(&mk(
+        "onnx",
+        Some("onnx"),
+        Some("seq-classifier"),
+        Some("rerank"),
+        "m.onnx",
+    ))
+    .unwrap_err();
+    assert!(err.contains("rerank"), "unexpected: {err}");
+    // An embedding model cannot rerank, even as GGUF.
+    assert!(EngineKind::validate(&mk(
         "gguf",
         Some("gguf"),
         Some("embedding"),
-        Some("embed"),
-        "m.gguf",
+        Some("rerank"),
+        "m.gguf"
     ))
-    .unwrap_err();
-    assert!(err.contains("causal-lm"), "unexpected: {err}");
+    .is_err());
 }
 
 #[test]

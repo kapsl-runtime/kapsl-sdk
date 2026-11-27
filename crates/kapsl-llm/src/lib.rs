@@ -48,4 +48,6 @@ pub mod sequence;
 #[path = "cache/turboquant.rs"]
 pub mod turboquant;
 
+#[cfg(feature = "gguf")]
+pub use gguf_backend::pooled::{GgufPooledBackend, GgufPooledConfig, GgufPooledTask, GgufPooling};
 pub use gguf_backend::GgufBackend;

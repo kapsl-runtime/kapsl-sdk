@@ -26,6 +26,18 @@ pub enum EngineKind {
     /// GGUF causal-LM, generative. Tokenizer is embedded in the `.gguf` file.
     /// Legacy framework: `"gguf"`.
     GgufGenerate,
+    /// GGUF model run through llama.cpp pooling for embeddings (mean, CLS or
+    /// last-token, as the model declares). Selected by `format=gguf`,
+    /// `task=embed`, for `model_type` `embedding` or `causal-lm`.
+    GgufEmbed,
+    /// GGUF cross-encoder scoring (query, document) pairs through llama.cpp
+    /// rank pooling and the model's classification head. Selected by
+    /// `format=gguf`, `model_type=seq-classifier`, `task=rerank`.
+    GgufRerank,
+    /// GGUF sequence classifier: llama.cpp rank pooling with an `n_cls_out`
+    /// classification head, followed by a softmax. Selected by `format=gguf`,
+    /// `model_type=seq-classifier`, `task=classify`.
+    GgufClassify,
     /// ONNX causal-LM, generative (autoregressive decode loop). Requires an
     /// external `tokenizer.json`. Legacy framework: `"llm"`.
     OnnxGenerate,
@@ -84,7 +96,12 @@ impl EngineKind {
         let format = effective_format(manifest);
         let task = effective_task(manifest);
         match format.as_str() {
-            "gguf" => Self::GgufGenerate,
+            "gguf" => match task.as_str() {
+                "embed" => Self::GgufEmbed,
+                "rerank" => Self::GgufRerank,
+                "classify" => Self::GgufClassify,
+                _ => Self::GgufGenerate,
+            },
             "safetensors" => Self::Native,
             "onnx" => match task.as_str() {
                 "generate" => Self::OnnxGenerate,
@@ -148,7 +165,9 @@ impl EngineKind {
         let task_ok = match model_type.as_str() {
             "causal-lm" => matches!(task.as_str(), "generate" | "embed" | "forward"),
             "embedding" => task == "embed",
-            "seq-classifier" => task == "classify",
+            // A reranker is a cross-encoder: a sequence classifier with one
+            // relevance output scored over a (query, document) pair.
+            "seq-classifier" => matches!(task.as_str(), "classify" | "rerank"),
             "detector" => task == "detect",
             "asr" => task == "transcribe",
             "seq2seq" => matches!(task.as_str(), "generate" | "forward"),
@@ -162,12 +181,32 @@ impl EngineKind {
             ));
         }
 
-        // GGUF is currently causal-LM/generate only (tokenizer embedded; decode loop).
-        if format == "gguf" && (model_type != "causal-lm" || task != "generate") {
+        // GGUF serves generation through the llama.cpp decode loop and the
+        // pooled tasks (embed, rerank, classify) through llama.cpp pooling.
+        // `forward` has no GGUF meaning: llama.cpp exposes no raw-tensor pass.
+        if format == "gguf"
+            && !matches!(
+                (model_type.as_str(), task.as_str()),
+                ("causal-lm", "generate")
+                    | ("causal-lm", "embed")
+                    | ("embedding", "embed")
+                    | ("seq-classifier", "classify")
+                    | ("seq-classifier", "rerank")
+            )
+        {
             return Err(format!(
-                "GGUF models are served as causal-lm/generate only; got model_type=`{}`, task=`{}`. \
-                 (A GGUF embedding/classifier backend does not exist yet.)",
+                "GGUF models are served as causal-lm/generate, embedding/embed, causal-lm/embed, \
+                 seq-classifier/classify, or seq-classifier/rerank; got model_type=`{}`, task=`{}`",
                 model_type, task
+            ));
+        }
+
+        // Only GGUF has a rerank backend. Without this check an ONNX reranker
+        // would resolve to a raw forward pass and return unlabeled logits.
+        if task == "rerank" && format != "gguf" {
+            return Err(format!(
+                "task `rerank` is served only for GGUF models; format `{}` has no rerank backend",
+                format
             ));
         }
 
@@ -179,9 +218,29 @@ impl EngineKind {
         matches!(self, Self::GgufGenerate | Self::OnnxGenerate)
     }
 
-    /// Whether this engine loads a GGUF model (embedded tokenizer).
+    /// Whether this engine loads a GGUF model (embedded tokenizer) through
+    /// llama.cpp, for any task. Use [`Self::is_gguf_generate`] for code that
+    /// is specific to the generation scheduler (KV cache, decode tuning).
     pub fn is_gguf(&self) -> bool {
+        matches!(
+            self,
+            Self::GgufGenerate | Self::GgufEmbed | Self::GgufRerank | Self::GgufClassify
+        )
+    }
+
+    /// Whether this engine is GGUF text generation (the llama.cpp decode loop
+    /// with its KV cache).
+    pub fn is_gguf_generate(&self) -> bool {
         matches!(self, Self::GgufGenerate)
+    }
+
+    /// Whether this engine is a pooled GGUF task (embed, rerank, classify):
+    /// one stateless forward pass per batch, no KV cache across requests.
+    pub fn is_gguf_pooled(&self) -> bool {
+        matches!(
+            self,
+            Self::GgufEmbed | Self::GgufRerank | Self::GgufClassify
+        )
     }
 
     /// Whether this engine is the ONNX **generative** path (`LLMBackend`): the
@@ -213,6 +272,9 @@ impl EngineKind {
     pub fn is_implemented(&self) -> bool {
         match self {
             Self::GgufGenerate
+            | Self::GgufEmbed
+            | Self::GgufRerank
+            | Self::GgufClassify
             | Self::OnnxGenerate
             | Self::Native
             | Self::OnnxForward
@@ -228,6 +290,9 @@ impl EngineKind {
     pub fn label(&self) -> &'static str {
         match self {
             Self::GgufGenerate => "gguf-generate",
+            Self::GgufEmbed => "gguf-embed",
+            Self::GgufRerank => "gguf-rerank",
+            Self::GgufClassify => "gguf-classify",
             Self::OnnxGenerate => "onnx-generate",
             Self::Native => "native",
             Self::OnnxForward => "onnx-forward",

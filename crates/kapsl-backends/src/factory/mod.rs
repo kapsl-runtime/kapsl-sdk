@@ -111,6 +111,26 @@ fn unimplemented_engine_error(kind: EngineKind) -> String {
     )
 }
 
+/// Pooled GGUF tasks (embed, rerank, classify) always run on llama.cpp
+/// pooling, whichever generation backend this build compiles in: the native
+/// GGUF kernels and the shared-KV path serve the decode loop only.
+fn create_gguf_pooled_backend(
+    engine_kind: EngineKind,
+    manifest: &Manifest,
+    device_id: usize,
+) -> Result<Box<dyn Engine>, String> {
+    let config = kapsl_llm::GgufPooledConfig::from_manifest(manifest)
+        .map_err(|error| format!("invalid {} model contract: {error}", engine_kind.label()))?;
+    log::info!(
+        "✓ Using GgufPooledBackend (llama.cpp {}), device {}",
+        engine_kind.label(),
+        device_id
+    );
+    Ok(Box::new(kapsl_llm::GgufPooledBackend::new(
+        device_id, config,
+    )))
+}
+
 /// Resolve and validate the model contract before any provider-specific path is
 /// considered. This is the final fail-closed boundary protecting ONNX Runtime:
 /// unsupported formats and SafeTensors without the native backend must never
@@ -431,6 +451,11 @@ impl BackendFactory {
         Self::register_gguf_engine_devices(device_info);
         let engine_kind = resolve_dispatch_engine_kind(manifest)?;
 
+        if engine_kind.is_gguf_pooled() {
+            let device_id = manifest.hardware_requirements.device_id.unwrap_or(0);
+            return create_gguf_pooled_backend(engine_kind, manifest, device_id as usize);
+        }
+
         // GGUF: prefer native CUDA kernels when gguf-native feature is compiled in.
         #[cfg(feature = "gguf-native")]
         if engine_kind.is_gguf() {
@@ -622,6 +647,10 @@ impl BackendFactory {
     ) -> Result<Box<dyn Engine>, String> {
         Self::register_gguf_engine_devices(device_info);
         let engine_kind = resolve_dispatch_engine_kind(manifest)?;
+
+        if engine_kind.is_gguf_pooled() {
+            return create_gguf_pooled_backend(engine_kind, manifest, device_id);
+        }
 
         // Native safetensors: route to custom CUDA kernel backend
         #[cfg(feature = "native")]

@@ -50,3 +50,36 @@ or cross-library Rust trait is required.
 Host tests cover one-shot admission, concurrent ownership, slot reuse, failed
 admission cleanup and independent cancellation of prefill leaders/followers.
 They do not establish real GPU correctness or performance qualification.
+
+## GGUF pooled tasks
+
+`GgufPooledBackend` serves GGUF models whose manifest task is `embed`,
+`rerank` or `classify` (`EngineKind::GgufEmbed`, `GgufRerank`, `GgufClassify`)
+through llama.cpp pooling. One worker thread owns a llama.cpp context with
+embeddings enabled; its memory is cleared before every batch, so no state
+outlives a request. Weights come from the same shared cache as `GgufBackend`.
+
+| task     | primary input     | additional inputs           | output                   |
+|----------|-------------------|-----------------------------|--------------------------|
+| embed    | text or token ids | `text` / `text.<n>`         | `float32 [n, n_embd]`    |
+| classify | text or token ids | `text` / `text.<n>`         | `float32 [n, n_cls_out]` |
+| rerank   | query text        | `document` / `document.<n>` | `float32 [n_documents]`  |
+
+Text is one UTF-8 string per tensor, tokenized with the model's embedded
+vocabulary the way llama-server does. Reranking uses the model's `rerank` chat
+template when it has one, and otherwise llama-server's
+`[BOS] query [EOS] [SEP] document [EOS]` layout. Rerank and classify refuse to
+load a model without a classification head (`cls` or `cls.output` tensors),
+because llama.cpp rank pooling would otherwise return a meaningless score.
+
+Manifest options: `metadata.embed.normalize` (default true),
+`metadata.embed.pooling` (`mean`, `cls`, `last`; default is the model's own),
+`metadata.classify.apply_softmax` (default true). `KAPSL_GGUF_CTX_PER_SEQ`
+caps tokens per input and `KAPSL_GGUF_POOLED_MAX_SEQS` (default 16) caps
+sequences per llama.cpp batch. Requests are not coalesced across callers, so
+one caller's invalid input cannot fail another caller's request.
+
+`tests/gguf_pooled_models.rs` checks real models when given model paths:
+batched and single-input embeddings must match, reranking must rank a relevant
+document first, and with `KAPSL_TEST_GGUF_EMBED_REFERENCE` the embeddings must
+match llama.cpp's `llama-embedding` output.

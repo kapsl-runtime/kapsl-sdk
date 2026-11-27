@@ -872,6 +872,57 @@ fn gguf_model_key(model_path: &Path) -> std::path::PathBuf {
     std::fs::canonicalize(model_path).unwrap_or_else(|_| model_path.to_path_buf())
 }
 
+/// The llama.cpp weights for `model_path` on engine device `device_id`, loaded
+/// once and shared by every backend instance that holds them: generation
+/// replicas and pooled (embed, rerank, classify) backends alike.
+#[cfg(feature = "gguf")]
+async fn shared_gguf_weights(
+    model_path: &Path,
+    device_id: usize,
+) -> Result<Arc<GgufWeights>, EngineError> {
+    let model_path_key = gguf_model_key(model_path);
+    let weights_key = gguf_weights_key(model_path, device_id);
+
+    let cached = gguf_weights_cache()
+        .lock()
+        .unwrap()
+        .get(&weights_key)
+        .and_then(|w| w.upgrade());
+
+    if let Some(shared) = cached {
+        log::info!(
+            "[gguf] Reusing shared weights for {}",
+            model_path_key.display()
+        );
+        return Ok(shared);
+    }
+
+    let model_path_load = model_path_key.clone();
+    let backend_for_load = global_gguf_backend()?;
+    let backend_for_closure = Arc::clone(&backend_for_load);
+    let (model, n_ctx_train) = tokio::task::spawn_blocking(move || {
+        let params = gguf_model_params(device_id)?;
+        let model = LlamaModel::load_from_file(&backend_for_closure, &model_path_load, &params)
+            .map_err(|e| EngineError::backend(format!("GGUF load failed: {e}")))?;
+        let n_ctx_train = model.n_ctx_train();
+        Ok::<_, EngineError>((model, n_ctx_train))
+    })
+    .await
+    .map_err(|e| EngineError::backend(format!("spawn_blocking join error: {e}")))??;
+
+    let arc = Arc::new(GgufWeights {
+        backend: backend_for_load,
+        model: Arc::new(model),
+        n_ctx_train,
+        allocation_id: gguf_allocation_id(&model_path_key, device_id),
+    });
+    gguf_weights_cache()
+        .lock()
+        .unwrap()
+        .insert(weights_key, Arc::downgrade(&arc));
+    Ok(arc)
+}
+
 /// Identity of loaded weights: the model file and the engine device they live
 /// on. With `gguf-cuda` the weights are loaded onto exactly one GPU
 /// (`gguf_model_params`), so replicas on different devices must not share them:
@@ -4008,11 +4059,94 @@ impl Default for GgufBackend {
     }
 }
 
+/// Planned rows for a model that has not been loaded, classified with the
+/// same rules as the reported rows: the offloaded fraction of weights and KV
+/// goes to the primary device's domain, the rest to the host.
+#[cfg(feature = "gguf")]
+fn planned_gguf_placement(
+    device_id: usize,
+    model_path: &Path,
+    weights: usize,
+    kv: usize,
+    scratch: usize,
+) -> Result<PlacementReport, EngineError> {
+    // llama.cpp enumerates its devices only once the backend is initialized.
+    let _backend = global_gguf_backend()?;
+    let devices = llama_device_list();
+    let engine = engine_devices();
+    let n_layers = kapsl_loader::gguf_loader::GgufFile::open(model_path)
+        .ok()
+        .and_then(|file| file.extract_config().ok())
+        .map(|config| config.num_hidden_layers)
+        .unwrap_or(1)
+        .max(1);
+    let primary = primary_llama_device(&devices, &engine, device_id);
+    let report = plan_rows(
+        primary,
+        &devices,
+        &engine,
+        Some(device_id),
+        PlanInput {
+            weights,
+            kv,
+            scratch,
+            n_layers,
+            n_gpu_layers: configured_n_gpu_layers(),
+        },
+    );
+    for warning in &report.warnings {
+        log::warn!("[gguf] {warning}");
+    }
+    Ok(report)
+}
+
+/// Where a loaded model's memory physically lives right now: weights, KV
+/// cache and compute buffers per llama device (plus the host-resident
+/// remainder), mapped to memory domains by `gguf_placement`.
+#[cfg(feature = "gguf")]
+fn actual_gguf_placement(
+    device_id: usize,
+    model: &LlamaModel,
+    context: &ContextMemory,
+) -> PlacementReport {
+    let devices = llama_device_list();
+    let named = |rows: &[(String, u64)], name: &str| {
+        rows.iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, bytes)| *bytes)
+            .unwrap_or(0)
+    };
+    let weights = model.device_memory();
+    let per_device: Vec<(usize, DeviceBytes)> = weights
+        .iter()
+        .filter_map(|(name, weight_bytes)| {
+            let index = devices.iter().position(|d| &d.name == name)?;
+            Some((
+                index,
+                DeviceBytes {
+                    weights: *weight_bytes,
+                    kv: named(&context.kv, name),
+                    compute: named(&context.compute, name),
+                },
+            ))
+        })
+        .collect();
+    let report = place_bytes(
+        &devices,
+        &engine_devices(),
+        Some(device_id),
+        &per_device,
+        context.host,
+    );
+    for warning in &report.warnings {
+        log::warn!("[gguf] {warning}");
+    }
+    report
+}
+
 #[cfg(feature = "gguf")]
 impl GgufBackend {
-    /// Planned rows for a model that has not been loaded, classified with the
-    /// same rules as the reported rows: the offloaded fraction of weights and KV
-    /// goes to the primary device's domain, the rest to the host.
+    /// [`planned_gguf_placement`] for this backend's device.
     fn planned_placement(
         &self,
         model_path: &Path,
@@ -4020,81 +4154,20 @@ impl GgufBackend {
         kv: usize,
         scratch: usize,
     ) -> Result<PlacementReport, EngineError> {
-        // llama.cpp enumerates its devices only once the backend is initialized.
-        let _backend = global_gguf_backend()?;
-        let devices = llama_device_list();
-        let engine = engine_devices();
-        let n_layers = kapsl_loader::gguf_loader::GgufFile::open(model_path)
-            .ok()
-            .and_then(|file| file.extract_config().ok())
-            .map(|config| config.num_hidden_layers)
-            .unwrap_or(1)
-            .max(1);
-        let primary = primary_llama_device(&devices, &engine, self.device_id);
-        let report = plan_rows(
-            primary,
-            &devices,
-            &engine,
-            Some(self.device_id),
-            PlanInput {
-                weights,
-                kv,
-                scratch,
-                n_layers,
-                n_gpu_layers: configured_n_gpu_layers(),
-            },
-        );
-        for warning in &report.warnings {
-            log::warn!("[gguf] {warning}");
-        }
-        Ok(report)
+        planned_gguf_placement(self.device_id, model_path, weights, kv, scratch)
     }
 
-    /// Where the loaded model's memory physically lives right now: weights, KV
-    /// cache and compute buffers per llama device (plus the host-resident
-    /// remainder), mapped to memory domains by `gguf_placement`.
+    /// [`actual_gguf_placement`] for the loaded model and its scheduler context.
     fn actual_placement(&self) -> PlacementReport {
         let Some(inner) = self.inner.as_ref() else {
             return PlacementReport::default();
         };
-        let devices = llama_device_list();
         let context = inner
             .compute_memory
             .lock()
             .map(|slot| slot.clone())
             .unwrap_or_default();
-        let named = |rows: &[(String, u64)], name: &str| {
-            rows.iter()
-                .find(|(n, _)| n == name)
-                .map(|(_, bytes)| *bytes)
-                .unwrap_or(0)
-        };
-        let weights = inner.weights.model.device_memory();
-        let per_device: Vec<(usize, DeviceBytes)> = weights
-            .iter()
-            .filter_map(|(name, weight_bytes)| {
-                let index = devices.iter().position(|d| &d.name == name)?;
-                Some((
-                    index,
-                    DeviceBytes {
-                        weights: *weight_bytes,
-                        kv: named(&context.kv, name),
-                        compute: named(&context.compute, name),
-                    },
-                ))
-            })
-            .collect();
-        let report = place_bytes(
-            &devices,
-            &engine_devices(),
-            Some(self.device_id),
-            &per_device,
-            context.host,
-        );
-        for warning in &report.warnings {
-            log::warn!("[gguf] {warning}");
-        }
-        report
+        actual_gguf_placement(self.device_id, &inner.weights.model, &context)
     }
 
     /// Bind an integration's engine request identity to the scheduler slot.
@@ -5367,49 +5440,7 @@ impl Engine for GgufBackend {
     }
 
     async fn load(&mut self, model_path: &Path) -> Result<(), EngineError> {
-        let model_path_key = gguf_model_key(model_path);
-        let weights_key = gguf_weights_key(model_path, self.device_id);
-
-        let cached = gguf_weights_cache()
-            .lock()
-            .unwrap()
-            .get(&weights_key)
-            .and_then(|w| w.upgrade());
-
-        let weights = if let Some(shared) = cached {
-            log::info!(
-                "[gguf] Reusing shared weights for {}",
-                model_path_key.display()
-            );
-            shared
-        } else {
-            let model_path_load = model_path_key.clone();
-            let device_id = self.device_id;
-            let backend_for_load = global_gguf_backend()?;
-            let backend_for_closure = Arc::clone(&backend_for_load);
-            let (model, n_ctx_train) = tokio::task::spawn_blocking(move || {
-                let params = gguf_model_params(device_id)?;
-                let model =
-                    LlamaModel::load_from_file(&backend_for_closure, &model_path_load, &params)
-                        .map_err(|e| EngineError::backend(format!("GGUF load failed: {e}")))?;
-                let n_ctx_train = model.n_ctx_train();
-                Ok::<_, EngineError>((model, n_ctx_train))
-            })
-            .await
-            .map_err(|e| EngineError::backend(format!("spawn_blocking join error: {e}")))??;
-
-            let arc = Arc::new(GgufWeights {
-                backend: backend_for_load,
-                model: Arc::new(model),
-                n_ctx_train,
-                allocation_id: gguf_allocation_id(&model_path_key, self.device_id),
-            });
-            gguf_weights_cache()
-                .lock()
-                .unwrap()
-                .insert(weights_key, Arc::downgrade(&arc));
-            arc
-        };
+        let weights = shared_gguf_weights(model_path, self.device_id).await?;
 
         let config = GgufServingConfig::from_model(&weights.model, weights.n_ctx_train);
         #[cfg(any(feature = "gguf-cuda-shared-kv", feature = "gguf-external-kv"))]
@@ -6185,6 +6216,12 @@ impl Engine for GgufBackend {
         ))
     }
 }
+
+/// Pooled GGUF tasks (embed, rerank, classify). A child module so it shares
+/// the weights cache, device placement and memory accounting above.
+#[cfg(feature = "gguf")]
+#[path = "pooled.rs"]
+pub mod pooled;
 
 #[cfg(all(test, feature = "gguf"))]
 #[path = "scheduler_lifecycle_tests.rs"]

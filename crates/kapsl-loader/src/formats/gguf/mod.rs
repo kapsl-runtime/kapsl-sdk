@@ -451,6 +451,17 @@ impl GgufFile {
         self.metadata.get(key)?.as_str()
     }
 
+    /// Whether the file contains a tensor with this exact GGUF name (for
+    /// example `cls.output.weight`).
+    pub fn has_tensor(&self, name: &str) -> bool {
+        self.tensors.contains_key(name)
+    }
+
+    /// The `general.architecture` metadata value, when present.
+    pub fn architecture(&self) -> Option<&str> {
+        self.meta_str("general.architecture")
+    }
+
     // ── Config extraction ────────────────────────────────────────────────────
 
     pub fn extract_config(&self) -> Result<ModelConfig, GgufError> {
