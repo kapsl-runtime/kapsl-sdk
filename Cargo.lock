@@ -1895,7 +1895,7 @@ version = "0.2.1"
 
 [[package]]
 name = "kapsl-backends"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2014,7 +2014,7 @@ dependencies = [
 
 [[package]]
 name = "kapsl-kernels"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "cc",
  "cudarc",
@@ -2091,7 +2091,7 @@ dependencies = [
 
 [[package]]
 name = "kapsl-loader"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "half",
  "kapsl-hal",
@@ -2114,7 +2114,7 @@ dependencies = [
 
 [[package]]
 name = "kapsl-monitor"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "async-trait",
  "futures",
@@ -2135,7 +2135,7 @@ dependencies = [
 
 [[package]]
 name = "kapsl-rag"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2156,7 +2156,7 @@ dependencies = [
 
 [[package]]
 name = "kapsl-rag-sdk"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "futures",
