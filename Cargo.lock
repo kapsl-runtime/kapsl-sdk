@@ -1904,7 +1904,7 @@ dependencies = [
  "half",
  "image",
  "kapsl-core",
- "kapsl-engine-api 0.3.1",
+ "kapsl-engine-api",
  "kapsl-hal",
  "kapsl-kernels",
  "kapsl-llama-cpp-2",
@@ -1930,7 +1930,7 @@ dependencies = [
  "async-trait",
  "bincode",
  "futures",
- "kapsl-engine-api 0.3.1",
+ "kapsl-engine-api",
  "kapsl-grpc",
  "log",
  "prometheus",
@@ -1948,7 +1948,7 @@ dependencies = [
  "flate2",
  "fs2",
  "hex",
- "kapsl-engine-api 0.3.1",
+ "kapsl-engine-api",
  "log",
  "parking_lot",
  "serde",
@@ -1962,27 +1962,13 @@ dependencies = [
 
 [[package]]
 name = "kapsl-engine-api"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "279a1f1abe9afc205c22bc0951df3ccd165cd3010ee4f0f360bad47f399f9931"
-dependencies = [
- "async-trait",
- "base64 0.22.1",
- "futures",
- "kapsl-kv-abi 0.6.0",
- "serde",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "kapsl-engine-api"
 version = "0.3.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
  "bincode",
  "futures",
- "kapsl-kv-abi 0.6.1",
+ "kapsl-kv-abi",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -1998,7 +1984,7 @@ dependencies = [
  "http",
  "http-body-util",
  "hyper-util",
- "kapsl-engine-api 0.3.1",
+ "kapsl-engine-api",
  "log",
  "prost",
  "prost-build",
@@ -2014,7 +2000,7 @@ dependencies = [
 
 [[package]]
 name = "kapsl-hal"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "cudarc",
  "half",
@@ -2036,16 +2022,6 @@ dependencies = [
  "kapsl-hal",
  "log",
  "rayon",
-]
-
-[[package]]
-name = "kapsl-kv-abi"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "975e66b4912d45b0e8aaf6c9ea787c68966b0141174ffc435fe202ff7c406ffc"
-dependencies = [
- "serde",
- "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -2093,9 +2069,9 @@ dependencies = [
  "futures",
  "half",
  "kapsl-core",
- "kapsl-engine-api 0.3.1",
+ "kapsl-engine-api",
  "kapsl-hal",
- "kapsl-kv-abi 0.6.1",
+ "kapsl-kv-abi",
  "kapsl-llama-cpp-2",
  "kapsl-llama-cpp-sys-2",
  "kapsl-loader",
@@ -2129,9 +2105,9 @@ dependencies = [
 
 [[package]]
 name = "kapsl-managed-abi"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
- "kapsl-engine-api 0.3.0",
+ "kapsl-engine-api",
  "serde",
  "serde_json",
 ]
@@ -2142,7 +2118,7 @@ version = "0.3.0"
 dependencies = [
  "async-trait",
  "futures",
- "kapsl-engine-api 0.3.1",
+ "kapsl-engine-api",
  "prometheus",
  "tokio",
 ]
@@ -2152,7 +2128,7 @@ name = "kapsl-pyo3"
 version = "0.3.0"
 dependencies = [
  "kapsl-communication",
- "kapsl-engine-api 0.3.1",
+ "kapsl-engine-api",
  "pyo3",
  "tokio",
 ]
@@ -2191,7 +2167,7 @@ dependencies = [
 
 [[package]]
 name = "kapsl-scheduler"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2199,7 +2175,7 @@ dependencies = [
  "cron",
  "futures",
  "kapsl-core",
- "kapsl-engine-api 0.3.1",
+ "kapsl-engine-api",
  "kapsl-hal",
  "log",
  "parking_lot",

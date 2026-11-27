@@ -56,11 +56,14 @@ impl CpuPool {
             .await
     }
 
-    /// Runs `job` on the pool, holding `slot` until the job finishes.
-    pub(super) fn spawn(&self, slot: PriorityAdmissionPermit, job: impl FnOnce() + Send + 'static) {
-        self.pool.spawn(move || {
-            let _slot = slot;
-            job();
-        });
+    /// Runs `job` on the pool and hands it `slot`. The job holds the slot
+    /// while it works and drops it before it reports its result, so a caller
+    /// woken by that result can be admitted again at once.
+    pub(super) fn spawn(
+        &self,
+        slot: PriorityAdmissionPermit,
+        job: impl FnOnce(PriorityAdmissionPermit) + Send + 'static,
+    ) {
+        self.pool.spawn(move || job(slot));
     }
 }

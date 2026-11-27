@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Tests for the release planner behind .github/workflows/publish.yml."""
 
+import json
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 
 import release_plan as rp
@@ -322,6 +324,84 @@ class TagTests(unittest.TestCase):
                 self.releases[:1], "abc", {"crate": "success"}, FakeGitHub({"abi-v1.1.0": "def"}),
                 lookup=lambda kind, name: {"1.1.0"}, sleep=lambda s: None,
             )
+
+
+class FakeResponse:
+    def __init__(self, body):
+        self.body = json.dumps(body).encode()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        return self.body
+
+
+def http_error(code):
+    return urllib.error.HTTPError("https://api.github.test", code, "error", None, None)
+
+
+class GitHubClientTests(unittest.TestCase):
+    def client(self, answers):
+        """A client whose requests get `answers` in turn: an exception or a JSON body."""
+        self.requests, self.sleeps = [], []
+        answers = iter(answers)
+
+        def urlopen(request, timeout):
+            self.requests.append((request.get_method(), request.full_url.rsplit("/repos/o/r", 1)[1]))
+            answer = next(answers)
+            if isinstance(answer, Exception):
+                raise answer
+            return FakeResponse(answer)
+
+        return rp.GitHub("o/r", "token", "https://api.github.test", attempts=4, sleep=self.sleeps.append, urlopen=urlopen)
+
+    def test_server_errors_rate_limits_and_network_failures_are_retried(self):
+        github = self.client([http_error(500), http_error(429), urllib.error.URLError("reset"), {"ok": True}])
+        self.assertEqual(github.request("GET", "/x"), {"ok": True})
+        self.assertEqual(self.sleeps, [5, 10, 20])
+
+    def test_client_errors_are_not_retried(self):
+        github = self.client([http_error(422)])
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            github.request("POST", "/git/refs", {})
+        raised.exception.close()
+        self.assertEqual((len(self.requests), self.sleeps), (1, []))
+
+    def test_gives_up_after_the_last_attempt(self):
+        github = self.client([http_error(500) for _ in range(4)])
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            github.request("GET", "/x")
+        raised.exception.close()
+        self.assertEqual(len(self.requests), 4)
+
+    def test_a_missing_tag_is_none_without_retrying(self):
+        self.assertIsNone(self.client([http_error(404)]).tag_commit("abi-v1.0.0"))
+        self.assertEqual(self.sleeps, [])
+
+    def test_creating_a_tag_tolerates_a_ref_made_by_an_attempt_that_seemed_to_fail(self):
+        github = self.client([
+            {"sha": "tagobj"},                                   # POST /git/tags
+            http_error(502),                                     # POST /git/refs: created, but answered 502
+            http_error(422),                                     # retry: the ref already exists
+            {"object": {"type": "tag", "sha": "tagobj"}},        # GET /git/ref/tags/abi-v1.0.0
+            {"object": {"type": "commit", "sha": "abc"}},        # GET /git/tags/tagobj
+        ])
+        github.create_tag("abi-v1.0.0", "abc", "abi 1.0.0")
+        self.assertEqual([path for _, path in self.requests][-2:], ["/git/ref/tags/abi-v1.0.0", "/git/tags/tagobj"])
+
+    def test_an_existing_ref_on_another_commit_is_still_an_error(self):
+        github = self.client([
+            {"sha": "tagobj"},
+            http_error(422),
+            {"object": {"type": "commit", "sha": "def"}},
+        ])
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            github.create_tag("abi-v1.0.0", "abc", "abi 1.0.0")
+        raised.exception.close()
 
 
 if __name__ == "__main__":
