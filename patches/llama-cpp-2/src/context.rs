@@ -255,6 +255,54 @@ impl<'model> LlamaContext<'model> {
         }
     }
 
+    /// The pooling type this context resolved. A context created with
+    /// [`params::LlamaPoolingType::Unspecified`] reports the model's own
+    /// default here.
+    #[must_use]
+    pub fn pooling_type(&self) -> params::LlamaPoolingType {
+        params::LlamaPoolingType::from(unsafe {
+            llama_cpp_sys_2::llama_pooling_type(self.context.as_ptr())
+        })
+    }
+
+    /// Get the classification-head outputs for the `i`th sequence after a
+    /// decode with `LLAMA_POOLING_TYPE_RANK`: [`LlamaModel::n_cls_out`]
+    /// floats (one relevance score for a reranker).
+    ///
+    /// Use this instead of [`Self::embeddings_seq_ith`] for rank pooling:
+    /// llama.cpp stores only `n_cls_out` floats per sequence there, so reading
+    /// `n_embd` floats would run past the buffer.
+    ///
+    /// # Errors
+    ///
+    /// - When the current context was constructed without enabling embeddings.
+    /// - When the context does not use rank pooling.
+    /// - When llama.cpp has no output for the sequence.
+    ///
+    /// # Panics
+    ///
+    /// * `n_cls_out` does not fit into a usize
+    pub fn rank_seq_ith(&self, i: i32) -> Result<&[f32], EmbeddingsError> {
+        if !self.embeddings_enabled {
+            return Err(EmbeddingsError::NotEnabled);
+        }
+        if self.pooling_type() != params::LlamaPoolingType::Rank {
+            return Err(EmbeddingsError::NonePoolType);
+        }
+
+        let n_cls_out =
+            usize::try_from(self.model.n_cls_out()).expect("n_cls_out does not fit into a usize");
+
+        unsafe {
+            let scores = llama_cpp_sys_2::llama_get_embeddings_seq(self.context.as_ptr(), i);
+            if scores.is_null() {
+                Err(EmbeddingsError::NonePoolType)
+            } else {
+                Ok(slice::from_raw_parts(scores, n_cls_out))
+            }
+        }
+    }
+
     /// Get the embeddings for the `i`th token in the current context.
     ///
     /// # Returns

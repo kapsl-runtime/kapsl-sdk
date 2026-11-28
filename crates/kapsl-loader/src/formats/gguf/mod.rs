@@ -124,6 +124,12 @@ impl GgufValue {
             _ => None,
         }
     }
+    fn as_bool(&self) -> Option<bool> {
+        match self {
+            Self::Bool(v) => Some(*v),
+            _ => None,
+        }
+    }
     fn array_len(&self) -> Option<usize> {
         match self {
             Self::Array(v) => Some(v.len()),
@@ -449,6 +455,45 @@ impl GgufFile {
     }
     fn meta_str(&self, key: &str) -> Option<&str> {
         self.metadata.get(key)?.as_str()
+    }
+
+    /// Whether the file contains a tensor with this exact GGUF name (for
+    /// example `cls.output.weight`).
+    pub fn has_tensor(&self, name: &str) -> bool {
+        self.tensors.contains_key(name)
+    }
+
+    /// The `general.architecture` metadata value, when present.
+    pub fn architecture(&self) -> Option<&str> {
+        self.meta_str("general.architecture")
+    }
+
+    /// Per-head key and value widths, in elements:
+    /// `{arch}.attention.key_length` and `{arch}.attention.value_length`, each
+    /// falling back to `embedding_length / head_count` as in llama.cpp. Size KV
+    /// caches from these, not [`ModelConfig::head_dim`]: Qwen3 and Gemma heads
+    /// are not that quotient wide (Qwen3-0.6B declares 128 against 1024 / 16).
+    pub fn attention_head_widths(&self) -> Result<(usize, usize), GgufError> {
+        let arch = self.meta_str("general.architecture").unwrap_or("llama");
+        let n_embd = self.meta_u32(&format!("{arch}.embedding_length"))? as usize;
+        let n_head = self.meta_u32(&format!("{arch}.attention.head_count"))? as usize;
+        let quotient = n_embd.checked_div(n_head).unwrap_or(0);
+        let width = |name: &str| {
+            self.meta_u32(&format!("{arch}.attention.{name}"))
+                .map_or(quotient, |value| value as usize)
+        };
+        Ok((width("key_length"), width("value_length")))
+    }
+
+    /// Whether attention is causal. Encoder conversions (BERT and its
+    /// relatives) write `{arch}.attention.causal = false`; llama.cpp treats a
+    /// missing key as causal, and so does this.
+    pub fn causal_attention(&self) -> bool {
+        let arch = self.meta_str("general.architecture").unwrap_or("llama");
+        self.metadata
+            .get(&format!("{arch}.attention.causal"))
+            .and_then(GgufValue::as_bool)
+            .unwrap_or(true)
     }
 
     // ── Config extraction ────────────────────────────────────────────────────
@@ -878,6 +923,81 @@ fn scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    enum Meta {
+        U32(u32),
+        Bool(bool),
+        Str(&'static str),
+    }
+
+    /// Writes a GGUF v3 file with `entries` as metadata and no tensors.
+    fn metadata_only_gguf(name: &str, entries: &[(&str, Meta)]) -> std::path::PathBuf {
+        fn put_str(out: &mut Vec<u8>, value: &str) {
+            out.extend_from_slice(&(value.len() as u64).to_le_bytes());
+            out.extend_from_slice(value.as_bytes());
+        }
+        let mut out = b"GGUF".to_vec();
+        out.extend_from_slice(&3u32.to_le_bytes());
+        out.extend_from_slice(&0u64.to_le_bytes());
+        out.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+        for (key, value) in entries {
+            put_str(&mut out, key);
+            match value {
+                Meta::U32(v) => {
+                    out.extend_from_slice(&(GgufValueType::U32 as u32).to_le_bytes());
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+                Meta::Bool(v) => {
+                    out.extend_from_slice(&(GgufValueType::Bool as u32).to_le_bytes());
+                    out.push(u8::from(*v));
+                }
+                Meta::Str(v) => {
+                    out.extend_from_slice(&(GgufValueType::Str as u32).to_le_bytes());
+                    put_str(&mut out, v);
+                }
+            }
+        }
+        let path =
+            std::env::temp_dir().join(format!("kapsl-loader-{}-{name}.gguf", std::process::id()));
+        std::fs::write(&path, out).unwrap();
+        path
+    }
+
+    #[test]
+    fn attention_shape_uses_declared_head_widths_and_causality() {
+        // Qwen3-Embedding-0.6B: 1024 / 16 = 64, but its heads are 128 wide.
+        let qwen3 = metadata_only_gguf(
+            "qwen3",
+            &[
+                ("general.architecture", Meta::Str("qwen3")),
+                ("qwen3.embedding_length", Meta::U32(1024)),
+                ("qwen3.attention.head_count", Meta::U32(16)),
+                ("qwen3.attention.key_length", Meta::U32(128)),
+                ("qwen3.attention.value_length", Meta::U32(128)),
+            ],
+        );
+        let file = GgufFile::open(&qwen3).unwrap();
+        assert_eq!(file.attention_head_widths().unwrap(), (128, 128));
+        assert!(file.causal_attention());
+        drop(file);
+        std::fs::remove_file(qwen3).unwrap();
+
+        // bge-small: no declared widths, and the encoder marks itself non-causal.
+        let bert = metadata_only_gguf(
+            "bert",
+            &[
+                ("general.architecture", Meta::Str("bert")),
+                ("bert.embedding_length", Meta::U32(384)),
+                ("bert.attention.head_count", Meta::U32(12)),
+                ("bert.attention.causal", Meta::Bool(false)),
+            ],
+        );
+        let file = GgufFile::open(&bert).unwrap();
+        assert_eq!(file.attention_head_widths().unwrap(), (32, 32));
+        assert!(!file.causal_attention());
+        drop(file);
+        std::fs::remove_file(bert).unwrap();
+    }
 
     #[test]
     fn reader_reports_truncated_and_overflowing_ranges() {

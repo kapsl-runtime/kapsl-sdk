@@ -364,6 +364,32 @@ impl LlamaModel {
             AddBos::Always => true,
             AddBos::Never => false,
         };
+        self.tokenize(str, add_bos, true)
+    }
+
+    /// Tokenize a string with explicit control over special tokens.
+    ///
+    /// `add_special` lets the vocabulary add its configured BOS/EOS/SEP tokens
+    /// (see [`Self::add_bos_token`], [`Self::add_eos_token`],
+    /// [`Self::add_sep_token`]). `parse_special` turns special-token text in
+    /// `str` (for example `<|endoftext|>`) into the special token instead of
+    /// tokenizing it as plain text; leave it off for untrusted user text that
+    /// is spliced into a fixed token layout.
+    ///
+    /// # Errors
+    ///
+    /// - if [`str`] contains a null byte.
+    ///
+    /// # Panics
+    ///
+    /// - if there is more than [`usize::MAX`] [`LlamaToken`]s in [`str`].
+    pub fn tokenize(
+        &self,
+        str: &str,
+        add_special: bool,
+        parse_special: bool,
+    ) -> Result<Vec<LlamaToken>, StringToTokenError> {
+        let add_bos = add_special;
 
         let tokens_estimation = std::cmp::max(8, (str.len() / 2) + usize::from(add_bos));
         let mut buffer: Vec<LlamaToken> = Vec::with_capacity(tokens_estimation);
@@ -380,7 +406,7 @@ impl LlamaModel {
                 buffer.as_mut_ptr().cast::<llama_cpp_sys_2::llama_token>(),
                 buffer_capacity,
                 add_bos,
-                true,
+                parse_special,
             )
         };
 
@@ -396,7 +422,7 @@ impl LlamaModel {
                     buffer.as_mut_ptr().cast::<llama_cpp_sys_2::llama_token>(),
                     -size,
                     add_bos,
-                    true,
+                    parse_special,
                 )
             }
         } else {
@@ -645,6 +671,60 @@ impl LlamaModel {
     #[must_use]
     pub fn n_embd(&self) -> c_int {
         unsafe { llama_cpp_sys_2::llama_n_embd(self.model.as_ptr()) }
+    }
+
+    /// Number of outputs of the model's classification head. llama.cpp
+    /// reports 1 for models without explicit classifier labels, so this is
+    /// the length of a `LLAMA_POOLING_TYPE_RANK` result, not proof that the
+    /// model has a head.
+    #[must_use]
+    pub fn n_cls_out(&self) -> u32 {
+        unsafe { llama_cpp_sys_2::llama_model_n_cls_out(self.model.as_ptr()) }
+    }
+
+    /// Label of classifier output `index`, when the model provides labels.
+    #[must_use]
+    pub fn cls_label(&self, index: u32) -> Option<String> {
+        let label = unsafe { llama_cpp_sys_2::llama_model_cls_label(self.model.as_ptr(), index) };
+        if label.is_null() {
+            None
+        } else {
+            Some(
+                unsafe { CStr::from_ptr(label) }
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        }
+    }
+
+    /// Whether the model has an encoder (T5-style encoder or encoder-decoder).
+    #[must_use]
+    pub fn has_encoder(&self) -> bool {
+        unsafe { llama_cpp_sys_2::llama_model_has_encoder(self.model.as_ptr()) }
+    }
+
+    /// Whether the model has a decoder.
+    #[must_use]
+    pub fn has_decoder(&self) -> bool {
+        unsafe { llama_cpp_sys_2::llama_model_has_decoder(self.model.as_ptr()) }
+    }
+
+    /// Whether the vocabulary adds a BOS token when tokenizing with special tokens.
+    #[must_use]
+    pub fn add_bos_token(&self) -> bool {
+        unsafe { llama_cpp_sys_2::llama_vocab_get_add_bos(self.vocab_ptr()) }
+    }
+
+    /// Whether the vocabulary adds an EOS token when tokenizing with special tokens.
+    #[must_use]
+    pub fn add_eos_token(&self) -> bool {
+        unsafe { llama_cpp_sys_2::llama_vocab_get_add_eos(self.vocab_ptr()) }
+    }
+
+    /// Whether the vocabulary adds a SEP token when tokenizing with special tokens.
+    #[must_use]
+    pub fn add_sep_token(&self) -> bool {
+        unsafe { llama_cpp_sys_2::llama_vocab_get_add_sep(self.vocab_ptr()) }
     }
 
     /// Returns the total size of all the tensors in the model in bytes.
