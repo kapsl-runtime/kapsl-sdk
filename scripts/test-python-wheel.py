@@ -38,6 +38,8 @@ import kapsl_sdk
 assert importlib.util.find_spec('grpc') is None, 'Use an environment without grpcio'
 with kapsl_sdk.KapslClient() as client:
     assert not client.closed
+with kapsl_sdk.KapslHttpClient('http://127.0.0.1:9095') as client:
+    assert client.protocol() == 'http'
 assert callable(kapsl_sdk.list_voices)
 try:
     kapsl_sdk.KapslGrpcClient()

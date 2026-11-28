@@ -40,11 +40,40 @@ iteration. Native streams also support `async for`. Streams expose explicit
 cancellation and close operations; deadlines cover their complete lifetime.
 Generated protobuf modules are bundled, so consumers do not need protoc.
 
+## HTTP management and OpenAI-compatible API
+
+```python
+from kapsl_sdk import KapslHttpClient
+
+with KapslHttpClient("http://127.0.0.1:9095", api_token="admin-token") as http:
+    result = http.start_model("/models/assistant.aimod", wait=True)
+    print(result.status, result.reason)          # active, or denied + reason
+    print([m.idle_unloaded for m in http.list_models()])
+    reply = http.chat_completion("assistant", [{"role": "user", "content": "Hi"}])
+    print(reply.text, reply.finish_reason)
+```
+
+`KapslHttpClient` uses only the standard library. It covers health, hardware,
+system and memory-authority statistics, `/metrics`, model lifecycle with
+memory-admission results, idle-unload state, autoscaling policy, access
+management, and the `/v1` models, chat completion (streaming and
+non-streaming) and embeddings routes. Errors raise `KapslHttpError` with the
+HTTP status, the engine's `reason`, and `retry_after_seconds`.
+
 `KapslShmClient` and `KapslHybridClient` provide local unary tensor inference
-with `infer(shape, dtype, data, *, model_id=0)`. All clients return bytes;
+with `infer(shape, dtype, data, *, model_id=0)`. All tensor clients return bytes;
 `infer_tensor` preserves shape/dtype and `infer_stream_tensors` yields `Tensor`
 objects on native/gRPC clients. SHM uses request-owned response mailboxes and
 shared allocation leases to isolate concurrent requests.
+
+## Version 0.3.0
+
+Adds `KapslHttpClient` and its typed results. Native, SHM, hybrid and gRPC
+protocols are unchanged from 0.2.0 and need engine 0.2.8 or later; the HTTP
+routes are available from engine 0.2.8. Waited model starts with
+memory-admission results, idle-unload fields, CUDA/GPU-sampling statistics,
+and redacted role-token status need engine 0.3.0. See the repository README
+for the full table and known engine 0.3.0 behaviour.
 
 ## Version 0.2.0 migration
 
