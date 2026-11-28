@@ -22,9 +22,11 @@ pub struct OnnxSessionContext<'a> {
 /// variables to configure a session.
 ///
 /// When a device allocation-scope provider is installed, this hook runs inside
-/// its model scope. The SDK enforces environment allocator participation and
-/// disables CPU execution-provider fallback after the hook returns. This Rust
-/// interface stays inside the integration library; it is not a native host ABI.
+/// its model scope. The SDK enforces environment allocator participation after
+/// the hook returns. It leaves `session.disable_cpu_ep_fallback` to the hook,
+/// because whether ORT keeps shape-computation nodes on the device depends on
+/// the ORT build the integration ships. This Rust interface stays inside the
+/// integration library; it is not a native host ABI.
 pub trait OnnxSessionConfigurator: Send + Sync {
     fn configure(
         &self,

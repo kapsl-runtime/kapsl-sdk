@@ -696,8 +696,11 @@ impl LLMBackend {
     /// closed if it cannot establish the requested context. CUDA/TensorRT
     /// availability is validated from the loaded ORT runtime, legacy provider
     /// pack discovery is bypassed because the caller owns that validation, and
-    /// ORT CPU execution-provider fallback is disabled for every resulting
-    /// session. Inference through a configured provider must use
+    /// an unavailable provider fails the load instead of selecting the CPU
+    /// provider. Nodes that ORT itself places on the CPU provider, such as
+    /// CUDA's shape-computation subgraphs, stay allowed unless the session
+    /// configurator sets `session.disable_cpu_ep_fallback`. Inference through a
+    /// configured provider must use
     /// [`Self::infer_stream_with_allocation_request_id`]; an unstamped request
     /// is rejected before provider execution.
     pub fn with_device_allocation_scope_provider(
