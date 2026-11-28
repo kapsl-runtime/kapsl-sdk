@@ -75,9 +75,14 @@ because llama.cpp rank pooling would otherwise return a meaningless score.
 Manifest options: `metadata.embed.normalize` (default true),
 `metadata.embed.pooling` (`mean`, `cls`, `last`; default is the model's own),
 `metadata.classify.apply_softmax` (default true). `KAPSL_GGUF_CTX_PER_SEQ`
-caps tokens per input and `KAPSL_GGUF_POOLED_MAX_SEQS` (default 16) caps
-sequences per llama.cpp batch. Requests are not coalesced across callers, so
-one caller's invalid input cannot fail another caller's request.
+caps tokens per input and `KAPSL_GGUF_POOLED_MAX_SEQS` caps sequences per
+llama.cpp batch. The default is 1: each input runs in its own llama.cpp call,
+so its result is bit-identical whether it is sent alone or inside a large
+request. That default is also faster on CPU for encoder models. Packing several
+inputs per batch makes llama.cpp choose kernels by batch shape, so packed
+results drift by up to about 3e-3 (cosine about 0.9998), as with
+`llama-embedding`. Requests are not coalesced across callers, so one caller's
+invalid input cannot fail another caller's request.
 
 `tests/gguf_pooled_models.rs` checks real models when given model paths:
 batched and single-input embeddings must match, reranking must rank a relevant

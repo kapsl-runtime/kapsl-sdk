@@ -50,8 +50,18 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 /// Maximum sequences packed into one llama.cpp batch.
+///
+/// The default of one sequence per llama.cpp call makes every result
+/// bit-identical to the same input sent alone. With several sequences per
+/// batch, llama.cpp's CPU kernels choose flash-attention tiling and matmul
+/// tiles by batch shape, and quantized activations amplify the resulting
+/// rounding changes: a packed input can drift by about 3e-3 (cosine about
+/// 0.9998). llama-embedding does the same. Packing is also slower for encoder
+/// models on CPU, because attention runs over every masked cross-sequence pair
+/// in the batch. Measured with bge-small Q8_0 and 64 30-token passages, the
+/// compute time was 575 ms with one sequence per call and 860 ms with 16.
 const POOLED_MAX_SEQS_ENV: &str = "KAPSL_GGUF_POOLED_MAX_SEQS";
-const POOLED_MAX_SEQS_DEFAULT: usize = 16;
+const POOLED_MAX_SEQS_DEFAULT: usize = 1;
 /// llama.cpp's `LLAMA_MAX_SEQ`.
 const LLAMA_MAX_SEQ: usize = 256;
 /// Upper bound on inputs in one request, so a single call cannot queue an

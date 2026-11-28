@@ -6,13 +6,15 @@
 //!
 //! Each test skips (passes) when its model variable is unset. The embedding
 //! test checks the property most sensitive to batching bugs: a text embedded
-//! alone and the same text packed into a multi-sequence batch must give the
-//! same vector.
+//! alone and the same text packed into a multi-sequence batch of several
+//! hundred tokens must give the same vector (within 1e-6). This holds with the
+//! default `KAPSL_GGUF_POOLED_MAX_SEQS=1`. Packed llama.cpp batches drift by
+//! about 1e-3.
 //!
 //! Set `KAPSL_TEST_GGUF_EMBED_REFERENCE` to the JSON that llama.cpp's own
 //! `llama-embedding --embd-normalize 2 --embd-output-format json` prints for
-//! the four test texts (newline-separated, in order) to also require parity
-//! with llama.cpp's reference embedding tool.
+//! the first four test texts (newline-separated, in order) to also require
+//! parity with llama.cpp's reference embedding tool.
 #![cfg(feature = "gguf")]
 
 use kapsl_engine_api::{
@@ -83,12 +85,26 @@ async fn embeddings_are_batch_invariant_and_semantic() {
     let info = backend.model_info().expect("model info");
     assert_eq!(info.output_names, vec!["embeddings"]);
 
-    let texts = [
+    // The four reference texts, then enough varied-length filler that the
+    // batch holds several hundred tokens: small batches hide precision paths
+    // that only engage on larger micro-batches.
+    let filler: Vec<String> = (0..20)
+        .map(|index| {
+            format!(
+                "filler sentence {index} {}",
+                "with several extra words ".repeat(1 + index % 6)
+            )
+        })
+        .collect();
+    let texts: Vec<&str> = [
         "The cat sat on the mat.",
         "A kitten is resting on a rug.",
         "Quarterly revenue grew by twelve percent.",
         "short",
-    ];
+    ]
+    .into_iter()
+    .chain(filler.iter().map(String::as_str))
+    .collect();
     let batched = rows(
         &backend
             .infer(&request(texts[0], &texts[1..], "text"))
@@ -106,7 +122,7 @@ async fn embeddings_are_batch_invariant_and_semantic() {
             .fold(0.0f32, f32::max);
         println!("text {index}: max |alone - batched| = {max_diff:e}");
         assert!(
-            max_diff < 1e-3,
+            max_diff <= 1e-6,
             "text {index} differs by {max_diff} when batched"
         );
     }
@@ -120,11 +136,7 @@ async fn embeddings_are_batch_invariant_and_semantic() {
             serde_json::from_slice(&std::fs::read(reference).expect("read reference JSON"))
                 .expect("parse reference JSON");
         let data = reference["data"].as_array().expect("reference data array");
-        assert_eq!(
-            data.len(),
-            texts.len(),
-            "reference must embed the test texts"
-        );
+        assert_eq!(data.len(), 4, "reference must embed the four test texts");
         for (index, item) in data.iter().enumerate() {
             let expected: Vec<f32> = item["embedding"]
                 .as_array()
