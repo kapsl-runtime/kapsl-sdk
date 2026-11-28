@@ -3,6 +3,7 @@
 
 use super::*;
 use kapsl_engine_api::NamedTensor;
+use std::path::PathBuf;
 
 fn text(value: &str) -> BinaryTensorPacket {
     BinaryTensorPacket::new(
@@ -361,14 +362,103 @@ fn pooling_must_fit_the_task() {
 #[test]
 fn compute_estimate_has_a_floor_and_grows_with_context() {
     assert_eq!(
-        estimate_pooled_compute_bytes(384, 1536, 12, 8, 8),
+        estimate_pooled_compute_bytes(384, 1536, 12, 0, 8, 8),
         MIN_POOLED_SCRATCH_BYTES
     );
-    let short = estimate_pooled_compute_bytes(1024, 4096, 16, 512, 512);
-    let long = estimate_pooled_compute_bytes(1024, 4096, 16, 2048, 2048);
+    let short = estimate_pooled_compute_bytes(1024, 4096, 16, 0, 512, 512);
+    let long = estimate_pooled_compute_bytes(1024, 4096, 16, 0, 2048, 2048);
     assert!(long > short);
     // 16 heads x 2048 x 2048 f32 scores alone are 256 MiB.
     assert!(long > 256 * 1024 * 1024);
+}
+
+enum Meta {
+    U32(u32),
+    Bool(bool),
+    Str(&'static str),
+}
+
+/// Writes `dir/name.gguf`: a GGUF v3 file with `entries` as metadata and no
+/// tensors.
+fn metadata_only_gguf(dir: &Path, name: &str, entries: &[(&str, Meta)]) -> PathBuf {
+    fn put_str(out: &mut Vec<u8>, value: &str) {
+        out.extend_from_slice(&(value.len() as u64).to_le_bytes());
+        out.extend_from_slice(value.as_bytes());
+    }
+    let mut out = b"GGUF".to_vec();
+    out.extend_from_slice(&3u32.to_le_bytes());
+    out.extend_from_slice(&0u64.to_le_bytes());
+    out.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+    for (key, value) in entries {
+        put_str(&mut out, key);
+        match value {
+            Meta::U32(v) => {
+                out.extend_from_slice(&4u32.to_le_bytes());
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            Meta::Bool(v) => {
+                out.extend_from_slice(&7u32.to_le_bytes());
+                out.push(u8::from(*v));
+            }
+            Meta::Str(v) => {
+                out.extend_from_slice(&8u32.to_le_bytes());
+                put_str(&mut out, v);
+            }
+        }
+    }
+    let path = dir.join(format!("{name}.gguf"));
+    std::fs::write(&path, out).unwrap();
+    path
+}
+
+/// Plans against the headers of Qwen3-Embedding-0.6B (a causal decoder
+/// embedder) and bge-small-en-v1.5 (a BERT encoder). The Qwen3 bounds are what
+/// llama.cpp allocated for it at the default 2048-token context: 234,881,024
+/// KV bytes and 1,267,695,648 compute bytes.
+#[test]
+fn plan_covers_decoder_heads_and_declared_head_widths() {
+    if std::env::var_os("KAPSL_GGUF_CTX_PER_SEQ").is_some() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let qwen3 = metadata_only_gguf(
+        dir.path(),
+        "qwen3",
+        &[
+            ("general.architecture", Meta::Str("qwen3")),
+            ("qwen3.block_count", Meta::U32(28)),
+            ("qwen3.context_length", Meta::U32(32768)),
+            ("qwen3.embedding_length", Meta::U32(1024)),
+            ("qwen3.feed_forward_length", Meta::U32(3072)),
+            ("qwen3.attention.head_count", Meta::U32(16)),
+            ("qwen3.attention.head_count_kv", Meta::U32(8)),
+            ("qwen3.attention.key_length", Meta::U32(128)),
+            ("qwen3.attention.value_length", Meta::U32(128)),
+            ("qwen3.vocab_size", Meta::U32(151_669)),
+        ],
+    );
+    let (kv, scratch) = planned_pooled_bytes(&qwen3, 639_150_592);
+    assert_eq!(kv, 234_881_024);
+    assert!(scratch >= 1_267_695_648, "{scratch}");
+
+    let bert = metadata_only_gguf(
+        dir.path(),
+        "bert",
+        &[
+            ("general.architecture", Meta::Str("bert")),
+            ("bert.block_count", Meta::U32(12)),
+            ("bert.context_length", Meta::U32(512)),
+            ("bert.embedding_length", Meta::U32(384)),
+            ("bert.feed_forward_length", Meta::U32(1536)),
+            ("bert.attention.head_count", Meta::U32(12)),
+            ("bert.attention.causal", Meta::Bool(false)),
+            ("bert.vocab_size", Meta::U32(30_522)),
+        ],
+    );
+    let (kv, scratch) = planned_pooled_bytes(&bert, 36_806_944);
+    assert_eq!(kv, 12 * 12 * (32 + 32) * 2 * 512);
+    // An encoder has no language-model head, so its estimate stays at the floor.
+    assert_eq!(scratch, MIN_POOLED_SCRATCH_BYTES);
 }
 
 #[test]

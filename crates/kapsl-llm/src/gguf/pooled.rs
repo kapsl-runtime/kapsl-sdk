@@ -607,6 +607,11 @@ fn check_pooling(task: GgufPooledTask, pooling: LlamaPoolingType) -> Result<(), 
 /// * `4 * n_head * n_ubatch * n_ctx`: the f32 attention scores of one
 ///   micro-batch when flash attention is not used (encoders attend over the
 ///   whole sequence at once).
+/// * `4 * n_vocab_out * n_ubatch`: the f32 language-model head output of a
+///   decoder. llama.cpp marks every token as an output when it computes
+///   embeddings, so the head runs over the whole micro-batch: 1.24 GB of the
+///   1.27 GB measured for Qwen3-Embedding-0.6B (151,669-token vocabulary,
+///   `n_ubatch` 2048). Zero for encoders, which have no head.
 /// * `256 * n_ctx`: masks and position bookkeeping.
 /// * `17/16` headroom, with a 64 MiB floor. The measured buffer replaces the
 ///   estimate after load.
@@ -614,6 +619,7 @@ fn estimate_pooled_compute_bytes(
     n_embd: usize,
     n_ff: usize,
     n_head: usize,
+    n_vocab_out: usize,
     n_ubatch: usize,
     n_ctx: usize,
 ) -> usize {
@@ -624,9 +630,11 @@ fn estimate_pooled_compute_bytes(
         .saturating_mul(n_head.max(1))
         .saturating_mul(n_ubatch)
         .saturating_mul(n_ctx);
+    let head = 4usize.saturating_mul(n_vocab_out).saturating_mul(n_ubatch);
     let bookkeeping = 256usize.saturating_mul(n_ctx);
     let raw = activations
         .saturating_add(attention)
+        .saturating_add(head)
         .saturating_add(bookkeeping);
     raw.saturating_add(raw / 16).max(MIN_POOLED_SCRATCH_BYTES)
 }
@@ -634,28 +642,31 @@ fn estimate_pooled_compute_bytes(
 /// `(kv, scratch)` planned bytes for `model_path`, without loading it.
 fn planned_pooled_bytes(model_path: &Path, file_bytes: usize) -> (usize, usize) {
     let fallback = (0, (file_bytes / 8).max(MIN_POOLED_SCRATCH_BYTES));
-    let Ok(config) = kapsl_loader::gguf_loader::GgufFile::open(model_path)
-        .and_then(|file| file.extract_config())
+    let Ok(file) = kapsl_loader::gguf_loader::GgufFile::open(model_path) else {
+        return fallback;
+    };
+    let (Ok(config), Ok((head_k, head_v))) = (file.extract_config(), file.attention_head_widths())
     else {
         return fallback;
     };
     let ctx = (n_ctx_per_seq() as usize)
         .min(config.max_position_embeddings)
         .max(1);
-    // Upper bound: decoder embedders keep one context of KV while a batch
-    // runs; encoder models allocate none.
+    // Upper bound: decoder embedders keep one context of f16 K and V while a
+    // batch runs; encoder models allocate none.
     let kv = config
         .num_hidden_layers
         .max(1)
         .saturating_mul(config.num_kv_heads().max(1))
-        .saturating_mul(config.head_dim().max(1))
-        .saturating_mul(2)
+        .saturating_mul(head_k.max(1).saturating_add(head_v.max(1)))
         .saturating_mul(std::mem::size_of::<u16>())
         .saturating_mul(ctx);
+    let has_lm_head = file.causal_attention() || file.has_tensor("output.weight");
     let scratch = estimate_pooled_compute_bytes(
         config.hidden_size,
         config.intermediate_size,
         config.num_attention_heads,
+        if has_lm_head { config.vocab_size } else { 0 },
         ctx,
         ctx,
     );

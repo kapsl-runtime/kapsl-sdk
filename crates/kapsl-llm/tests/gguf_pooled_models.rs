@@ -18,7 +18,8 @@
 #![cfg(feature = "gguf")]
 
 use kapsl_engine_api::{
-    BinaryTensorPacket, Engine, InferenceRequest, MemoryAllocationClass, NamedTensor, TensorDtype,
+    BinaryTensorPacket, Engine, InferenceRequest, MemoryAllocationClass, MemoryReport, NamedTensor,
+    TensorDtype,
 };
 use kapsl_llm::{GgufPooledBackend, GgufPooledConfig, GgufPooledTask};
 use std::path::PathBuf;
@@ -169,6 +170,27 @@ async fn embeddings_are_batch_invariant_and_semantic() {
                 allocation.class, allocation.domain, allocation.bytes
             );
         }
+    }
+    // The runtime admits a model on the plan, before llama.cpp has measured
+    // anything, so the plan must cover what the loaded context holds.
+    for class in [
+        MemoryAllocationClass::KvCache,
+        MemoryAllocationClass::TransientWorkspace,
+    ] {
+        let bytes = |report: &MemoryReport| -> usize {
+            report
+                .allocations
+                .iter()
+                .filter(|allocation| allocation.class == class)
+                .map(|allocation| allocation.bytes)
+                .sum()
+        };
+        assert!(
+            bytes(&planned) >= bytes(&actual),
+            "{class:?}: planned {} bytes, but llama.cpp allocated {}",
+            bytes(&planned),
+            bytes(&actual)
+        );
     }
     assert!(actual
         .allocations
