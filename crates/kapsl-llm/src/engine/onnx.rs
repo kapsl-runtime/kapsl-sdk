@@ -65,8 +65,20 @@ const DEFAULT_NUM_LAYERS: usize = 32;
 const DEFAULT_NUM_HEADS: usize = 32;
 const DEFAULT_HEAD_DIM: usize = 128;
 const MAX_SEQ_LEN: usize = 4096;
-const DISABLE_CPU_EP_FALLBACK_KEY: &str = "session.disable_cpu_ep_fallback";
 
+/// Apply the adapter's session hook, then the SDK's allocation authority.
+///
+/// Scoped device sessions must take device memory from the governed
+/// environment allocator. The SDK does not set ORT's
+/// `session.disable_cpu_ep_fallback`: ONNX Runtime 1.23.2's CUDA provider
+/// always leaves small shape-computation subgraphs to the CPU provider
+/// (`GetCpuPreferredNodes`) and that option rejects any graph with a node on
+/// the CPU provider, so it failed ordinary transformer exports on every GPU.
+/// CPU-provider nodes use host memory only; host/device copies run on the
+/// CUDA provider and allocate from the governed allocator. Whether a node may
+/// run on the CPU provider depends on the ORT build the integration ships, so
+/// that policy belongs to the integration's configurator. Provider selection
+/// itself never falls back to the CPU for scoped sessions.
 fn configure_adapter_session(
     mut builder: SessionBuilder,
     context: OnnxSessionContext<'_>,
@@ -77,8 +89,8 @@ fn configure_adapter_session(
     if let Some(configurator) = configurator {
         builder = configurator.configure(builder, context)?;
     }
-    // Apply the authority requirements last, even if the adapter supplied
-    // conflicting settings. A hook cannot opt a governed model out of them.
+    // Apply the authority requirement last, even if the adapter supplied a
+    // conflicting setting. A hook cannot opt a governed model out of it.
     if (use_env_allocators
         && matches!(
             context.provider.to_ascii_lowercase().as_str(),
@@ -88,11 +100,6 @@ fn configure_adapter_session(
     {
         builder = builder
             .with_config_entry("session.use_env_allocators", "1")
-            .map_err(|error| EngineError::backend(error.to_string()))?;
-    }
-    if scoped_device_provider {
-        builder = builder
-            .with_config_entry(DISABLE_CPU_EP_FALLBACK_KEY, "1")
             .map_err(|error| EngineError::backend(error.to_string()))?;
     }
     Ok(builder)

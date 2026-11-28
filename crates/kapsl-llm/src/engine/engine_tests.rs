@@ -7,7 +7,6 @@ mod tests {
         resolve_prepend_bos_token_id, tokenizer_add_bos_token, tokenizer_declared_bos_token_id,
         validate_scoped_device_provider_with, KvCacheMode, KvLayout, LLMEngine, LLMMetrics,
         SafeLoadSetting, SamplingParams, SchedulerConfig, SequenceGroup,
-        DISABLE_CPU_EP_FALLBACK_KEY,
     };
     use crate::allocation_scope::{
         DeviceAllocationClass, DeviceAllocationScope, DeviceAllocationScopeGuard,
@@ -30,6 +29,8 @@ mod tests {
     use tokenizers::models::bpe::{Vocab, BPE};
     use tokenizers::Tokenizer;
     use tokio::sync::mpsc;
+
+    const DISABLE_CPU_EP_FALLBACK_KEY: &str = "session.disable_cpu_ep_fallback";
 
     fn retain_test_ort_environment() {
         // ORT keeps only a weak reference globally. Keep its environment alive
@@ -88,6 +89,21 @@ mod tests {
         std::str::from_utf8(&value[..size - 1]).unwrap().to_string()
     }
 
+    fn has_session_config_entry(builder: &SessionBuilder, key: &str) -> bool {
+        let key = std::ffi::CString::new(key).unwrap();
+        let mut present: std::ffi::c_int = 0;
+        // SAFETY: the builder and key remain live and `present` is a valid
+        // output slot.
+        let status = unsafe {
+            (ort::api().HasSessionConfigEntry)(builder.ptr(), key.as_ptr(), &mut present)
+        };
+        assert!(
+            status.0.is_null(),
+            "ORT must report session option presence"
+        );
+        present != 0
+    }
+
     #[test]
     fn adapter_sessions_keep_model_options_isolated_and_enforce_governance_last() {
         retain_test_ort_environment();
@@ -130,7 +146,8 @@ mod tests {
             );
             assert_eq!(
                 session_config_entry(&builder, DISABLE_CPU_EP_FALLBACK_KEY),
-                "1"
+                "0",
+                "CPU-provider placement policy belongs to the adapter's ORT build"
             );
         }
         let first_calls = first.calls.lock().unwrap();
@@ -187,6 +204,45 @@ mod tests {
             session_config_entry(&builder, DISABLE_CPU_EP_FALLBACK_KEY),
             "0"
         );
+    }
+
+    #[test]
+    fn scoped_sessions_accept_nodes_that_ort_places_on_the_cpu_provider() {
+        retain_test_ort_environment();
+        for provider in ["cuda", "tensorrt"] {
+            let context = OnnxSessionContext {
+                model_path: std::path::Path::new("model.onnx"),
+                provider,
+                device_id: 0,
+            };
+            let builder =
+                configure_adapter_session(Session::builder().unwrap(), context, None, true, true)
+                    .unwrap();
+            assert_eq!(
+                session_config_entry(&builder, "session.use_env_allocators"),
+                "1"
+            );
+            // ORT 1.23.2's CUDA provider leaves shape subgraphs to the CPU
+            // provider; this option made every such model fail to load.
+            assert!(!has_session_config_entry(
+                &builder,
+                DISABLE_CPU_EP_FALLBACK_KEY
+            ));
+            // No accelerator is registered here, so every node lands on the
+            // CPU provider. With the option set, ORT rejected this commit with
+            // "This session contains graph nodes that are assigned to the
+            // default CPU EP, but fallback to CPU EP has been explicitly
+            // disabled by the user."
+            let mut session = builder
+                .commit_from_memory(include_bytes!("../../tests/fixtures/profile-matmul.onnx"))
+                .expect("scoped sessions must accept CPU-provider nodes");
+            let input =
+                ort::value::Tensor::from_array(([1_usize, 4], vec![1.0_f32, 2.0, 3.0, 4.0]))
+                    .unwrap();
+            let outputs = session.run(ort::inputs![input]).unwrap();
+            let (_, values) = outputs[0].try_extract_tensor::<f32>().unwrap();
+            assert_eq!(values, &[2.0, 4.0, 6.0, 8.0]);
+        }
     }
 
     #[tokio::test]
@@ -263,10 +319,6 @@ mod tests {
 
     #[test]
     fn scoped_device_provider_validation_disables_every_cpu_fallback_path() {
-        assert_eq!(
-            DISABLE_CPU_EP_FALLBACK_KEY,
-            "session.disable_cpu_ep_fallback"
-        );
         assert!(
             validate_scoped_device_provider_with(Some("cuda"), |provider| { provider == "cuda" })
                 .is_ok()

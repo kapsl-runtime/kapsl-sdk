@@ -14,10 +14,16 @@ environment settings. A configuration error aborts loading; it cannot trigger
 an SDK provider or CPU fallback.
 
 With a device allocation-scope provider, configuration executes inside the
-model's allocation scope. The SDK enforces environment allocator use and
-disables CPU execution-provider fallback after the configurator returns,
-including on retries. This hook uses Rust and ORT types within the integration;
-the engine continues to use the existing backend ABI.
+model's allocation scope. The SDK enforces environment allocator use after the
+configurator returns, including on retries, and never selects the CPU provider
+in place of an unavailable CUDA or TensorRT provider. It does not set ORT's
+`session.disable_cpu_ep_fallback`: ONNX Runtime 1.23.2's CUDA provider leaves
+small shape-computation subgraphs to the CPU provider, and that option rejects
+any graph with a CPU-provider node, so it fails ordinary transformer exports.
+CPU-provider nodes use host memory only. An integration whose ORT build keeps
+those nodes on the device may set the option in its configurator. This hook
+uses Rust and ORT types within the integration; the engine continues to use the
+existing backend ABI.
 
 ## GGUF request ownership
 
