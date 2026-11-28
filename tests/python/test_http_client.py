@@ -726,10 +726,11 @@ def test_chat_completion_stream_can_be_cancelled(client, engine):
     release.set()
 
 
-def test_chat_completion_stream_cancel_wakes_a_blocked_reader(client, engine):
+def test_chat_completion_stream_cancel_from_another_thread(client, engine):
     release = threading.Event()
     engine.route("POST", "/v1/chat/completions", stream=[
-        chunk({"content": "first"}), lambda: release.wait(10), "data: [DONE]\n\n",
+        chunk({"content": "first"}), lambda: release.wait(10),
+        chunk({"content": "late"}), "data: [DONE]\n\n",
     ])
     stream = client.chat_completion_stream("m", [{"role": "user", "content": "x"}])
     assert next(stream).text == "first"
@@ -745,34 +746,41 @@ def test_chat_completion_stream_cancel_wakes_a_blocked_reader(client, engine):
     thread.start()
     time.sleep(0.2)
     started = time.monotonic()
-    stream.cancel()
-    thread.join(3)
+    assert stream.cancel() is True
+    # Cancelling does not wait for the blocked read.
+    assert time.monotonic() - started < 1 and stream.closed
+    # The read ends once the connection closes (on Linux and macOS, at once).
     release.set()
-    assert not thread.is_alive() and time.monotonic() - started < 3
+    thread.join(5)
+    assert not thread.is_alive()
     assert len(outcome) == 1 and isinstance(outcome[0], StopIteration)
 
 
 def test_chat_completion_stream_asyncio_cancellation(client, engine):
     release = threading.Event()
     engine.route("POST", "/v1/chat/completions", stream=[
-        chunk({"content": "first"}), lambda: release.wait(10), "data: [DONE]\n\n",
+        chunk({"content": "first"}), lambda: release.wait(10),
+        chunk({"content": "late"}), "data: [DONE]\n\n",
     ])
 
     async def run():
         stream = client.chat_completion_stream("m", [{"role": "user", "content": "x"}])
         assert (await stream.__anext__()).text == "first"
+        started = time.monotonic()
         with pytest.raises(asyncio.TimeoutError):
             await asyncio.wait_for(stream.__anext__(), 0.2)
+        # The cancelled read did not block the event loop.
+        elapsed = time.monotonic() - started
         assert stream.closed
+        with pytest.raises(StopAsyncIteration):
+            await stream.__anext__()
+        release.set()
+        return elapsed
 
-    # asyncio.run also waits for the worker thread that was reading, so this
-    # only finishes early if cancelling woke that read.
-    started = time.monotonic()
     try:
-        asyncio.run(run())
+        assert asyncio.run(run()) < 1.5
     finally:
         release.set()
-    assert time.monotonic() - started < 5
 
 
 def test_chat_completion_stream_raises_http_errors_before_streaming(client, engine):

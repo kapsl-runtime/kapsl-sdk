@@ -588,9 +588,12 @@ class KapslHttpClient:
 
         Returns a stream of ``ChatCompletionChunk`` objects that supports
         ``for``, ``async for``, ``with``, ``cancel()`` and ``close()``; closing
-        it disconnects, which cancels generation. An error the engine reports
-        after the stream started raises ``KapslHttpError`` with status 200, and
-        a connection that ends before ``[DONE]`` raises ``ConnectionError``.
+        it disconnects, which cancels generation. Cancelling never blocks: a
+        read still waiting in another thread (as with ``async for``) ends when
+        the engine closes the connection, or at once on Linux and macOS. An
+        error the engine reports after the stream started raises
+        ``KapslHttpError`` with status 200, and a connection that ends before
+        ``[DONE]`` raises ``ConnectionError``.
         """
         body = self._chat_body(
             model, messages, True, max_tokens, max_completion_tokens, temperature,
@@ -606,25 +609,27 @@ class KapslHttpClient:
             accept="text/event-stream",
         )
         status = response.status
-        # Reads and the final close share a lock: http.client is not safe to
-        # close while another thread reads. Cancelling first shuts the socket
-        # down, which wakes a blocked read so the lock is released promptly.
+        # http.client is not safe to close while another thread reads, so
+        # reads and the close share a lock. Cancelling shuts the socket down
+        # (the engine sees the disconnect and stops generating) and closes the
+        # response only if no read holds the lock; otherwise that read closes
+        # it when it returns. Shutdown wakes a blocked read on Linux and macOS
+        # but not on Windows, so cancel() must not wait for the lock.
         lock = threading.Lock()
         cancelled = threading.Event()
 
         def read():
             with lock:
+                if not cancelled.is_set():
+                    try:
+                        data = read_sse_data(response.readline)
+                    except (OSError, ValueError):
+                        if not cancelled.is_set():
+                            raise
                 if cancelled.is_set():
+                    response.close()
                     return None
-                try:
-                    data = read_sse_data(response.readline)
-                except (OSError, ValueError):
-                    if cancelled.is_set():
-                        return None
-                    raise
             if data is None:
-                if cancelled.is_set():
-                    return None
                 raise ConnectionError("The chat completion stream ended before [DONE]")
             if data.strip() == "[DONE]":
                 return None
@@ -638,8 +643,11 @@ class KapslHttpClient:
         def cancel():
             cancelled.set()
             _shutdown(response)
-            with lock:
-                response.close()
+            if lock.acquire(blocking=False):
+                try:
+                    response.close()
+                finally:
+                    lock.release()
 
         return InferenceStream(
             read, cancel, typed=True, owner=self, is_closed=lambda: response.closed,
@@ -666,8 +674,8 @@ class KapslHttpClient:
 
 
 def _shutdown(response):
-    # Async iteration reads in a worker thread. Shutting the socket down makes
-    # a read blocked there return at once instead of at the next event.
+    # Sends the disconnect to the engine even while another thread reads, and
+    # on Linux and macOS also wakes that read.
     sock = getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
     if sock is not None:
         try:
