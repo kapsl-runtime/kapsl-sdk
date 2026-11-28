@@ -5,6 +5,30 @@ from __future__ import annotations
 import asyncio
 
 
+def read_sse_data(readline):
+    """Return the data of the next server-sent event, or None at end of input.
+
+    Multi-line data fields are joined with newlines. Comments and the
+    ``event``, ``id`` and ``retry`` fields are ignored. As the SSE standard
+    requires, an event cut off by the end of input is discarded.
+    """
+    data = []
+    while True:
+        line = readline()
+        if not line:
+            return None
+        line = line.decode("utf-8").rstrip("\r\n")
+        if not line:
+            if data:
+                return "\n".join(data)
+            continue
+        if line.startswith(":"):
+            continue
+        name, _, value = line.partition(":")
+        if name == "data":
+            data.append(value[1:] if value.startswith(" ") else value)
+
+
 class InferenceStream:
     def __init__(self, read, cancel, *, typed=False, owner=None, is_closed=None):
         self._read = read

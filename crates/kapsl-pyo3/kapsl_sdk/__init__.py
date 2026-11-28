@@ -1,7 +1,15 @@
 from .kapsl_sdk import KapslHybridClient, KapslShmClient
 from .client import KapslClient
 from .grpc_client import KapslGrpcClient, AsyncKapslGrpcClient
-from ._types import Tensor
+from .http_client import KapslHttpClient, KapslHttpError
+from ._types import (
+    ApiKey, AuthAccess, AuthLogin, AuthStatus, AuthUser, ChatCompletion,
+    ChatCompletionChoice, ChatCompletionChunk, ChatCompletionChunkChoice,
+    ChatCompletionDelta, ChatCompletionMessage, CreatedApiKey, CudaVersions,
+    Embedding, EmbeddingList, HealthStatus, MemoryAuthority, MemoryDomainUsage,
+    MemoryRequest, ModelLoadResult, ModelMemoryUsage, ModelStatus, OpenAIModel,
+    RoleSummary, RoleTokenStatus, ScalingPolicy, SystemStats, Tensor, TokenUsage,
+)
 from importlib.metadata import version as _package_version
 
 import pathlib
@@ -10,7 +18,14 @@ __version__ = _package_version("kapsl-sdk")
 
 __all__ = [
     "KapslClient", "KapslGrpcClient", "AsyncKapslGrpcClient",
-    "KapslHybridClient", "KapslShmClient", "Tensor", "load_voice", "list_voices",
+    "KapslHybridClient", "KapslShmClient", "KapslHttpClient", "KapslHttpError",
+    "Tensor", "load_voice", "list_voices",
+    "ApiKey", "AuthAccess", "AuthLogin", "AuthStatus", "AuthUser", "ChatCompletion",
+    "ChatCompletionChoice", "ChatCompletionChunk", "ChatCompletionChunkChoice",
+    "ChatCompletionDelta", "ChatCompletionMessage", "CreatedApiKey", "CudaVersions",
+    "Embedding", "EmbeddingList", "HealthStatus", "MemoryAuthority", "MemoryDomainUsage",
+    "MemoryRequest", "ModelLoadResult", "ModelMemoryUsage", "ModelStatus", "OpenAIModel",
+    "RoleSummary", "RoleTokenStatus", "ScalingPolicy", "SystemStats", "TokenUsage",
 ]
 
 _VOICES_DIR = pathlib.Path(__file__).parent
